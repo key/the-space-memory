@@ -1,0 +1,29 @@
+name: DevContainer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".devcontainer/**"
+  pull_request:
+    paths:
+      - ".devcontainer/**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create dummy .env
+        run: touch .env
+      - name: Build DevContainer
+        uses: devcontainers/ci@v0.3
+        with:
+          runCmd: |
+            rumdl --version
+            yamllint --version
+            shellcheck --version
+            taplo --version
+            gh --version
+            jq --version
+            cargo --version
