@@ -82,9 +82,24 @@ impl Embedder {
             return Ok(Vec::new());
         }
 
+        // Truncate texts to avoid OOM/crash on very long inputs.
+        // ruri-v3-30m supports up to 8192 tokens; we limit input chars
+        // conservatively (Japanese averages ~1.5 chars/token).
+        const MAX_CHARS: usize = 8192;
+        let truncated: Vec<String> = texts
+            .iter()
+            .map(|t| {
+                if t.len() > MAX_CHARS {
+                    t[..t.floor_char_boundary(MAX_CHARS)].to_string()
+                } else {
+                    t.clone()
+                }
+            })
+            .collect();
+
         let encodings = self
             .tokenizer
-            .encode_batch(texts.to_vec(), true)
+            .encode_batch(truncated, true)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let input_ids: Vec<Vec<u32>> = encodings.iter().map(|e| e.get_ids().to_vec()).collect();

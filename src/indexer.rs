@@ -445,17 +445,18 @@ pub fn backfill_vectors(
     let mut last_id: i64 = 0;
 
     loop {
-        let batch: Vec<(i64, String)> = conn
+        let batch: Vec<(i64, String, String)> = conn
             .prepare(
-                "SELECT c.id, c.content
+                "SELECT c.id, c.content, d.file_path
                  FROM chunks c
                  LEFT JOIN chunks_vec v ON c.id = v.rowid
+                 JOIN documents d ON c.document_id = d.id
                  WHERE v.rowid IS NULL AND c.id > ?
                  ORDER BY c.id
                  LIMIT ?",
             )?
             .query_map(rusqlite::params![last_id, batch_size as i64], |row| {
-                Ok((row.get(0)?, row.get(1)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .filter_map(|r| r.ok())
             .collect();
@@ -465,14 +466,20 @@ pub fn backfill_vectors(
         }
         last_id = batch.last().unwrap().0;
 
-        let texts: Vec<String> = batch.iter().map(|(_, content)| content.clone()).collect();
+        let files: Vec<&str> = batch.iter().map(|(_, _, f)| f.as_str()).collect();
         let batch_start_id = batch.first().unwrap().0;
         let batch_end_id = last_id;
+        eprintln!(
+            "  batch {batch_start_id}..{batch_end_id}: {:?}",
+            files
+        );
+
+        let texts: Vec<String> = batch.iter().map(|(_, content, _)| content.clone()).collect();
 
         match catch_unwind(AssertUnwindSafe(|| encode_fn(&texts))) {
             Ok(Ok(embeddings)) => {
                 let tx = conn.unchecked_transaction()?;
-                for ((chunk_id, _), emb) in batch.iter().zip(embeddings.iter()) {
+                for ((chunk_id, _, _), emb) in batch.iter().zip(embeddings.iter()) {
                     if write_vec_row(conn, *chunk_id, emb) {
                         stats.filled += 1;
                     } else {
