@@ -4,6 +4,9 @@
 # Rust
 /target/
 
+# Built binary (use Docker build to generate)
+/tsm
+
 # Data & models
 /data/
 /models/
