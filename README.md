@@ -2,7 +2,8 @@
 
 A cross-workspace knowledge search engine built in Rust.
 
-Indexes Markdown documents across multiple workspaces and provides hybrid search combining FTS5 full-text search with vector semantic search (ruri-v3-30m, 256-dim).
+Indexes Markdown documents across multiple workspaces and provides hybrid search
+combining FTS5 full-text search with vector semantic search (ruri-v3-30m, 256-dim).
 
 ## Features
 

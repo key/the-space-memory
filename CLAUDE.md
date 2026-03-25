@@ -90,7 +90,8 @@ docker build -t the-space-memory /path/to/the-space-memory
 
 ## Gotchas
 
-- ruri safetensors have no tensor name prefix. candle's ModernBert::load expects `model.` prefix — key names are remapped at load time
+- ruri safetensors have no tensor name prefix.
+  candle's ModernBert::load expects `model.` prefix — key names are remapped at load time
 - Use `rusqlite`'s bundled feature (don't depend on system SQLite)
 - Embedder daemon auto-stops after 10 min idle. Check with `doctor`, restart if needed
 - Search works without embedder (FTS5-only fallback)
