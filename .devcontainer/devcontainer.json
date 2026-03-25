@@ -1,0 +1,37 @@
+{
+  "name": "The Space Memory",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "runArgs": [
+    "--name",
+    "The Space Memory",
+    "--rm",
+    "--env-file",
+    ".env"
+  ],
+  "mounts": [
+    "source=claude,target=/home/vscode/.claude,type=volume",
+    "source=gh,target=/home/vscode/.config/gh,type=volume"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "redhat.vscode-yaml",
+        "github.vscode-github-actions",
+        "editorconfig.editorconfig",
+        "rvben.rumdl"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "files.eol": "\n",
+        "files.insertFinalNewline": true,
+        "files.trimTrailingWhitespace": true,
+        "yaml.schemaStore.enable": true,
+        "yaml.format.enable": true
+      }
+    }
+  },
+  "remoteUser": "vscode",
+  "postCreateCommand": "bash .devcontainer/post-create.sh"
+}

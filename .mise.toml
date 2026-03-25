@@ -1,0 +1,7 @@
+[tools]
+"github-cli" = "latest"
+jq = "latest"
+shellcheck = "latest"
+"github:rvben/rumdl" = "latest"
+taplo = "latest"
+"pipx:yamllint" = "latest"
