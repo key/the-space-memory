@@ -39,7 +39,7 @@ src/
 ├── lib.rs              — Crate root
 ├── main.rs             — CLI entry point (clap)
 ├── cli.rs              — CLI command implementations
-├── config.rs           — Configuration (PROJECT_ROOT, CONTENT_DIRS, scoring params)
+├── config.rs           — Configuration (TSM_* env vars, config file, scoring params)
 ├── db.rs               — SQLite (rusqlite) DB init & connection management
 ├── indexer.rs           — Indexer (diff detection, FTS5/vector registration)
 ├── searcher.rs          — FTS5 + vector search, RRF fusion, scoring

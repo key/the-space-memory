@@ -1,10 +1,10 @@
 [package]
-name = "knowledge-search"
+name = "the-space-memory"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "knowledge-search"
+name = "tsm"
 path = "src/main.rs"
 
 [dependencies]

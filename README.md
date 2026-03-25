@@ -19,19 +19,19 @@ combining FTS5 full-text search with vector semantic search (ruri-v3-30m, 256-di
 
 ```bash
 # Search
-knowledge-search search -q "query" -k 5
+tsm search -q "query" -k 5
 
 # Index all documents
-knowledge-search index
+tsm index
 
 # Start embedder daemon (required for vector search)
-knowledge-search embedder-start
+tsm embedder-start
 
 # Health check
-knowledge-search doctor
+tsm doctor
 
 # Rebuild database
-knowledge-search rebuild --force
+tsm rebuild --force
 ```
 
 ## License

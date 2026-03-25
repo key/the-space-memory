@@ -1,12 +1,11 @@
 use std::path::PathBuf;
 
-pub const PROJECT_ROOT: &str = "/workspaces";
 pub const MAX_CHUNK_CHARS: usize = 800;
 pub const RRF_K: f64 = 60.0;
 pub const SCORE_THRESHOLD: f64 = 0.005;
 pub const MAX_RESULTS: usize = 5;
 pub const EMBEDDING_DIM: usize = 256;
-pub const SOCKET_PATH: &str = "/tmp/knowledge-search-embedder.sock";
+pub const SOCKET_PATH: &str = "/tmp/tsm-embedder.sock";
 pub const DEFAULT_HALF_LIFE_DAYS: f64 = 90.0;
 pub const SNIPPET_MAX_CHARS: usize = 200;
 pub const MIN_SESSION_MESSAGE_LEN: usize = 10;
@@ -15,6 +14,9 @@ pub const MAX_QUERY_EXPANSIONS: usize = 5;
 pub const RECENT_DAYS: i64 = 30;
 pub const EMBEDDER_IDLE_TIMEOUT_SECS: u64 = 600;
 pub const DICT_CANDIDATE_FREQ_THRESHOLD: i64 = 5;
+
+const DEFAULT_PROJECT_ROOT: &str = "/workspaces";
+const DEFAULT_DB_NAME: &str = "tsm.db";
 
 /// Content directories with score weights. (directory, weight)
 pub const CONTENT_DIRS: &[(&str, f64)] = &[
@@ -38,20 +40,66 @@ pub const CONTENT_DIRS: &[(&str, f64)] = &[
 ];
 pub const SESSION_WEIGHT: f64 = 0.3;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+/// Resolve data_dir: TSM_DATA_DIR env > config file > CARGO_MANIFEST_DIR/data
+pub fn data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("TSM_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = load_config_value("data_dir") {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data")
+}
+
+/// Resolve project_root: TSM_PROJECT_ROOT env > config file > default
+pub fn project_root() -> PathBuf {
+    if let Ok(root) = std::env::var("TSM_PROJECT_ROOT") {
+        return PathBuf::from(root);
+    }
+    if let Some(root) = load_config_value("project_root") {
+        return PathBuf::from(root);
+    }
+    PathBuf::from(DEFAULT_PROJECT_ROOT)
 }
 
 pub fn db_path() -> PathBuf {
-    repo_root().join("data").join("knowledge-rust.db")
+    data_dir().join(DEFAULT_DB_NAME)
 }
 
 pub fn user_dict_path() -> PathBuf {
-    repo_root().join("data").join("user_dict.csv")
+    data_dir().join("user_dict.csv")
 }
 
 pub fn custom_terms_path() -> PathBuf {
-    repo_root().join("data").join("custom_terms.toml")
+    data_dir().join("custom_terms.toml")
+}
+
+/// Load a value from config file.
+/// Search order: TSM_CONFIG env > ./tsm.toml > ~/.config/tsm/config.toml
+fn load_config_value(key: &str) -> Option<String> {
+    let candidates = config_file_candidates();
+    for path in candidates {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(table) = content.parse::<toml::Table>() {
+                if let Some(val) = table.get(key).and_then(|v| v.as_str()) {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn config_file_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("TSM_CONFIG") {
+        candidates.push(PathBuf::from(path));
+    }
+    candidates.push(PathBuf::from("tsm.toml"));
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(PathBuf::from(home).join(".config/tsm/config.toml"));
+    }
+    candidates
 }
 
 pub fn status_penalty(status: Option<&str>) -> f64 {
@@ -185,9 +233,43 @@ mod tests {
     }
 
     #[test]
-    fn test_user_dict_path() {
+    fn test_data_dir_env() {
+        std::env::set_var("TSM_DATA_DIR", "/tmp/tsm-test-data");
+        let dir = data_dir();
+        assert_eq!(dir, PathBuf::from("/tmp/tsm-test-data"));
+        std::env::remove_var("TSM_DATA_DIR");
+    }
+
+    #[test]
+    fn test_project_root_env() {
+        std::env::set_var("TSM_PROJECT_ROOT", "/tmp/tsm-test-root");
+        let root = project_root();
+        assert_eq!(root, PathBuf::from("/tmp/tsm-test-root"));
+        std::env::remove_var("TSM_PROJECT_ROOT");
+    }
+
+    #[test]
+    fn test_project_root_default() {
+        std::env::remove_var("TSM_PROJECT_ROOT");
+        std::env::remove_var("TSM_CONFIG");
+        let root = project_root();
+        assert_eq!(root, PathBuf::from(DEFAULT_PROJECT_ROOT));
+    }
+
+    #[test]
+    fn test_db_path_uses_data_dir() {
+        std::env::set_var("TSM_DATA_DIR", "/tmp/tsm-db-test");
+        let path = db_path();
+        assert_eq!(path, PathBuf::from("/tmp/tsm-db-test/tsm.db"));
+        std::env::remove_var("TSM_DATA_DIR");
+    }
+
+    #[test]
+    fn test_user_dict_path_uses_data_dir() {
+        std::env::set_var("TSM_DATA_DIR", "/tmp/tsm-dict-test");
         let path = user_dict_path();
-        assert!(path.to_string_lossy().ends_with("data/user_dict.csv"));
+        assert_eq!(path, PathBuf::from("/tmp/tsm-dict-test/user_dict.csv"));
+        std::env::remove_var("TSM_DATA_DIR");
     }
 
     #[test]

@@ -18,7 +18,7 @@ pub fn cmd_init() -> anyhow::Result<()> {
 pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
-    let project_root = PathBuf::from(config::PROJECT_ROOT);
+    let project_root = config::project_root();
 
     let file_paths: Vec<PathBuf> = if files_from_stdin {
         read_paths_from_stdin(&project_root)
@@ -194,7 +194,7 @@ fn print_json(
     results: &[searcher::SearchResult],
     include_content: Option<usize>,
 ) -> anyhow::Result<()> {
-    let project_root = PathBuf::from(config::PROJECT_ROOT);
+    let project_root = config::project_root();
     println!("{}", format_json(results, include_content, &project_root)?);
     Ok(())
 }
@@ -526,7 +526,7 @@ fn get_command_output(cmd: &str, args: &[&str]) -> Option<String> {
 
 pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
-    let project_root = PathBuf::from(config::PROJECT_ROOT);
+    let project_root = config::project_root();
     let socket = Path::new(config::SOCKET_PATH);
 
     if !socket.exists() {

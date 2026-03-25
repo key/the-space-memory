@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use knowledge_search::cli;
-use knowledge_search::user_dict::DictFormat;
+use the_space_memory::cli;
+use the_space_memory::user_dict::DictFormat;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DictFormatArg {
@@ -21,7 +21,7 @@ impl From<DictFormatArg> for DictFormat {
 }
 
 #[derive(Parser)]
-#[command(name = "knowledge-search", version, about = "Knowledge search engine")]
+#[command(name = "tsm", version, about = "The Space Memory — knowledge search engine")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

@@ -10,5 +10,5 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libssl3 ca-certificates \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/knowledge-search /usr/local/bin/knowledge-search
-ENTRYPOINT ["knowledge-search"]
+COPY --from=builder /app/target/release/tsm /usr/local/bin/tsm
+ENTRYPOINT ["tsm"]
