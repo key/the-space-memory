@@ -35,11 +35,6 @@ pub const CONTENT_DIRS: &[(&str, f64)] = &[
     ("company/products", 1.2),
     ("company/decisions", 1.1),
     ("company/retrospectives", 0.9),
-    // novels
-    ("novels/novels", 1.0),
-    ("novels/references", 1.0),
-    ("novels/memory", 0.8),
-    ("novels/styles", 0.8),
 ];
 pub const SESSION_WEIGHT: f64 = 0.3;
 
@@ -135,10 +130,6 @@ pub fn source_type_from_dir(directory: &str) -> String {
         "products" => "product",
         "decisions" => "decision",
         "retrospectives" => "retrospective",
-        "novels" => "novel",
-        "references" => "reference",
-        "memory" => "memory",
-        "styles" => "style",
         other => other,
     }
     .to_string()
@@ -227,7 +218,7 @@ mod tests {
         assert_eq!(source_type_from_dir("daily/notes"), "note");
         assert_eq!(source_type_from_dir("company/knowledge"), "knowledge");
         assert_eq!(source_type_from_dir("company/products"), "product");
-        assert_eq!(source_type_from_dir("novels/novels"), "novel");
+        assert_eq!(source_type_from_dir("novels/novels"), "novels");
         assert_eq!(
             source_type_from_dir("company/retrospectives"),
             "retrospective"
