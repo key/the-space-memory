@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_content_dirs_count() {
-        assert_eq!(CONTENT_DIRS.len(), 14);
+        assert_eq!(CONTENT_DIRS.len(), 10);
     }
 
     #[test]
