@@ -279,8 +279,7 @@ fn backfill_with_worker_sized(db_path: &Path, batch_size: usize) -> anyhow::Resu
 
     loop {
         let encode_fn = |texts: &[String]| worker.borrow_mut().encode(texts);
-        let stats =
-            indexer::backfill_vectors(&conn, &encode_fn, batch_size, Some(&progress_cb))?;
+        let stats = indexer::backfill_vectors(&conn, &encode_fn, batch_size, Some(&progress_cb))?;
 
         if stats.errors == 0 {
             if stats.filled > 0 {
