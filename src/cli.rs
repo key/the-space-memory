@@ -276,7 +276,10 @@ fn backfill_with_worker_sized(db_path: &Path, batch_size: usize) -> anyhow::Resu
                 break;
             }
             restarts += 1;
-            eprintln!("Worker crashed. Restarting ({restarts}/{})...", config::MAX_WORKER_RESTARTS);
+            eprintln!(
+                "Worker crashed. Restarting ({restarts}/{})...",
+                config::MAX_WORKER_RESTARTS
+            );
             *worker.borrow_mut() =
                 embedder::WorkerHandle::spawn(std::time::Duration::from_secs(120))?;
             // Next iteration will pick up remaining unchunked vectors

@@ -4,4 +4,8 @@ user-invocable: true
 disable-model-invocation: true
 ---
 
-!`cd "${CLAUDE_PROJECT_DIR:-/workspaces/workspace}" && ${CLAUDE_PLUGIN_ROOT}/tsm search -q "$ARGUMENTS" -k 5 -f json --include-content 3`
+# Search
+
+```bash
+cd "${CLAUDE_PROJECT_DIR:-/workspaces/workspace}" && ${CLAUDE_PLUGIN_ROOT}/tsm search -q "$ARGUMENTS" -k 5 -f json --include-content 3
+```

@@ -469,12 +469,12 @@ pub fn backfill_vectors(
         let files: Vec<&str> = batch.iter().map(|(_, _, f)| f.as_str()).collect();
         let batch_start_id = batch.first().unwrap().0;
         let batch_end_id = last_id;
-        eprintln!(
-            "  batch {batch_start_id}..{batch_end_id}: {:?}",
-            files
-        );
+        eprintln!("  batch {batch_start_id}..{batch_end_id}: {:?}", files);
 
-        let texts: Vec<String> = batch.iter().map(|(_, content, _)| content.clone()).collect();
+        let texts: Vec<String> = batch
+            .iter()
+            .map(|(_, content, _)| content.clone())
+            .collect();
 
         match catch_unwind(AssertUnwindSafe(|| encode_fn(&texts))) {
             Ok(Ok(embeddings)) => {

@@ -1702,31 +1702,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "knowledge-search"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "candle-core",
- "candle-nn",
- "candle-transformers",
- "chrono",
- "clap",
- "hf-hub",
- "lindera",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "sqlite-vec",
- "tempfile",
- "thiserror 2.0.18",
- "tokenizers",
- "toml",
-]
-
-[[package]]
 name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3226,6 +3201,31 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "the-space-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "chrono",
+ "clap",
+ "hf-hub",
+ "lindera",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "sqlite-vec",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokenizers",
+ "toml",
 ]
 
 [[package]]

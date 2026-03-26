@@ -85,14 +85,17 @@ Limit to **5 files maximum** to stay focused.
 Structure your findings based on the question type:
 
 **For timelines** (changes, history, evolution):
+
 - Organize chronologically with date ranges
 - Cite source files for each period
 
 **For topics** (multiple subjects):
+
 - Group by topic with clear headings
 - Cross-reference between topics where relevant
 
 **For simple answers**:
+
 - Lead with the answer
 - Provide supporting evidence with citations
 

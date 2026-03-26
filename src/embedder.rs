@@ -430,8 +430,9 @@ impl WorkerHandle {
             }
         });
 
-        rx.recv_timeout(timeout)
-            .map_err(|_| anyhow::anyhow!("backfill-worker did not become ready within {timeout:?}"))?;
+        rx.recv_timeout(timeout).map_err(|_| {
+            anyhow::anyhow!("backfill-worker did not become ready within {timeout:?}")
+        })?;
 
         Ok(Self {
             child,
