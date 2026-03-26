@@ -144,12 +144,13 @@ impl Embedder {
 }
 
 /// Load safetensors with "model." prefix added to tensor names.
+/// Uses mmap to leverage OS page cache for faster repeated loads.
 fn load_tensors_with_prefix(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
-    let data = std::fs::read(path)?;
-    let tensors = candle_core::safetensors::load_buffer(&data, device)?;
+    let mmaped = unsafe { candle_core::safetensors::MmapedSafetensors::new(path)? };
     let mut renamed = HashMap::new();
-    for (key, tensor) in tensors {
-        renamed.insert(format!("model.{key}"), tensor);
+    for (name, _view) in mmaped.tensors() {
+        let tensor = mmaped.load(&name, device)?;
+        renamed.insert(format!("model.{name}"), tensor);
     }
     Ok(renamed)
 }
