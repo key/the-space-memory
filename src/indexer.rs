@@ -767,6 +767,12 @@ mod tests {
 
     // ─── backfill_vectors tests ───────────────────────────────────
 
+    /// Clear all vectors so backfill tests start from a known state.
+    /// Needed because index_file may insert vectors if the embedder daemon is running.
+    fn clear_vectors(conn: &Connection) {
+        let _ = conn.execute("DELETE FROM chunks_vec", []);
+    }
+
     fn mock_encode(texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
         Ok(texts
             .iter()
@@ -798,8 +804,8 @@ mod tests {
             "daily/notes/test.md",
             "# Hello\n\nSome content here.\n",
         );
-        // Index file (no embedder running, so no vectors)
         index_file(&conn, &path, dir.path()).unwrap();
+        clear_vectors(&conn); // Ensure no vectors exist before backfill
 
         let chunks: i64 = conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
@@ -827,6 +833,7 @@ mod tests {
         let (conn, dir) = setup();
         let path = write_md(dir.path(), "daily/notes/test.md", "# Hello\n\nContent.\n");
         index_file(&conn, &path, dir.path()).unwrap();
+        clear_vectors(&conn);
 
         let stats1 = backfill_vectors(&conn, &mock_encode, BACKFILL_BATCH_SIZE, None).unwrap();
         assert!(stats1.filled > 0);
@@ -846,6 +853,7 @@ mod tests {
             let path = write_md(dir.path(), &format!("daily/notes/test{i}.md"), &md);
             index_file(&conn, &path, dir.path()).unwrap();
         }
+        clear_vectors(&conn);
 
         let chunks: i64 = conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
@@ -867,6 +875,7 @@ mod tests {
         let (conn, dir) = setup();
         let path = write_md(dir.path(), "daily/notes/test.md", "# Hello\n\nContent.\n");
         index_file(&conn, &path, dir.path()).unwrap();
+        clear_vectors(&conn);
 
         let stats = backfill_vectors(&conn, &mock_encode_fail, BACKFILL_BATCH_SIZE, None).unwrap();
         assert_eq!(stats.filled, 0);
@@ -882,6 +891,7 @@ mod tests {
         let (conn, dir) = setup();
         let path = write_md(dir.path(), "daily/notes/test.md", "# Hello\n\nContent.\n");
         index_file(&conn, &path, dir.path()).unwrap();
+        clear_vectors(&conn);
 
         let stats = backfill_vectors(&conn, &mock_encode_panic, BACKFILL_BATCH_SIZE, None).unwrap();
         assert_eq!(stats.filled, 0);
@@ -898,6 +908,7 @@ mod tests {
             let path = write_md(dir.path(), &format!("daily/notes/test{i}.md"), &md);
             index_file(&conn, &path, dir.path()).unwrap();
         }
+        clear_vectors(&conn);
 
         let call_count = std::sync::atomic::AtomicUsize::new(0);
         let panic_on_first = |texts: &[String]| -> anyhow::Result<Vec<Vec<f32>>> {
