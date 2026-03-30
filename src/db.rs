@@ -95,6 +95,8 @@ CREATE TABLE IF NOT EXISTS dictionary_candidates (
 
 CREATE INDEX IF NOT EXISTS idx_dict_candidates_status_freq
     ON dictionary_candidates(status, frequency DESC);
+
+CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);
 "#;
 
 static VEC_INIT: Once = Once::new();

@@ -148,7 +148,9 @@ pub fn index_file(
         Some(format!("{:?}", fm.tags))
     };
 
-    conn.execute(
+    // Wrap all inserts in a single transaction to avoid per-statement fsync
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rusqlite::params![
@@ -163,13 +165,13 @@ pub fn index_file(
             now,
         ],
     )?;
-    let doc_id = conn.last_insert_rowid();
+    let doc_id = tx.last_insert_rowid();
 
     // Chunk and insert
     let chunks = chunk_markdown_default(body, &directory, &filename);
     let mut chunk_entries: Vec<(i64, String)> = Vec::new();
     for chunk in &chunks {
-        conn.execute(
+        tx.execute(
             "INSERT INTO chunks (document_id, chunk_index, section_path, content)
              VALUES (?, ?, ?, ?)",
             rusqlite::params![
@@ -179,30 +181,33 @@ pub fn index_file(
                 chunk.content
             ],
         )?;
-        let chunk_id = conn.last_insert_rowid();
+        let chunk_id = tx.last_insert_rowid();
         let wakachi_text = wakachi(&chunk.content);
-        conn.execute(
+        tx.execute(
             "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
             rusqlite::params![chunk_id, wakachi_text],
         )?;
         chunk_entries.push((chunk_id, chunk.content.clone()));
     }
 
-    // Vector embedding (if embedder is running and vec table exists)
-    insert_vectors(conn, &chunk_entries);
-
     // Entity extraction (if entity tables exist)
-    if let Err(e) = entity::insert_entities(conn, doc_id, &chunk_entries, &fm.tags) {
+    if let Err(e) = entity::insert_entities(&tx, doc_id, &chunk_entries, &fm.tags) {
         eprintln!("entity extraction warning: {e}");
     }
 
     // Document links (tags, explicit links, entity co-occurrence)
-    doc_links::build_links(conn, doc_id, &text, &fm.tags);
+    doc_links::build_links(&tx, doc_id, &text, &fm.tags);
 
     // Collect dictionary candidates from chunk text
     for (_, content) in &chunk_entries {
-        user_dict::collect_from_text(conn, content, "document");
+        user_dict::collect_from_text(&tx, content, "document");
     }
+
+    tx.commit()?;
+
+    // Vector embedding (if embedder is running and vec table exists)
+    // Done outside transaction since it involves socket I/O
+    insert_vectors(conn, &chunk_entries);
 
     Ok(true)
 }
@@ -305,7 +310,10 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
         .filter_map(|c| c.timestamp.as_deref())
         .next_back()
         .unwrap_or(&now);
-    conn.execute(
+
+    // Wrap all inserts in a single transaction to avoid per-statement fsync
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rusqlite::params![
@@ -320,27 +328,30 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
             &now,
         ],
     )?;
-    let doc_id = conn.last_insert_rowid();
+    let doc_id = tx.last_insert_rowid();
 
     let mut chunk_entries: Vec<(i64, String)> = Vec::new();
     for chunk in &chunks {
-        conn.execute(
+        tx.execute(
             "INSERT INTO chunks (document_id, chunk_index, section_path, content)
              VALUES (?, ?, ?, ?)",
             rusqlite::params![doc_id, chunk.chunk_index as i64, "session", chunk.content],
         )?;
-        let chunk_id = conn.last_insert_rowid();
+        let chunk_id = tx.last_insert_rowid();
         let wakachi_text = wakachi(&chunk.content);
-        conn.execute(
+        tx.execute(
             "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
             rusqlite::params![chunk_id, wakachi_text],
         )?;
         chunk_entries.push((chunk_id, chunk.content.clone()));
     }
+    tx.commit()?;
 
-    insert_vectors(conn, &chunk_entries);
+    // Insert vectors only if embedder is already running (don't auto-start).
+    // Backfill will handle missing vectors later.
+    insert_vectors_no_autostart(conn, &chunk_entries);
 
-    // Learn synonyms from human messages in the session
+    // Learn synonyms from human messages in the session (wrapped in transaction)
     learn_from_session_jsonl(conn, jsonl_path);
 
     Ok(true)
@@ -355,6 +366,8 @@ fn learn_from_session_jsonl(conn: &Connection, jsonl_path: &Path) {
         Err(_) => return,
     };
 
+    // Collect all user messages first, then batch-process in a transaction
+    let mut messages: Vec<String> = Vec::new();
     for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
         let val: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
@@ -384,10 +397,24 @@ fn learn_from_session_jsonl(conn: &Connection, jsonl_path: &Path) {
             _ => String::new(),
         };
         if content.len() >= 4 {
-            crate::synonyms::learn_from_message(conn, &content, "chat");
-            user_dict::collect_from_text(conn, &content, "session");
+            messages.push(content);
         }
     }
+
+    if messages.is_empty() {
+        return;
+    }
+
+    // Wrap all synonym/dictionary upserts in a single transaction
+    let tx = match conn.unchecked_transaction() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    for content in &messages {
+        crate::synonyms::learn_from_message(&tx, content, "chat");
+        user_dict::collect_from_text(&tx, content, "session");
+    }
+    let _ = tx.commit();
 }
 
 /// Insert vectors for chunks if embedder is running and vec table exists.
@@ -414,6 +441,34 @@ fn insert_vectors(conn: &Connection, chunk_entries: &[(i64, String)]) {
 
     let texts: Vec<String> = chunk_entries.iter().map(|(_, text)| text.clone()).collect();
     let embeddings = match embedder::embed_via_socket(&texts) {
+        Some(e) => e,
+        None => return,
+    };
+
+    for ((chunk_id, _), emb) in chunk_entries.iter().zip(embeddings.iter()) {
+        write_vec_row(conn, *chunk_id, emb);
+    }
+}
+
+/// Insert vectors only if the embedder daemon is already running.
+/// Does NOT auto-start the daemon — lets backfill handle missing vectors later.
+fn insert_vectors_no_autostart(conn: &Connection, chunk_entries: &[(i64, String)]) {
+    if chunk_entries.is_empty() {
+        return;
+    }
+    if !db::has_vec_table(conn) {
+        return;
+    }
+    // Only proceed if the socket already exists (embedder is running)
+    if !std::path::Path::new(config::SOCKET_PATH).exists() {
+        return;
+    }
+
+    let texts: Vec<String> = chunk_entries.iter().map(|(_, text)| text.clone()).collect();
+    let embeddings = match embedder::embed_via_socket_at(
+        std::path::Path::new(config::SOCKET_PATH),
+        &texts,
+    ) {
         Some(e) => e,
         None => return,
     };
