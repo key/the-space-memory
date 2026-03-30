@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
 
 # stdin から JSON を読む
 INPUT=$(cat)
-SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
 
 [ -z "$SESSION_ID" ] && exit 0
 
