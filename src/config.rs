@@ -95,8 +95,13 @@ fn load_config_value(key: &str) -> Option<String> {
     for path in candidates {
         if let Ok(content) = std::fs::read_to_string(&path) {
             if let Ok(table) = content.parse::<toml::Table>() {
-                if let Some(val) = table.get(key).and_then(|v| v.as_str()) {
-                    return Some(val.to_string());
+                if let Some(val) = table.get(key) {
+                    // Handle both string and non-string TOML values
+                    let s = match val.as_str() {
+                        Some(s) => s.to_string(),
+                        None => val.to_string(),
+                    };
+                    return Some(s);
                 }
             }
         }
