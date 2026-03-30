@@ -3214,6 +3214,7 @@ dependencies = [
  "chrono",
  "clap",
  "hf-hub",
+ "libc",
  "lindera",
  "regex",
  "rusqlite",

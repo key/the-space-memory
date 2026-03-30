@@ -213,9 +213,25 @@ pub fn index_all(
     file_paths: &[PathBuf],
     project_root: &Path,
 ) -> anyhow::Result<IndexStats> {
-    let mut stats = IndexStats::default();
+    index_all_with_progress(conn, file_paths, project_root, None)
+}
 
-    for fp in file_paths {
+/// Progress callback type for index_all_with_progress: (current, total, file_path).
+pub type IndexProgressCb<'a> = &'a dyn Fn(usize, usize, &Path);
+
+pub fn index_all_with_progress(
+    conn: &Connection,
+    file_paths: &[PathBuf],
+    project_root: &Path,
+    progress_cb: Option<IndexProgressCb<'_>>,
+) -> anyhow::Result<IndexStats> {
+    let mut stats = IndexStats::default();
+    let total = file_paths.len();
+
+    for (i, fp) in file_paths.iter().enumerate() {
+        if let Some(cb) = progress_cb {
+            cb(i + 1, total, fp);
+        }
         if !fp.exists() {
             let rel_path = fp
                 .strip_prefix(project_root)
@@ -972,6 +988,42 @@ mod tests {
             count > 0,
             "should collect dictionary candidates during indexing"
         );
+    }
+
+    #[test]
+    fn test_index_all_with_progress_callback() {
+        let (conn, dir) = setup();
+        write_md(dir.path(), "daily/notes/a.md", "# A\n\nContent A.\n");
+        write_md(dir.path(), "daily/notes/b.md", "# B\n\nContent B.\n");
+
+        let files = vec![
+            dir.path().join("daily/notes/a.md"),
+            dir.path().join("daily/notes/b.md"),
+        ];
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let cb = |current: usize, total: usize, _path: &std::path::Path| {
+            calls.borrow_mut().push((current, total));
+        };
+
+        let stats =
+            index_all_with_progress(&conn, &files, dir.path(), Some(&cb)).unwrap();
+        assert_eq!(stats.indexed, 2);
+
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], (1, 2));
+        assert_eq!(calls[1], (2, 2));
+    }
+
+    #[test]
+    fn test_index_all_with_progress_none() {
+        let (conn, dir) = setup();
+        write_md(dir.path(), "daily/notes/c.md", "# C\n\nContent C.\n");
+
+        let files = vec![dir.path().join("daily/notes/c.md")];
+        let stats = index_all_with_progress(&conn, &files, dir.path(), None).unwrap();
+        assert_eq!(stats.indexed, 1);
     }
 
     #[test]

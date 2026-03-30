@@ -957,6 +957,35 @@ fn get_command_output(cmd: &str, args: &[&str]) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
+/// Spawn `tsm vector-fill` as a detached child process in a new session.
+fn spawn_background_backfill() {
+    use std::os::unix::process::CommandExt;
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Cannot determine executable path: {e}");
+            return;
+        }
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("vector-fill")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Detach into a new session so Ctrl-C on the parent doesn't kill the child
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    match cmd.spawn() {
+        Ok(_) => {}
+        Err(e) => eprintln!("Failed to start background backfill: {e}"),
+    }
+}
+
 pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let project_root = config::project_root();
@@ -984,26 +1013,48 @@ pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
     db::init_db(&db_path)?;
     eprintln!("DB initialized");
 
-    // Full index
+    // Full index (synchronous, with progress)
     let conn = db::get_connection(&db_path)?;
     let file_paths = collect_content_files(&project_root);
-    let stats = indexer::index_all(&conn, &file_paths, &project_root)?;
+    let total = file_paths.len();
+    eprintln!("Indexing {total} files...");
+
+    let progress = |current: usize, total: usize, path: &Path| {
+        let rel = path
+            .strip_prefix(&project_root)
+            .unwrap_or(path)
+            .display();
+        eprintln!("  [{current}/{total}] {rel}");
+    };
+    let stats =
+        indexer::index_all_with_progress(&conn, &file_paths, &project_root, Some(&progress))?;
     eprintln!(
         "Done: Indexed: {}, Skipped: {}, Removed: {}",
         stats.indexed, stats.skipped, stats.removed
     );
 
-    // Report
+    // Report & async backfill
     let chunks: i64 = conn
         .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
         .unwrap_or(0);
     let vecs: i64 = conn
         .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
         .unwrap_or(0);
-    if vecs > 0 {
-        eprintln!("Vectors: {vecs} / {chunks} chunks");
+    drop(conn);
+
+    if vecs >= chunks {
+        eprintln!("Vectors: {vecs} (matches all chunks)");
+    } else if socket.exists() && chunks > 0 {
+        let current_status = crate::status::read(&config::data_dir());
+        if current_status.backfill.is_some() {
+            eprintln!("Vectors: {vecs} / {chunks} — backfill already in progress");
+        } else {
+            eprintln!("Vectors: {vecs} / {chunks} — starting backfill in background...");
+            spawn_background_backfill();
+        }
+        eprintln!("Run `tsm doctor` to check progress.");
     } else if chunks > 0 {
-        eprintln!("Warning: Vectors: 0 / {chunks} — embedder may not be running");
+        eprintln!("Vectors: {vecs} / {chunks} — embedder not running, skipping backfill");
     }
 
     Ok(())
