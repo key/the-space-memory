@@ -417,10 +417,8 @@ fn handle_client(mut stream: UnixStream, embedder: &Embedder) -> Result<()> {
 /// Auto-starts the daemon if not running. Returns None if startup fails.
 pub fn embed_via_socket(texts: &[String]) -> Option<Vec<Vec<f32>>> {
     let socket_path = Path::new(config::SOCKET_PATH);
-    if !socket_path.exists() {
-        if !auto_start_daemon() {
-            return None;
-        }
+    if !socket_path.exists() && !auto_start_daemon() {
+        return None;
     }
     embed_via_socket_at(socket_path, texts)
 }

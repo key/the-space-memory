@@ -528,6 +528,30 @@ pub fn doctor_check(db_path: &Path) -> DoctorReport {
         let vecs: i64 = conn
             .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
             .unwrap_or(-1);
+
+        // Check if backfill is in progress
+        let data_dir = config::data_dir();
+        let sf = crate::status::read(&data_dir);
+        let backfill_hint = if let Some(ref bf) = sf.backfill {
+            let pct = if bf.total > 0 {
+                (bf.filled as f64 / bf.total as f64 * 100.0) as u32
+            } else {
+                0
+            };
+            let processed = bf.filled + bf.errors;
+            let eta = if processed > 0 && bf.total > 0 {
+                estimate_eta(&bf.started_at, processed, bf.total as usize)
+            } else {
+                "calculating...".to_string()
+            };
+            Some(format!(
+                "Backfill in progress: {}/{} ({pct}%), ETA {eta}",
+                bf.filled, bf.total
+            ))
+        } else {
+            None
+        };
+
         if vecs < 0 {
             emb_section.items.push(CheckItem {
                 status: CheckStatus::Error,
@@ -538,13 +562,17 @@ pub fn doctor_check(db_path: &Path) -> DoctorReport {
             emb_section.items.push(CheckItem {
                 status: CheckStatus::Warning,
                 message: format!("Vectors: 0 / {chunks} chunks"),
-                hint: Some("Run `vector-fill` (needs embedder) or `rebuild`.".to_string()),
+                hint: Some(backfill_hint.unwrap_or_else(|| {
+                    "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
+                })),
             });
         } else if vecs < chunks {
             emb_section.items.push(CheckItem {
                 status: CheckStatus::Warning,
                 message: format!("Vectors: {vecs} / {chunks} chunks (mismatch)"),
-                hint: Some("Run `vector-fill` (needs embedder) or `rebuild`.".to_string()),
+                hint: Some(backfill_hint.unwrap_or_else(|| {
+                    "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
+                })),
             });
         } else {
             emb_section.items.push(CheckItem {

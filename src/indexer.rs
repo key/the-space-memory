@@ -287,7 +287,7 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
     let updated = chunks
         .iter()
         .filter_map(|c| c.timestamp.as_deref())
-        .last()
+        .next_back()
         .unwrap_or(&now);
     conn.execute(
         "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
