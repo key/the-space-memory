@@ -355,42 +355,92 @@ pub fn cmd_setup() -> anyhow::Result<()> {
 }
 
 /// Doctor output as a structured result for testability.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckStatus {
+    Ok,
+    Warning,
+    Error,
+}
+
+#[derive(Debug)]
+pub struct CheckItem {
+    pub status: CheckStatus,
+    pub message: String,
+    pub hint: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct DoctorSection {
+    pub name: String,
+    pub items: Vec<CheckItem>,
+}
+
 #[derive(Debug, Default)]
 pub struct DoctorReport {
-    pub ok: Vec<String>,
-    pub issues: Vec<String>,
+    pub sections: Vec<DoctorSection>,
+}
+
+impl DoctorReport {
+    /// Backward-compatible: collect all OK messages.
+    pub fn ok(&self) -> Vec<String> {
+        self.sections
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .filter(|i| i.status == CheckStatus::Ok)
+            .map(|i| i.message.clone())
+            .collect()
+    }
+
+    /// Backward-compatible: collect all issue messages.
+    pub fn issues(&self) -> Vec<String> {
+        self.sections
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .filter(|i| i.status != CheckStatus::Ok)
+            .map(|i| match &i.hint {
+                Some(hint) => format!("{} {hint}", i.message),
+                None => i.message.clone(),
+            })
+            .collect()
+    }
+
+    pub fn issue_count(&self) -> usize {
+        self.sections
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .filter(|i| i.status != CheckStatus::Ok)
+            .count()
+    }
 }
 
 pub fn doctor_check(db_path: &Path) -> DoctorReport {
     let mut report = DoctorReport::default();
 
-    // 1. DB
+    // ── Database section ──
+    let mut db_section = DoctorSection {
+        name: "Database".to_string(),
+        items: Vec::new(),
+    };
+
     if db_path.exists() {
         if let Ok(meta) = std::fs::metadata(db_path) {
             let size_mb = meta.len() as f64 / 1024.0 / 1024.0;
-            report
-                .ok
-                .push(format!("DB: {} ({size_mb:.1} MB)", db_path.display()));
+            db_section.items.push(CheckItem {
+                status: CheckStatus::Ok,
+                message: format!("DB: {} ({size_mb:.1} MB)", db_path.display()),
+                hint: None,
+            });
         }
     } else {
-        report.issues.push(format!(
-            "DB: {} does not exist. Run `init`.",
-            db_path.display()
-        ));
+        db_section.items.push(CheckItem {
+            status: CheckStatus::Error,
+            message: format!("DB: {} does not exist", db_path.display()),
+            hint: Some("Run `init`.".to_string()),
+        });
+        report.sections.push(db_section);
         return report;
     }
 
-    // 2. Embedder
-    let socket = Path::new(config::SOCKET_PATH);
-    if socket.exists() {
-        report.ok.push("Embedder: running".to_string());
-    } else {
-        report
-            .issues
-            .push("Embedder: stopped. Run `embedder-start`.".to_string());
-    }
-
-    // 3. Record counts
     if let Ok(conn) = db::get_connection(db_path) {
         let docs: i64 = conn
             .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
@@ -398,45 +448,110 @@ pub fn doctor_check(db_path: &Path) -> DoctorReport {
         let chunks: i64 = conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
             .unwrap_or(0);
-        report.ok.push(format!("Documents: {docs}"));
-        report.ok.push(format!("Chunks: {chunks}"));
+        db_section.items.push(CheckItem {
+            status: CheckStatus::Ok,
+            message: format!("Documents: {docs}"),
+            hint: None,
+        });
+        db_section.items.push(CheckItem {
+            status: CheckStatus::Ok,
+            message: format!("Chunks: {chunks}"),
+            hint: None,
+        });
 
-        // Dictionary candidates
-        if db::has_candidates_table(&conn) {
-            let summary = user_dict::candidate_summary(&conn);
-            if summary.ready_count > 0 {
-                report.issues.push(format!(
-                    "Dict candidates: {} words ready (freq >= {}). Run `dict-update`.",
-                    summary.ready_count,
-                    config::DICT_CANDIDATE_FREQ_THRESHOLD
-                ));
-            }
-            report.ok.push(format!(
-                "User dict: {} words, {} pending candidates, {} rejected",
-                summary.dict_word_count, summary.total_pending, summary.rejected_count
-            ));
+        report.sections.push(db_section);
+
+        // ── Embedder section ──
+        let mut emb_section = DoctorSection {
+            name: "Embedder".to_string(),
+            items: Vec::new(),
+        };
+
+        let socket = Path::new(config::SOCKET_PATH);
+        let timeout = config::embedder_idle_timeout_secs();
+        if socket.exists() {
+            let timeout_info = if timeout == 0 {
+                "idle timeout: disabled".to_string()
+            } else {
+                format!("idle timeout: {timeout}s")
+            };
+            emb_section.items.push(CheckItem {
+                status: CheckStatus::Ok,
+                message: format!("Running ({timeout_info})"),
+                hint: None,
+            });
+        } else {
+            emb_section.items.push(CheckItem {
+                status: CheckStatus::Warning,
+                message: "Stopped".to_string(),
+                hint: Some("Run `embedder-start`.".to_string()),
+            });
         }
 
         let vecs: i64 = conn
             .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
             .unwrap_or(-1);
         if vecs < 0 {
-            report
-                .issues
-                .push("Vectors: chunks_vec unreadable".to_string());
+            emb_section.items.push(CheckItem {
+                status: CheckStatus::Error,
+                message: "Vectors: chunks_vec unreadable".to_string(),
+                hint: None,
+            });
         } else if vecs == 0 && chunks > 0 {
-            report.issues.push(format!(
-                "Vectors: 0 / {chunks} chunks. Run `vector-fill` (needs embedder) or `rebuild`."
-            ));
+            emb_section.items.push(CheckItem {
+                status: CheckStatus::Warning,
+                message: format!("Vectors: 0 / {chunks} chunks"),
+                hint: Some("Run `vector-fill` (needs embedder) or `rebuild`.".to_string()),
+            });
         } else if vecs < chunks {
-            report.issues.push(format!(
-                "Vectors: {vecs} / {chunks} chunks (mismatch). Run `vector-fill` (needs embedder) or `rebuild`."
-            ));
+            emb_section.items.push(CheckItem {
+                status: CheckStatus::Warning,
+                message: format!("Vectors: {vecs} / {chunks} chunks (mismatch)"),
+                hint: Some("Run `vector-fill` (needs embedder) or `rebuild`.".to_string()),
+            });
         } else {
-            report
-                .ok
-                .push(format!("Vectors: {vecs} (matches all chunks)"));
+            emb_section.items.push(CheckItem {
+                status: CheckStatus::Ok,
+                message: format!("Vectors: {vecs} (matches all chunks)"),
+                hint: None,
+            });
         }
+
+        report.sections.push(emb_section);
+
+        // ── Dictionary section ──
+        if db::has_candidates_table(&conn) {
+            let mut dict_section = DoctorSection {
+                name: "Dictionary".to_string(),
+                items: Vec::new(),
+            };
+
+            let summary = user_dict::candidate_summary(&conn);
+            dict_section.items.push(CheckItem {
+                status: CheckStatus::Ok,
+                message: format!(
+                    "User dict: {} words, {} pending, {} rejected",
+                    summary.dict_word_count, summary.total_pending, summary.rejected_count
+                ),
+                hint: None,
+            });
+
+            if summary.ready_count > 0 {
+                dict_section.items.push(CheckItem {
+                    status: CheckStatus::Warning,
+                    message: format!(
+                        "{} candidates ready (freq >= {})",
+                        summary.ready_count,
+                        config::DICT_CANDIDATE_FREQ_THRESHOLD
+                    ),
+                    hint: Some("Run `dict-update`.".to_string()),
+                });
+            }
+
+            report.sections.push(dict_section);
+        }
+    } else {
+        report.sections.push(db_section);
     }
 
     report
@@ -445,21 +560,90 @@ pub fn doctor_check(db_path: &Path) -> DoctorReport {
 pub fn cmd_doctor() -> anyhow::Result<()> {
     let db_path = config::db_path();
     let report = doctor_check(&db_path);
-
-    println!("=== Knowledge Search Doctor ===\n");
-    for line in &report.ok {
-        println!("  OK  {line}");
-    }
-    if !report.issues.is_empty() {
-        println!();
-        for line in &report.issues {
-            println!("  !!  {line}");
-        }
-        println!("\n{} issue(s) found.", report.issues.len());
-    } else {
-        println!("\nAll good.");
-    }
+    render_doctor_report(&report);
     Ok(())
+}
+
+fn render_doctor_report(report: &DoctorReport) {
+    let use_color = std::env::var("NO_COLOR").is_err();
+
+    let (green, yellow, red, bold, dim, reset) = if use_color {
+        ("\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[1m", "\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "", "", "", "", "")
+    };
+
+    // Collect all rendered lines to compute box width
+    let title = "Knowledge Search Doctor";
+    let mut body_lines: Vec<String> = Vec::new();
+
+    for (i, section) in report.sections.iter().enumerate() {
+        if i > 0 {
+            body_lines.push(String::new()); // blank separator
+        }
+        body_lines.push(format!("{bold}  {}{reset}", section.name));
+        for item in &section.items {
+            let (icon, color) = match item.status {
+                CheckStatus::Ok => ("\u{2714}", green),      // ✔
+                CheckStatus::Warning => ("\u{26a0}", yellow), // ⚠
+                CheckStatus::Error => ("\u{2718}", red),      // ✘
+            };
+            let line = match &item.hint {
+                Some(hint) => format!("    {color}{icon}{reset} {}  {dim}{hint}{reset}", item.message),
+                None => format!("    {color}{icon}{reset} {}", item.message),
+            };
+            body_lines.push(line);
+        }
+    }
+
+    // Summary line
+    let issue_count = report.issue_count();
+    body_lines.push(String::new());
+    if issue_count > 0 {
+        body_lines.push(format!("  {yellow}{issue_count} issue(s) found.{reset}"));
+    } else {
+        body_lines.push(format!("  {green}All good.{reset}"));
+    }
+
+    // Strip ANSI for width calculation
+    let strip_ansi = |s: &str| -> String {
+        let mut out = String::new();
+        let mut in_escape = false;
+        for c in s.chars() {
+            if c == '\x1b' {
+                in_escape = true;
+            } else if in_escape {
+                if c.is_ascii_alphabetic() {
+                    in_escape = false;
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+
+    let content_width = body_lines
+        .iter()
+        .map(|l| strip_ansi(l).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(title.len() + 4);
+    let box_width = content_width + 2; // padding
+
+    // Render box
+    println!("{dim}\u{256d}\u{2500} {reset}{bold}{title}{reset} {dim}{}\u{256e}{reset}",
+        "\u{2500}".repeat(box_width - title.len() - 3));
+    println!("{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}", " ".repeat(box_width));
+
+    for line in &body_lines {
+        let visible_len = strip_ansi(line).chars().count();
+        let pad = box_width.saturating_sub(visible_len);
+        println!("{dim}\u{2502}{reset}{line}{}{dim}\u{2502}{reset}", " ".repeat(pad));
+    }
+
+    println!("{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}", " ".repeat(box_width));
+    println!("{dim}\u{2570}{}\u{256f}{reset}", "\u{2500}".repeat(box_width));
 }
 
 pub fn cmd_status() -> anyhow::Result<()> {
@@ -977,8 +1161,9 @@ mod tests {
     #[test]
     fn test_doctor_no_db() {
         let report = doctor_check(Path::new("/nonexistent/knowledge.db"));
-        assert!(!report.issues.is_empty());
-        assert!(report.issues[0].contains("does not exist"));
+        let issues = report.issues();
+        assert!(!issues.is_empty());
+        assert!(issues[0].contains("does not exist"));
     }
 
     #[test]
@@ -988,10 +1173,11 @@ mod tests {
         db::init_db(&db_path).unwrap();
 
         let report = doctor_check(&db_path);
+        let ok = report.ok();
         // DB exists, so should have OK entries
-        assert!(report.ok.iter().any(|s| s.contains("DB:")));
-        assert!(report.ok.iter().any(|s| s.contains("Documents:")));
-        assert!(report.ok.iter().any(|s| s.contains("Chunks:")));
+        assert!(ok.iter().any(|s| s.contains("DB:")));
+        assert!(ok.iter().any(|s| s.contains("Documents:")));
+        assert!(ok.iter().any(|s| s.contains("Chunks:")));
     }
 
     #[test]
@@ -1001,8 +1187,9 @@ mod tests {
         db::init_db(&db_path).unwrap();
 
         let report = doctor_check(&db_path);
+        let ok = report.ok();
         // 0 chunks, 0 vectors — should be OK (matches)
-        assert!(report.ok.iter().any(|s| s.contains("Vectors: 0")));
+        assert!(ok.iter().any(|s| s.contains("Vectors: 0")));
     }
 
     #[test]
@@ -1020,16 +1207,18 @@ mod tests {
         drop(conn);
 
         let report = doctor_check(&db_path);
+        let issues = report.issues();
+        let ok = report.ok();
         // Should report ready candidates as an issue
         assert!(
-            report.issues.iter().any(|s| s.contains("Dict candidates")),
+            issues.iter().any(|s| s.contains("candidates ready")),
             "should report dict candidates: {:?}",
-            report.issues
+            issues
         );
         assert!(
-            report.ok.iter().any(|s| s.contains("User dict")),
+            ok.iter().any(|s| s.contains("User dict")),
             "should show user dict summary: {:?}",
-            report.ok
+            ok
         );
     }
 
