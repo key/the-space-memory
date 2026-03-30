@@ -61,6 +61,51 @@ src/
 - **Scoring**: RRF (Reciprocal Rank Fusion) combining FTS5 and vector results. Time decay + status penalty applied
 - **DB schema changes require `rebuild --force`** (e.g. FTS tokenizer changes)
 
+## Data Flow
+
+```text
+                        ┌─────────────────────────────────────────────┐
+                        │              main process                   │
+                        │                                             │
+  index-file ──────────►│  indexer queue ──► chunking ──► FTS5 write  │
+  ingest-session ──────►│       ▲                  │                  │
+                        │       │                  ▼                  │
+  watcher daemon ───────┘       │          vector queue               │
+  (file change notify)         │                  │                  │
+                        │       │                  ▼                  │
+                        │       │     embedder request (socket)       │
+                        │       │                  │                  │
+                        │       │                  ▼                  │
+                        │       │     receive vector → chunks_vec     │
+                        │       │                                     │
+                        │  backfill = enqueue missing to vector queue │
+                        └─────────────────────────────────────────────┘
+                                               │
+                                          socket (text→vec)
+                                               │
+                                               ▼
+                                     ┌──────────────────┐
+                                     │ embedder daemon   │
+                                     │ (pure inference)  │
+                                     │ text in → vec out │
+                                     │ no DB access      │
+                                     └──────────────────┘
+```
+
+**Ownership:**
+- **main process** — sole DB owner. All reads/writes go through here
+- **embedder daemon** — stateless inference server. No DB access
+- **watcher daemon** — stateless file monitor. Enqueues to main, no DB access
+
+## Design Principles
+
+- **Embedder daemon** — Model inference latency hiding. Responsibility: embedding computation + vector DB writes. Must NOT take on unrelated concerns (file watching, indexing)
+- **Watch daemon** (#27) — File system monitoring via OS-native events (inotify/FSEvents). Separate process from embedder
+- **Vector writes are always async** — Callers enqueue, embedder processes in background. Search reads whatever vectors are available; FTS5 fallback if vectors not yet ready
+- **Incremental over full rebuild** — Chunk-level content hashing for diff-based index updates. Avoid full DELETE+INSERT on every change
+- **Transactions for batch DB writes** — Wrap inserts in transactions to avoid per-statement fsync in WAL mode. Use small batch sizes (per-file or per-session), not one giant transaction across all files
+- **Doctor as single observability surface** — All daemon health, queue status, and data integrity checks visible via `tsm doctor`
+
 ## Testing
 
 - **TDD required** — Write tests first, then implement to pass them
