@@ -66,8 +66,10 @@ src/
 - **TDD required** — Write tests first, then implement to pass them
 - **90%+ coverage** — Enforced via `cargo llvm-cov --fail-under-lines 90` in CI
 - **Unit tests required** — All pub functions must have tests in `#[cfg(test)] mod tests`
+- **AAA pattern** — Arrange (setup + state cleanup like `clear_vectors`) → Act → Assert
 - DB tests use in-memory SQLite (`:memory:`) to prevent state leakage
 - Embedder tests should use mockable trait design
+- Tests must not depend on external daemon state (embedder, etc.)
 
 ## Build & Deploy
 
@@ -90,6 +92,7 @@ docker build -t the-space-memory /path/to/the-space-memory
 
 ## Gotchas
 
+- **Hook stdin JSON key is `prompt`** (not `user_prompt`). Hook output must wrap `additionalContext` in `hookSpecificOutput: { hookEventName, additionalContext }`
 - ruri safetensors have no tensor name prefix.
   candle's ModernBert::load expects `model.` prefix — key names are remapped at load time
 - Use `rusqlite`'s bundled feature (don't depend on system SQLite)
