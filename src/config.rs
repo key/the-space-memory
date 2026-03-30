@@ -107,6 +107,13 @@ pub fn custom_terms_path() -> PathBuf {
     data_dir().join("custom_terms.toml")
 }
 
+pub fn stopwords_path() -> PathBuf {
+    data_dir().join("stopwords.txt")
+}
+
+/// Minimum number of meaningful keyword tokens for a query to be searchable.
+pub const MIN_QUERY_KEYWORDS: usize = 1;
+
 /// Load a value from config file.
 /// Search order: TSM_CONFIG env > ./tsm.toml > ~/.config/tsm/config.toml
 fn load_config_value(key: &str) -> Option<String> {

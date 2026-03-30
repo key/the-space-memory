@@ -11,7 +11,7 @@ use crate::embedder;
 use crate::entity;
 use crate::synonyms;
 use crate::temporal::TimeFilter;
-use crate::tokenizer::wakachi;
+use crate::tokenizer::{extract_search_keywords, wakachi};
 use crate::user_dict;
 
 #[derive(Debug, Clone, Default)]
@@ -32,6 +32,13 @@ pub fn search(
     top_k: usize,
     time_filter: Option<&TimeFilter>,
 ) -> anyhow::Result<Vec<SearchResult>> {
+    // Query preprocessing: extract meaningful keywords, skip noise-only queries
+    let keywords = extract_search_keywords(query);
+    if keywords.len() < config::MIN_QUERY_KEYWORDS {
+        return Ok(Vec::new());
+    }
+    let query = &keywords.join(" ");
+
     let limit = top_k * 3;
     let cls = classifier::classify(conn, query);
 
@@ -667,6 +674,48 @@ mod tests {
     fn test_build_expanded_fts_query_empty_query() {
         let result = build_expanded_fts_query("", &["sqlite".to_string()]);
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_search_noise_query_returns_empty() {
+        let conn = db::get_memory_connection().unwrap();
+        // Pure interjection/greeting should return empty results
+        let results = search(&conn, "よかったーーー", 5, None).unwrap();
+        assert!(results.is_empty(), "Noise query should return empty results");
+    }
+
+    #[test]
+    fn test_search_stopword_query_returns_empty() {
+        let conn = db::get_memory_connection().unwrap();
+        let results = search(&conn, "なるほど", 5, None).unwrap();
+        assert!(
+            results.is_empty(),
+            "Stopword-only query should return empty results"
+        );
+    }
+
+    #[test]
+    fn test_search_meaningful_query_still_works() {
+        use crate::indexer;
+        use std::io::Write;
+
+        let conn = db::get_memory_connection().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let md =
+            "---\nstatus: current\n---\n\n# LoRaモジュール\n\nLoRaモジュールの開発進捗について。\n";
+        let full = dir.path().join("daily/notes/lora.md");
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&full).unwrap();
+        f.write_all(md.as_bytes()).unwrap();
+        indexer::index_file(&conn, &full, dir.path()).unwrap();
+
+        // A meaningful query should still find results
+        let results = search(&conn, "LoRaモジュール", 5, None).unwrap();
+        assert!(
+            !results.is_empty(),
+            "Meaningful query should find results"
+        );
     }
 
     #[test]
