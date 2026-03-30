@@ -5,7 +5,8 @@ LOG="/tmp/tsm-hook-search.log"
 
 # stdin から JSON を読む
 INPUT=$(cat)
-QUERY=$(echo "$INPUT" | jq -r '.user_prompt // empty' 2>/dev/null || true)
+echo "[$(date -Iseconds)] RAW_INPUT='${INPUT:0:300}'" >> "$LOG"
+QUERY=$(echo "$INPUT" | jq -r '.prompt // .user_prompt // empty' 2>/dev/null || true)
 
 echo "[$(date -Iseconds)] query='${QUERY:0:80}' PLUGIN_ROOT='${CLAUDE_PLUGIN_ROOT:-}' PROJECT_DIR='${CLAUDE_PROJECT_DIR:-}'" >> "$LOG"
 
@@ -53,5 +54,8 @@ echo "[$(date -Iseconds)] OK: $COUNT results" >> "$LOG"
 
 # additionalContext 形式で出力
 jq -n --argjson results "$RESULT" '{
-  additionalContext: ("ナレッジ検索結果 (自動):\n" + ($results | map("- [\(.source_file)] \(.section_path): \(.snippet[0:100])") | join("\n")))
+  hookSpecificOutput: {
+    hookEventName: "UserPromptSubmit",
+    additionalContext: ("ナレッジ検索結果 (自動):\n" + ($results | map("- [\(.source_file)] \(.section_path): \(.snippet[0:100])") | join("\n")))
+  }
 }'
