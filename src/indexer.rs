@@ -278,6 +278,17 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
     }
 
     let now = chrono::Utc::now().to_rfc3339();
+    // Use conversation timestamps from JSONL (first/last chunk) instead of index time
+    let created = chunks
+        .iter()
+        .filter_map(|c| c.timestamp.as_deref())
+        .next()
+        .unwrap_or(&now);
+    let updated = chunks
+        .iter()
+        .filter_map(|c| c.timestamp.as_deref())
+        .last()
+        .unwrap_or(&now);
     conn.execute(
         "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -286,8 +297,8 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
             "session",
             jsonl_path.file_stem().unwrap_or_default().to_string_lossy().to_string(),
             "current",
-            &now,
-            &now,
+            created,
+            updated,
             Option::<String>::None,
             current_hash,
             &now,

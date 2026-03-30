@@ -9,6 +9,7 @@ const MIN_MESSAGE_LEN: usize = 10;
 pub struct SessionChunk {
     pub content: String,
     pub chunk_index: usize,
+    pub timestamp: Option<String>,
 }
 
 /// Parse a Claude session JSONL file into Q&A chunks.
@@ -16,7 +17,8 @@ pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Vec<SessionChunk>> {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
 
-    let mut messages: Vec<(String, String)> = Vec::new(); // (role, text)
+    // (role, text, timestamp)
+    let mut messages: Vec<(String, String, Option<String>)> = Vec::new();
 
     for line in reader.lines() {
         let line = match line {
@@ -43,17 +45,20 @@ pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Vec<SessionChunk>> {
             _ => continue,
         };
 
-        messages.push((role, text));
+        let timestamp = json["timestamp"].as_str().map(|s| s.to_string());
+
+        messages.push((role, text, timestamp));
     }
 
     let mut chunks = Vec::new();
     let mut i = 0;
 
     while i < messages.len() {
-        let (role, text) = &messages[i];
+        let (role, text, ts) = &messages[i];
 
         if role == "user" {
             let q_text = truncate_text(text, MAX_CHUNK_CHARS);
+            let q_ts = ts.clone();
             if i + 1 < messages.len() && messages[i + 1].0 == "assistant" {
                 let a_text = truncate_text(&messages[i + 1].1, MAX_CHUNK_CHARS);
 
@@ -62,16 +67,18 @@ pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Vec<SessionChunk>> {
                     chunks.push(SessionChunk {
                         content: pair,
                         chunk_index: chunks.len(),
+                        timestamp: q_ts,
                     });
                 } else {
-                    // Split into separate Q and A chunks
                     chunks.push(SessionChunk {
                         content: format!("Q: {q_text}"),
                         chunk_index: chunks.len(),
+                        timestamp: q_ts,
                     });
                     chunks.push(SessionChunk {
                         content: format!("A: {a_text}"),
                         chunk_index: chunks.len(),
+                        timestamp: messages[i + 1].2.clone(),
                     });
                 }
                 i += 2;
@@ -81,6 +88,7 @@ pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Vec<SessionChunk>> {
             chunks.push(SessionChunk {
                 content: format!("Q: {q_text}"),
                 chunk_index: chunks.len(),
+                timestamp: q_ts,
             });
         } else {
             // Orphan assistant message
@@ -88,6 +96,7 @@ pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Vec<SessionChunk>> {
             chunks.push(SessionChunk {
                 content: a_text,
                 chunk_index: chunks.len(),
+                timestamp: ts.clone(),
             });
         }
         i += 1;
@@ -239,6 +248,32 @@ mod tests {
         ]);
         let chunks = parse_session_jsonl(f.path()).unwrap();
         assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn test_timestamp_extracted() {
+        let f = write_jsonl(&[
+            r#"{"message":{"role":"user","content":"これはテストの質問です。長いテキスト。"},"timestamp":"2026-03-30T08:00:00.000Z"}"#,
+            r#"{"message":{"role":"assistant","content":"これはテストの回答です。長いテキスト。"},"timestamp":"2026-03-30T08:01:00.000Z"}"#,
+        ]);
+        let chunks = parse_session_jsonl(f.path()).unwrap();
+        assert_eq!(chunks.len(), 1);
+        // Q&A pair uses Q's timestamp
+        assert_eq!(
+            chunks[0].timestamp.as_deref(),
+            Some("2026-03-30T08:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn test_timestamp_none_when_missing() {
+        let f = write_jsonl(&[
+            r#"{"message":{"role":"user","content":"タイムスタンプなしの質問メッセージ。"}}"#,
+            r#"{"message":{"role":"assistant","content":"タイムスタンプなしの回答メッセージ。"}}"#,
+        ]);
+        let chunks = parse_session_jsonl(f.path()).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].timestamp.is_none());
     }
 
     #[test]
