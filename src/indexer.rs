@@ -131,11 +131,6 @@ pub fn index_file(
         }
     }
 
-    // Delete old entries if they exist
-    if let Some((doc_id, _)) = existing {
-        delete_old_entries(conn, doc_id)?;
-    }
-
     // Parse file
     let text = std::fs::read_to_string(file_path)?;
     let (fm, body) = frontmatter::parse(&text);
@@ -148,8 +143,13 @@ pub fn index_file(
         Some(format!("{:?}", fm.tags))
     };
 
-    // Wrap all inserts in a single transaction to avoid per-statement fsync
+    // Wrap delete + inserts in a single transaction for atomicity
     let tx = conn.unchecked_transaction()?;
+
+    // Delete old entries if they exist
+    if let Some((doc_id, _)) = existing {
+        delete_old_entries(&tx, doc_id)?;
+    }
     tx.execute(
         "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -289,10 +289,6 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
         }
     }
 
-    if let Some((doc_id, _)) = existing {
-        delete_old_entries(conn, doc_id)?;
-    }
-
     let chunks = parse_session_jsonl(jsonl_path)?;
     if chunks.is_empty() {
         return Ok(false);
@@ -311,8 +307,12 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
         .next_back()
         .unwrap_or(&now);
 
-    // Wrap all inserts in a single transaction to avoid per-statement fsync
+    // Wrap delete + inserts in a single transaction for atomicity
     let tx = conn.unchecked_transaction()?;
+
+    if let Some((doc_id, _)) = existing {
+        delete_old_entries(&tx, doc_id)?;
+    }
     tx.execute(
         "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -414,7 +414,9 @@ fn learn_from_session_jsonl(conn: &Connection, jsonl_path: &Path) {
         crate::synonyms::learn_from_message(&tx, content, "chat");
         user_dict::collect_from_text(&tx, content, "session");
     }
-    let _ = tx.commit();
+    if let Err(e) = tx.commit() {
+        eprintln!("learn_from_session_jsonl: transaction commit failed: {e}");
+    }
 }
 
 /// Insert vectors for chunks if embedder is running and vec table exists.
