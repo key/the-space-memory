@@ -249,6 +249,15 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
         eprintln!("Idle timeout disabled.");
     }
 
+    // Periodic backfill thread (skipped when interval is 0)
+    let backfill_interval_secs = config::embedder_backfill_interval_secs();
+    if backfill_interval_secs > 0 {
+        let running = Arc::clone(&running);
+        std::thread::spawn(move || {
+            periodic_backfill(&running, backfill_interval_secs);
+        });
+    }
+
     while running.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -296,6 +305,57 @@ fn watchdog(
             // Poke the listener to unblock accept
             let _ = UnixStream::connect(socket_path);
             break;
+        }
+    }
+}
+
+fn periodic_backfill(running: &AtomicBool, interval_secs: u64) {
+    let interval = Duration::from_secs(interval_secs);
+    let db_path = crate::config::db_path();
+
+    // Wait one full interval before first check (startup backfill handles the initial run)
+    let mut elapsed = Duration::ZERO;
+    while elapsed < interval {
+        std::thread::sleep(Duration::from_secs(10));
+        if !running.load(Ordering::Relaxed) {
+            return;
+        }
+        elapsed += Duration::from_secs(10);
+    }
+
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+
+        if db_path.exists() {
+            if let Ok(conn) = crate::db::get_connection(&db_path) {
+                let chunks: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+                    .unwrap_or(0);
+                let vecs: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+                    .unwrap_or(0);
+                drop(conn);
+
+                if chunks > vecs {
+                    let missing = chunks - vecs;
+                    eprintln!("Periodic backfill: {missing} vectors missing. Starting backfill.");
+                    if let Err(e) = crate::cli::backfill_with_worker(&db_path) {
+                        eprintln!("Periodic backfill warning: {e}");
+                    }
+                }
+            }
+        }
+
+        // Sleep for the next interval (in 10s increments to check running flag)
+        let mut elapsed = Duration::ZERO;
+        while elapsed < interval {
+            std::thread::sleep(Duration::from_secs(10));
+            if !running.load(Ordering::Relaxed) {
+                return;
+            }
+            elapsed += Duration::from_secs(10);
         }
     }
 }

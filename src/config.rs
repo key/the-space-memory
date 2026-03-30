@@ -29,6 +29,25 @@ pub fn embedder_idle_timeout_secs() -> u64 {
     }
     EMBEDDER_IDLE_TIMEOUT_SECS
 }
+
+pub const EMBEDDER_BACKFILL_INTERVAL_SECS: u64 = 300;
+
+/// Load embedder backfill interval from config.
+/// TSM_EMBEDDER_BACKFILL_INTERVAL env > config file > default (300s). 0 = disable.
+pub fn embedder_backfill_interval_secs() -> u64 {
+    if let Ok(val) = std::env::var("TSM_EMBEDDER_BACKFILL_INTERVAL") {
+        if let Ok(n) = val.parse::<u64>() {
+            return n;
+        }
+    }
+    if let Some(val) = load_config_value("embedder_backfill_interval_secs") {
+        if let Ok(n) = val.parse::<u64>() {
+            return n;
+        }
+    }
+    EMBEDDER_BACKFILL_INTERVAL_SECS
+}
+
 pub const DICT_CANDIDATE_FREQ_THRESHOLD: i64 = 5;
 pub const WORKER_ENCODE_TIMEOUT_PER_ITEM_SECS: u64 = 5;
 pub const WORKER_ENCODE_TIMEOUT_BASE_SECS: u64 = 10;
@@ -314,6 +333,30 @@ mod tests {
         let timeout = embedder_idle_timeout_secs();
         assert_eq!(timeout, 3600);
         std::env::remove_var("TSM_EMBEDDER_IDLE_TIMEOUT");
+    }
+
+    #[test]
+    fn test_embedder_backfill_interval_default() {
+        std::env::remove_var("TSM_EMBEDDER_BACKFILL_INTERVAL");
+        std::env::remove_var("TSM_CONFIG");
+        let interval = embedder_backfill_interval_secs();
+        assert_eq!(interval, EMBEDDER_BACKFILL_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn test_embedder_backfill_interval_env() {
+        std::env::set_var("TSM_EMBEDDER_BACKFILL_INTERVAL", "0");
+        let interval = embedder_backfill_interval_secs();
+        assert_eq!(interval, 0);
+        std::env::remove_var("TSM_EMBEDDER_BACKFILL_INTERVAL");
+    }
+
+    #[test]
+    fn test_embedder_backfill_interval_env_custom() {
+        std::env::set_var("TSM_EMBEDDER_BACKFILL_INTERVAL", "60");
+        let interval = embedder_backfill_interval_secs();
+        assert_eq!(interval, 60);
+        std::env::remove_var("TSM_EMBEDDER_BACKFILL_INTERVAL");
     }
 
     #[test]
