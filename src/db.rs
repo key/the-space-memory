@@ -97,6 +97,12 @@ CREATE INDEX IF NOT EXISTS idx_dict_candidates_status_freq
     ON dictionary_candidates(status, frequency DESC);
 
 CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);
+
+CREATE TABLE IF NOT EXISTS chunks_vec_skip (
+    chunk_id INTEGER PRIMARY KEY,
+    reason   TEXT NOT NULL DEFAULT 'encode_error',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 "#;
 
 static VEC_INIT: Once = Once::new();

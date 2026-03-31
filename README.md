@@ -24,9 +24,6 @@ tsm search -q "query" -k 5
 # Index all documents
 tsm index
 
-# Start embedder daemon (required for vector search)
-tsm embedder-start
-
 # Health check
 tsm doctor
 

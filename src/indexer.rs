@@ -71,6 +71,12 @@ fn delete_old_entries(conn: &Connection, doc_id: i64) -> anyhow::Result<()> {
             param_refs.as_slice(),
         );
 
+        // chunks_vec_skip — may not exist
+        let _ = conn.execute(
+            &format!("DELETE FROM chunks_vec_skip WHERE chunk_id IN ({placeholders})"),
+            param_refs.as_slice(),
+        );
+
         // chunk_entities — may not exist
         let _ = conn.execute(
             &format!("DELETE FROM chunk_entities WHERE chunk_id IN ({placeholders})"),
@@ -496,6 +502,57 @@ fn panic_message(info: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+/// Record a chunk in the skip table so it is not retried on subsequent backfill runs.
+/// The skip record is automatically cleaned up when the parent document is re-indexed
+/// (chunks are deleted and re-created with new IDs).
+fn mark_chunk_skip(conn: &Connection, chunk_id: i64, reason: &str) {
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO chunks_vec_skip(chunk_id, reason) VALUES (?, ?)",
+        rusqlite::params![chunk_id, reason],
+    );
+}
+
+/// Retry each chunk in the batch individually, writing sentinels for failures.
+fn retry_individually(
+    batch: &[(i64, String, String)],
+    encode_fn: EncodeFn,
+    conn: &Connection,
+    stats: &mut BackfillStats,
+) {
+    for (chunk_id, content, file_path) in batch {
+        let single = vec![content.clone()];
+        let result = catch_unwind(AssertUnwindSafe(|| encode_fn(&single)));
+        match result {
+            Ok(Ok(ref embeddings)) if !embeddings.is_empty() => {
+                if write_vec_row(conn, *chunk_id, &embeddings[0]) {
+                    stats.filled += 1;
+                } else {
+                    eprintln!("    chunk {chunk_id} ({file_path}): insert error — writing sentinel");
+                    mark_chunk_skip(conn, *chunk_id, "encode_error");
+                    stats.errors += 1;
+                }
+            }
+            Ok(Ok(_)) => {
+                eprintln!("    chunk {chunk_id} ({file_path}): empty embedding — writing sentinel");
+                mark_chunk_skip(conn, *chunk_id, "encode_error");
+                stats.errors += 1;
+            }
+            Ok(Err(e)) => {
+                eprintln!("    chunk {chunk_id} ({file_path}): error ({e}) — writing sentinel");
+                mark_chunk_skip(conn, *chunk_id, "encode_error");
+                stats.errors += 1;
+            }
+            Err(panic_info) => {
+                let msg = panic_message(&panic_info);
+                eprintln!("    chunk {chunk_id} ({file_path}): PANIC ({msg}) — writing sentinel");
+                mark_chunk_skip(conn, *chunk_id, "encode_error");
+                stats.panics += 1;
+                stats.errors += 1;
+            }
+        }
+    }
+}
+
 /// Fill in missing vectors for chunks that have FTS5 entries but no vector entries.
 /// Uses keyset pagination to avoid loading all missing chunks into memory at once.
 /// Each INSERT auto-commits individually (rusqlite default autocommit mode).
@@ -538,8 +595,9 @@ pub fn backfill_vectors(
                 "SELECT c.id, c.content, d.file_path
                  FROM chunks c
                  LEFT JOIN chunks_vec v ON c.id = v.rowid
+                 LEFT JOIN chunks_vec_skip s ON c.id = s.chunk_id
                  JOIN documents d ON c.document_id = d.id
-                 WHERE v.rowid IS NULL AND c.id > ?
+                 WHERE v.rowid IS NULL AND s.chunk_id IS NULL AND c.id > ?
                  ORDER BY c.id
                  LIMIT ?",
             )?
@@ -565,10 +623,10 @@ pub fn backfill_vectors(
             .collect();
 
         match catch_unwind(AssertUnwindSafe(|| encode_fn(&texts))) {
-            Ok(Ok(embeddings)) => {
+            Ok(Ok(embeddings)) if embeddings.len() == batch.len() => {
                 let tx = conn.unchecked_transaction()?;
                 for ((chunk_id, _, _), emb) in batch.iter().zip(embeddings.iter()) {
-                    if write_vec_row(conn, *chunk_id, emb) {
+                    if write_vec_row(&tx, *chunk_id, emb) {
                         stats.filled += 1;
                     } else {
                         eprintln!("Insert error for chunk {chunk_id} (skipping)");
@@ -577,17 +635,43 @@ pub fn backfill_vectors(
                 }
                 tx.commit()?;
             }
+            Ok(Ok(embeddings)) => {
+                eprintln!(
+                    "Embedding count mismatch (got {}, expected {}) for batch {batch_start_id}..{batch_end_id}",
+                    embeddings.len(),
+                    batch.len()
+                );
+                if batch.len() > 1 {
+                    eprintln!("  Retrying {} chunks individually...", batch.len());
+                    retry_individually(&batch, encode_fn, conn, &mut stats);
+                } else {
+                    mark_chunk_skip(conn, batch_start_id, "embedding_count_mismatch");
+                    stats.errors += 1;
+                }
+            }
             Ok(Err(e)) => {
-                eprintln!("Batch error (chunks {batch_start_id}..{batch_end_id}): {e} — skipping");
-                stats.errors += batch.len();
+                eprintln!("Batch error (chunks {batch_start_id}..{batch_end_id}): {e}");
+                if batch.len() > 1 {
+                    eprintln!("  Retrying {} chunks individually...", batch.len());
+                    retry_individually(&batch, encode_fn, conn, &mut stats);
+                } else {
+                    eprintln!("  chunk {batch_start_id}: failed individually — writing sentinel");
+                    mark_chunk_skip(conn, batch_start_id, "encode_error");
+                    stats.errors += 1;
+                }
             }
             Err(panic_info) => {
                 let msg = panic_message(&panic_info);
-                eprintln!(
-                    "PANIC in encode (chunks {batch_start_id}..{batch_end_id}): {msg} — skipping"
-                );
+                eprintln!("PANIC in encode (chunks {batch_start_id}..{batch_end_id}): {msg}");
                 stats.panics += 1;
-                stats.errors += batch.len();
+                if batch.len() > 1 {
+                    eprintln!("  Retrying {} chunks individually...", batch.len());
+                    retry_individually(&batch, encode_fn, conn, &mut stats);
+                } else {
+                    eprintln!("  chunk {batch_start_id}: failed individually — writing sentinel");
+                    mark_chunk_skip(conn, batch_start_id, "encode_error");
+                    stats.errors += 1;
+                }
             }
         }
 
@@ -926,6 +1010,80 @@ mod tests {
             stats.filled > 0,
             "should have filled some chunks after the panic"
         );
+    }
+
+    #[test]
+    fn test_backfill_retry_individually_on_batch_error() {
+        let (conn, dir) = setup();
+        // Create 3 files → at least 3 chunks
+        for i in 0..3 {
+            let md = format!("# Doc {i}\n\nContent for document number {i}.\n");
+            let path = write_md(dir.path(), &format!("daily/notes/test{i}.md"), &md);
+            index_file(&conn, &path, dir.path()).unwrap();
+        }
+        clear_vectors(&conn);
+
+        let chunk_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(chunk_count >= 3, "need at least 3 chunks");
+
+        // Fail on batch (len > 1), succeed on individual (len == 1)
+        let encode_fail_batch = |texts: &[String]| -> anyhow::Result<Vec<Vec<f32>>> {
+            if texts.len() > 1 {
+                anyhow::bail!("batch error");
+            }
+            mock_encode(texts)
+        };
+
+        // Use batch_size > 1 to trigger batch failure + individual retry
+        let stats = backfill_vectors(&conn, &encode_fail_batch, 8, None).unwrap();
+        assert_eq!(
+            stats.filled as i64, chunk_count,
+            "all chunks should be filled via individual retry"
+        );
+        assert_eq!(stats.errors, 0, "no chunks should remain as errors");
+    }
+
+    #[test]
+    fn test_backfill_skip_written_for_persistent_failure() {
+        let (conn, dir) = setup();
+        let path = write_md(
+            dir.path(),
+            "daily/notes/test.md",
+            "# Hello\n\nContent here.\n",
+        );
+        index_file(&conn, &path, dir.path()).unwrap();
+        clear_vectors(&conn);
+
+        // Always fail
+        let stats =
+            backfill_vectors(&conn, &mock_encode_fail, BACKFILL_BATCH_SIZE, None).unwrap();
+        assert!(stats.errors > 0);
+
+        // Skip records should have been written
+        let skip_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec_skip", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            skip_count > 0,
+            "skip records should be written for failed chunks"
+        );
+
+        // chunks_vec should remain empty (no sentinel vectors polluting search)
+        let vec_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vec_count, 0, "no vectors should be written for failed chunks");
+
+        // A second run should find no missing vectors (skip table excludes them)
+        let stats2 =
+            backfill_vectors(&conn, &mock_encode_fail, BACKFILL_BATCH_SIZE, None).unwrap();
+        assert_eq!(
+            stats2.filled, 0,
+            "no chunks should be retried after skip"
+        );
+        assert_eq!(stats2.errors, 0, "no errors on second run");
     }
 
     // ─── entity integration tests ────────────────────────────
