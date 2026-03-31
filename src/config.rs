@@ -48,6 +48,25 @@ pub fn embedder_backfill_interval_secs() -> u64 {
     EMBEDDER_BACKFILL_INTERVAL_SECS
 }
 
+pub const DAEMON_SOCKET_PATH: &str = "/tmp/tsm-daemon.sock";
+pub const DAEMON_PID_FILENAME: &str = "tsmd.pid";
+
+/// Load daemon socket path from config.
+/// TSM_DAEMON_SOCKET env > config file > default.
+pub fn daemon_socket_path() -> PathBuf {
+    if let Ok(p) = std::env::var("TSM_DAEMON_SOCKET") {
+        return PathBuf::from(p);
+    }
+    if let Some(p) = load_config_value("daemon_socket_path") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(DAEMON_SOCKET_PATH)
+}
+
+pub fn daemon_pid_path() -> PathBuf {
+    data_dir().join(DAEMON_PID_FILENAME)
+}
+
 pub const DICT_CANDIDATE_FREQ_THRESHOLD: i64 = 5;
 pub const WORKER_ENCODE_TIMEOUT_PER_ITEM_SECS: u64 = 5;
 pub const WORKER_ENCODE_TIMEOUT_BASE_SECS: u64 = 10;
@@ -373,5 +392,29 @@ mod tests {
         assert_eq!(SCORE_THRESHOLD, 0.005);
         assert_eq!(MAX_RESULTS, 5);
         assert_eq!(EMBEDDING_DIM, 256);
+    }
+
+    #[test]
+    fn test_daemon_socket_path_default() {
+        std::env::remove_var("TSM_DAEMON_SOCKET");
+        std::env::remove_var("TSM_CONFIG");
+        let path = daemon_socket_path();
+        assert_eq!(path, PathBuf::from(DAEMON_SOCKET_PATH));
+    }
+
+    #[test]
+    fn test_daemon_socket_path_env() {
+        std::env::set_var("TSM_DAEMON_SOCKET", "/tmp/custom-daemon.sock");
+        let path = daemon_socket_path();
+        assert_eq!(path, PathBuf::from("/tmp/custom-daemon.sock"));
+        std::env::remove_var("TSM_DAEMON_SOCKET");
+    }
+
+    #[test]
+    fn test_daemon_pid_path() {
+        std::env::set_var("TSM_DATA_DIR", "/tmp/tsm-pid-test");
+        let path = daemon_pid_path();
+        assert_eq!(path, PathBuf::from("/tmp/tsm-pid-test/tsmd.pid"));
+        std::env::remove_var("TSM_DATA_DIR");
     }
 }

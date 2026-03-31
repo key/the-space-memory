@@ -10,6 +10,8 @@ pub struct StatusFile {
     pub backfill: Option<BackfillStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedder: Option<EmbedderStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<DaemonStatus>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -24,6 +26,13 @@ pub struct BackfillStatus {
 pub struct EmbedderStatus {
     pub started_at: String,
     pub pid: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    pub started_at: String,
+    pub pid: u32,
+    pub socket: String,
 }
 
 pub fn status_path(data_dir: &Path) -> std::path::PathBuf {

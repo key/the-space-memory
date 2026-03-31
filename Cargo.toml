@@ -7,6 +7,10 @@ edition = "2021"
 name = "tsm"
 path = "src/main.rs"
 
+[[bin]]
+name = "tsmd"
+path = "src/bin/tsmd.rs"
+
 [dependencies]
 rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }
 lindera = { version = "2.3", features = ["embed-ipadic"] }

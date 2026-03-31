@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -15,6 +15,7 @@ use candle_transformers::models::modernbert::{Config, ModernBert};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 
 use crate::config;
+use crate::ipc::{read_message, write_message};
 
 const MODEL_ID: &str = "cl-nagoya/ruri-v3-30m";
 
@@ -171,28 +172,6 @@ fn mean_pooling(output: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         .sqrt()?
         .clamp(1e-9, f64::MAX)?;
     Ok(pooled.broadcast_div(&norms)?)
-}
-
-// ─── Socket protocol ───────────────────────────────────────────────
-
-/// Read a length-prefixed message from a stream.
-pub fn read_message(stream: &mut impl Read) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-    let mut buf = vec![0u8; msg_len];
-    stream.read_exact(&mut buf)?;
-    Ok(buf)
-}
-
-/// Write a length-prefixed message to a stream.
-pub fn write_message(stream: &mut impl Write, data: &[u8]) -> Result<()> {
-    let len_bytes = (data.len() as u32).to_be_bytes();
-    stream.write_all(&len_bytes)?;
-    stream.write_all(data)?;
-    stream.flush()?;
-    Ok(())
 }
 
 // ─── Daemon ────────────────────────────────────────────────────────

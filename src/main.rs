@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use the_space_memory::cli;
+use the_space_memory::config;
+use the_space_memory::daemon_protocol::{self, DaemonRequest};
 use the_space_memory::user_dict::DictFormat;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -35,6 +37,10 @@ struct Cli {
 enum Commands {
     /// Initialize the database
     Init,
+    /// Start the daemon (tsmd)
+    Start,
+    /// Stop the daemon (tsmd)
+    Stop,
     /// Index documents
     Index {
         /// Read file paths from stdin
@@ -123,6 +129,8 @@ fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     match args.command {
         Commands::Init => cli::cmd_init()?,
+        Commands::Start => cmd_start()?,
+        Commands::Stop => cmd_stop()?,
         Commands::Index { files_from_stdin } => cli::cmd_index(files_from_stdin)?,
         Commands::Search {
             query,
@@ -158,5 +166,104 @@ fn main() -> anyhow::Result<()> {
         Commands::Rebuild { force } => cli::cmd_rebuild(force)?,
         Commands::BackfillWorker => cli::cmd_backfill_worker()?,
     }
+    Ok(())
+}
+
+/// Start the tsmd daemon as a background process.
+fn cmd_start() -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let socket_path = config::daemon_socket_path();
+
+    // Check if already running
+    if socket_path.exists() {
+        // Try to ping
+        if let Ok(resp) = daemon_protocol::send_request(&socket_path, &DaemonRequest::Ping) {
+            if resp.ok {
+                eprintln!("tsmd is already running.");
+                return Ok(());
+            }
+        }
+        // Stale socket — remove it
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    // Find the tsmd binary (same directory as tsm)
+    let exe_dir = std::env::current_exe()?
+        .parent()
+        .expect("executable has parent dir")
+        .to_path_buf();
+    let tsmd_path = exe_dir.join("tsmd");
+
+    if !tsmd_path.exists() {
+        anyhow::bail!(
+            "tsmd binary not found at {}. Build with `cargo build`.",
+            tsmd_path.display()
+        );
+    }
+
+    // Spawn tsmd in a new session (detached)
+    let mut cmd = std::process::Command::new(&tsmd_path);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    cmd.spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to start tsmd: {e}"))?;
+
+    // Wait for socket to appear (max 30 seconds)
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(30);
+    loop {
+        if socket_path.exists() {
+            // Verify it responds to ping
+            if let Ok(resp) = daemon_protocol::send_request(&socket_path, &DaemonRequest::Ping) {
+                if resp.ok {
+                    eprintln!("tsmd started.");
+                    return Ok(());
+                }
+            }
+        }
+        if start.elapsed() > timeout {
+            anyhow::bail!("Timeout waiting for tsmd to start.");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Stop the tsmd daemon by sending a Shutdown request.
+fn cmd_stop() -> anyhow::Result<()> {
+    let socket_path = config::daemon_socket_path();
+
+    if !socket_path.exists() {
+        eprintln!("tsmd is not running.");
+        return Ok(());
+    }
+
+    match daemon_protocol::send_request(&socket_path, &DaemonRequest::Shutdown) {
+        Ok(resp) => {
+            if resp.ok {
+                eprintln!("tsmd stopped.");
+            } else {
+                eprintln!(
+                    "tsmd reported error: {}",
+                    resp.error.unwrap_or_default()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("Could not connect to tsmd: {e}");
+            // Try to clean up stale socket
+            let _ = std::fs::remove_file(&socket_path);
+            eprintln!("Removed stale socket.");
+        }
+    }
+
     Ok(())
 }
