@@ -470,6 +470,29 @@ impl DoctorReport {
     }
 }
 
+/// Run doctor check with an existing DB connection.
+pub fn run_doctor(conn: &rusqlite::Connection, db_path: &Path) -> DoctorReport {
+    let mut report = DoctorReport::default();
+
+    // ── Database section ──
+    let mut db_section = DoctorSection {
+        name: "Database".to_string(),
+        items: Vec::new(),
+    };
+
+    if let Ok(meta) = std::fs::metadata(db_path) {
+        let size_mb = meta.len() as f64 / 1024.0 / 1024.0;
+        db_section.items.push(CheckItem {
+            status: CheckStatus::Ok,
+            message: format!("DB: {} ({size_mb:.1} MB)", db_path.display()),
+            hint: None,
+        });
+    }
+
+    doctor_check_with_conn(conn, &mut report, db_section);
+    report
+}
+
 pub fn doctor_check(db_path: &Path) -> DoctorReport {
     let mut report = DoctorReport::default();
 
@@ -499,147 +522,155 @@ pub fn doctor_check(db_path: &Path) -> DoctorReport {
     }
 
     if let Ok(conn) = db::get_connection(db_path) {
-        let docs: i64 = conn
-            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
-            .unwrap_or(0);
-        let chunks: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
-            .unwrap_or(0);
-        db_section.items.push(CheckItem {
-            status: CheckStatus::Ok,
-            message: format!("Documents: {docs}"),
-            hint: None,
-        });
-        db_section.items.push(CheckItem {
-            status: CheckStatus::Ok,
-            message: format!("Chunks: {chunks}"),
-            hint: None,
-        });
-
-        report.sections.push(db_section);
-
-        // ── Embedder section ──
-        let mut emb_section = DoctorSection {
-            name: "Embedder".to_string(),
-            items: Vec::new(),
-        };
-
-        let socket = Path::new(config::SOCKET_PATH);
-        let timeout = config::embedder_idle_timeout_secs();
-        if socket.exists() {
-            let timeout_info = if timeout == 0 {
-                "idle timeout: disabled".to_string()
-            } else {
-                format!("idle timeout: {timeout}s")
-            };
-            emb_section.items.push(CheckItem {
-                status: CheckStatus::Ok,
-                message: format!("Running ({timeout_info})"),
-                hint: None,
-            });
-        } else {
-            emb_section.items.push(CheckItem {
-                status: CheckStatus::Warning,
-                message: "Stopped".to_string(),
-                hint: Some("Run `embedder-start`.".to_string()),
-            });
-        }
-
-        let vecs: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
-            .unwrap_or(-1);
-
-        // Check if backfill is in progress
-        let data_dir = config::data_dir();
-        let sf = crate::status::read(&data_dir);
-        let backfill_hint = if let Some(ref bf) = sf.backfill {
-            let pct = if bf.total > 0 {
-                (bf.filled as f64 / bf.total as f64 * 100.0) as u32
-            } else {
-                0
-            };
-            let processed = bf.filled + bf.errors;
-            let eta = if processed > 0 && bf.total > 0 {
-                estimate_eta(&bf.started_at, processed, bf.total as usize)
-            } else {
-                "calculating...".to_string()
-            };
-            Some(format!(
-                "Backfill in progress: {}/{} ({pct}%), ETA {eta}",
-                bf.filled, bf.total
-            ))
-        } else {
-            None
-        };
-
-        if vecs < 0 {
-            emb_section.items.push(CheckItem {
-                status: CheckStatus::Error,
-                message: "Vectors: chunks_vec unreadable".to_string(),
-                hint: None,
-            });
-        } else if vecs == 0 && chunks > 0 {
-            emb_section.items.push(CheckItem {
-                status: CheckStatus::Warning,
-                message: format!("Vectors: 0 / {chunks} chunks"),
-                hint: Some(backfill_hint.unwrap_or_else(|| {
-                    "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
-                })),
-            });
-        } else if vecs < chunks {
-            emb_section.items.push(CheckItem {
-                status: CheckStatus::Warning,
-                message: format!("Vectors: {vecs} / {chunks} chunks (mismatch)"),
-                hint: Some(backfill_hint.unwrap_or_else(|| {
-                    "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
-                })),
-            });
-        } else {
-            emb_section.items.push(CheckItem {
-                status: CheckStatus::Ok,
-                message: format!("Vectors: {vecs} (matches all chunks)"),
-                hint: None,
-            });
-        }
-
-        report.sections.push(emb_section);
-
-        // ── Dictionary section ──
-        if db::has_candidates_table(&conn) {
-            let mut dict_section = DoctorSection {
-                name: "Dictionary".to_string(),
-                items: Vec::new(),
-            };
-
-            let summary = user_dict::candidate_summary(&conn);
-            dict_section.items.push(CheckItem {
-                status: CheckStatus::Ok,
-                message: format!(
-                    "User dict: {} words, {} pending, {} rejected",
-                    summary.dict_word_count, summary.total_pending, summary.rejected_count
-                ),
-                hint: None,
-            });
-
-            if summary.ready_count > 0 {
-                dict_section.items.push(CheckItem {
-                    status: CheckStatus::Warning,
-                    message: format!(
-                        "{} candidates ready (freq >= {})",
-                        summary.ready_count,
-                        config::DICT_CANDIDATE_FREQ_THRESHOLD
-                    ),
-                    hint: Some("Run `dict-update`.".to_string()),
-                });
-            }
-
-            report.sections.push(dict_section);
-        }
+        doctor_check_with_conn(&conn, &mut report, db_section);
     } else {
         report.sections.push(db_section);
     }
 
     report
+}
+
+fn doctor_check_with_conn(
+    conn: &rusqlite::Connection,
+    report: &mut DoctorReport,
+    mut db_section: DoctorSection,
+) {
+    let docs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+        .unwrap_or(0);
+    let chunks: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+        .unwrap_or(0);
+    db_section.items.push(CheckItem {
+        status: CheckStatus::Ok,
+        message: format!("Documents: {docs}"),
+        hint: None,
+    });
+    db_section.items.push(CheckItem {
+        status: CheckStatus::Ok,
+        message: format!("Chunks: {chunks}"),
+        hint: None,
+    });
+
+    report.sections.push(db_section);
+
+    // ── Embedder section ──
+    let mut emb_section = DoctorSection {
+        name: "Embedder".to_string(),
+        items: Vec::new(),
+    };
+
+    let socket = Path::new(config::SOCKET_PATH);
+    let timeout = config::embedder_idle_timeout_secs();
+    if socket.exists() {
+        let timeout_info = if timeout == 0 {
+            "idle timeout: disabled".to_string()
+        } else {
+            format!("idle timeout: {timeout}s")
+        };
+        emb_section.items.push(CheckItem {
+            status: CheckStatus::Ok,
+            message: format!("Running ({timeout_info})"),
+            hint: None,
+        });
+    } else {
+        emb_section.items.push(CheckItem {
+            status: CheckStatus::Warning,
+            message: "Stopped".to_string(),
+            hint: Some("Run `embedder-start`.".to_string()),
+        });
+    }
+
+    let vecs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+        .unwrap_or(-1);
+
+    // Check if backfill is in progress
+    let data_dir = config::data_dir();
+    let sf = crate::status::read(&data_dir);
+    let backfill_hint = if let Some(ref bf) = sf.backfill {
+        let pct = if bf.total > 0 {
+            (bf.filled as f64 / bf.total as f64 * 100.0) as u32
+        } else {
+            0
+        };
+        let processed = bf.filled + bf.errors;
+        let eta = if processed > 0 && bf.total > 0 {
+            estimate_eta(&bf.started_at, processed, bf.total as usize)
+        } else {
+            "calculating...".to_string()
+        };
+        Some(format!(
+            "Backfill in progress: {}/{} ({pct}%), ETA {eta}",
+            bf.filled, bf.total
+        ))
+    } else {
+        None
+    };
+
+    if vecs < 0 {
+        emb_section.items.push(CheckItem {
+            status: CheckStatus::Error,
+            message: "Vectors: chunks_vec unreadable".to_string(),
+            hint: None,
+        });
+    } else if vecs == 0 && chunks > 0 {
+        emb_section.items.push(CheckItem {
+            status: CheckStatus::Warning,
+            message: format!("Vectors: 0 / {chunks} chunks"),
+            hint: Some(backfill_hint.unwrap_or_else(|| {
+                "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
+            })),
+        });
+    } else if vecs < chunks {
+        emb_section.items.push(CheckItem {
+            status: CheckStatus::Warning,
+            message: format!("Vectors: {vecs} / {chunks} chunks (mismatch)"),
+            hint: Some(backfill_hint.unwrap_or_else(|| {
+                "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
+            })),
+        });
+    } else {
+        emb_section.items.push(CheckItem {
+            status: CheckStatus::Ok,
+            message: format!("Vectors: {vecs} (matches all chunks)"),
+            hint: None,
+        });
+    }
+
+    report.sections.push(emb_section);
+
+    // ── Dictionary section ──
+    if db::has_candidates_table(conn) {
+        let mut dict_section = DoctorSection {
+            name: "Dictionary".to_string(),
+            items: Vec::new(),
+        };
+
+        let summary = user_dict::candidate_summary(conn);
+        dict_section.items.push(CheckItem {
+            status: CheckStatus::Ok,
+            message: format!(
+                "User dict: {} words, {} pending, {} rejected",
+                summary.dict_word_count, summary.total_pending, summary.rejected_count
+            ),
+            hint: None,
+        });
+
+        if summary.ready_count > 0 {
+            dict_section.items.push(CheckItem {
+                status: CheckStatus::Warning,
+                message: format!(
+                    "{} candidates ready (freq >= {})",
+                    summary.ready_count,
+                    config::DICT_CANDIDATE_FREQ_THRESHOLD
+                ),
+                hint: Some("Run `dict-update`.".to_string()),
+            });
+        }
+
+        report.sections.push(dict_section);
+    }
 }
 
 pub fn cmd_doctor(format: &str) -> anyhow::Result<()> {
@@ -740,6 +771,9 @@ fn render_doctor_report(report: &DoctorReport) {
 /// Structured status information for the system.
 #[derive(Debug, serde::Serialize)]
 pub struct StatusInfo {
+    pub daemon_running: bool,
+    pub daemon_pid: Option<u32>,
+    pub daemon_socket: Option<String>,
     pub embedder_running: bool,
     pub embedder_pid: Option<u32>,
     pub embedder_since: Option<String>,
@@ -764,6 +798,11 @@ pub fn run_status(conn: Option<&rusqlite::Connection>) -> StatusInfo {
 
     let data_dir = config::data_dir();
     let sf = status::read(&data_dir);
+
+    let daemon_socket_path = config::daemon_socket_path();
+    let daemon_running = daemon_socket_path.exists();
+    let daemon_pid = sf.daemon.as_ref().map(|d| d.pid);
+    let daemon_socket = sf.daemon.as_ref().map(|d| d.socket.clone());
 
     let socket = Path::new(config::SOCKET_PATH);
     let embedder_running = socket.exists();
@@ -799,6 +838,9 @@ pub fn run_status(conn: Option<&rusqlite::Connection>) -> StatusInfo {
     };
 
     StatusInfo {
+        daemon_running,
+        daemon_pid,
+        daemon_socket,
         embedder_running,
         embedder_pid,
         embedder_since,
@@ -816,6 +858,17 @@ pub fn cmd_status() -> anyhow::Result<()> {
     let info = run_status(conn.as_ref());
 
     println!("=== The Space Memory Status ===\n");
+
+    // Daemon
+    if info.daemon_running {
+        if let Some(pid) = info.daemon_pid {
+            println!("  Daemon:    running (PID {pid})");
+        } else {
+            println!("  Daemon:    running");
+        }
+    } else {
+        println!("  Daemon:    stopped");
+    }
 
     // Embedder
     if info.embedder_running {

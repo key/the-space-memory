@@ -121,6 +121,8 @@ fn handle_client(
     conn: &Arc<Mutex<rusqlite::Connection>>,
     project_root: &std::path::Path,
 ) -> Result<()> {
+    // Prevent slow/disconnected clients from holding threads indefinitely
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
     let req = read_request(stream)?;
     let conn = conn
         .lock()

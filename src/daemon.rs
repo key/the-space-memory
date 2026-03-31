@@ -87,25 +87,13 @@ pub fn handle_request(
             }
         }
 
-        DaemonRequest::Doctor { format } => {
+        DaemonRequest::Doctor { .. } => {
             let db_path = config::db_path();
-            let report = cli::doctor_check(&db_path);
-            match format.as_str() {
-                "json" => {
-                    let json_str = report.to_json();
-                    match serde_json::from_str::<serde_json::Value>(&json_str) {
-                        Ok(v) => DaemonResponse::success(v),
-                        Err(e) => DaemonResponse::error(format!("JSON parse error: {e}")),
-                    }
-                }
-                _ => {
-                    // For text format, return JSON with the report data anyway
-                    let json_str = report.to_json();
-                    match serde_json::from_str::<serde_json::Value>(&json_str) {
-                        Ok(v) => DaemonResponse::success(v),
-                        Err(e) => DaemonResponse::error(format!("JSON parse error: {e}")),
-                    }
-                }
+            let report = cli::run_doctor(conn, &db_path);
+            let json_str = report.to_json();
+            match serde_json::from_str::<serde_json::Value>(&json_str) {
+                Ok(v) => DaemonResponse::success(v),
+                Err(e) => DaemonResponse::error(format!("JSON parse error: {e}")),
             }
         }
 
