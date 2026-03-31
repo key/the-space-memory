@@ -109,21 +109,27 @@ fn main() -> Result<()> {
             let _ = std::fs::remove_file(&embedder_pid_path);
             remove_stale_embedder_socket();
             match start_child("tsm-embedder", &[("TSM_EMBEDDER_IDLE_TIMEOUT", "0")]) {
-                Ok(child) => {
+                Ok(mut child) => {
                     let child_pid = child.id();
                     log::info!("embedder started (PID {child_pid})");
                     if let Err(e) = std::fs::write(&embedder_pid_path, child_pid.to_string()) {
-                        log::warn!("failed to write embedder PID file: {e}");
+                        log::error!(
+                            "failed to write embedder PID file: {e}; \
+                             killing child to prevent unguarded spawn"
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        None
                     } else {
                         log::info!("embedder PID file: {}", embedder_pid_path.display());
-                    }
-                    status::update(&data_dir, |s| {
-                        s.embedder = Some(status::EmbedderStatus {
-                            started_at: chrono::Utc::now().to_rfc3339(),
-                            pid: child_pid,
+                        status::update(&data_dir, |s| {
+                            s.embedder = Some(status::EmbedderStatus {
+                                started_at: chrono::Utc::now().to_rfc3339(),
+                                pid: child_pid,
+                            });
                         });
-                    });
-                    Some(child)
+                        Some(child)
+                    }
                 }
                 Err(e) => {
                     log::error!("failed to start embedder: {e}");
@@ -143,21 +149,27 @@ fn main() -> Result<()> {
         } else {
             let _ = std::fs::remove_file(&watcher_pid_path);
             match start_child("tsm-watcher", &[]) {
-                Ok(child) => {
+                Ok(mut child) => {
                     let child_pid = child.id();
                     log::info!("watcher started (PID {child_pid})");
                     if let Err(e) = std::fs::write(&watcher_pid_path, child_pid.to_string()) {
-                        log::warn!("failed to write watcher PID file: {e}");
+                        log::error!(
+                            "failed to write watcher PID file: {e}; \
+                             killing child to prevent unguarded spawn"
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        None
                     } else {
                         log::info!("watcher PID file: {}", watcher_pid_path.display());
-                    }
-                    status::update(&data_dir, |s| {
-                        s.watcher = Some(status::WatcherStatus {
-                            started_at: chrono::Utc::now().to_rfc3339(),
-                            pid: child_pid,
+                        status::update(&data_dir, |s| {
+                            s.watcher = Some(status::WatcherStatus {
+                                started_at: chrono::Utc::now().to_rfc3339(),
+                                pid: child_pid,
+                            });
                         });
-                    });
-                    Some(child)
+                        Some(child)
+                    }
                 }
                 Err(e) => {
                     log::error!("failed to start watcher: {e}");

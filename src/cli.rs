@@ -258,6 +258,14 @@ pub fn cmd_backfill_worker() -> anyhow::Result<()> {
 static BACKFILL_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// RAII guard that resets `BACKFILL_RUNNING` on drop (including panic unwind).
+struct BackfillGuard;
+impl Drop for BackfillGuard {
+    fn drop(&mut self) {
+        BACKFILL_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Run backfill via a worker subprocess with default batch size.
 /// Skips if another backfill is already running in this process.
 pub fn backfill_with_worker(db_path: &Path) -> anyhow::Result<()> {
@@ -273,9 +281,8 @@ pub fn backfill_with_worker(db_path: &Path) -> anyhow::Result<()> {
         log::info!("Backfill already running, skipping");
         return Ok(());
     }
-    let result = backfill_with_worker_sized(db_path, indexer::BACKFILL_BATCH_SIZE);
-    BACKFILL_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-    result
+    let _guard = BackfillGuard;
+    backfill_with_worker_sized(db_path, indexer::BACKFILL_BATCH_SIZE)
 }
 
 /// Run vector backfill with an existing connection (daemon-safe).
