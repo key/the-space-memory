@@ -21,7 +21,8 @@ static LOGGER_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 pub fn init_logger(mode: LogMode) -> anyhow::Result<()> {
     let result = LOGGER_INIT.get_or_init(|| {
         let logger = Logger::try_with_env_or_str("info")
-            .map_err(|e| format!("failed to parse log spec: {e}"))?;
+            .map_err(|e| format!("failed to parse log spec: {e}"))?
+            .use_utc();
         match mode {
             LogMode::Stderr => {
                 logger

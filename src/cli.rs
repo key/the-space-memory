@@ -969,9 +969,10 @@ pub fn cmd_dict_update(
         return Ok(());
     }
 
-    log::info!("=== Dictionary Update Candidates ===\n");
+    // Interactive TUI output — bypass log system for clean display
+    eprintln!("=== Dictionary Update Candidates ===\n");
     for c in &candidates {
-        log::info!(
+        eprintln!(
             "  {:<20} {:>3} hits  (first: {}, last: {})",
             c.surface,
             c.frequency,
@@ -979,7 +980,7 @@ pub fn cmd_dict_update(
             &c.last_seen[..10.min(c.last_seen.len())]
         );
     }
-    log::info!(
+    eprintln!(
         "\n{} word(s) will be added to user_dict.csv.",
         candidates.len()
     );

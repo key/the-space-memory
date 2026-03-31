@@ -204,6 +204,7 @@ pub fn import_wordnet(conn: &Connection, wordnet_path: &std::path::Path) -> anyh
         }
     }
 
+    eprint!("\r                              \r"); // clear progress line
     log::info!("{imported}/{total} synonym pairs imported.");
     Ok(imported)
 }
