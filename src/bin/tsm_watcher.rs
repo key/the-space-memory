@@ -36,8 +36,8 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon { name: "tsm-watcher" })?;
     config::ensure_model_cache_env();
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon { name: "tsm-watcher" })?;
     let args = Args::parse();
 
     let daemon_socket = args

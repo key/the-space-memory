@@ -41,8 +41,8 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon { name: "tsmd" })?;
     config::ensure_model_cache_env();
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon { name: "tsmd" })?;
     let args = Args::parse();
 
     let socket_path = args.socket.unwrap_or_else(config::daemon_socket_path);

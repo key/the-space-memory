@@ -50,11 +50,11 @@ pub const SESSION_WEIGHT: f64 = 0.3;
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct ConfigFile {
-    data_dir: Option<String>,
-    project_root: Option<String>,
-    embedder_socket_path: Option<String>,
-    daemon_socket_path: Option<String>,
-    log_dir: Option<String>,
+    data_dir: Option<PathBuf>,
+    project_root: Option<PathBuf>,
+    embedder_socket_path: Option<PathBuf>,
+    daemon_socket_path: Option<PathBuf>,
+    log_dir: Option<PathBuf>,
     embedder_idle_timeout_secs: Option<u64>,
     embedder_backfill_interval_secs: Option<u64>,
 }
@@ -66,21 +66,34 @@ fn cfg() -> &'static ConfigFile {
     CONFIG.get_or_init(|| load_config_from(&config_file_candidates()))
 }
 
-/// Load and merge config files.
-/// Priority (first wins per field): TSM_CONFIG env > ./tsm.toml > XDG config
+/// Merge config values from `candidates` in order; first non-None value for each field wins.
 fn load_config_from(candidates: &[PathBuf]) -> ConfigFile {
+    // Determine which path was explicitly requested via TSM_CONFIG (if any)
+    let explicit_config = std::env::var_os("TSM_CONFIG").map(PathBuf::from);
+
     let mut merged = ConfigFile::default();
 
     // Iterate in priority order (highest first); `.or()` keeps first-seen value
     for path in candidates {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                if explicit_config.as_deref() == Some(path.as_path()) {
+                    log::error!(
+                        "Cannot read TSM_CONFIG file '{}': {e}",
+                        path.display()
+                    );
+                }
+                continue;
+            }
         };
         let file: ConfigFile = match toml::from_str(&content) {
             Ok(f) => f,
             Err(e) => {
-                log::warn!("Failed to parse {}: {e}", path.display());
+                log::warn!(
+                    "Config file '{}' has a parse error and will be ignored: {e}",
+                    path.display()
+                );
                 continue;
             }
         };
@@ -115,7 +128,7 @@ pub fn data_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
     if let Some(ref dir) = cfg().data_dir {
-        return PathBuf::from(dir);
+        return dir.clone();
     }
     PathBuf::from(DEFAULT_DATA_DIR)
 }
@@ -126,7 +139,7 @@ pub fn project_root() -> PathBuf {
         return PathBuf::from(root);
     }
     if let Some(ref root) = cfg().project_root {
-        return PathBuf::from(root);
+        return root.clone();
     }
     PathBuf::from(DEFAULT_PROJECT_ROOT)
 }
@@ -137,7 +150,7 @@ pub fn embedder_socket_path() -> PathBuf {
         return PathBuf::from(p);
     }
     if let Some(ref p) = cfg().embedder_socket_path {
-        return PathBuf::from(p);
+        return p.clone();
     }
     data_dir().join("embedder.sock")
 }
@@ -148,7 +161,7 @@ pub fn daemon_socket_path() -> PathBuf {
         return PathBuf::from(p);
     }
     if let Some(ref p) = cfg().daemon_socket_path {
-        return PathBuf::from(p);
+        return p.clone();
     }
     data_dir().join("daemon.sock")
 }
@@ -159,7 +172,7 @@ pub fn log_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
     if let Some(ref dir) = cfg().log_dir {
-        return PathBuf::from(dir);
+        return dir.clone();
     }
     data_dir().join("logs")
 }
@@ -168,8 +181,11 @@ pub fn log_dir() -> PathBuf {
 /// TSM_EMBEDDER_IDLE_TIMEOUT env > config file > default (600s). 0 = disable.
 pub fn embedder_idle_timeout_secs() -> u64 {
     if let Ok(val) = std::env::var("TSM_EMBEDDER_IDLE_TIMEOUT") {
-        if let Ok(n) = val.parse::<u64>() {
-            return n;
+        match val.parse::<u64>() {
+            Ok(n) => return n,
+            Err(e) => log::warn!(
+                "TSM_EMBEDDER_IDLE_TIMEOUT='{val}' is not a valid integer ({e}); using default"
+            ),
         }
     }
     if let Some(n) = cfg().embedder_idle_timeout_secs {
@@ -182,8 +198,11 @@ pub fn embedder_idle_timeout_secs() -> u64 {
 /// TSM_EMBEDDER_BACKFILL_INTERVAL env > config file > default (300s). 0 = disable.
 pub fn embedder_backfill_interval_secs() -> u64 {
     if let Ok(val) = std::env::var("TSM_EMBEDDER_BACKFILL_INTERVAL") {
-        if let Ok(n) = val.parse::<u64>() {
-            return n;
+        match val.parse::<u64>() {
+            Ok(n) => return n,
+            Err(e) => log::warn!(
+                "TSM_EMBEDDER_BACKFILL_INTERVAL='{val}' is not a valid integer ({e}); using default"
+            ),
         }
     }
     if let Some(n) = cfg().embedder_backfill_interval_secs {
@@ -228,12 +247,14 @@ pub fn model_cache_dir() -> PathBuf {
 
 /// Set HF_HUB_CACHE env var if not already set so hf_hub uses XDG cache.
 ///
-/// SAFETY: Must be called from main() before any threads are spawned.
-/// `std::env::set_var` is not thread-safe.
+/// # Safety
+/// Must be called before any threads are spawned (including the logger).
+/// `std::env::set_var` is unsound if concurrent reads or writes to the
+/// environment exist. Call this as the very first thing in `main()`.
 pub fn ensure_model_cache_env() {
     if std::env::var_os("HF_HUB_CACHE").is_none() {
         let cache_dir = model_cache_dir();
-        // Safe: called single-threaded at startup
+        // SAFETY: called single-threaded before init_logger() and any thread spawn
         unsafe { std::env::set_var("HF_HUB_CACHE", cache_dir) };
     }
 }
@@ -550,8 +571,8 @@ embedder_idle_timeout_secs = 1200
         .unwrap();
 
         let cfg = load_config_from(&[config_path]);
-        assert_eq!(cfg.data_dir.as_deref(), Some("/custom/data"));
-        assert_eq!(cfg.project_root.as_deref(), Some("/custom/root"));
+        assert_eq!(cfg.data_dir, Some(PathBuf::from("/custom/data")));
+        assert_eq!(cfg.project_root, Some(PathBuf::from("/custom/root")));
         assert_eq!(cfg.embedder_idle_timeout_secs, Some(1200));
         assert!(cfg.daemon_socket_path.is_none());
     }
@@ -575,9 +596,9 @@ project_root = "/low-root"
 
         // High-priority file is first in the list
         let cfg = load_config_from(&[high, low]);
-        assert_eq!(cfg.data_dir.as_deref(), Some("/high"));
+        assert_eq!(cfg.data_dir, Some(PathBuf::from("/high")));
         // project_root only in low-priority file, still picked up
-        assert_eq!(cfg.project_root.as_deref(), Some("/low-root"));
+        assert_eq!(cfg.project_root, Some(PathBuf::from("/low-root")));
     }
 
     #[test]
@@ -599,5 +620,39 @@ project_root = "/low-root"
         std::env::set_var("TSM_DATA_DIR", "/env/data");
         assert_eq!(data_dir(), PathBuf::from("/env/data"));
         std::env::remove_var("TSM_DATA_DIR");
+    }
+
+    #[test]
+    fn test_load_config_malformed_file_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let malformed = dir.path().join("bad.toml");
+        std::fs::write(&malformed, "this is not valid toml [[[").unwrap();
+
+        let valid = dir.path().join("good.toml");
+        std::fs::write(&valid, r#"data_dir = "/good""#).unwrap();
+
+        // Malformed file is higher priority but skipped; valid file still used
+        let cfg = load_config_from(&[malformed, valid]);
+        assert_eq!(cfg.data_dir, Some(PathBuf::from("/good")));
+    }
+
+    #[test]
+    fn test_ensure_model_cache_env_sets_when_absent() {
+        std::env::remove_var("HF_HUB_CACHE");
+        ensure_model_cache_env();
+        assert!(std::env::var_os("HF_HUB_CACHE").is_some());
+        std::env::remove_var("HF_HUB_CACHE");
+    }
+
+    #[test]
+    fn test_ensure_model_cache_env_preserves_existing() {
+        std::env::set_var("HF_HUB_CACHE", "/my/custom/cache");
+        ensure_model_cache_env();
+        assert_eq!(
+            std::env::var("HF_HUB_CACHE").unwrap(),
+            "/my/custom/cache"
+        );
+        std::env::remove_var("HF_HUB_CACHE");
     }
 }
