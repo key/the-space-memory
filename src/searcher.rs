@@ -14,7 +14,7 @@ use crate::temporal::TimeFilter;
 use crate::tokenizer::{extract_search_keywords, wakachi};
 use crate::user_dict;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
     pub source_file: String,
     pub source_type: String,
@@ -748,5 +748,29 @@ mod tests {
             count > 0,
             "should collect dictionary candidates from search query"
         );
+    }
+
+    #[test]
+    fn test_search_result_serde_roundtrip() {
+        let result = SearchResult {
+            source_file: "daily/notes/test.md".to_string(),
+            source_type: "note".to_string(),
+            section_path: "Test > Section".to_string(),
+            snippet: "Some content".to_string(),
+            score: 0.5,
+            status: Some("current".to_string()),
+            related_docs: vec![doc_links::RelatedDoc {
+                file_path: "company/knowledge/related.md".to_string(),
+                link_type: "tag".to_string(),
+                strength: 0.8,
+            }],
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        let decoded: SearchResult = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.source_file, "daily/notes/test.md");
+        assert_eq!(decoded.score, 0.5);
+        assert_eq!(decoded.related_docs.len(), 1);
+        assert_eq!(decoded.related_docs[0].file_path, "company/knowledge/related.md");
+        assert_eq!(decoded.related_docs[0].link_type, "tag");
     }
 }

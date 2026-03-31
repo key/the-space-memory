@@ -258,11 +258,10 @@ pub fn backfill_with_worker(db_path: &Path) -> anyhow::Result<()> {
     backfill_with_worker_sized(db_path, indexer::BACKFILL_BATCH_SIZE)
 }
 
-/// Run backfill via a worker subprocess with specified batch size.
-pub fn backfill_with_worker_sized(db_path: &Path, batch_size: usize) -> anyhow::Result<()> {
+/// Run vector backfill with an existing connection (daemon-safe).
+pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow::Result<()> {
     use crate::status;
 
-    let conn = db::get_connection(db_path)?;
     let worker = std::cell::RefCell::new(embedder::WorkerHandle::spawn(
         std::time::Duration::from_secs(120),
     )?);
@@ -299,7 +298,7 @@ pub fn backfill_with_worker_sized(db_path: &Path, batch_size: usize) -> anyhow::
             );
             worker.borrow_mut().encode(texts, timeout)
         };
-        let stats = indexer::backfill_vectors(&conn, &encode_fn, batch_size, Some(&progress_cb))?;
+        let stats = indexer::backfill_vectors(conn, &encode_fn, batch_size, Some(&progress_cb))?;
 
         if stats.errors == 0 {
             if stats.filled > 0 {
@@ -343,6 +342,12 @@ pub fn backfill_with_worker_sized(db_path: &Path, batch_size: usize) -> anyhow::
     Ok(())
 }
 
+/// Run backfill via a worker subprocess with specified batch size (opens DB).
+pub fn backfill_with_worker_sized(db_path: &Path, batch_size: usize) -> anyhow::Result<()> {
+    let conn = db::get_connection(db_path)?;
+    run_vector_fill(&conn, batch_size)
+}
+
 pub fn cmd_import_wordnet(wordnet_db: &Path) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
@@ -375,27 +380,29 @@ pub fn cmd_setup() -> anyhow::Result<()> {
 }
 
 /// Doctor output as a structured result for testability.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
     Ok,
     Warning,
     Error,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct CheckItem {
     pub status: CheckStatus,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct DoctorSection {
     pub name: String,
     pub items: Vec<CheckItem>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct DoctorReport {
     pub sections: Vec<DoctorSection>,
 }
@@ -433,37 +440,8 @@ impl DoctorReport {
     }
 
     pub fn to_json(&self) -> String {
-        let sections: Vec<serde_json::Value> = self
-            .sections
-            .iter()
-            .map(|s| {
-                let items: Vec<serde_json::Value> = s
-                    .items
-                    .iter()
-                    .map(|i| {
-                        let mut obj = serde_json::json!({
-                            "status": match i.status {
-                                CheckStatus::Ok => "ok",
-                                CheckStatus::Warning => "warning",
-                                CheckStatus::Error => "error",
-                            },
-                            "message": i.message,
-                        });
-                        if let Some(hint) = &i.hint {
-                            obj["hint"] = serde_json::Value::String(hint.clone());
-                        }
-                        obj
-                    })
-                    .collect();
-                serde_json::json!({
-                    "name": s.name,
-                    "items": items,
-                })
-            })
-            .collect();
-
         serde_json::json!({
-            "sections": sections,
+            "sections": self.sections,
             "issue_count": self.issue_count(),
         })
         .to_string()
@@ -535,12 +513,30 @@ fn doctor_check_with_conn(
     report: &mut DoctorReport,
     mut db_section: DoctorSection,
 ) {
-    let docs: i64 = conn
-        .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
-        .unwrap_or(0);
-    let chunks: i64 = conn
-        .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
-        .unwrap_or(0);
+    let docs: i64 = match conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0)) {
+        Ok(n) => n,
+        Err(e) => {
+            db_section.items.push(CheckItem {
+                status: CheckStatus::Error,
+                message: format!("Failed to query documents: {e}"),
+                hint: Some("Run `init` to initialize the database.".to_string()),
+            });
+            report.sections.push(db_section);
+            return;
+        }
+    };
+    let chunks: i64 = match conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)) {
+        Ok(n) => n,
+        Err(e) => {
+            db_section.items.push(CheckItem {
+                status: CheckStatus::Error,
+                message: format!("Failed to query chunks: {e}"),
+                hint: Some("Run `init` to initialize the database.".to_string()),
+            });
+            report.sections.push(db_section);
+            return;
+        }
+    };
     db_section.items.push(CheckItem {
         status: CheckStatus::Ok,
         message: format!("Documents: {docs}"),
@@ -686,7 +682,7 @@ pub fn cmd_doctor(format: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn render_doctor_report(report: &DoctorReport) {
+pub fn render_doctor_report(report: &DoctorReport) {
     let use_color = std::env::var("NO_COLOR").is_err();
 
     let (green, yellow, red, bold, dim, reset) = if use_color {
@@ -769,7 +765,7 @@ fn render_doctor_report(report: &DoctorReport) {
 }
 
 /// Structured status information for the system.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct StatusInfo {
     pub daemon_running: bool,
     pub daemon_pid: Option<u32>,
@@ -784,7 +780,7 @@ pub struct StatusInfo {
     pub dict_candidates_ready: Option<i64>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct BackfillInfo {
     pub filled: usize,
     pub total: i64,
@@ -852,11 +848,7 @@ pub fn run_status(conn: Option<&rusqlite::Connection>) -> StatusInfo {
     }
 }
 
-pub fn cmd_status() -> anyhow::Result<()> {
-    let db_path = config::db_path();
-    let conn = db::get_connection(&db_path).ok();
-    let info = run_status(conn.as_ref());
-
+pub fn print_status_info(info: &StatusInfo) {
     println!("=== The Space Memory Status ===\n");
 
     // Daemon
@@ -928,7 +920,13 @@ pub fn cmd_status() -> anyhow::Result<()> {
     } else {
         println!("  DB:        not found");
     }
+}
 
+pub fn cmd_status() -> anyhow::Result<()> {
+    let db_path = config::db_path();
+    let conn = db::get_connection(&db_path).ok();
+    let info = run_status(conn.as_ref());
+    print_status_info(&info);
     Ok(())
 }
 
@@ -1480,5 +1478,60 @@ mod tests {
     fn test_ingest_session_file_not_found() {
         let result = cmd_ingest_session(Path::new("/nonexistent/session.jsonl"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_doctor_report_serde_roundtrip() {
+        let report = DoctorReport {
+            sections: vec![DoctorSection {
+                name: "Database".to_string(),
+                items: vec![
+                    CheckItem {
+                        status: CheckStatus::Ok,
+                        message: "DB: /tmp/test.db (1.0 MB)".to_string(),
+                        hint: None,
+                    },
+                    CheckItem {
+                        status: CheckStatus::Warning,
+                        message: "Vectors: 0 / 100 chunks".to_string(),
+                        hint: Some("Run `vector-fill`.".to_string()),
+                    },
+                    CheckItem {
+                        status: CheckStatus::Error,
+                        message: "DB missing".to_string(),
+                        hint: Some("Run `init`.".to_string()),
+                    },
+                ],
+            }],
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        let decoded: DoctorReport = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.sections.len(), 1);
+        assert_eq!(decoded.sections[0].items.len(), 3);
+        assert_eq!(decoded.sections[0].items[0].status, CheckStatus::Ok);
+        assert_eq!(decoded.sections[0].items[1].status, CheckStatus::Warning);
+        assert_eq!(decoded.sections[0].items[2].status, CheckStatus::Error);
+        assert!(decoded.sections[0].items[0].hint.is_none());
+        assert!(decoded.sections[0].items[1].hint.is_some());
+    }
+
+    #[test]
+    fn test_doctor_to_json_output_shape() {
+        let report = DoctorReport {
+            sections: vec![DoctorSection {
+                name: "Test".to_string(),
+                items: vec![CheckItem {
+                    status: CheckStatus::Ok,
+                    message: "All good".to_string(),
+                    hint: None,
+                }],
+            }],
+        };
+        let json_str = report.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed["sections"].is_array());
+        assert_eq!(parsed["issue_count"], 0);
+        assert_eq!(parsed["sections"][0]["name"], "Test");
+        assert_eq!(parsed["sections"][0]["items"][0]["status"], "ok");
     }
 }

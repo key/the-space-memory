@@ -100,7 +100,8 @@ fn main() -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => {
-                eprintln!("tsmd: accept error: {e}");
+                eprintln!("tsmd: fatal accept error: {e}");
+                break;
             }
         }
     }
@@ -123,6 +124,7 @@ fn handle_client(
 ) -> Result<()> {
     // Prevent slow/disconnected clients from holding threads indefinitely
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
     let req = read_request(stream)?;
     let conn = conn
         .lock()

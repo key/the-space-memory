@@ -2,6 +2,9 @@ use std::io::{Read, Write};
 
 use anyhow::Result;
 
+/// Maximum message size (64 MB). Prevents OOM from malformed length headers.
+const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 /// Read a length-prefixed message from a stream.
 ///
 /// Wire format: `[4-byte big-endian length][payload bytes]`
@@ -9,6 +12,10 @@ pub fn read_message(stream: &mut impl Read) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+    if msg_len > MAX_MESSAGE_SIZE {
+        anyhow::bail!("Message too large: {msg_len} bytes (max {MAX_MESSAGE_SIZE})");
+    }
 
     let mut buf = vec![0u8; msg_len];
     stream.read_exact(&mut buf)?;
@@ -104,5 +111,15 @@ mod tests {
         buf.extend_from_slice(b"short"); // Only 5 bytes
         let mut cursor = Cursor::new(buf);
         assert!(read_message(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn read_oversized_message_fails() {
+        let huge_len = (super::MAX_MESSAGE_SIZE as u32) + 1;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&huge_len.to_be_bytes());
+        let mut cursor = Cursor::new(buf);
+        let err = read_message(&mut cursor).unwrap_err();
+        assert!(err.to_string().contains("too large"));
     }
 }

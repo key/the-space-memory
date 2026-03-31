@@ -41,10 +41,19 @@ pub fn status_path(data_dir: &Path) -> std::path::PathBuf {
 
 pub fn read(data_dir: &Path) -> StatusFile {
     let path = status_path(data_dir);
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let Ok(s) = std::fs::read_to_string(&path) else {
+        return StatusFile::default(); // File absent is normal
+    };
+    match serde_json::from_str(&s) {
+        Ok(sf) => sf,
+        Err(e) => {
+            eprintln!(
+                "warning: failed to parse status file ({}): {e}",
+                path.display()
+            );
+            StatusFile::default()
+        }
+    }
 }
 
 /// Atomic write: write to tmp file then rename.
@@ -61,7 +70,12 @@ pub fn update(data_dir: &Path, f: impl FnOnce(&mut StatusFile)) {
     let path = status_path(data_dir);
     let mut status = read(data_dir);
     f(&mut status);
-    if let Ok(json) = serde_json::to_string_pretty(&status) {
-        let _ = write_atomic(&path, json.as_bytes());
+    match serde_json::to_string_pretty(&status) {
+        Ok(json) => {
+            if let Err(e) = write_atomic(&path, json.as_bytes()) {
+                eprintln!("warning: failed to write status file: {e}");
+            }
+        }
+        Err(e) => eprintln!("warning: failed to serialize status: {e}"),
     }
 }
