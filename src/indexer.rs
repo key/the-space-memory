@@ -353,8 +353,7 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
     }
     tx.commit()?;
 
-    // Insert vectors only if embedder is already running (don't auto-start).
-    // Backfill will handle missing vectors later.
+    // Insert vectors if embedder is running; backfill handles the rest.
     insert_vectors(conn, &chunk_entries);
 
     // Learn synonyms from human messages in the session (wrapped in transaction)
@@ -446,6 +445,10 @@ fn insert_vectors(conn: &Connection, chunk_entries: &[(i64, String)]) {
     if !db::has_vec_table(conn) {
         return;
     }
+    // Skip socket I/O if embedder is not running
+    if !std::path::Path::new(config::SOCKET_PATH).exists() {
+        return;
+    }
 
     let texts: Vec<String> = chunk_entries.iter().map(|(_, text)| text.clone()).collect();
     let embeddings = match embedder::embed_via_socket(&texts) {
@@ -457,7 +460,6 @@ fn insert_vectors(conn: &Connection, chunk_entries: &[(i64, String)]) {
         write_vec_row(conn, *chunk_id, emb);
     }
 }
-
 
 pub use crate::config::BACKFILL_BATCH_SIZE;
 

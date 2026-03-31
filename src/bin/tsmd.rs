@@ -122,35 +122,8 @@ fn main() -> Result<()> {
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Check embedder health periodically (every 100ms poll)
-                if let Some(ref mut child) = embedder_child {
-                    if let Ok(Some(_exit)) = child.try_wait() {
-                        if embedder_restarts < MAX_EMBEDDER_RESTARTS {
-                            embedder_restarts += 1;
-                            eprintln!(
-                                "tsmd: embedder exited, restarting ({embedder_restarts}/{MAX_EMBEDDER_RESTARTS})..."
-                            );
-                            match start_embedder() {
-                                Ok(new_child) => {
-                                    eprintln!(
-                                        "tsmd: embedder restarted (PID {})",
-                                        new_child.id()
-                                    );
-                                    *child = new_child;
-                                }
-                                Err(e) => {
-                                    eprintln!("tsmd: failed to restart embedder: {e}");
-                                    embedder_child = None;
-                                }
-                            }
-                        } else {
-                            eprintln!(
-                                "tsmd: embedder crashed {MAX_EMBEDDER_RESTARTS} times, giving up"
-                            );
-                            embedder_child = None;
-                        }
-                    }
-                }
+                // Check embedder health on each idle poll (every 100ms)
+                maybe_restart_embedder(&mut embedder_child, &mut embedder_restarts, MAX_EMBEDDER_RESTARTS);
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => {
@@ -179,6 +152,39 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Check if the embedder child has exited and restart it if within the retry limit.
+/// Sets `child` to `None` once the limit is exhausted or when a restart fails to spawn.
+fn maybe_restart_embedder(child: &mut Option<Child>, restarts: &mut u32, max: u32) {
+    let exited = match child {
+        Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+        None => return,
+    };
+
+    if !exited {
+        return;
+    }
+
+    if *restarts >= max {
+        eprintln!("tsmd: embedder crashed {max} times, giving up");
+        *child = None;
+        return;
+    }
+
+    *restarts += 1;
+    eprintln!("tsmd: embedder exited, restarting ({restarts}/{max})...");
+    match start_embedder() {
+        Ok(new_child) => {
+            eprintln!("tsmd: embedder restarted (PID {})", new_child.id());
+            *child = Some(new_child);
+            *restarts = 0; // reset on successful restart
+        }
+        Err(e) => {
+            eprintln!("tsmd: failed to restart embedder: {e}");
+            *child = None;
+        }
+    }
+}
+
 /// Start the embedder as a child process with idle timeout disabled.
 fn start_embedder() -> Result<Child> {
     let embedder_socket = Path::new(config::SOCKET_PATH);
@@ -204,17 +210,9 @@ fn start_embedder() -> Result<Child> {
         .spawn()
         .context("Failed to spawn embedder process")?;
 
-    // Wait for embedder socket to appear (max 60s for model loading)
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(60);
-    while start.elapsed() < timeout {
-        if embedder_socket.exists() {
-            return Ok(child);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-
-    eprintln!("tsmd: warning: embedder socket not ready after 60s, continuing anyway");
+    // Don't block waiting for embedder socket — model loading can take tens of seconds.
+    // The accept loop starts immediately; embed_via_socket returns None until ready,
+    // and backfill handles missing vectors later.
     Ok(child)
 }
 
