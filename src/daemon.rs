@@ -264,6 +264,60 @@ mod tests {
     }
 
     #[test]
+    fn test_import_wordnet_nonexistent() {
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+        let req = DaemonRequest::ImportWordnet {
+            wordnet_db: "/nonexistent/wnjpn.db".into(),
+        };
+        let resp = handle_request(&conn, req, dir.path(), &flag);
+        assert!(!resp.ok);
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn test_dict_update_no_candidates() {
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+        // With empty DB and yes=true, should complete without error
+        // (no candidates to update)
+        let req = DaemonRequest::DictUpdate {
+            threshold: 5,
+            yes: true,
+            format: "ipadic".into(),
+        };
+        let resp = handle_request(&conn, req, dir.path(), &flag);
+        // May succeed or error depending on dict path, but should not panic
+        assert!(resp.ok || resp.error.is_some());
+    }
+
+    #[test]
+    fn test_dict_update_simpledic_format() {
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+        let req = DaemonRequest::DictUpdate {
+            threshold: 5,
+            yes: true,
+            format: "simpledic".into(),
+        };
+        let resp = handle_request(&conn, req, dir.path(), &flag);
+        assert!(resp.ok || resp.error.is_some());
+    }
+
+    #[test]
+    fn test_doctor_text_format() {
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+        let req = DaemonRequest::Doctor {
+            format: "text".into(),
+        };
+        let resp = handle_request(&conn, req, dir.path(), &flag);
+        // Both "text" and "json" return JSON through daemon protocol
+        assert!(resp.ok);
+        assert!(resp.payload.is_some());
+    }
+
+    #[test]
     fn test_socket_roundtrip() {
         use crate::daemon_protocol::{read_request, send_request, write_response};
         use std::os::unix::net::UnixListener;

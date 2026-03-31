@@ -362,4 +362,55 @@ mod tests {
         assert!(decoded.ok);
         assert_eq!(decoded.payload.unwrap()["status"], "ok");
     }
+
+    #[test]
+    fn invalid_json_fails_to_deserialize() {
+        // Valid IPC frame but invalid JSON content
+        let garbage = b"not json at all";
+        let mut buf = Vec::new();
+        write_message(&mut buf, garbage).unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let decoded_bytes = read_message(&mut cursor).unwrap();
+        let result = serde_json::from_slice::<DaemonRequest>(&decoded_bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_cmd_fails_to_deserialize() {
+        let unknown = serde_json::json!({"cmd": "UnknownCommand", "foo": "bar"});
+        let result = serde_json::from_value::<DaemonRequest>(unknown);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_json_via_socket() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("test-invalid.sock");
+        let sock_path_clone = sock_path.clone();
+
+        let server = std::thread::spawn(move || {
+            let listener = UnixListener::bind(&sock_path_clone).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            // read_request should fail on invalid JSON
+            let result = read_request(&mut stream);
+            assert!(result.is_err());
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Client sends garbage through the socket
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        write_message(&mut client, b"not valid json").unwrap();
+        drop(client);
+
+        server.join().unwrap();
+    }
 }
