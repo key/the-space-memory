@@ -254,9 +254,28 @@ pub fn cmd_backfill_worker() -> anyhow::Result<()> {
     embedder::run_backfill_worker()
 }
 
+/// Guard to prevent concurrent backfill runs (startup + periodic).
+static BACKFILL_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Run backfill via a worker subprocess with default batch size.
+/// Skips if another backfill is already running in this process.
 pub fn backfill_with_worker(db_path: &Path) -> anyhow::Result<()> {
-    backfill_with_worker_sized(db_path, indexer::BACKFILL_BATCH_SIZE)
+    if BACKFILL_RUNNING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        log::info!("Backfill already running, skipping");
+        return Ok(());
+    }
+    let result = backfill_with_worker_sized(db_path, indexer::BACKFILL_BATCH_SIZE);
+    BACKFILL_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    result
 }
 
 /// Run vector backfill with an existing connection (daemon-safe).

@@ -443,11 +443,20 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
-    /// Spawn a new `tsm backfill-worker` child process.
+    /// Spawn a new `tsm-embedder backfill-worker` child process.
     /// Blocks until the child reports "READY" on stderr (with timeout).
+    ///
+    /// Always invokes the `tsm-embedder` sibling binary explicitly instead of
+    /// `current_exe()`, so the caller's identity doesn't matter — this is safe
+    /// to call from tsm, tsmd, or tsm-embedder itself.
     pub fn spawn(timeout: Duration) -> Result<Self> {
-        let exe = std::env::current_exe().context("cannot determine executable path")?;
-        let mut child = Command::new(exe)
+        let exe_dir = std::env::current_exe()
+            .context("cannot determine executable path")?
+            .parent()
+            .context("executable has no parent directory")?
+            .to_path_buf();
+        let worker_bin = exe_dir.join("tsm-embedder");
+        let mut child = Command::new(&worker_bin)
             .arg("backfill-worker")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

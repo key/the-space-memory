@@ -1,16 +1,28 @@
 fn main() -> anyhow::Result<()> {
-    // When spawned as a backfill-worker subprocess (via WorkerHandle::spawn
-    // which calls `current_exe() backfill-worker`), dispatch to the worker
-    // entry point instead of starting a full embedder server.
-    if std::env::args_os().nth(1).is_some_and(|a| a == "backfill-worker") {
-        the_space_memory::config::ensure_model_cache_env();
-        the_space_memory::logging::init_logger(
-            the_space_memory::logging::LogMode::Daemon { name: "tsm-embedder" },
-        )?;
-        return the_space_memory::cli::cmd_backfill_worker();
-    }
+    let arg = std::env::args_os().nth(1);
 
-    the_space_memory::config::ensure_model_cache_env();
-    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon { name: "tsm-embedder" })?;
-    the_space_memory::cli::cmd_embedder_start(None)
+    match arg.as_deref().and_then(|a| a.to_str()) {
+        Some("backfill-worker") => {
+            // Dispatched by WorkerHandle::spawn via `tsm-embedder backfill-worker`.
+            the_space_memory::config::ensure_model_cache_env();
+            the_space_memory::logging::init_logger(
+                the_space_memory::logging::LogMode::Daemon { name: "tsm-embedder" },
+            )?;
+            the_space_memory::cli::cmd_backfill_worker()
+        }
+        None => {
+            // No arguments — start the embedder server.
+            the_space_memory::config::ensure_model_cache_env();
+            the_space_memory::logging::init_logger(
+                the_space_memory::logging::LogMode::Daemon { name: "tsm-embedder" },
+            )?;
+            the_space_memory::cli::cmd_embedder_start(None)
+        }
+        Some(other) => {
+            eprintln!("tsm-embedder: unknown argument '{other}'");
+            eprintln!("Usage: tsm-embedder                  Start the embedder server");
+            eprintln!("       tsm-embedder backfill-worker   Run as a backfill worker (internal)");
+            std::process::exit(1);
+        }
+    }
 }
