@@ -35,6 +35,11 @@ fn file_hash(path: &Path) -> anyhow::Result<String> {
     Ok(format!("{hash:x}"))
 }
 
+fn chunk_hash(content: &str) -> String {
+    let hash = Sha256::digest(content.as_bytes());
+    format!("{hash:x}")
+}
+
 fn directory_from_rel_path(rel_path: &str) -> String {
     let parts: Vec<&str> = rel_path.split('/').collect();
     if parts.len() >= 3 {
@@ -44,6 +49,45 @@ fn directory_from_rel_path(rel_path: &str) -> String {
     }
 }
 
+/// Delete FTS, vector, skip, and entity entries for specific chunk IDs.
+fn delete_chunk_side_tables(conn: &Connection, chunk_ids: &[i64]) -> anyhow::Result<()> {
+    if chunk_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk_ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params.iter().map(|p| p.as_ref()).collect();
+
+    conn.execute(
+        &format!("DELETE FROM chunks_fts WHERE rowid IN ({placeholders})"),
+        param_refs.as_slice(),
+    )?;
+
+    // chunks_vec may not exist
+    let _ = conn.execute(
+        &format!("DELETE FROM chunks_vec WHERE rowid IN ({placeholders})"),
+        param_refs.as_slice(),
+    );
+
+    // chunks_vec_skip — may not exist
+    let _ = conn.execute(
+        &format!("DELETE FROM chunks_vec_skip WHERE chunk_id IN ({placeholders})"),
+        param_refs.as_slice(),
+    );
+
+    // chunk_entities — may not exist
+    let _ = conn.execute(
+        &format!("DELETE FROM chunk_entities WHERE chunk_id IN ({placeholders})"),
+        param_refs.as_slice(),
+    );
+
+    Ok(())
+}
+
 fn delete_old_entries(conn: &Connection, doc_id: i64) -> anyhow::Result<()> {
     let chunk_ids: Vec<i64> = conn
         .prepare("SELECT id FROM chunks WHERE document_id = ?")?
@@ -51,38 +95,7 @@ fn delete_old_entries(conn: &Connection, doc_id: i64) -> anyhow::Result<()> {
         .filter_map(|r| r.ok())
         .collect();
 
-    if !chunk_ids.is_empty() {
-        let placeholders = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk_ids
-            .iter()
-            .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
-            .collect();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-
-        conn.execute(
-            &format!("DELETE FROM chunks_fts WHERE rowid IN ({placeholders})"),
-            param_refs.as_slice(),
-        )?;
-
-        // chunks_vec may not exist
-        let _ = conn.execute(
-            &format!("DELETE FROM chunks_vec WHERE rowid IN ({placeholders})"),
-            param_refs.as_slice(),
-        );
-
-        // chunks_vec_skip — may not exist
-        let _ = conn.execute(
-            &format!("DELETE FROM chunks_vec_skip WHERE chunk_id IN ({placeholders})"),
-            param_refs.as_slice(),
-        );
-
-        // chunk_entities — may not exist
-        let _ = conn.execute(
-            &format!("DELETE FROM chunk_entities WHERE chunk_id IN ({placeholders})"),
-            param_refs.as_slice(),
-        );
-    }
+    delete_chunk_side_tables(conn, &chunk_ids)?;
 
     // document_links
     doc_links::delete_links(conn, doc_id);
@@ -99,6 +112,115 @@ fn delete_old_entries(conn: &Connection, doc_id: i64) -> anyhow::Result<()> {
 
     conn.execute("DELETE FROM documents WHERE id = ?", [doc_id])?;
     Ok(())
+}
+
+struct ChunkInput {
+    chunk_index: usize,
+    section_path: String,
+    content: String,
+    content_hash: String,
+}
+
+struct DiffResult {
+    /// All chunk entries (new + existing) as (chunk_id, content) — for entity rebuild.
+    all_chunk_entries: Vec<(i64, String)>,
+    /// Chunks needing vector embedding (new + changed).
+    chunks_needing_vectors: Vec<(i64, String)>,
+    /// Whether any mutation occurred.
+    had_mutations: bool,
+}
+
+/// Compare freshly parsed chunks against stored chunks for a document.
+/// Inserts new chunks, updates changed chunks, deletes removed chunks, skips unchanged.
+fn diff_chunks(conn: &Connection, doc_id: i64, new_chunks: &[ChunkInput]) -> anyhow::Result<DiffResult> {
+    use std::collections::HashMap;
+
+    // Load existing chunks: chunk_index → (id, content_hash)
+    let mut existing: HashMap<usize, (i64, Option<String>)> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, chunk_index, content_hash FROM chunks WHERE document_id = ?",
+        )?;
+        let rows = stmt.query_map([doc_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, idx, hash) = row?;
+            existing.insert(idx, (id, hash));
+        }
+    }
+
+    let mut all_chunk_entries: Vec<(i64, String)> = Vec::new();
+    let mut chunks_needing_vectors: Vec<(i64, String)> = Vec::new();
+    let mut had_mutations = false;
+
+    for chunk in new_chunks {
+        if let Some((existing_id, ref stored_hash)) = existing.remove(&chunk.chunk_index) {
+            // Chunk exists at this index
+            if stored_hash.as_deref() == Some(&chunk.content_hash) {
+                // Unchanged — skip
+                all_chunk_entries.push((existing_id, chunk.content.clone()));
+            } else {
+                // Content changed — update
+                had_mutations = true;
+                conn.execute(
+                    "UPDATE chunks SET content = ?, content_hash = ?, section_path = ? WHERE id = ?",
+                    rusqlite::params![chunk.content, chunk.content_hash, chunk.section_path, existing_id],
+                )?;
+                // FTS5 does not support UPDATE — delete + insert
+                delete_chunk_side_tables(conn, &[existing_id])?;
+                let wakachi_text = wakachi(&chunk.content);
+                conn.execute(
+                    "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
+                    rusqlite::params![existing_id, wakachi_text],
+                )?;
+                all_chunk_entries.push((existing_id, chunk.content.clone()));
+                chunks_needing_vectors.push((existing_id, chunk.content.clone()));
+            }
+        } else {
+            // New chunk — insert
+            had_mutations = true;
+            conn.execute(
+                "INSERT INTO chunks (document_id, chunk_index, section_path, content, content_hash)
+                 VALUES (?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    doc_id,
+                    chunk.chunk_index as i64,
+                    chunk.section_path,
+                    chunk.content,
+                    chunk.content_hash,
+                ],
+            )?;
+            let chunk_id = conn.last_insert_rowid();
+            let wakachi_text = wakachi(&chunk.content);
+            conn.execute(
+                "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
+                rusqlite::params![chunk_id, wakachi_text],
+            )?;
+            all_chunk_entries.push((chunk_id, chunk.content.clone()));
+            chunks_needing_vectors.push((chunk_id, chunk.content.clone()));
+        }
+    }
+
+    // Delete chunks that no longer exist
+    if !existing.is_empty() {
+        had_mutations = true;
+        let removed_ids: Vec<i64> = existing.values().map(|(id, _)| *id).collect();
+        delete_chunk_side_tables(conn, &removed_ids)?;
+        for id in &removed_ids {
+            conn.execute("DELETE FROM chunks WHERE id = ?", [id])?;
+        }
+    }
+
+    Ok(DiffResult {
+        all_chunk_entries,
+        chunks_needing_vectors,
+        had_mutations,
+    })
 }
 
 /// Index a single file. Returns true if the file was (re-)indexed, false if skipped.
@@ -149,71 +271,71 @@ pub fn index_file(
         Some(format!("{:?}", fm.tags))
     };
 
-    // Wrap delete + inserts in a single transaction for atomicity
+    // Build chunk inputs with content hashes
+    let chunks = chunk_markdown_default(body, &directory, &filename);
+    let chunk_inputs: Vec<ChunkInput> = chunks
+        .iter()
+        .map(|c| ChunkInput {
+            chunk_index: c.chunk_index,
+            section_path: c.section_path.clone(),
+            content: c.content.clone(),
+            content_hash: chunk_hash(&c.content),
+        })
+        .collect();
+
     let tx = conn.unchecked_transaction()?;
 
-    // Delete old entries if they exist
-    if let Some((doc_id, _)) = existing {
-        delete_old_entries(&tx, doc_id)?;
-    }
-    tx.execute(
-        "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        rusqlite::params![
-            rel_path,
-            source_type,
-            filename,
-            fm.status,
-            fm.created,
-            fm.updated,
-            tags_str,
-            current_hash,
-            now,
-        ],
-    )?;
-    let doc_id = tx.last_insert_rowid();
-
-    // Chunk and insert
-    let chunks = chunk_markdown_default(body, &directory, &filename);
-    let mut chunk_entries: Vec<(i64, String)> = Vec::new();
-    for chunk in &chunks {
+    let doc_id = if let Some((doc_id, _)) = existing {
+        // Update existing document row (preserves doc_id for entity_edges/doc_links)
         tx.execute(
-            "INSERT INTO chunks (document_id, chunk_index, section_path, content)
-             VALUES (?, ?, ?, ?)",
+            "UPDATE documents SET source_type=?, title=?, status=?, created=?, updated=?, tags=?, file_hash=?, indexed_at=?
+             WHERE id=?",
             rusqlite::params![
-                doc_id,
-                chunk.chunk_index as i64,
-                chunk.section_path,
-                chunk.content
+                source_type, filename, fm.status, fm.created, fm.updated,
+                tags_str, current_hash, now, doc_id,
             ],
         )?;
-        let chunk_id = tx.last_insert_rowid();
-        let wakachi_text = wakachi(&chunk.content);
+        doc_id
+    } else {
         tx.execute(
-            "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
-            rusqlite::params![chunk_id, wakachi_text],
+            "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                rel_path, source_type, filename, fm.status, fm.created, fm.updated,
+                tags_str, current_hash, now,
+            ],
         )?;
-        chunk_entries.push((chunk_id, chunk.content.clone()));
-    }
+        tx.last_insert_rowid()
+    };
 
-    // Entity extraction (if entity tables exist)
-    if let Err(e) = entity::insert_entities(&tx, doc_id, &chunk_entries, &fm.tags) {
-        eprintln!("entity extraction warning: {e}");
-    }
+    let diff = diff_chunks(&tx, doc_id, &chunk_inputs)?;
 
-    // Document links (tags, explicit links, entity co-occurrence)
-    doc_links::build_links(&tx, doc_id, &text, &fm.tags);
+    if diff.had_mutations {
+        // Rebuild entity graph (document-level)
+        let _ = tx.execute("DELETE FROM entity_edges WHERE doc_id = ?", [doc_id])
+            .or_else(|e| {
+                if e.to_string().contains("no such table") { Ok(0) } else { Err(e) }
+            });
+        if let Err(e) = entity::insert_entities(&tx, doc_id, &diff.all_chunk_entries, &fm.tags) {
+            eprintln!("entity extraction warning: {e}");
+        }
 
-    // Collect dictionary candidates from chunk text
-    for (_, content) in &chunk_entries {
-        user_dict::collect_from_text(&tx, content, "document");
+        // Rebuild document links
+        doc_links::delete_links(&tx, doc_id);
+        doc_links::build_links(&tx, doc_id, &text, &fm.tags);
+
+        // Collect dictionary candidates
+        for (_, content) in &diff.all_chunk_entries {
+            user_dict::collect_from_text(&tx, content, "document");
+        }
     }
 
     tx.commit()?;
 
-    // Vector embedding (if embedder is running and vec table exists)
-    // Done outside transaction since it involves socket I/O
-    insert_vectors(conn, &chunk_entries);
+    // Vector embedding outside transaction (socket I/O)
+    if !diff.chunks_needing_vectors.is_empty() {
+        insert_vectors(conn, &diff.chunks_needing_vectors);
+    }
 
     Ok(true)
 }
@@ -313,48 +435,51 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
         .next_back()
         .unwrap_or(&now);
 
-    // Wrap delete + inserts in a single transaction for atomicity
+    // Build chunk inputs with content hashes
+    let chunk_inputs: Vec<ChunkInput> = chunks
+        .iter()
+        .map(|c| ChunkInput {
+            chunk_index: c.chunk_index,
+            section_path: "session".to_string(),
+            content: c.content.clone(),
+            content_hash: chunk_hash(&c.content),
+        })
+        .collect();
+
+    let title = jsonl_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+
     let tx = conn.unchecked_transaction()?;
 
-    if let Some((doc_id, _)) = existing {
-        delete_old_entries(&tx, doc_id)?;
-    }
-    tx.execute(
-        "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        rusqlite::params![
-            file_key,
-            "session",
-            jsonl_path.file_stem().unwrap_or_default().to_string_lossy().to_string(),
-            "current",
-            created,
-            updated,
-            Option::<String>::None,
-            current_hash,
-            &now,
-        ],
-    )?;
-    let doc_id = tx.last_insert_rowid();
+    let doc_id = if let Some((doc_id, _)) = existing {
+        tx.execute(
+            "UPDATE documents SET source_type=?, title=?, status=?, created=?, updated=?, tags=?, file_hash=?, indexed_at=?
+             WHERE id=?",
+            rusqlite::params![
+                "session", title, "current", created, updated,
+                Option::<String>::None, current_hash, &now, doc_id,
+            ],
+        )?;
+        doc_id
+    } else {
+        tx.execute(
+            "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                file_key, "session", title, "current", created, updated,
+                Option::<String>::None, current_hash, &now,
+            ],
+        )?;
+        tx.last_insert_rowid()
+    };
 
-    let mut chunk_entries: Vec<(i64, String)> = Vec::new();
-    for chunk in &chunks {
-        tx.execute(
-            "INSERT INTO chunks (document_id, chunk_index, section_path, content)
-             VALUES (?, ?, ?, ?)",
-            rusqlite::params![doc_id, chunk.chunk_index as i64, "session", chunk.content],
-        )?;
-        let chunk_id = tx.last_insert_rowid();
-        let wakachi_text = wakachi(&chunk.content);
-        tx.execute(
-            "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
-            rusqlite::params![chunk_id, wakachi_text],
-        )?;
-        chunk_entries.push((chunk_id, chunk.content.clone()));
-    }
+    let diff = diff_chunks(&tx, doc_id, &chunk_inputs)?;
+
     tx.commit()?;
 
-    // Insert vectors if embedder is running; backfill handles the rest.
-    insert_vectors(conn, &chunk_entries);
+    // Vector embedding outside transaction (socket I/O)
+    if !diff.chunks_needing_vectors.is_empty() {
+        insert_vectors(conn, &diff.chunks_needing_vectors);
+    }
 
     // Learn synonyms from human messages in the session (wrapped in transaction)
     learn_from_session_jsonl(conn, jsonl_path);
@@ -1352,5 +1477,173 @@ mod tests {
             count > 0,
             "should collect dictionary candidates during session ingest"
         );
+    }
+
+    // --- Incremental chunk-level diff tests ---
+
+    fn get_chunk_ids(conn: &Connection, doc_id: i64) -> Vec<(i64, i64)> {
+        conn.prepare("SELECT id, chunk_index FROM chunks WHERE document_id = ? ORDER BY chunk_index")
+            .unwrap()
+            .query_map([doc_id], |row| Ok((row.get::<_, i64>(0).unwrap(), row.get::<_, i64>(1).unwrap())))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    fn get_doc_id(conn: &Connection) -> i64 {
+        conn.query_row("SELECT id FROM documents LIMIT 1", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_content_hash_stored() {
+        let (conn, dir) = setup();
+        let path = write_md(dir.path(), "daily/notes/test.md", "# Title\n\nSome content here.\n");
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let hash: String = conn
+            .query_row("SELECT content_hash FROM chunks LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hash.len(), 64, "content_hash should be 64-char hex SHA-256");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_incremental_skip_unchanged_chunks() {
+        let (conn, dir) = setup();
+        let content = "# Doc\n\n## Section A\n\nContent A is here with enough text.\n\n## Section B\n\nContent B is here with enough text.\n";
+        let path = write_md(dir.path(), "daily/notes/test.md", content);
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let doc_id = get_doc_id(&conn);
+        let ids_before = get_chunk_ids(&conn, doc_id);
+        assert!(ids_before.len() >= 2, "should have at least 2 chunks");
+
+        // Re-write with trailing whitespace change (file_hash changes but chunk content same)
+        let content2 = "# Doc\n\n## Section A\n\nContent A is here with enough text.\n\n## Section B\n\nContent B is here with enough text.\n\n";
+        std::fs::write(&path, content2).unwrap();
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let ids_after = get_chunk_ids(&conn, doc_id);
+        // Chunk IDs should be preserved (not deleted and re-created)
+        assert_eq!(ids_before, ids_after, "unchanged chunk IDs should be preserved");
+    }
+
+    #[test]
+    fn test_incremental_update_changed_chunk() {
+        let (conn, dir) = setup();
+        let content = "# Doc\n\n## Section A\n\nContent A original text here.\n\n## Section B\n\nContent B original text here.\n";
+        let path = write_md(dir.path(), "daily/notes/test.md", content);
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let doc_id = get_doc_id(&conn);
+        let ids_before = get_chunk_ids(&conn, doc_id);
+
+        // Modify section B only
+        let content2 = "# Doc\n\n## Section A\n\nContent A original text here.\n\n## Section B\n\nContent B UPDATED text here.\n";
+        std::fs::write(&path, content2).unwrap();
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let ids_after = get_chunk_ids(&conn, doc_id);
+        assert_eq!(ids_before.len(), ids_after.len(), "chunk count should be same");
+        // Section A chunk (index 0) should keep same ID
+        assert_eq!(ids_before[0].0, ids_after[0].0, "unchanged chunk A should keep its ID");
+
+        // Verify updated content is searchable in FTS
+        let fts_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks_fts WHERE content MATCH ?",
+                ["UPDATED"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(fts_count > 0, "updated content should be searchable in FTS");
+    }
+
+    #[test]
+    fn test_incremental_insert_new_chunk() {
+        let (conn, dir) = setup();
+        let content = "# Doc\n\n## Section A\n\nContent A here with text.\n\n## Section B\n\nContent B here with text.\n";
+        let path = write_md(dir.path(), "daily/notes/test.md", content);
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let doc_id = get_doc_id(&conn);
+        let ids_before = get_chunk_ids(&conn, doc_id);
+        let count_before = ids_before.len();
+
+        // Add a third section
+        let content2 = "# Doc\n\n## Section A\n\nContent A here with text.\n\n## Section B\n\nContent B here with text.\n\n## Section C\n\nNew content C here.\n";
+        std::fs::write(&path, content2).unwrap();
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let ids_after = get_chunk_ids(&conn, doc_id);
+        assert!(ids_after.len() > count_before, "should have more chunks after adding section");
+        // Original chunks should keep their IDs
+        for (id, idx) in &ids_before {
+            assert!(ids_after.iter().any(|(aid, aidx)| aid == id && aidx == idx),
+                "original chunk at index {} should be preserved", idx);
+        }
+    }
+
+    #[test]
+    fn test_incremental_delete_removed_chunk() {
+        let (conn, dir) = setup();
+        let content = "# Doc\n\n## Section A\n\nContent A here with text.\n\n## Section B\n\nContent B here with text.\n\n## Section C\n\nContent C here with text.\n";
+        let path = write_md(dir.path(), "daily/notes/test.md", content);
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let doc_id = get_doc_id(&conn);
+        let count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks WHERE document_id = ?", [doc_id], |r| r.get(0))
+            .unwrap();
+
+        // Remove section C
+        let content2 = "# Doc\n\n## Section A\n\nContent A here with text.\n\n## Section B\n\nContent B here with text.\n";
+        std::fs::write(&path, content2).unwrap();
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks WHERE document_id = ?", [doc_id], |r| r.get(0))
+            .unwrap();
+        assert!(count_after < count_before, "should have fewer chunks after removal");
+
+        // FTS count should match chunk count
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, count_after, "FTS count should match chunk count");
+    }
+
+    #[test]
+    fn test_session_incremental_append() {
+        let (conn, dir) = setup();
+        let jsonl1 = r#"{"message":{"role":"user","content":"First question text here for testing."},"timestamp":"2026-01-01T00:00:00Z"}
+{"message":{"role":"assistant","content":"First answer text here for testing."},"timestamp":"2026-01-01T00:01:00Z"}"#;
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, jsonl1).unwrap();
+        index_session(&conn, &path).unwrap();
+
+        let doc_id = get_doc_id(&conn);
+        let ids_before = get_chunk_ids(&conn, doc_id);
+        let count_before = ids_before.len();
+        assert!(count_before >= 1);
+
+        // Append a second Q&A pair
+        let jsonl2 = format!(
+            "{}\n{}\n{}",
+            r#"{"message":{"role":"user","content":"First question text here for testing."},"timestamp":"2026-01-01T00:00:00Z"}"#,
+            r#"{"message":{"role":"assistant","content":"First answer text here for testing."},"timestamp":"2026-01-01T00:01:00Z"}"#,
+            r#"{"message":{"role":"user","content":"Second question text here for testing."},"timestamp":"2026-01-01T00:02:00Z"}"#,
+        );
+        std::fs::write(&path, jsonl2).unwrap();
+        index_session(&conn, &path).unwrap();
+
+        let ids_after = get_chunk_ids(&conn, doc_id);
+        assert!(ids_after.len() > count_before, "should have more chunks after append");
+        // Original chunk(s) should keep their IDs
+        for (id, idx) in &ids_before {
+            let found = ids_after.iter().any(|(aid, aidx)| aid == id && aidx == idx);
+            assert!(found, "original chunk at index {} should be preserved", idx);
+        }
     }
 }
