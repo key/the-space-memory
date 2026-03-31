@@ -505,14 +505,20 @@ fn panic_message(info: &Box<dyn std::any::Any + Send>) -> String {
 /// Record a chunk in the skip table so it is not retried on subsequent backfill runs.
 /// The skip record is automatically cleaned up when the parent document is re-indexed
 /// (chunks are deleted and re-created with new IDs).
-fn mark_chunk_skip(conn: &Connection, chunk_id: i64, reason: &str) {
-    let _ = conn.execute(
+fn mark_chunk_skip(conn: &Connection, chunk_id: i64, reason: &str) -> bool {
+    match conn.execute(
         "INSERT OR IGNORE INTO chunks_vec_skip(chunk_id, reason) VALUES (?, ?)",
         rusqlite::params![chunk_id, reason],
-    );
+    ) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("    WARNING: failed to write skip record for chunk {chunk_id}: {e} — chunk will be retried next run");
+            false
+        }
+    }
 }
 
-/// Retry each chunk in the batch individually, writing sentinels for failures.
+/// Retry each chunk in the batch individually, skipping persistent failures.
 fn retry_individually(
     batch: &[(i64, String, String)],
     encode_fn: EncodeFn,
@@ -527,25 +533,25 @@ fn retry_individually(
                 if write_vec_row(conn, *chunk_id, &embeddings[0]) {
                     stats.filled += 1;
                 } else {
-                    eprintln!("    chunk {chunk_id} ({file_path}): insert error — writing sentinel");
-                    mark_chunk_skip(conn, *chunk_id, "encode_error");
+                    eprintln!("    chunk {chunk_id} ({file_path}): insert error — skipping");
+                    mark_chunk_skip(conn, *chunk_id, "insert_error");
                     stats.errors += 1;
                 }
             }
             Ok(Ok(_)) => {
-                eprintln!("    chunk {chunk_id} ({file_path}): empty embedding — writing sentinel");
-                mark_chunk_skip(conn, *chunk_id, "encode_error");
+                eprintln!("    chunk {chunk_id} ({file_path}): empty embedding — skipping");
+                mark_chunk_skip(conn, *chunk_id, "empty_embedding");
                 stats.errors += 1;
             }
             Ok(Err(e)) => {
-                eprintln!("    chunk {chunk_id} ({file_path}): error ({e}) — writing sentinel");
+                eprintln!("    chunk {chunk_id} ({file_path}): error ({e}) — skipping");
                 mark_chunk_skip(conn, *chunk_id, "encode_error");
                 stats.errors += 1;
             }
             Err(panic_info) => {
                 let msg = panic_message(&panic_info);
-                eprintln!("    chunk {chunk_id} ({file_path}): PANIC ({msg}) — writing sentinel");
-                mark_chunk_skip(conn, *chunk_id, "encode_error");
+                eprintln!("    chunk {chunk_id} ({file_path}): PANIC ({msg}) — skipping");
+                mark_chunk_skip(conn, *chunk_id, "panic");
                 stats.panics += 1;
                 stats.errors += 1;
             }
@@ -629,7 +635,8 @@ pub fn backfill_vectors(
                     if write_vec_row(&tx, *chunk_id, emb) {
                         stats.filled += 1;
                     } else {
-                        eprintln!("Insert error for chunk {chunk_id} (skipping)");
+                        eprintln!("Insert error for chunk {chunk_id} — skipping");
+                        mark_chunk_skip(conn, *chunk_id, "insert_error");
                         stats.errors += 1;
                     }
                 }
@@ -645,7 +652,8 @@ pub fn backfill_vectors(
                     eprintln!("  Retrying {} chunks individually...", batch.len());
                     retry_individually(&batch, encode_fn, conn, &mut stats);
                 } else {
-                    mark_chunk_skip(conn, batch_start_id, "embedding_count_mismatch");
+                    let chunk_id = batch[0].0;
+                    mark_chunk_skip(conn, chunk_id, "embedding_count_mismatch");
                     stats.errors += 1;
                 }
             }
@@ -655,8 +663,9 @@ pub fn backfill_vectors(
                     eprintln!("  Retrying {} chunks individually...", batch.len());
                     retry_individually(&batch, encode_fn, conn, &mut stats);
                 } else {
-                    eprintln!("  chunk {batch_start_id}: failed individually — writing sentinel");
-                    mark_chunk_skip(conn, batch_start_id, "encode_error");
+                    let chunk_id = batch[0].0;
+                    eprintln!("  chunk {chunk_id}: failed individually — skipping");
+                    mark_chunk_skip(conn, chunk_id, "encode_error");
                     stats.errors += 1;
                 }
             }
@@ -668,8 +677,9 @@ pub fn backfill_vectors(
                     eprintln!("  Retrying {} chunks individually...", batch.len());
                     retry_individually(&batch, encode_fn, conn, &mut stats);
                 } else {
-                    eprintln!("  chunk {batch_start_id}: failed individually — writing sentinel");
-                    mark_chunk_skip(conn, batch_start_id, "encode_error");
+                    let chunk_id = batch[0].0;
+                    eprintln!("  chunk {chunk_id}: failed individually — skipping");
+                    mark_chunk_skip(conn, chunk_id, "panic");
                     stats.errors += 1;
                 }
             }

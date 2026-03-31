@@ -563,15 +563,16 @@ impl WorkerHandle {
     /// Send texts and receive embeddings via the pipe protocol.
     /// Returns Err on timeout or if the child has died.
     pub fn encode(&mut self, texts: &[String], timeout: Duration) -> Result<Vec<Vec<f32>>> {
+        if self.stdout.is_none() {
+            anyhow::bail!("worker handle is dead (killed after a previous timeout or crash)");
+        }
+
         let request = serde_json::json!({ "texts": texts });
         let request_bytes = serde_json::to_vec(&request)?;
         write_message(&mut self.stdin, &request_bytes)?;
 
         // Take stdout to move into a reader thread so we can enforce a timeout.
-        let mut stdout = self
-            .stdout
-            .take()
-            .context("worker stdout already taken")?;
+        let mut stdout = self.stdout.take().unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -581,11 +582,13 @@ impl WorkerHandle {
 
         let (read_result, stdout_back) = match rx.recv_timeout(timeout) {
             Ok(pair) => pair,
-            Err(_) => {
-                // Timeout — kill the worker. The reader thread will get a broken pipe
-                // and exit naturally once the child process is gone.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 self.kill();
                 anyhow::bail!("worker encode timed out after {timeout:?}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.kill();
+                anyhow::bail!("worker reader thread died unexpectedly");
             }
         };
 
