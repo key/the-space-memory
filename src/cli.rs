@@ -240,7 +240,8 @@ pub fn cmd_ingest_session(session_file: &Path) -> anyhow::Result<()> {
 }
 
 pub fn cmd_embedder_start(socket_path: Option<&Path>) -> anyhow::Result<()> {
-    let path = socket_path.unwrap_or(Path::new(config::SOCKET_PATH));
+    let default_path = config::embedder_socket_path();
+    let path = socket_path.unwrap_or(&default_path);
     embedder::run_daemon(path)
 }
 
@@ -556,7 +557,7 @@ fn doctor_check_with_conn(
         items: Vec::new(),
     };
 
-    let socket = Path::new(config::SOCKET_PATH);
+    let socket = config::embedder_socket_path();
     let timeout = config::embedder_idle_timeout_secs();
     if socket.exists() {
         let timeout_info = if timeout == 0 {
@@ -800,7 +801,7 @@ pub fn run_status(conn: Option<&rusqlite::Connection>) -> StatusInfo {
     let daemon_pid = sf.daemon.as_ref().map(|d| d.pid);
     let daemon_socket = sf.daemon.as_ref().map(|d| d.socket.clone());
 
-    let socket = Path::new(config::SOCKET_PATH);
+    let socket = config::embedder_socket_path();
     let embedder_running = socket.exists();
     let embedder_pid = sf.embedder.as_ref().map(|e| e.pid);
     let embedder_since = sf.embedder.as_ref().map(|e| e.started_at.clone());
@@ -1120,7 +1121,7 @@ fn spawn_background_backfill() {
 pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let project_root = config::project_root();
-    let socket = Path::new(config::SOCKET_PATH);
+    let socket = config::embedder_socket_path();
 
     if !socket.exists() {
         log::warn!("Embedder is not running. Rebuilding without vectors.");

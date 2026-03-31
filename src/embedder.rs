@@ -395,7 +395,7 @@ fn handle_client(mut stream: UnixStream, embedder: &Embedder) -> Result<()> {
 /// Send texts to the embedder daemon and get embeddings back.
 /// Returns None if the embedder is not running.
 pub fn embed_via_socket(texts: &[String]) -> Option<Vec<Vec<f32>>> {
-    embed_via_socket_at(Path::new(config::SOCKET_PATH), texts)
+    embed_via_socket_at(&config::embedder_socket_path(), texts)
 }
 
 /// Send texts to the embedder daemon at a specific socket path.
