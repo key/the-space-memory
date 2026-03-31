@@ -7,8 +7,14 @@ FILE=$(jq -r '.tool_input.file_path // empty') || exit 0
 # .md ファイルのみ対象
 [[ "$FILE" != *.md ]] && exit 0
 
-TSM="${CLAUDE_PLUGIN_ROOT:-}/tsm"
-[ ! -x "$TSM" ] && exit 0
+# Prefer system-installed tsm over plugin-bundled one
+if command -v tsm >/dev/null 2>&1; then
+  TSM="tsm"
+elif [ -x "${CLAUDE_PLUGIN_ROOT:-}/tsm" ]; then
+  TSM="${CLAUDE_PLUGIN_ROOT:-}/tsm"
+else
+  exit 0
+fi
 
 cd "${CLAUDE_PROJECT_DIR:-/workspaces/workspace}"
 

@@ -16,9 +16,14 @@ if [ ${#QUERY} -lt 3 ]; then
   exit 0
 fi
 
-TSM="${CLAUDE_PLUGIN_ROOT:-}/tsm"
-if [ ! -x "$TSM" ]; then
-  echo "[$(date -Iseconds)] SKIP: tsm not found at $TSM" >> "$LOG"
+# Prefer system-installed tsm over plugin-bundled one
+# (bundled binary may have hardcoded paths from Docker build)
+if command -v tsm >/dev/null 2>&1; then
+  TSM="tsm"
+elif [ -x "${CLAUDE_PLUGIN_ROOT:-}/tsm" ]; then
+  TSM="${CLAUDE_PLUGIN_ROOT:-}/tsm"
+else
+  echo "[$(date -Iseconds)] SKIP: tsm not found" >> "$LOG"
   exit 0
 fi
 
