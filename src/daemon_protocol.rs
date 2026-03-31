@@ -105,6 +105,38 @@ pub fn send_request(socket: &Path, req: &DaemonRequest) -> Result<DaemonResponse
     Ok(resp)
 }
 
+/// Try to send a request to the daemon, with transparent fallback.
+///
+/// Returns `None` if the daemon is not running (socket absent or connection refused).
+/// Returns `Some(Ok(resp))` on successful communication.
+/// Returns `Some(Err(e))` on protocol-level errors.
+pub fn try_send_request(socket: &Path, req: &DaemonRequest) -> Option<Result<DaemonResponse>> {
+    if !socket.exists() {
+        return None;
+    }
+    let mut stream = match UnixStream::connect(socket) {
+        Ok(s) => s,
+        Err(_) => return None, // stale socket or connection refused
+    };
+    if stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(300)))
+        .is_err()
+    {
+        return None;
+    }
+    let req_bytes = match serde_json::to_vec(req) {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e.into())),
+    };
+    if let Err(e) = write_message(&mut stream, &req_bytes) {
+        return Some(Err(e));
+    }
+    match read_message(&mut stream) {
+        Ok(resp_bytes) => Some(serde_json::from_slice(&resp_bytes).map_err(Into::into)),
+        Err(e) => Some(Err(e)),
+    }
+}
+
 // ─── Server helpers ───────────────────────────────────────────────
 
 /// Read a request from a connected client stream.
@@ -412,5 +444,24 @@ mod tests {
         drop(client);
 
         server.join().unwrap();
+    }
+
+    #[test]
+    fn try_send_request_no_socket_returns_none() {
+        let result = try_send_request(
+            std::path::Path::new("/tmp/nonexistent-tsm-test.sock"),
+            &DaemonRequest::Ping,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_send_request_stale_socket_returns_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("stale.sock");
+        // Create a file (not a socket listener) to simulate a stale socket
+        std::fs::write(&sock_path, "stale").unwrap();
+        let result = try_send_request(&sock_path, &DaemonRequest::Ping);
+        assert!(result.is_none());
     }
 }

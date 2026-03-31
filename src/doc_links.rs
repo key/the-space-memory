@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use crate::db;
 
 /// A related document found via document links.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RelatedDoc {
     pub file_path: String,
     pub link_type: String,

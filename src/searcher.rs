@@ -14,7 +14,7 @@ use crate::temporal::TimeFilter;
 use crate::tokenizer::{extract_search_keywords, wakachi};
 use crate::user_dict;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
     pub source_file: String,
     pub source_type: String,

@@ -6,7 +6,6 @@ use rusqlite::Connection;
 use crate::cli;
 use crate::config;
 use crate::daemon_protocol::{DaemonRequest, DaemonResponse};
-use crate::user_dict::DictFormat;
 
 /// Handle a single daemon request and return a response.
 ///
@@ -106,8 +105,7 @@ pub fn handle_request(
         }
 
         DaemonRequest::VectorFill { batch_size } => {
-            let db_path = config::db_path();
-            match cli::backfill_with_worker_sized(&db_path, batch_size) {
+            match cli::run_vector_fill(conn, batch_size) {
                 Ok(()) => DaemonResponse::success_empty(),
                 Err(e) => DaemonResponse::error(format!("{e}")),
             }
@@ -123,25 +121,13 @@ pub fn handle_request(
             }
         }
 
-        DaemonRequest::DictUpdate {
-            threshold,
-            yes,
-            format,
-        } => {
-            let dict_format = match format.as_str() {
-                "simpledic" => DictFormat::Simpledic,
-                _ => DictFormat::Ipadic,
-            };
-            match cli::cmd_dict_update(threshold, yes, dict_format) {
-                Ok(()) => DaemonResponse::success_empty(),
-                Err(e) => DaemonResponse::error(format!("{e}")),
-            }
-        }
+        DaemonRequest::DictUpdate { .. } => DaemonResponse::error(
+            "dict-update cannot run while tsmd is active. Run `tsm stop` first.",
+        ),
 
-        DaemonRequest::Rebuild { force } => match cli::cmd_rebuild(force) {
-            Ok(()) => DaemonResponse::success_empty(),
-            Err(e) => DaemonResponse::error(format!("{e}")),
-        },
+        DaemonRequest::Rebuild { .. } => DaemonResponse::error(
+            "rebuild cannot run while tsmd is active. Run `tsm stop` first.",
+        ),
     }
 }
 
@@ -276,32 +262,27 @@ mod tests {
     }
 
     #[test]
-    fn test_dict_update_no_candidates() {
+    fn test_dict_update_rejected_by_daemon() {
         let (conn, dir) = setup();
         let flag = AtomicBool::new(false);
-        // With empty DB and yes=true, should complete without error
-        // (no candidates to update)
         let req = DaemonRequest::DictUpdate {
             threshold: 5,
             yes: true,
             format: "ipadic".into(),
         };
         let resp = handle_request(&conn, req, dir.path(), &flag);
-        // May succeed or error depending on dict path, but should not panic
-        assert!(resp.ok || resp.error.is_some());
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().contains("tsm stop"));
     }
 
     #[test]
-    fn test_dict_update_simpledic_format() {
+    fn test_rebuild_rejected_by_daemon() {
         let (conn, dir) = setup();
         let flag = AtomicBool::new(false);
-        let req = DaemonRequest::DictUpdate {
-            threshold: 5,
-            yes: true,
-            format: "simpledic".into(),
-        };
+        let req = DaemonRequest::Rebuild { force: true };
         let resp = handle_request(&conn, req, dir.path(), &flag);
-        assert!(resp.ok || resp.error.is_some());
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().contains("tsm stop"));
     }
 
     #[test]
