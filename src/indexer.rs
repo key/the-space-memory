@@ -580,7 +580,7 @@ fn insert_vectors(conn: &Connection, chunk_entries: &[(i64, String)]) {
         return;
     }
     // Skip socket I/O if embedder is not running
-    if !std::path::Path::new(config::SOCKET_PATH).exists() {
+    if !config::embedder_socket_path().exists() {
         return;
     }
 
@@ -1219,7 +1219,7 @@ mod tests {
         let encode_mismatch = |texts: &[String]| -> anyhow::Result<Vec<Vec<f32>>> {
             if texts.len() > 1 {
                 // Return only 1 embedding for a batch of N
-                mock_encode(&texts[..1].to_vec())
+                mock_encode(&texts[..1])
             } else {
                 mock_encode(texts)
             }

@@ -1,5 +1,5 @@
 use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,6 +41,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    config::ensure_model_cache_env();
     the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon { name: "tsmd" })?;
     let args = Args::parse();
 
@@ -215,7 +216,7 @@ fn start_child(binary: &str, env_vars: &[(&str, &str)]) -> Result<Child> {
 
 /// Remove the embedder UNIX socket if it exists.
 fn remove_stale_embedder_socket() {
-    let path = Path::new(config::SOCKET_PATH);
+    let path = config::embedder_socket_path();
     if path.exists() {
         if let Err(e) = std::fs::remove_file(path) {
             log::warn!("could not remove stale embedder socket: {e}");
