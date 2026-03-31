@@ -1,5 +1,5 @@
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -94,24 +94,37 @@ fn main() -> Result<()> {
         );
     }
 
-    // Start child processes
+    // Start child processes.
+    // Each child is guarded by a PID file: if a previous instance is still
+    // alive (orphaned from a prior tsmd), we skip spawning a duplicate.
+    // Children are NOT auto-restarted on crash to prevent OOM restart loops.
+    let embedder_pid_path = data_dir.join("embedder.pid");
+    let watcher_pid_path = data_dir.join("watcher.pid");
+
     let mut embedder_child: Option<Child> = if !args.no_embedder {
-        remove_stale_embedder_socket();
-        match start_child("tsm-embedder", &[("TSM_EMBEDDER_IDLE_TIMEOUT", "0")]) {
-            Ok(child) => {
-                let child_pid = child.id();
-                log::info!("embedder started (PID {child_pid})");
-                status::update(&data_dir, |s| {
-                    s.embedder = Some(status::EmbedderStatus {
-                        started_at: chrono::Utc::now().to_rfc3339(),
-                        pid: child_pid,
+        if is_process_alive(&embedder_pid_path) {
+            log::info!("embedder already running (PID file: {})", embedder_pid_path.display());
+            None
+        } else {
+            let _ = std::fs::remove_file(&embedder_pid_path);
+            remove_stale_embedder_socket();
+            match start_child("tsm-embedder", &[("TSM_EMBEDDER_IDLE_TIMEOUT", "0")]) {
+                Ok(child) => {
+                    let child_pid = child.id();
+                    log::info!("embedder started (PID {child_pid})");
+                    let _ = std::fs::write(&embedder_pid_path, child_pid.to_string());
+                    status::update(&data_dir, |s| {
+                        s.embedder = Some(status::EmbedderStatus {
+                            started_at: chrono::Utc::now().to_rfc3339(),
+                            pid: child_pid,
+                        });
                     });
-                });
-                Some(child)
-            }
-            Err(e) => {
-                log::error!("failed to start embedder: {e}");
-                None
+                    Some(child)
+                }
+                Err(e) => {
+                    log::error!("failed to start embedder: {e}");
+                    None
+                }
             }
         }
     } else {
@@ -120,21 +133,28 @@ fn main() -> Result<()> {
     };
 
     let mut watcher_child: Option<Child> = if !args.no_watcher {
-        match start_child("tsm-watcher", &[]) {
-            Ok(child) => {
-                let child_pid = child.id();
-                log::info!("watcher started (PID {child_pid})");
-                status::update(&data_dir, |s| {
-                    s.watcher = Some(status::WatcherStatus {
-                        started_at: chrono::Utc::now().to_rfc3339(),
-                        pid: child_pid,
+        if is_process_alive(&watcher_pid_path) {
+            log::info!("watcher already running (PID file: {})", watcher_pid_path.display());
+            None
+        } else {
+            let _ = std::fs::remove_file(&watcher_pid_path);
+            match start_child("tsm-watcher", &[]) {
+                Ok(child) => {
+                    let child_pid = child.id();
+                    log::info!("watcher started (PID {child_pid})");
+                    let _ = std::fs::write(&watcher_pid_path, child_pid.to_string());
+                    status::update(&data_dir, |s| {
+                        s.watcher = Some(status::WatcherStatus {
+                            started_at: chrono::Utc::now().to_rfc3339(),
+                            pid: child_pid,
+                        });
                     });
-                });
-                Some(child)
-            }
-            Err(e) => {
-                log::error!("failed to start watcher: {e}");
-                None
+                    Some(child)
+                }
+                Err(e) => {
+                    log::error!("failed to start watcher: {e}");
+                    None
+                }
             }
         }
     } else {
@@ -142,11 +162,7 @@ fn main() -> Result<()> {
         None
     };
 
-    let mut embedder_restarts = 0u32;
-    let mut watcher_restarts = 0u32;
-    const MAX_CHILD_RESTARTS: u32 = 3;
-
-    // Accept loop
+    // Accept loop — children are NOT restarted on crash
     while !SHUTDOWN.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -160,10 +176,12 @@ fn main() -> Result<()> {
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if maybe_restart_child("embedder", &mut embedder_child, &mut embedder_restarts, MAX_CHILD_RESTARTS) {
-                    remove_stale_embedder_socket();
+                if reap_child("embedder", &mut embedder_child, &embedder_pid_path) {
+                    status::update(&data_dir, |s| s.embedder = None);
                 }
-                maybe_restart_child("watcher", &mut watcher_child, &mut watcher_restarts, MAX_CHILD_RESTARTS);
+                if reap_child("watcher", &mut watcher_child, &watcher_pid_path) {
+                    status::update(&data_dir, |s| s.watcher = None);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => {
@@ -175,13 +193,14 @@ fn main() -> Result<()> {
 
     // Cleanup
     log::info!("shutting down");
-    stop_child("embedder", embedder_child);
-    stop_child("watcher", watcher_child);
+    stop_child("embedder", embedder_child, &embedder_pid_path);
+    stop_child("watcher", watcher_child, &watcher_pid_path);
 
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&pid_path);
     status::update(&data_dir, |s| {
         s.daemon = None;
+        s.embedder = None;
         s.watcher = None;
     });
 
@@ -224,74 +243,43 @@ fn remove_stale_embedder_socket() {
     }
 }
 
-/// Check if a child has exited and restart it within the retry limit.
-/// Returns `true` if a restart was attempted (for pre-restart hooks like socket cleanup).
-fn maybe_restart_child(
-    label: &str,
-    child: &mut Option<Child>,
-    restarts: &mut u32,
-    max: u32,
-) -> bool {
-    let exited = match child {
-        Some(c) => match c.try_wait() {
-            Ok(Some(exit_status)) => {
-                if exit_status.success() {
-                    log::info!("{label} exited with status: {exit_status}");
-                } else {
-                    log::warn!("{label} exited with non-zero status: {exit_status}");
-                }
-                true
-            }
-            Ok(None) => false,
-            Err(e) => {
-                log::warn!("error checking {label} status: {e}");
-                false
-            }
-        },
-        None => return false,
+/// Check if a PID file points to a running process.
+fn is_process_alive(pid_path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(pid_path) else {
+        return false;
     };
-
-    if !exited {
+    let Ok(pid) = content.trim().parse::<i32>() else {
         return false;
-    }
+    };
+    // kill(pid, 0) checks process existence without sending a signal.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
 
-    if *restarts >= max {
-        log::error!("{label} crashed {max} times, giving up");
-        *child = None;
-        return false;
-    }
-
-    *restarts += 1;
-    log::warn!("{label} exited, restarting ({restarts}/{max})...");
-
-    // Determine binary name and env vars from label
-    let (binary, env_vars): (&str, &[(&str, &str)]) = match label {
-        "embedder" => ("tsm-embedder", &[("TSM_EMBEDDER_IDLE_TIMEOUT", "0")]),
-        "watcher" => ("tsm-watcher", &[]),
-        _ => {
-            log::error!("unknown child label: {label}");
+/// Detect child exit. Returns `true` if the child exited.
+/// The child is NOT restarted — this only logs and cleans up the PID file.
+fn reap_child(label: &str, child: &mut Option<Child>, pid_path: &Path) -> bool {
+    let Some(c) = child else { return false };
+    match c.try_wait() {
+        Ok(Some(exit_status)) => {
+            if exit_status.success() {
+                log::info!("{label} exited normally");
+            } else {
+                log::warn!("{label} exited with {exit_status}, not restarting");
+            }
             *child = None;
-            return false;
-        }
-    };
-
-    match start_child(binary, env_vars) {
-        Ok(new_child) => {
-            log::info!("{label} restarted (PID {})", new_child.id());
-            *child = Some(new_child);
-            *restarts = 0;
+            let _ = std::fs::remove_file(pid_path);
             true
         }
+        Ok(None) => false,
         Err(e) => {
-            log::error!("failed to restart {label}: {e}");
-            *child = None;
+            log::warn!("error checking {label}: {e}");
             false
         }
     }
 }
 
-/// Stop a child process: SIGTERM → wait (2s grace) → SIGKILL.
-fn stop_child(label: &str, child: Option<Child>) {
+/// Stop a child process: SIGTERM → wait (2s grace) → SIGKILL. Removes PID file.
+fn stop_child(label: &str, child: Option<Child>, pid_path: &Path) {
     if let Some(mut child) = child {
         let pid = child.id();
         log::info!("stopping {label} (PID {pid})...");
@@ -304,6 +292,7 @@ fn stop_child(label: &str, child: Option<Child>) {
         // Wait up to 2 seconds for graceful exit
         for _ in 0..20 {
             if matches!(child.try_wait(), Ok(Some(_))) {
+                let _ = std::fs::remove_file(pid_path);
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -317,6 +306,7 @@ fn stop_child(label: &str, child: Option<Child>) {
             log::warn!("failed to wait for {label} (PID {pid}): {e}");
         }
     }
+    let _ = std::fs::remove_file(pid_path);
 }
 
 // ─── Client handling ──────────────────────────────────────────────
