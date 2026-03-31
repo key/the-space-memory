@@ -56,6 +56,11 @@ echo "[$(date -Iseconds)] OK: $COUNT results" >> "$LOG"
 jq -n --argjson results "$RESULT" '{
   hookSpecificOutput: {
     hookEventName: "UserPromptSubmit",
-    additionalContext: ("ナレッジ検索結果 (自動):\n" + ($results | map("- [\(.source_file)] \(.section_path): \(.snippet[0:100])") | join("\n")))
+    additionalContext: ("ナレッジ検索結果 (自動):\n" + ($results | map(
+      "- [\(.source_file)] \(.section_path): \(.snippet[0:100])"
+      + (if (.related_docs // [] | length) > 0
+         then "\n  関連: " + (.related_docs | map("[\(.file_path)](\(.link_type))") | join(", "))
+         else "" end)
+    ) | join("\n")))
   }
 }'
