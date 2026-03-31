@@ -12,6 +12,8 @@ pub struct StatusFile {
     pub embedder: Option<EmbedderStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub daemon: Option<DaemonStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watcher: Option<WatcherStatus>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,6 +35,12 @@ pub struct DaemonStatus {
     pub started_at: String,
     pub pid: u32,
     pub socket: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WatcherStatus {
+    pub started_at: String,
+    pub pid: u32,
 }
 
 pub fn status_path(data_dir: &Path) -> std::path::PathBuf {

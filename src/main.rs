@@ -79,9 +79,6 @@ enum Commands {
         /// Path to the JSONL file
         session_file: PathBuf,
     },
-    /// Internal: start the embedder daemon (managed by tsmd)
-    #[command(hide = true)]
-    EmbedderStart,
     /// Download model files from HuggingFace Hub
     Setup,
     /// Fill missing vectors for chunks (needs running embedder)
@@ -133,7 +130,6 @@ fn main() -> anyhow::Result<()> {
         Commands::Init => cli::cmd_init()?,
         Commands::Start => cmd_start()?,
         Commands::Stop => cmd_stop()?,
-        Commands::EmbedderStart => cli::cmd_embedder_start(None)?,
         Commands::Setup => cli::cmd_setup()?,
         Commands::BackfillWorker => cli::cmd_backfill_worker()?,
         Commands::VectorFill { batch_size } => cli::cmd_vector_fill(batch_size)?,

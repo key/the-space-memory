@@ -573,7 +573,7 @@ fn doctor_check_with_conn(
         emb_section.items.push(CheckItem {
             status: CheckStatus::Warning,
             message: "Stopped".to_string(),
-            hint: Some("Run `embedder-start`.".to_string()),
+            hint: Some("Run `tsmd` to start the daemon (includes embedder).".to_string()),
         });
     }
 
