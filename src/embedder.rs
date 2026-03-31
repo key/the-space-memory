@@ -468,7 +468,7 @@ impl WorkerHandle {
                 match stderr.read_line(&mut line) {
                     Ok(0) => break, // EOF
                     Ok(_) => {
-                        log::debug!("[worker] {}", line.trim_end());
+                        log::info!("[worker] {}", line.trim_end());
                         if line.trim() == "READY" {
                             let _ = tx.send(true);
                             // Continue forwarding stderr
@@ -476,7 +476,7 @@ impl WorkerHandle {
                                 line.clear();
                                 match stderr.read_line(&mut line) {
                                     Ok(0) => break,
-                                    Ok(_) => log::debug!("[worker] {}", line.trim_end()),
+                                    Ok(_) => log::info!("[worker] {}", line.trim_end()),
                                     Err(_) => break,
                                 }
                             }

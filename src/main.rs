@@ -386,11 +386,11 @@ fn cmd_start() -> anyhow::Result<()> {
     }
 
     // Spawn tsmd in a new session (detached)
-    // tsmd manages its own log file via flexi_logger, so stderr goes to null
+    // Keep stderr inherited so pre-logger startup errors are visible
     let mut cmd = std::process::Command::new(&tsmd_path);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::inherit());
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();

@@ -109,7 +109,7 @@ fn main() -> Result<()> {
                 Some(child)
             }
             Err(e) => {
-                log::warn!("failed to start embedder: {e}");
+                log::error!("failed to start embedder: {e}");
                 None
             }
         }
@@ -132,7 +132,7 @@ fn main() -> Result<()> {
                 Some(child)
             }
             Err(e) => {
-                log::warn!("failed to start watcher: {e}");
+                log::error!("failed to start watcher: {e}");
                 None
             }
         }
@@ -202,10 +202,10 @@ fn sibling_binary(name: &str) -> Result<PathBuf> {
 fn start_child(binary: &str, env_vars: &[(&str, &str)]) -> Result<Child> {
     let bin_path = sibling_binary(binary)?;
     let mut cmd = Command::new(&bin_path);
-    // Child processes manage their own log files via flexi_logger
+    // Keep stderr inherited so pre-logger startup errors are visible
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::inherit());
     for &(k, v) in env_vars {
         cmd.env(k, v);
     }
@@ -234,7 +234,11 @@ fn maybe_restart_child(
     let exited = match child {
         Some(c) => match c.try_wait() {
             Ok(Some(exit_status)) => {
-                log::info!("{label} exited with status: {exit_status}");
+                if exit_status.success() {
+                    log::info!("{label} exited with status: {exit_status}");
+                } else {
+                    log::warn!("{label} exited with non-zero status: {exit_status}");
+                }
                 true
             }
             Ok(None) => false,

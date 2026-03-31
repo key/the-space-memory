@@ -15,23 +15,26 @@ pub enum LogMode {
     Daemon { name: &'static str },
 }
 
-static LOGGER_INIT: OnceLock<()> = OnceLock::new();
+static LOGGER_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
 /// Initialize the logger. Safe to call multiple times (idempotent via OnceLock).
 pub fn init_logger(mode: LogMode) -> anyhow::Result<()> {
-    LOGGER_INIT.get_or_init(|| {
-        let logger = Logger::try_with_env_or_str("info").unwrap();
+    let result = LOGGER_INIT.get_or_init(|| {
+        let logger = Logger::try_with_env_or_str("info")
+            .map_err(|e| format!("failed to parse log spec: {e}"))?;
         match mode {
             LogMode::Stderr => {
                 logger
                     .log_to_stderr()
                     .format(tsm_log_format)
                     .start()
-                    .ok();
+                    .map(|_| ())
+                    .map_err(|e| format!("failed to start stderr logger: {e}"))
             }
             LogMode::Daemon { name } => {
                 let dir = config::log_dir();
-                std::fs::create_dir_all(&dir).ok();
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| format!("failed to create log dir {}: {e}", dir.display()))?;
                 logger
                     .log_to_file(
                         FileSpec::default()
@@ -47,11 +50,15 @@ pub fn init_logger(mode: LogMode) -> anyhow::Result<()> {
                     )
                     .format(tsm_log_format)
                     .start()
-                    .ok();
+                    .map(|_| ())
+                    .map_err(|e| format!("failed to start file logger: {e}"))
             }
         }
     });
-    Ok(())
+    result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn tsm_log_format(
