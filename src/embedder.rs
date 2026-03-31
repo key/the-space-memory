@@ -500,7 +500,7 @@ pub fn embed_via_socket_at(socket_path: &Path, texts: &[String]) -> Option<Vec<V
 pub struct WorkerHandle {
     child: Child,
     stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    stdout: Option<BufReader<std::process::ChildStdout>>,
 }
 
 impl WorkerHandle {
@@ -556,21 +556,45 @@ impl WorkerHandle {
         Ok(Self {
             child,
             stdin,
-            stdout,
+            stdout: Some(stdout),
         })
     }
 
     /// Send texts and receive embeddings via the pipe protocol.
     /// Returns Err on timeout or if the child has died.
-    pub fn encode(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    pub fn encode(&mut self, texts: &[String], timeout: Duration) -> Result<Vec<Vec<f32>>> {
+        if self.stdout.is_none() {
+            anyhow::bail!("worker handle is dead (killed after a previous timeout or crash)");
+        }
+
         let request = serde_json::json!({ "texts": texts });
         let request_bytes = serde_json::to_vec(&request)?;
         write_message(&mut self.stdin, &request_bytes)?;
 
-        // Read response — blocking read on pipe.
-        // If the child crashes, read_message returns Err (broken pipe).
-        let response_data = read_message(&mut self.stdout)
-            .context("worker pipe read error (child may have crashed)")?;
+        // Take stdout to move into a reader thread so we can enforce a timeout.
+        let mut stdout = self.stdout.take().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = read_message(&mut stdout);
+            let _ = tx.send((result, stdout));
+        });
+
+        let (read_result, stdout_back) = match rx.recv_timeout(timeout) {
+            Ok(pair) => pair,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.kill();
+                anyhow::bail!("worker encode timed out after {timeout:?}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.kill();
+                anyhow::bail!("worker reader thread died unexpectedly");
+            }
+        };
+
+        self.stdout = Some(stdout_back);
+        let response_data =
+            read_result.context("worker pipe read error (child may have crashed)")?;
 
         let response: serde_json::Value = serde_json::from_slice(&response_data)?;
 
