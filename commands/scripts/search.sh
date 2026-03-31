@@ -6,8 +6,14 @@ QUERY=$(printf '%s' "$*" | tr -d '`$(){}|;&<>!\\'\'' "' | head -c 500)
 
 [ ${#QUERY} -lt 2 ] && echo '[]' && exit 0
 
-TSM="${CLAUDE_PLUGIN_ROOT:-$(dirname "$0")/../..}/tsm"
-[ ! -x "$TSM" ] && echo '[]' && exit 0
+# Prefer system-installed tsm over plugin-bundled one
+if command -v tsm >/dev/null 2>&1; then
+  TSM="tsm"
+elif [ -x "${CLAUDE_PLUGIN_ROOT:-$(dirname "$0")/../..}/tsm" ]; then
+  TSM="${CLAUDE_PLUGIN_ROOT:-$(dirname "$0")/../..}/tsm"
+else
+  echo '[]' && exit 0
+fi
 
 cd "${CLAUDE_PROJECT_DIR:-/workspaces/workspace}"
 
