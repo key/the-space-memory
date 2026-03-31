@@ -76,13 +76,13 @@ fn get_custom_terms() -> &'static [CompiledTerm] {
 fn load_custom_terms_from_file() -> Vec<CompiledTerm> {
     let path = crate::config::custom_terms_path();
     if !path.exists() {
-        eprintln!("Info: custom terms file not found at {}", path.display());
+        log::info!("custom terms file not found at {}", path.display());
         return Vec::new();
     }
     match std::fs::read_to_string(&path) {
         Ok(content) => compile_custom_terms(&parse_custom_terms(&content)),
         Err(e) => {
-            eprintln!("Warning: failed to read custom terms: {e}");
+            log::warn!("failed to read custom terms: {e}");
             Vec::new()
         }
     }
@@ -93,7 +93,7 @@ pub fn parse_custom_terms(content: &str) -> Vec<Entity> {
     let file: CustomTermsFile = match toml::from_str(content) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("Warning: failed to parse custom terms TOML: {e}");
+            log::warn!("failed to parse custom terms TOML: {e}");
             return Vec::new();
         }
     };

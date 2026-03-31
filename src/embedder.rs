@@ -183,9 +183,9 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
         std::fs::remove_file(socket_path)?;
     }
 
-    eprintln!("Loading model...");
+    log::info!("Loading model...");
     let embedder = Embedder::load(&Device::Cpu)?;
-    eprintln!("Model loaded.");
+    log::info!("Model loaded.");
 
     // Backfill via worker subprocess in background (crash-isolated)
     {
@@ -193,7 +193,7 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
         if db_path.exists() {
             std::thread::spawn(move || {
                 if let Err(e) = crate::cli::backfill_with_worker(&db_path) {
-                    eprintln!("Backfill warning: {e}");
+                    log::warn!("Backfill warning: {e}");
                 }
             });
         }
@@ -207,7 +207,7 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
         });
     });
 
-    eprintln!("Listening on {}", socket_path.display());
+    log::info!("Listening on {}", socket_path.display());
 
     let listener = UnixListener::bind(socket_path)?;
     listener.set_nonblocking(true)?;
@@ -225,7 +225,7 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
             watchdog(&running, &last_activity, &socket_path, idle_timeout_secs);
         });
     } else {
-        eprintln!("Idle timeout disabled.");
+        log::info!("Idle timeout disabled.");
     }
 
     // Periodic backfill thread (skipped when interval is 0)
@@ -242,7 +242,7 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
             Ok((stream, _)) => {
                 *last_activity.lock().unwrap() = Instant::now();
                 if let Err(e) = handle_client(stream, &embedder) {
-                    eprintln!("Client error: {e}");
+                    log::warn!("Client error: {e}");
                 }
                 *last_activity.lock().unwrap() = Instant::now();
             }
@@ -251,13 +251,13 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
             }
             Err(e) => {
                 if running.load(Ordering::Relaxed) {
-                    eprintln!("Accept error: {e}");
+                    log::warn!("Accept error: {e}");
                 }
             }
         }
     }
 
-    eprintln!("Shutting down (idle timeout).");
+    log::info!("Shutting down (idle timeout).");
     crate::status::update(&crate::config::data_dir(), |s| {
         s.embedder = None;
     });
@@ -279,7 +279,7 @@ fn watchdog(
         }
         let elapsed = last_activity.lock().unwrap().elapsed();
         if elapsed >= timeout {
-            eprintln!("Idle timeout reached ({timeout_secs}s). Stopping.");
+            log::info!("Idle timeout reached ({timeout_secs}s). Stopping.");
             running.store(false, Ordering::Relaxed);
             // Poke the listener to unblock accept
             let _ = UnixStream::connect(socket_path);
@@ -319,9 +319,9 @@ fn periodic_backfill(running: &AtomicBool, interval_secs: u64) {
 
                 if chunks > vecs {
                     let missing = chunks - vecs;
-                    eprintln!("Periodic backfill: {missing} vectors missing. Starting backfill.");
+                    log::debug!("Periodic backfill: {missing} vectors missing. Starting backfill.");
                     if let Err(e) = crate::cli::backfill_with_worker(&db_path) {
-                        eprintln!("Periodic backfill warning: {e}");
+                        log::warn!("Periodic backfill warning: {e}");
                     }
                 }
             }
@@ -359,7 +359,7 @@ fn handle_client(mut stream: UnixStream, embedder: &Embedder) -> Result<()> {
     let embeddings = match encode_result {
         Ok(Ok(emb)) => emb,
         Ok(Err(e)) => {
-            eprintln!("Encode error: {e}");
+            log::error!("Encode error: {e}");
             let err_resp = serde_json::json!({ "error": format!("{e}") });
             let err_bytes = serde_json::to_vec(&err_resp)?;
             write_message(&mut stream, &err_bytes)?;
@@ -374,7 +374,7 @@ fn handle_client(mut stream: UnixStream, embedder: &Embedder) -> Result<()> {
             } else {
                 "unknown panic".to_string()
             };
-            eprintln!("PANIC in encode: {msg}");
+            log::error!("PANIC in encode: {msg}");
             let err_resp = serde_json::json!({ "error": format!("panic: {msg}") });
             let err_bytes = serde_json::to_vec(&err_resp)?;
             write_message(&mut stream, &err_bytes)?;
@@ -468,7 +468,7 @@ impl WorkerHandle {
                 match stderr.read_line(&mut line) {
                     Ok(0) => break, // EOF
                     Ok(_) => {
-                        eprint!("[worker] {line}");
+                        log::debug!("[worker] {}", line.trim_end());
                         if line.trim() == "READY" {
                             let _ = tx.send(true);
                             // Continue forwarding stderr
@@ -476,7 +476,7 @@ impl WorkerHandle {
                                 line.clear();
                                 match stderr.read_line(&mut line) {
                                     Ok(0) => break,
-                                    Ok(_) => eprint!("[worker] {line}"),
+                                    Ok(_) => log::debug!("[worker] {}", line.trim_end()),
                                     Err(_) => break,
                                 }
                             }
@@ -581,10 +581,10 @@ impl Drop for WorkerHandle {
 /// Entry point for the `tsm backfill-worker` subprocess.
 /// Loads the model, signals READY, then processes encode requests on stdin/stdout.
 pub fn run_backfill_worker() -> Result<()> {
-    eprintln!("Loading model...");
+    log::info!("Loading model...");
     let embedder = Embedder::load(&Device::Cpu)?;
-    eprintln!("Model loaded.");
-    eprintln!("READY");
+    log::info!("Model loaded.");
+    eprintln!("READY"); // IPC protocol signal — must NOT use log macro
 
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
@@ -621,7 +621,7 @@ pub fn run_backfill_worker() -> Result<()> {
         let response = match encode_result {
             Ok(Ok(emb)) => serde_json::json!({ "embeddings": emb }),
             Ok(Err(e)) => {
-                eprintln!("Encode error: {e}");
+                log::error!("Encode error: {e}");
                 serde_json::json!({ "error": format!("{e}") })
             }
             Err(panic_info) => {
@@ -632,7 +632,7 @@ pub fn run_backfill_worker() -> Result<()> {
                 } else {
                     "unknown panic".to_string()
                 };
-                eprintln!("PANIC in encode: {msg}");
+                log::error!("PANIC in encode: {msg}");
                 serde_json::json!({ "error": format!("panic: {msg}") })
             }
         };
@@ -641,7 +641,7 @@ pub fn run_backfill_worker() -> Result<()> {
         write_message(&mut stdout, &response_bytes)?;
     }
 
-    eprintln!("Worker exiting.");
+    log::info!("Worker exiting.");
     Ok(())
 }
 

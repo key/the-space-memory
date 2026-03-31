@@ -55,10 +55,7 @@ pub fn read(data_dir: &Path) -> StatusFile {
     match serde_json::from_str(&s) {
         Ok(sf) => sf,
         Err(e) => {
-            eprintln!(
-                "warning: failed to parse status file ({}): {e}",
-                path.display()
-            );
+            log::warn!("failed to parse status file ({}): {e}", path.display());
             StatusFile::default()
         }
     }
@@ -81,9 +78,9 @@ pub fn update(data_dir: &Path, f: impl FnOnce(&mut StatusFile)) {
     match serde_json::to_string_pretty(&status) {
         Ok(json) => {
             if let Err(e) = write_atomic(&path, json.as_bytes()) {
-                eprintln!("warning: failed to write status file: {e}");
+                log::warn!("failed to write status file: {e}");
             }
         }
-        Err(e) => eprintln!("warning: failed to serialize status: {e}"),
+        Err(e) => log::warn!("failed to serialize status: {e}"),
     }
 }

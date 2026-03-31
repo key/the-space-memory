@@ -41,6 +41,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon { name: "tsmd" })?;
     let args = Args::parse();
 
     let socket_path = args.socket.unwrap_or_else(config::daemon_socket_path);
@@ -78,7 +79,7 @@ fn main() -> Result<()> {
         });
     });
 
-    eprintln!("tsmd: listening on {} (PID {pid})", socket_path.display());
+    log::info!("listening on {} (PID {pid})", socket_path.display());
 
     // Install signal handlers BEFORE spawning children
     unsafe {
@@ -98,7 +99,7 @@ fn main() -> Result<()> {
         match start_child("tsm-embedder", &[("TSM_EMBEDDER_IDLE_TIMEOUT", "0")]) {
             Ok(child) => {
                 let child_pid = child.id();
-                eprintln!("tsmd: embedder started (PID {child_pid})");
+                log::info!("embedder started (PID {child_pid})");
                 status::update(&data_dir, |s| {
                     s.embedder = Some(status::EmbedderStatus {
                         started_at: chrono::Utc::now().to_rfc3339(),
@@ -108,12 +109,12 @@ fn main() -> Result<()> {
                 Some(child)
             }
             Err(e) => {
-                eprintln!("tsmd: warning: failed to start embedder: {e}");
+                log::warn!("failed to start embedder: {e}");
                 None
             }
         }
     } else {
-        eprintln!("tsmd: embedder disabled (--no-embedder)");
+        log::info!("embedder disabled (--no-embedder)");
         None
     };
 
@@ -121,7 +122,7 @@ fn main() -> Result<()> {
         match start_child("tsm-watcher", &[]) {
             Ok(child) => {
                 let child_pid = child.id();
-                eprintln!("tsmd: watcher started (PID {child_pid})");
+                log::info!("watcher started (PID {child_pid})");
                 status::update(&data_dir, |s| {
                     s.watcher = Some(status::WatcherStatus {
                         started_at: chrono::Utc::now().to_rfc3339(),
@@ -131,12 +132,12 @@ fn main() -> Result<()> {
                 Some(child)
             }
             Err(e) => {
-                eprintln!("tsmd: warning: failed to start watcher: {e}");
+                log::warn!("failed to start watcher: {e}");
                 None
             }
         }
     } else {
-        eprintln!("tsmd: watcher disabled (--no-watcher)");
+        log::info!("watcher disabled (--no-watcher)");
         None
     };
 
@@ -153,7 +154,7 @@ fn main() -> Result<()> {
 
                 std::thread::spawn(move || {
                     if let Err(e) = handle_client(&mut stream, &conn, &project_root) {
-                        eprintln!("tsmd: client error: {e}");
+                        log::warn!("client error: {e}");
                     }
                 });
             }
@@ -165,14 +166,14 @@ fn main() -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => {
-                eprintln!("tsmd: fatal accept error: {e}");
+                log::error!("fatal accept error: {e}");
                 break;
             }
         }
     }
 
     // Cleanup
-    eprintln!("tsmd: shutting down");
+    log::info!("shutting down");
     stop_child("embedder", embedder_child);
     stop_child("watcher", watcher_child);
 
@@ -201,9 +202,10 @@ fn sibling_binary(name: &str) -> Result<PathBuf> {
 fn start_child(binary: &str, env_vars: &[(&str, &str)]) -> Result<Child> {
     let bin_path = sibling_binary(binary)?;
     let mut cmd = Command::new(&bin_path);
+    // Child processes manage their own log files via flexi_logger
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::null());
     for &(k, v) in env_vars {
         cmd.env(k, v);
     }
@@ -216,7 +218,7 @@ fn remove_stale_embedder_socket() {
     let path = Path::new(config::SOCKET_PATH);
     if path.exists() {
         if let Err(e) = std::fs::remove_file(path) {
-            eprintln!("tsmd: warning: could not remove stale embedder socket: {e}");
+            log::warn!("could not remove stale embedder socket: {e}");
         }
     }
 }
@@ -232,12 +234,12 @@ fn maybe_restart_child(
     let exited = match child {
         Some(c) => match c.try_wait() {
             Ok(Some(exit_status)) => {
-                eprintln!("tsmd: {label} exited with status: {exit_status}");
+                log::info!("{label} exited with status: {exit_status}");
                 true
             }
             Ok(None) => false,
             Err(e) => {
-                eprintln!("tsmd: error checking {label} status: {e}");
+                log::warn!("error checking {label} status: {e}");
                 false
             }
         },
@@ -249,20 +251,20 @@ fn maybe_restart_child(
     }
 
     if *restarts >= max {
-        eprintln!("tsmd: {label} crashed {max} times, giving up");
+        log::error!("{label} crashed {max} times, giving up");
         *child = None;
         return false;
     }
 
     *restarts += 1;
-    eprintln!("tsmd: {label} exited, restarting ({restarts}/{max})...");
+    log::warn!("{label} exited, restarting ({restarts}/{max})...");
 
     // Determine binary name and env vars from label
     let (binary, env_vars): (&str, &[(&str, &str)]) = match label {
         "embedder" => ("tsm-embedder", &[("TSM_EMBEDDER_IDLE_TIMEOUT", "0")]),
         "watcher" => ("tsm-watcher", &[]),
         _ => {
-            eprintln!("tsmd: unknown child label: {label}");
+            log::error!("unknown child label: {label}");
             *child = None;
             return false;
         }
@@ -270,13 +272,13 @@ fn maybe_restart_child(
 
     match start_child(binary, env_vars) {
         Ok(new_child) => {
-            eprintln!("tsmd: {label} restarted (PID {})", new_child.id());
+            log::info!("{label} restarted (PID {})", new_child.id());
             *child = Some(new_child);
             *restarts = 0;
             true
         }
         Err(e) => {
-            eprintln!("tsmd: failed to restart {label}: {e}");
+            log::error!("failed to restart {label}: {e}");
             *child = None;
             false
         }
@@ -287,7 +289,7 @@ fn maybe_restart_child(
 fn stop_child(label: &str, child: Option<Child>) {
     if let Some(mut child) = child {
         let pid = child.id();
-        eprintln!("tsmd: stopping {label} (PID {pid})...");
+        log::info!("stopping {label} (PID {pid})...");
 
         // Send SIGTERM for graceful shutdown
         unsafe {
@@ -304,10 +306,10 @@ fn stop_child(label: &str, child: Option<Child>) {
 
         // Force kill if still running
         if let Err(e) = child.kill() {
-            eprintln!("tsmd: warning: failed to kill {label} (PID {pid}): {e}");
+            log::warn!("failed to kill {label} (PID {pid}): {e}");
         }
         if let Err(e) = child.wait() {
-            eprintln!("tsmd: warning: failed to wait for {label} (PID {pid}): {e}");
+            log::warn!("failed to wait for {label} (PID {pid}): {e}");
         }
     }
 }

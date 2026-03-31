@@ -124,6 +124,7 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Stderr)?;
     let args = Cli::parse();
     match args.command {
         // ── Always direct ──
@@ -293,7 +294,7 @@ fn render_index(resp: DaemonResponse) -> anyhow::Result<()> {
         let indexed = payload["indexed"].as_i64().unwrap_or(0);
         let skipped = payload["skipped"].as_i64().unwrap_or(0);
         let removed = payload["removed"].as_i64().unwrap_or(0);
-        eprintln!("Indexed: {indexed}, Skipped: {skipped}, Removed: {removed}");
+        log::info!("indexed: {indexed}, skipped: {skipped}, removed: {removed}");
     }
     Ok(())
 }
@@ -306,9 +307,9 @@ fn render_ingest(resp: DaemonResponse, session_file: &std::path::Path) -> anyhow
         .to_string_lossy();
     if let Some(payload) = resp.payload {
         if payload["indexed"].as_bool().unwrap_or(false) {
-            eprintln!("Session indexed: {name}");
+            log::info!("session indexed: {name}");
         } else {
-            eprintln!("Session unchanged: {name}");
+            log::info!("session unchanged: {name}");
         }
     }
     Ok(())
@@ -347,7 +348,7 @@ fn render_import_wordnet(resp: DaemonResponse) -> anyhow::Result<()> {
     check_resp(&resp)?;
     if let Some(payload) = resp.payload {
         let count = payload["imported"].as_i64().unwrap_or(0);
-        eprintln!("Imported {count} synonym pairs from WordNet.");
+        log::info!("imported {count} synonym pairs from WordNet");
     }
     Ok(())
 }
@@ -362,7 +363,7 @@ fn cmd_start() -> anyhow::Result<()> {
     if socket_path.exists() {
         if let Ok(resp) = daemon_protocol::send_request(&socket_path, &DaemonRequest::Ping) {
             if resp.ok {
-                eprintln!("tsmd is already running.");
+                log::info!("tsmd is already running");
                 return Ok(());
             }
         }
@@ -384,21 +385,12 @@ fn cmd_start() -> anyhow::Result<()> {
         );
     }
 
-    // Spawn tsmd in a new session (detached), stderr to log file
-    let log_path = config::data_dir().join("tsmd.log");
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .ok();
-    let stderr_cfg = match log_file {
-        Some(f) => std::process::Stdio::from(f),
-        None => std::process::Stdio::null(),
-    };
+    // Spawn tsmd in a new session (detached)
+    // tsmd manages its own log file via flexi_logger, so stderr goes to null
     let mut cmd = std::process::Command::new(&tsmd_path);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(stderr_cfg);
+        .stderr(std::process::Stdio::null());
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();
@@ -416,7 +408,7 @@ fn cmd_start() -> anyhow::Result<()> {
         if socket_path.exists() {
             if let Ok(resp) = daemon_protocol::send_request(&socket_path, &DaemonRequest::Ping) {
                 if resp.ok {
-                    eprintln!("tsmd started.");
+                    log::info!("tsmd started");
                     return Ok(());
                 }
             }
@@ -433,25 +425,25 @@ fn cmd_stop() -> anyhow::Result<()> {
     let socket_path = config::daemon_socket_path();
 
     if !socket_path.exists() {
-        eprintln!("tsmd is not running.");
+        log::info!("tsmd is not running");
         return Ok(());
     }
 
     match daemon_protocol::send_request(&socket_path, &DaemonRequest::Shutdown) {
         Ok(resp) => {
             if resp.ok {
-                eprintln!("tsmd stopped.");
+                log::info!("tsmd stopped");
             } else {
-                eprintln!(
+                log::warn!(
                     "tsmd reported error: {}",
                     resp.error.unwrap_or_default()
                 );
             }
         }
         Err(e) => {
-            eprintln!("Could not connect to tsmd: {e}");
+            log::warn!("could not connect to tsmd: {e}");
             let _ = std::fs::remove_file(&socket_path);
-            eprintln!("Removed stale socket.");
+            log::info!("removed stale socket");
         }
     }
 

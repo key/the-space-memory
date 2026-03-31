@@ -103,6 +103,14 @@ pub fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data")
 }
 
+/// Resolve log directory: TSM_LOG_DIR env > default (.tsm/logs in CWD)
+pub fn log_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("TSM_LOG_DIR") {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from(".tsm/logs")
+}
+
 /// Resolve project_root: TSM_PROJECT_ROOT env > config file > default
 pub fn project_root() -> PathBuf {
     if let Ok(root) = std::env::var("TSM_PROJECT_ROOT") {

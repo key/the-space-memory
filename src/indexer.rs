@@ -323,7 +323,7 @@ pub fn index_file(
                 if e.to_string().contains("no such table") { Ok(0) } else { Err(e) }
             })?;
         if let Err(e) = entity::insert_entities(&tx, doc_id, &diff.all_chunk_entries, &fm.tags) {
-            eprintln!("entity extraction warning: {e}");
+            log::warn!("entity extraction warning: {e}");
         }
 
         // Rebuild document links
@@ -554,7 +554,7 @@ fn learn_from_session_jsonl(conn: &Connection, jsonl_path: &Path) {
         user_dict::collect_from_text(&tx, content, "session");
     }
     if let Err(e) = tx.commit() {
-        eprintln!("learn_from_session_jsonl: transaction commit failed: {e}");
+        log::error!("learn_from_session_jsonl: transaction commit failed: {e}");
     }
 }
 
@@ -621,7 +621,7 @@ fn mark_chunk_skip(conn: &Connection, chunk_id: i64, reason: &str) -> bool {
     ) {
         Ok(_) => true,
         Err(e) => {
-            eprintln!("    WARNING: failed to write skip record for chunk {chunk_id}: {e} — chunk will be retried next run");
+            log::warn!("failed to write skip record for chunk {chunk_id}: {e} — chunk will be retried next run");
             false
         }
     }
@@ -642,24 +642,24 @@ fn retry_individually(
                 if write_vec_row(conn, *chunk_id, &embeddings[0]) {
                     stats.filled += 1;
                 } else {
-                    eprintln!("    chunk {chunk_id} ({file_path}): insert error — skipping");
+                    log::warn!("chunk {chunk_id} ({file_path}): insert error — skipping");
                     mark_chunk_skip(conn, *chunk_id, "insert_error");
                     stats.errors += 1;
                 }
             }
             Ok(Ok(_)) => {
-                eprintln!("    chunk {chunk_id} ({file_path}): empty embedding — skipping");
+                log::warn!("chunk {chunk_id} ({file_path}): empty embedding — skipping");
                 mark_chunk_skip(conn, *chunk_id, "empty_embedding");
                 stats.errors += 1;
             }
             Ok(Err(e)) => {
-                eprintln!("    chunk {chunk_id} ({file_path}): error ({e}) — skipping");
+                log::warn!("chunk {chunk_id} ({file_path}): error ({e}) — skipping");
                 mark_chunk_skip(conn, *chunk_id, "encode_error");
                 stats.errors += 1;
             }
             Err(panic_info) => {
                 let msg = panic_message(&panic_info);
-                eprintln!("    chunk {chunk_id} ({file_path}): PANIC ({msg}) — skipping");
+                log::error!("chunk {chunk_id} ({file_path}): PANIC ({msg}) — skipping");
                 mark_chunk_skip(conn, *chunk_id, "panic");
                 stats.panics += 1;
                 stats.errors += 1;
@@ -697,7 +697,7 @@ pub fn backfill_vectors(
         return Ok(BackfillStats::default());
     }
 
-    eprintln!("Backfilling {total} chunks...");
+    log::info!("Backfilling {total} chunks...");
     if let Some(cb) = &progress_cb {
         cb(total, 0, 0);
     }
@@ -730,7 +730,7 @@ pub fn backfill_vectors(
         let files: Vec<&str> = batch.iter().map(|(_, _, f)| f.as_str()).collect();
         let batch_start_id = batch.first().unwrap().0;
         let batch_end_id = last_id;
-        eprintln!("  batch {batch_start_id}..{batch_end_id}: {:?}", files);
+        log::debug!("batch {batch_start_id}..{batch_end_id}: {:?}", files);
 
         let texts: Vec<String> = batch
             .iter()
@@ -744,7 +744,7 @@ pub fn backfill_vectors(
                     if write_vec_row(&tx, *chunk_id, emb) {
                         stats.filled += 1;
                     } else {
-                        eprintln!("Insert error for chunk {chunk_id} — skipping");
+                        log::warn!("Insert error for chunk {chunk_id} — skipping");
                         mark_chunk_skip(conn, *chunk_id, "insert_error");
                         stats.errors += 1;
                     }
@@ -752,13 +752,13 @@ pub fn backfill_vectors(
                 tx.commit()?;
             }
             Ok(Ok(embeddings)) => {
-                eprintln!(
+                log::warn!(
                     "Embedding count mismatch (got {}, expected {}) for batch {batch_start_id}..{batch_end_id}",
                     embeddings.len(),
                     batch.len()
                 );
                 if batch.len() > 1 {
-                    eprintln!("  Retrying {} chunks individually...", batch.len());
+                    log::warn!("Retrying {} chunks individually...", batch.len());
                     retry_individually(&batch, encode_fn, conn, &mut stats);
                 } else {
                     let chunk_id = batch[0].0;
@@ -767,27 +767,27 @@ pub fn backfill_vectors(
                 }
             }
             Ok(Err(e)) => {
-                eprintln!("Batch error (chunks {batch_start_id}..{batch_end_id}): {e}");
+                log::warn!("Batch error (chunks {batch_start_id}..{batch_end_id}): {e}");
                 if batch.len() > 1 {
-                    eprintln!("  Retrying {} chunks individually...", batch.len());
+                    log::warn!("Retrying {} chunks individually...", batch.len());
                     retry_individually(&batch, encode_fn, conn, &mut stats);
                 } else {
                     let chunk_id = batch[0].0;
-                    eprintln!("  chunk {chunk_id}: failed individually — skipping");
+                    log::warn!("chunk {chunk_id}: failed individually — skipping");
                     mark_chunk_skip(conn, chunk_id, "encode_error");
                     stats.errors += 1;
                 }
             }
             Err(panic_info) => {
                 let msg = panic_message(&panic_info);
-                eprintln!("PANIC in encode (chunks {batch_start_id}..{batch_end_id}): {msg}");
+                log::error!("PANIC in encode (chunks {batch_start_id}..{batch_end_id}): {msg}");
                 stats.panics += 1;
                 if batch.len() > 1 {
-                    eprintln!("  Retrying {} chunks individually...", batch.len());
+                    log::warn!("Retrying {} chunks individually...", batch.len());
                     retry_individually(&batch, encode_fn, conn, &mut stats);
                 } else {
                     let chunk_id = batch[0].0;
-                    eprintln!("  chunk {chunk_id}: failed individually — skipping");
+                    log::warn!("chunk {chunk_id}: failed individually — skipping");
                     mark_chunk_skip(conn, chunk_id, "panic");
                     stats.errors += 1;
                 }
@@ -795,7 +795,7 @@ pub fn backfill_vectors(
         }
 
         let processed = stats.filled + stats.errors;
-        eprintln!("  {processed}/{total}");
+        log::debug!("{processed}/{total}");
 
         if let Some(cb) = &progress_cb {
             cb(total, stats.filled, stats.errors);
@@ -803,12 +803,12 @@ pub fn backfill_vectors(
     }
 
     if stats.panics > 0 {
-        eprintln!(
+        log::info!(
             "Backfill complete: {} filled, {} errors, {} panics.",
             stats.filled, stats.errors, stats.panics
         );
     } else {
-        eprintln!(
+        log::info!(
             "Backfill complete: {} filled, {} errors.",
             stats.filled, stats.errors
         );

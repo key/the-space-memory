@@ -99,7 +99,7 @@ fn get_existing_surfaces() -> &'static HashSet<String> {
     EXISTING_SURFACES.get_or_init(|| match load_existing_surfaces(&config::user_dict_path()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Warning: could not read user dict: {e}");
+            log::warn!("could not read user dict: {e}");
             HashSet::new()
         }
     })
@@ -151,7 +151,7 @@ fn extract_raw_candidates(text: &str) -> Vec<RawCandidate> {
     let mut tokens = match segmenter.segment(std::borrow::Cow::Borrowed(text)) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("Warning: segmentation failed: {e}");
+            log::warn!("segmentation failed: {e}");
             return Vec::new();
         }
     };
@@ -245,7 +245,7 @@ pub fn collect_from_text(conn: &Connection, text: &str, source: &str) {
                      THEN ?4 ELSE dictionary_candidates.last_seen END",
             rusqlite::params![c.surface, c.pos.as_str(), source, now],
         ) {
-            eprintln!("Warning: failed to upsert dictionary candidate '{}': {e}", c.surface);
+            log::warn!("failed to upsert dictionary candidate '{}': {e}", c.surface);
             break; // DB likely in bad state, stop trying
         }
     }

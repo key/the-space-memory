@@ -36,6 +36,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon { name: "tsm-watcher" })?;
     let args = Args::parse();
 
     let daemon_socket = args
@@ -70,7 +71,7 @@ fn main() -> Result<()> {
                     .watcher()
                     .watch(&full_dir, RecursiveMode::Recursive)
             {
-                eprintln!("tsm-watcher: warning: cannot watch {}: {e}", full_dir.display());
+                log::warn!("cannot watch {}: {e}", full_dir.display());
             } else {
                 watched += 1;
             }
@@ -81,8 +82,8 @@ fn main() -> Result<()> {
         anyhow::bail!("No content directories found to watch under {}", project_root.display());
     }
 
-    eprintln!(
-        "tsm-watcher: watching {watched} directories under {}",
+    log::info!(
+        "watching {watched} directories under {}",
         project_root.display()
     );
 
@@ -103,8 +104,8 @@ fn main() -> Result<()> {
                             files_to_index.insert(rel.to_string_lossy().into_owned());
                         }
                         Err(_) => {
-                            eprintln!(
-                                "tsm-watcher: warning: path {} outside project root, skipping",
+                            log::warn!(
+                                "path {} outside project root, skipping",
                                 event.path.display()
                             );
                         }
@@ -123,37 +124,37 @@ fn main() -> Result<()> {
                                     let indexed = payload["indexed"].as_i64().unwrap_or(0);
                                     let removed = payload["removed"].as_i64().unwrap_or(0);
                                     if indexed > 0 || removed > 0 {
-                                        eprintln!(
-                                            "tsm-watcher: indexed {indexed}, removed {removed} ({count} file(s))"
+                                        log::info!(
+                                            "indexed {indexed}, removed {removed} ({count} file(s))"
                                         );
                                     }
                                 }
                             } else {
-                                eprintln!(
-                                    "tsm-watcher: index error: {}",
+                                log::warn!(
+                                    "index error: {}",
                                     resp.error.unwrap_or_default()
                                 );
                             }
                         }
                         Err(e) => {
-                            eprintln!("tsm-watcher: daemon communication error: {e}");
+                            log::warn!("daemon communication error: {e}");
                         }
                     }
                 }
             }
             Ok(Err(e)) => {
-                eprintln!("tsm-watcher: watch error: {e}");
+                log::warn!("watch error: {e}");
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Normal timeout, check shutdown flag
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!("tsm-watcher: watcher channel disconnected");
+                log::warn!("watcher channel disconnected");
                 break;
             }
         }
     }
 
-    eprintln!("tsm-watcher: shutting down");
+    log::info!("shutting down");
     Ok(())
 }

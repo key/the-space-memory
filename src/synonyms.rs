@@ -183,7 +183,7 @@ pub fn import_wordnet(conn: &Connection, wordnet_path: &std::path::Path) -> anyh
         .collect();
 
     let total = pairs.len();
-    eprintln!("Importing {total} synonym pairs from WordNet...");
+    log::info!("importing {total} synonym pairs from WordNet...");
 
     let batch_size = 1000;
     let mut imported = 0;
@@ -204,7 +204,7 @@ pub fn import_wordnet(conn: &Connection, wordnet_path: &std::path::Path) -> anyh
         }
     }
 
-    eprintln!("\r  {imported}/{total} done.");
+    log::info!("{imported}/{total} synonym pairs imported.");
     Ok(imported)
 }
 
@@ -296,7 +296,7 @@ pub fn cleanup_stale(conn: &Connection) {
         .unwrap_or(0);
 
     if deleted > 0 {
-        eprintln!("Cleaned up {deleted} stale synonym pairs.");
+        log::info!("cleaned up {deleted} stale synonym pairs");
     }
 }
 

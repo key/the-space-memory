@@ -11,7 +11,7 @@ use crate::user_dict;
 pub fn cmd_init() -> anyhow::Result<()> {
     let db_path = config::db_path();
     db::init_db(&db_path)?;
-    eprintln!("Database initialized at {}", db_path.display());
+    log::info!("Database initialized at {}", db_path.display());
     Ok(())
 }
 
@@ -36,7 +36,7 @@ pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     };
 
     let stats = run_index(&conn, &file_paths, &project_root)?;
-    eprintln!(
+    log::info!(
         "Indexed: {}, Skipped: {}, Removed: {}",
         stats.indexed, stats.skipped, stats.removed
     );
@@ -232,9 +232,9 @@ pub fn cmd_ingest_session(session_file: &Path) -> anyhow::Result<()> {
         .unwrap_or_default()
         .to_string_lossy();
     if indexed {
-        eprintln!("Session indexed: {name}");
+        log::info!("Session indexed: {name}");
     } else {
-        eprintln!("Session unchanged: {name}");
+        log::info!("Session unchanged: {name}");
     }
     Ok(())
 }
@@ -302,9 +302,9 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
 
         if stats.errors == 0 {
             if stats.filled > 0 {
-                eprintln!("Backfilled {} vectors.", stats.filled);
+                log::info!("Backfilled {} vectors.", stats.filled);
             } else {
-                eprintln!("No missing vectors.");
+                log::info!("No missing vectors.");
             }
             break;
         }
@@ -312,7 +312,7 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
         // Worker may have crashed — check and restart
         if !worker.borrow_mut().is_alive() {
             if restarts >= config::MAX_WORKER_RESTARTS {
-                eprintln!(
+                log::error!(
                     "Worker crashed {} times. {} errors remain.",
                     restarts + 1,
                     stats.errors
@@ -320,7 +320,7 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
                 break;
             }
             restarts += 1;
-            eprintln!(
+            log::warn!(
                 "Worker crashed. Restarting ({restarts}/{})...",
                 config::MAX_WORKER_RESTARTS
             );
@@ -329,7 +329,7 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
             // Next iteration will pick up remaining unchunked vectors
         } else {
             // Worker alive but had encode errors — don't retry
-            eprintln!("Done: {} filled, {} errors.", stats.filled, stats.errors);
+            log::info!("Done: {} filled, {} errors.", stats.filled, stats.errors);
             break;
         }
     }
@@ -353,12 +353,12 @@ pub fn cmd_import_wordnet(wordnet_db: &Path) -> anyhow::Result<()> {
     let conn = db::get_connection(&db_path)?;
 
     let count = crate::synonyms::import_wordnet(&conn, wordnet_db)?;
-    eprintln!("Imported {count} synonym pairs from WordNet.");
+    log::info!("Imported {count} synonym pairs from WordNet.");
 
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM synonyms", [], |r| r.get(0))
         .unwrap_or(0);
-    eprintln!("Total synonyms: {total}");
+    log::info!("Total synonyms: {total}");
     Ok(())
 }
 
@@ -372,10 +372,10 @@ pub fn cmd_setup() -> anyhow::Result<()> {
     let config_path = repo.get("config.json")?;
     let tokenizer_path = repo.get("tokenizer.json")?;
     let weights_path = repo.get("model.safetensors")?;
-    eprintln!("Model files downloaded:");
-    eprintln!("  config:    {}", config_path.display());
-    eprintln!("  tokenizer: {}", tokenizer_path.display());
-    eprintln!("  weights:   {}", weights_path.display());
+    log::info!("Model files downloaded:");
+    log::info!("  config:    {}", config_path.display());
+    log::info!("  tokenizer: {}", tokenizer_path.display());
+    log::info!("  weights:   {}", weights_path.display());
     Ok(())
 }
 
@@ -965,13 +965,13 @@ pub fn cmd_dict_update(
 
     let candidates = user_dict::get_threshold_candidates(&conn, threshold);
     if candidates.is_empty() {
-        eprintln!("No candidates meet the threshold (freq >= {threshold}).");
+        log::info!("No candidates meet the threshold (freq >= {threshold}).");
         return Ok(());
     }
 
-    eprintln!("=== Dictionary Update Candidates ===\n");
+    log::info!("=== Dictionary Update Candidates ===\n");
     for c in &candidates {
-        eprintln!(
+        log::info!(
             "  {:<20} {:>3} hits  (first: {}, last: {})",
             c.surface,
             c.frequency,
@@ -979,7 +979,7 @@ pub fn cmd_dict_update(
             &c.last_seen[..10.min(c.last_seen.len())]
         );
     }
-    eprintln!(
+    log::info!(
         "\n{} word(s) will be added to user_dict.csv.",
         candidates.len()
     );
@@ -989,7 +989,7 @@ pub fn cmd_dict_update(
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         if input.trim().to_lowercase() != "y" {
-            eprintln!("Cancelled.");
+            log::info!("Cancelled.");
             return Ok(());
         }
     }
@@ -998,17 +998,17 @@ pub fn cmd_dict_update(
     let csv_path = config::user_dict_path();
     let exported = user_dict::export_candidates_to_csv(&conn, &csv_path, threshold, format)?;
     let count = exported.len();
-    eprintln!("Wrote {count} word(s) to {}", csv_path.display());
+    log::info!("Wrote {count} word(s) to {}", csv_path.display());
 
     if count == 0 {
-        eprintln!("All candidates were already in the dict file. Nothing to do.");
+        log::info!("All candidates were already in the dict file. Nothing to do.");
         return Ok(());
     }
 
     drop(conn);
 
     // Rebuild
-    eprintln!("\nRebuilding index...");
+    log::info!("\nRebuilding index...");
     cmd_rebuild(true)?;
 
     // Save current branch to return to later
@@ -1055,7 +1055,7 @@ pub fn cmd_dict_update(
         "gh",
         &["pr", "create", "--title", &pr_title, "--body", &pr_body],
     ) {
-        eprintln!("Warning: `gh pr create` failed ({e}). Push succeeded — create the PR manually.");
+        log::warn!("`gh pr create` failed ({e}). Push succeeded — create the PR manually.");
     }
 
     // Return to original branch
@@ -1094,7 +1094,7 @@ fn spawn_background_backfill() {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Cannot determine executable path: {e}");
+            log::error!("Cannot determine executable path: {e}");
             return;
         }
     };
@@ -1112,7 +1112,7 @@ fn spawn_background_backfill() {
     }
     match cmd.spawn() {
         Ok(_) => {}
-        Err(e) => eprintln!("Failed to start background backfill: {e}"),
+        Err(e) => log::error!("Failed to start background backfill: {e}"),
     }
 }
 
@@ -1122,43 +1122,43 @@ pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
     let socket = Path::new(config::SOCKET_PATH);
 
     if !socket.exists() {
-        eprintln!("Warning: Embedder is not running. Rebuilding without vectors.");
+        log::warn!("Embedder is not running. Rebuilding without vectors.");
         if !force {
             anyhow::bail!("Use --force to proceed without embedder.");
         }
     } else {
-        eprintln!("Embedder: running");
+        log::info!("Embedder: running");
     }
 
     // Backup
     if db_path.exists() {
         let backup = db_path.with_extension("db.bak");
         std::fs::copy(&db_path, &backup)?;
-        eprintln!("Backup: {}", backup.display());
+        log::info!("Backup: {}", backup.display());
         std::fs::remove_file(&db_path)?;
-        eprintln!("Deleted: {}", db_path.display());
+        log::info!("Deleted: {}", db_path.display());
     }
 
     // Init
     db::init_db(&db_path)?;
-    eprintln!("DB initialized");
+    log::info!("DB initialized");
 
     // Full index (synchronous, with progress)
     let conn = db::get_connection(&db_path)?;
     let file_paths = collect_content_files(&project_root);
     let total = file_paths.len();
-    eprintln!("Indexing {total} files...");
+    log::info!("Indexing {total} files...");
 
     let progress = |current: usize, total: usize, path: &Path| {
         let rel = path
             .strip_prefix(&project_root)
             .unwrap_or(path)
             .display();
-        eprintln!("  [{current}/{total}] {rel}");
+        log::debug!("  [{current}/{total}] {rel}");
     };
     let stats =
         indexer::index_all_with_progress(&conn, &file_paths, &project_root, Some(&progress))?;
-    eprintln!(
+    log::info!(
         "Done: Indexed: {}, Skipped: {}, Removed: {}",
         stats.indexed, stats.skipped, stats.removed
     );
@@ -1173,18 +1173,18 @@ pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
     drop(conn);
 
     if vecs >= chunks {
-        eprintln!("Vectors: {vecs} (matches all chunks)");
+        log::info!("Vectors: {vecs} (matches all chunks)");
     } else if socket.exists() && chunks > 0 {
         let current_status = crate::status::read(&config::data_dir());
         if current_status.backfill.is_some() {
-            eprintln!("Vectors: {vecs} / {chunks} — backfill already in progress");
+            log::info!("Vectors: {vecs} / {chunks} — backfill already in progress");
         } else {
-            eprintln!("Vectors: {vecs} / {chunks} — starting backfill in background...");
+            log::info!("Vectors: {vecs} / {chunks} — starting backfill in background...");
             spawn_background_backfill();
         }
-        eprintln!("Run `tsm doctor` to check progress.");
+        log::info!("Run `tsm doctor` to check progress.");
     } else if chunks > 0 {
-        eprintln!("Vectors: {vecs} / {chunks} — embedder not running, skipping backfill");
+        log::warn!("Vectors: {vecs} / {chunks} — embedder not running, skipping backfill");
     }
 
     Ok(())
