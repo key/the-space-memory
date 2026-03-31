@@ -155,18 +155,18 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
 }
 
 /// Ensure the `content_hash` column exists on the `chunks` table (migration for older DBs).
-pub fn ensure_chunk_hash_column(conn: &Connection) {
+pub fn ensure_chunk_hash_column(conn: &Connection) -> anyhow::Result<()> {
     let has: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('chunks') WHERE name='content_hash'",
             [],
             |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
+        )?
         > 0;
     if !has {
-        let _ = conn.execute("ALTER TABLE chunks ADD COLUMN content_hash TEXT", []);
+        conn.execute("ALTER TABLE chunks ADD COLUMN content_hash TEXT", [])?;
     }
+    Ok(())
 }
 
 /// Get a connection to the database at the given path.
@@ -174,7 +174,7 @@ pub fn get_connection(db_path: &Path) -> anyhow::Result<Connection> {
     ensure_vec_extension();
     let conn = Connection::open(db_path)?;
     apply_pragmas(&conn)?;
-    ensure_chunk_hash_column(&conn);
+    ensure_chunk_hash_column(&conn)?;
     Ok(conn)
 }
 

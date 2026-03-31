@@ -318,10 +318,10 @@ pub fn index_file(
 
     if diff.had_mutations {
         // Rebuild entity graph (document-level)
-        let _ = tx.execute("DELETE FROM entity_edges WHERE doc_id = ?", [doc_id])
+        tx.execute("DELETE FROM entity_edges WHERE doc_id = ?", [doc_id])
             .or_else(|e| {
                 if e.to_string().contains("no such table") { Ok(0) } else { Err(e) }
-            });
+            })?;
         if let Err(e) = entity::insert_entities(&tx, doc_id, &diff.all_chunk_entries, &fm.tags) {
             eprintln!("entity extraction warning: {e}");
         }
@@ -1567,6 +1567,18 @@ mod tests {
             )
             .unwrap();
         assert!(fts_count > 0, "updated content should be searchable in FTS");
+
+        // Verify old Section B content is no longer in FTS
+        // (search for the combined unique phrase from old Section B)
+        let old_b_id = ids_after.last().unwrap().0;
+        let old_b_content: String = conn
+            .query_row(
+                "SELECT content FROM chunks_fts WHERE rowid = ?",
+                [old_b_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!old_b_content.contains("original"), "updated chunk's FTS should not contain old text");
     }
 
     #[test]
@@ -1654,5 +1666,84 @@ mod tests {
             let found = ids_after.iter().any(|(aid, aidx)| aid == id && aidx == idx);
             assert!(found, "original chunk at index {} should be preserved", idx);
         }
+    }
+
+    #[test]
+    fn test_null_content_hash_treated_as_changed() {
+        let (conn, dir) = setup();
+        let content = "# Doc\n\n## Section A\n\nContent A here with text.\n";
+        let path = write_md(dir.path(), "daily/notes/test.md", content);
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let doc_id = get_doc_id(&conn);
+
+        // Simulate a pre-migration chunk by clearing content_hash to NULL
+        conn.execute("UPDATE chunks SET content_hash = NULL WHERE document_id = ?", [doc_id])
+            .unwrap();
+        // Force file_hash change to trigger re-index
+        conn.execute("UPDATE documents SET file_hash = 'stale' WHERE id = ?", [doc_id])
+            .unwrap();
+
+        // Re-index same content — NULL hash should be treated as changed
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        // Verify content_hash is now populated
+        let hash: Option<String> = conn
+            .query_row("SELECT content_hash FROM chunks WHERE document_id = ? LIMIT 1", [doc_id], |r| r.get(0))
+            .unwrap();
+        assert!(hash.is_some(), "content_hash should be populated after re-index");
+        assert_eq!(hash.unwrap().len(), 64, "content_hash should be 64-char hex");
+    }
+
+    #[test]
+    fn test_no_mutation_preserves_entities_and_links() {
+        let (conn, dir) = setup();
+        let content = "---\ntags: [rust, test]\n---\n\n# Doc\n\nSome content about Rust testing.\n";
+        let path = write_md(dir.path(), "daily/notes/test.md", content);
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let doc_id = get_doc_id(&conn);
+
+        // Check entity data exists after first index
+        let entity_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunk_entities ce JOIN chunks c ON ce.chunk_id = c.id WHERE c.document_id = ?",
+                [doc_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        // Force file_hash to differ (but keep content identical) to trigger re-index
+        conn.execute("UPDATE documents SET file_hash = 'stale' WHERE id = ?", [doc_id])
+            .unwrap();
+
+        // Re-index — had_mutations should be false, entities should be preserved
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let entity_count_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunk_entities ce JOIN chunks c ON ce.chunk_id = c.id WHERE c.document_id = ?",
+                [doc_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert_eq!(entity_count, entity_count_after, "entity data should be preserved when chunks unchanged");
+    }
+
+    #[test]
+    fn test_doc_id_preserved_on_reindex() {
+        let (conn, dir) = setup();
+        let content = "# Doc\n\n## Section A\n\nContent A here with text.\n";
+        let path = write_md(dir.path(), "daily/notes/test.md", content);
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let doc_id_before = get_doc_id(&conn);
+
+        // Modify and re-index
+        std::fs::write(&path, "# Doc\n\n## Section A\n\nUpdated content here.\n").unwrap();
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let doc_id_after = get_doc_id(&conn);
+        assert_eq!(doc_id_before, doc_id_after, "doc_id should be preserved across re-indexes");
     }
 }
