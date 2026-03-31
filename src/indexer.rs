@@ -67,23 +67,26 @@ fn delete_chunk_side_tables(conn: &Connection, chunk_ids: &[i64]) -> anyhow::Res
         param_refs.as_slice(),
     )?;
 
-    // chunks_vec may not exist
-    let _ = conn.execute(
+    // chunks_vec may not exist in older DBs
+    conn.execute(
         &format!("DELETE FROM chunks_vec WHERE rowid IN ({placeholders})"),
         param_refs.as_slice(),
-    );
+    )
+    .or_else(|e| if e.to_string().contains("no such table") { Ok(0) } else { Err(e) })?;
 
-    // chunks_vec_skip — may not exist
-    let _ = conn.execute(
+    // chunks_vec_skip — may not exist in older DBs
+    conn.execute(
         &format!("DELETE FROM chunks_vec_skip WHERE chunk_id IN ({placeholders})"),
         param_refs.as_slice(),
-    );
+    )
+    .or_else(|e| if e.to_string().contains("no such table") { Ok(0) } else { Err(e) })?;
 
-    // chunk_entities — may not exist
-    let _ = conn.execute(
+    // chunk_entities — may not exist in older DBs
+    conn.execute(
         &format!("DELETE FROM chunk_entities WHERE chunk_id IN ({placeholders})"),
         param_refs.as_slice(),
-    );
+    )
+    .or_else(|e| if e.to_string().contains("no such table") { Ok(0) } else { Err(e) })?;
 
     Ok(())
 }
@@ -132,6 +135,9 @@ struct DiffResult {
 
 /// Compare freshly parsed chunks against stored chunks for a document.
 /// Inserts new chunks, updates changed chunks, deletes removed chunks, skips unchanged.
+///
+/// MUST be called within a transaction — the caller is responsible for wrapping
+/// this in `unchecked_transaction()` to ensure atomicity of the multi-statement diff.
 fn diff_chunks(conn: &Connection, doc_id: i64, new_chunks: &[ChunkInput]) -> anyhow::Result<DiffResult> {
     use std::collections::HashMap;
 
@@ -473,6 +479,9 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
     };
 
     let diff = diff_chunks(&tx, doc_id, &chunk_inputs)?;
+
+    // Note: entity graph and doc_links are not rebuilt for sessions.
+    // Sessions don't participate in entity co-occurrence or link graphs.
 
     tx.commit()?;
 
