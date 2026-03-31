@@ -192,8 +192,10 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
         let db_path = crate::config::db_path();
         if db_path.exists() {
             std::thread::spawn(move || {
-                if let Err(e) = crate::cli::backfill_with_worker(&db_path) {
-                    log::warn!("Backfill warning: {e}");
+                log::info!("Starting backfill worker...");
+                match crate::cli::backfill_with_worker(&db_path) {
+                    Ok(()) => log::info!("Backfill completed"),
+                    Err(e) => log::warn!("Backfill failed: {e}"),
                 }
             });
         }

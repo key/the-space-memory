@@ -112,7 +112,11 @@ fn main() -> Result<()> {
                 Ok(child) => {
                     let child_pid = child.id();
                     log::info!("embedder started (PID {child_pid})");
-                    let _ = std::fs::write(&embedder_pid_path, child_pid.to_string());
+                    if let Err(e) = std::fs::write(&embedder_pid_path, child_pid.to_string()) {
+                        log::warn!("failed to write embedder PID file: {e}");
+                    } else {
+                        log::info!("embedder PID file: {}", embedder_pid_path.display());
+                    }
                     status::update(&data_dir, |s| {
                         s.embedder = Some(status::EmbedderStatus {
                             started_at: chrono::Utc::now().to_rfc3339(),
@@ -142,7 +146,11 @@ fn main() -> Result<()> {
                 Ok(child) => {
                     let child_pid = child.id();
                     log::info!("watcher started (PID {child_pid})");
-                    let _ = std::fs::write(&watcher_pid_path, child_pid.to_string());
+                    if let Err(e) = std::fs::write(&watcher_pid_path, child_pid.to_string()) {
+                        log::warn!("failed to write watcher PID file: {e}");
+                    } else {
+                        log::info!("watcher PID file: {}", watcher_pid_path.display());
+                    }
                     status::update(&data_dir, |s| {
                         s.watcher = Some(status::WatcherStatus {
                             started_at: chrono::Utc::now().to_rfc3339(),
