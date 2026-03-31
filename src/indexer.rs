@@ -1096,6 +1096,103 @@ mod tests {
         assert_eq!(stats2.errors, 0, "no errors on second run");
     }
 
+    #[test]
+    fn test_backfill_embedding_count_mismatch_triggers_retry() {
+        let (conn, dir) = setup();
+        for i in 0..3 {
+            let md = format!("# Doc {i}\n\nContent for doc number {i}.\n");
+            let path = write_md(dir.path(), &format!("daily/notes/test{i}.md"), &md);
+            index_file(&conn, &path, dir.path()).unwrap();
+        }
+        clear_vectors(&conn);
+
+        // Return wrong number of embeddings for batch (> 1), correct for individual (== 1)
+        let encode_mismatch = |texts: &[String]| -> anyhow::Result<Vec<Vec<f32>>> {
+            if texts.len() > 1 {
+                // Return only 1 embedding for a batch of N
+                mock_encode(&texts[..1].to_vec())
+            } else {
+                mock_encode(texts)
+            }
+        };
+
+        let stats = backfill_vectors(&conn, &encode_mismatch, 8, None).unwrap();
+        let chunk_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            stats.filled as i64, chunk_count,
+            "all chunks should be filled via individual retry after mismatch"
+        );
+    }
+
+    #[test]
+    fn test_backfill_skip_cleared_on_reindex() {
+        let (conn, dir) = setup();
+        let path = write_md(
+            dir.path(),
+            "daily/notes/test.md",
+            "# Hello\n\nContent here.\n",
+        );
+        index_file(&conn, &path, dir.path()).unwrap();
+        clear_vectors(&conn);
+
+        // Fail to create skip records
+        backfill_vectors(&conn, &mock_encode_fail, BACKFILL_BATCH_SIZE, None).unwrap();
+        let skip_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec_skip", [], |r| r.get(0))
+            .unwrap();
+        assert!(skip_before > 0);
+
+        // Re-index same file with new content → old chunks deleted → skip records cleaned
+        std::fs::write(&path, "# Updated\n\nNew content.\n").unwrap();
+        index_file(&conn, &path, dir.path()).unwrap();
+        // Clear vectors that may have been inserted by a running embedder daemon
+        clear_vectors(&conn);
+
+        let skip_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec_skip", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            skip_after, 0,
+            "skip records should be cleaned up on re-index"
+        );
+
+        // Backfill should now succeed for the new chunks
+        let stats = backfill_vectors(&conn, &mock_encode, BACKFILL_BATCH_SIZE, None).unwrap();
+        assert!(stats.filled > 0, "new chunks should be backfilled");
+        assert_eq!(stats.errors, 0);
+    }
+
+    #[test]
+    fn test_backfill_batch_panic_retries_individually() {
+        let (conn, dir) = setup();
+        for i in 0..3 {
+            let md = format!("# Doc {i}\n\nContent for document number {i}.\n");
+            let path = write_md(dir.path(), &format!("daily/notes/test{i}.md"), &md);
+            index_file(&conn, &path, dir.path()).unwrap();
+        }
+        clear_vectors(&conn);
+
+        // Panic on batch (len > 1), succeed on individual (len == 1)
+        let encode_panic_batch = |texts: &[String]| -> anyhow::Result<Vec<Vec<f32>>> {
+            if texts.len() > 1 {
+                panic!("batch panic");
+            }
+            mock_encode(texts)
+        };
+
+        let stats = backfill_vectors(&conn, &encode_panic_batch, 8, None).unwrap();
+        let chunk_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(stats.panics > 0, "should have caught batch panic");
+        assert_eq!(
+            stats.filled as i64, chunk_count,
+            "all chunks should be filled via individual retry after batch panic"
+        );
+    }
+
     // ─── entity integration tests ────────────────────────────
 
     #[test]
