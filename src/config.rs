@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -26,6 +27,55 @@ const DEFAULT_STATE_DIR: &str = ".tsm";
 const DEFAULT_INDEX_ROOT: &str = "/workspaces";
 const DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS: u64 = 300;
+
+/// Behavior when the embedder is stopped during search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub enum SearchFallback {
+    /// Error exit (default) — refuse to search without vector search.
+    #[default]
+    Error,
+    /// Fall back to FTS5-only search with a warning.
+    FtsOnly,
+}
+
+impl<'de> serde::Deserialize<'de> for SearchFallback {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "error" => Ok(SearchFallback::Error),
+            "fts_only" => Ok(SearchFallback::FtsOnly),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown search_fallback value: '{other}' (expected 'error' or 'fts_only')"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for SearchFallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SearchFallback::Error => write!(f, "error"),
+            SearchFallback::FtsOnly => write!(f, "fts_only"),
+        }
+    }
+}
+
+impl std::str::FromStr for SearchFallback {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "error" => Ok(SearchFallback::Error),
+            "fts_only" => Ok(SearchFallback::FtsOnly),
+            other => Err(format!(
+                "unknown search_fallback value: '{other}' (expected 'error' or 'fts_only')"
+            )),
+        }
+    }
+}
 
 /// Content directories with score weights. (directory, weight)
 pub const CONTENT_DIRS: &[(&str, f64)] = &[
@@ -57,6 +107,7 @@ pub(crate) struct ConfigFile {
     log_dir: Option<PathBuf>,
     embedder_idle_timeout_secs: Option<u64>,
     embedder_backfill_interval_secs: Option<u64>,
+    search_fallback: Option<SearchFallback>,
 }
 
 /// Fully resolved configuration — all values determined at startup.
@@ -100,6 +151,11 @@ pub struct ResolvedConfig {
     /// Default: 300.
     /// Env: `TSM_EMBEDDER_BACKFILL_INTERVAL`. Config: `embedder_backfill_interval_secs`.
     pub embedder_backfill_interval_secs: u64,
+
+    /// Behavior when the embedder is stopped during search.
+    /// Default: `Error` (refuse to search without vector search).
+    /// Env: `TSM_SEARCH_FALLBACK`. Config: `search_fallback`.
+    pub search_fallback: SearchFallback,
 }
 
 impl ResolvedConfig {
@@ -142,6 +198,8 @@ impl ResolvedConfig {
         )
         .unwrap_or(DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS);
 
+        let search_fallback = env_parse_fallback(file_cfg.search_fallback);
+
         Self {
             state_dir,
             index_root,
@@ -150,6 +208,7 @@ impl ResolvedConfig {
             log_dir,
             embedder_idle_timeout_secs,
             embedder_backfill_interval_secs,
+            search_fallback,
         }
     }
 }
@@ -160,6 +219,17 @@ fn env_or(var: &str, file_val: Option<&PathBuf>) -> Option<PathBuf> {
         return Some(PathBuf::from(val));
     }
     file_val.cloned()
+}
+
+/// Resolve search_fallback: env var > config file > default (Error).
+fn env_parse_fallback(file_val: Option<SearchFallback>) -> SearchFallback {
+    if let Ok(val) = std::env::var("TSM_SEARCH_FALLBACK") {
+        match val.parse::<SearchFallback>() {
+            Ok(f) => return f,
+            Err(e) => log::warn!("TSM_SEARCH_FALLBACK='{val}' is invalid ({e}); using default"),
+        }
+    }
+    file_val.unwrap_or_default()
 }
 
 /// Read an env var as u64, falling back to a config file value.
@@ -219,6 +289,7 @@ fn load_config_from(candidates: &[PathBuf]) -> ConfigFile {
         merged.embedder_backfill_interval_secs = merged
             .embedder_backfill_interval_secs
             .or(file.embedder_backfill_interval_secs);
+        merged.search_fallback = merged.search_fallback.or(file.search_fallback);
     }
     merged
 }
@@ -263,6 +334,10 @@ pub fn embedder_idle_timeout_secs() -> u64 {
 
 pub fn embedder_backfill_interval_secs() -> u64 {
     resolved().embedder_backfill_interval_secs
+}
+
+pub fn search_fallback() -> SearchFallback {
+    resolved().search_fallback
 }
 
 // ─── Derived paths ───────────────────────────────────────────────
@@ -740,5 +815,80 @@ index_root = "/low-root"
         ensure_model_cache_env();
         assert_eq!(std::env::var("HF_HUB_CACHE").unwrap(), "/my/custom/cache");
         std::env::remove_var("HF_HUB_CACHE");
+    }
+
+    // ─── SearchFallback ────────────────────────────────────────────────
+
+    #[test]
+    fn test_search_fallback_default() {
+        assert_eq!(SearchFallback::default(), SearchFallback::Error);
+    }
+
+    #[test]
+    fn test_search_fallback_from_str() {
+        assert_eq!("error".parse::<SearchFallback>().unwrap(), SearchFallback::Error);
+        assert_eq!("fts_only".parse::<SearchFallback>().unwrap(), SearchFallback::FtsOnly);
+        assert!("invalid".parse::<SearchFallback>().is_err());
+    }
+
+    #[test]
+    fn test_search_fallback_display() {
+        assert_eq!(SearchFallback::Error.to_string(), "error");
+        assert_eq!(SearchFallback::FtsOnly.to_string(), "fts_only");
+    }
+
+    #[test]
+    fn test_search_fallback_serde_roundtrip() {
+        let val: SearchFallback = serde_json::from_str("\"error\"").unwrap();
+        assert_eq!(val, SearchFallback::Error);
+        let val: SearchFallback = serde_json::from_str("\"fts_only\"").unwrap();
+        assert_eq!(val, SearchFallback::FtsOnly);
+        assert!(serde_json::from_str::<SearchFallback>("\"bogus\"").is_err());
+    }
+
+    #[test]
+    fn test_search_fallback_toml() {
+        let cfg: ConfigFile = toml::from_str(r#"search_fallback = "fts_only""#).unwrap();
+        assert_eq!(cfg.search_fallback, Some(SearchFallback::FtsOnly));
+
+        let cfg: ConfigFile = toml::from_str(r#"search_fallback = "error""#).unwrap();
+        assert_eq!(cfg.search_fallback, Some(SearchFallback::Error));
+
+        assert!(toml::from_str::<ConfigFile>(r#"search_fallback = "nope""#).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolved_search_fallback_default() {
+        std::env::remove_var("TSM_SEARCH_FALLBACK");
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.search_fallback, SearchFallback::Error);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolved_search_fallback_from_config() {
+        std::env::remove_var("TSM_SEARCH_FALLBACK");
+        let cfg = resolved_from_toml(r#"search_fallback = "fts_only""#);
+        assert_eq!(cfg.search_fallback, SearchFallback::FtsOnly);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolved_search_fallback_env_overrides_config() {
+        std::env::set_var("TSM_SEARCH_FALLBACK", "fts_only");
+        let cfg = resolved_from_toml(r#"search_fallback = "error""#);
+        std::env::remove_var("TSM_SEARCH_FALLBACK");
+        assert_eq!(cfg.search_fallback, SearchFallback::FtsOnly);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolved_search_fallback_invalid_env_falls_back() {
+        std::env::set_var("TSM_SEARCH_FALLBACK", "bogus");
+        let cfg = resolved_from_toml(r#"search_fallback = "fts_only""#);
+        std::env::remove_var("TSM_SEARCH_FALLBACK");
+        // Invalid env → falls back to config file value
+        assert_eq!(cfg.search_fallback, SearchFallback::FtsOnly);
     }
 }
