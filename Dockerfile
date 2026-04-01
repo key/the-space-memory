@@ -13,5 +13,4 @@ RUN apt-get update \
 COPY --from=builder /app/target/release/tsm /usr/local/bin/tsm
 COPY --from=builder /app/target/release/tsmd /usr/local/bin/tsmd
 COPY --from=builder /app/target/release/tsm-embedder /usr/local/bin/tsm-embedder
-COPY --from=builder /app/target/release/tsm-watcher /usr/local/bin/tsm-watcher
 ENTRYPOINT ["tsm"]

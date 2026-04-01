@@ -143,7 +143,7 @@ fn discover_subdirs(dir: &Path) -> Vec<PathBuf> {
     result
 }
 
-/// List directories to watch (for tsm-watcher). When content_dirs is configured,
+/// List directories to watch (for the watcher thread). When content_dirs is configured,
 /// returns those paths. Otherwise discovers non-hidden subdirs under index_root.
 pub fn discover_watch_dirs(index_root: &Path) -> Vec<PathBuf> {
     let dirs = config::content_dirs();
@@ -887,6 +887,8 @@ pub struct StatusInfo {
     pub embedder_running: bool,
     pub embedder_pid: Option<u32>,
     pub embedder_since: Option<String>,
+    pub watcher_running: bool,
+    pub watcher_since: Option<String>,
     pub backfill: Option<BackfillInfo>,
     pub documents: Option<i64>,
     pub chunks: Option<i64>,
@@ -918,6 +920,9 @@ pub fn run_status(conn: Option<&rusqlite::Connection>) -> StatusInfo {
     let embedder_running = socket.exists();
     let embedder_pid = sf.embedder.as_ref().map(|e| e.pid);
     let embedder_since = sf.embedder.as_ref().map(|e| e.started_at.clone());
+
+    let watcher_running = sf.watcher.is_some();
+    let watcher_since = sf.watcher.as_ref().map(|w| w.started_at.clone());
 
     let backfill = sf.backfill.as_ref().map(|bf| BackfillInfo {
         filled: bf.filled,
@@ -954,6 +959,8 @@ pub fn run_status(conn: Option<&rusqlite::Connection>) -> StatusInfo {
         embedder_running,
         embedder_pid,
         embedder_since,
+        watcher_running,
+        watcher_since,
         backfill,
         documents,
         chunks,
@@ -986,6 +993,18 @@ pub fn print_status_info(info: &StatusInfo) {
         }
     } else {
         println!("  Embedder:  stopped");
+    }
+
+    // Watcher
+    if info.watcher_running {
+        if let Some(ref since) = info.watcher_since {
+            let since_fmt = format_since(since);
+            println!("  Watcher:   running (since {since_fmt})");
+        } else {
+            println!("  Watcher:   running");
+        }
+    } else {
+        println!("  Watcher:   stopped");
     }
 
     // Backfill

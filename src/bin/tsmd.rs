@@ -1,12 +1,17 @@
+use std::collections::HashSet;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use notify_debouncer_mini::notify::RecursiveMode;
+use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
 
+use the_space_memory::cli;
 use the_space_memory::config;
 use the_space_memory::daemon;
 use the_space_memory::daemon_protocol::{read_request, write_response, DaemonRequest};
@@ -101,7 +106,6 @@ fn main() -> Result<()> {
     // alive (orphaned from a prior tsmd), we skip spawning a duplicate.
     // Children are NOT auto-restarted on crash to prevent OOM restart loops.
     let embedder_pid_path = state_dir.join("embedder.pid");
-    let watcher_pid_path = state_dir.join("watcher.pid");
 
     let mut embedder_child: Option<Child> = if !args.no_embedder {
         if is_process_alive(&embedder_pid_path) {
@@ -147,48 +151,31 @@ fn main() -> Result<()> {
         None
     };
 
-    let mut watcher_child: Option<Child> = if !args.no_watcher {
-        if is_process_alive(&watcher_pid_path) {
-            log::info!(
-                "watcher already running (PID file: {})",
-                watcher_pid_path.display()
-            );
-            None
-        } else {
-            let _ = std::fs::remove_file(&watcher_pid_path);
-            match start_child("tsm-watcher", &[]) {
-                Ok(mut child) => {
-                    let child_pid = child.id();
-                    log::info!("watcher started (PID {child_pid})");
-                    if let Err(e) = std::fs::write(&watcher_pid_path, child_pid.to_string()) {
-                        log::error!(
-                            "failed to write watcher PID file: {e}; \
-                             killing child to prevent unguarded spawn"
-                        );
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        None
-                    } else {
-                        log::info!("watcher PID file: {}", watcher_pid_path.display());
-                        status::update(&state_dir, |s| {
-                            s.watcher = Some(status::WatcherStatus {
-                                started_at: chrono::Utc::now().to_rfc3339(),
-                                pid: child_pid,
-                            });
-                        });
-                        Some(child)
-                    }
-                }
-                Err(e) => {
-                    log::error!("failed to start watcher: {e}");
-                    None
-                }
+    // Start watcher as a thread (not a child process)
+    if !args.no_watcher {
+        let conn = Arc::clone(&conn);
+        let index_root = index_root.clone();
+        let watcher_state_dir = state_dir.clone();
+        status::update(&state_dir, |s| {
+            s.watcher = Some(status::WatcherStatus {
+                started_at: chrono::Utc::now().to_rfc3339(),
+            });
+        });
+        log::info!("starting watcher thread");
+        std::thread::spawn(move || {
+            if let Err(e) = run_watcher(&conn, &index_root) {
+                log::error!("watcher thread failed: {e}");
             }
-        }
+            log::info!("watcher thread stopped");
+            status::update(&watcher_state_dir, |s| s.watcher = None);
+        });
     } else {
         log::info!("watcher disabled (--no-watcher)");
-        None
     };
+
+    // Clean up stale watcher PID file from previous process-based watcher
+    let watcher_pid_path = state_dir.join("watcher.pid");
+    let _ = std::fs::remove_file(&watcher_pid_path);
 
     // Search-active counter: backfill yields when search requests are in-flight.
     let search_active = Arc::new(AtomicUsize::new(0));
@@ -243,9 +230,6 @@ fn main() -> Result<()> {
                 if reap_child("embedder", &mut embedder_child, &embedder_pid_path) {
                     status::update(&state_dir, |s| s.embedder = None);
                 }
-                if reap_child("watcher", &mut watcher_child, &watcher_pid_path) {
-                    status::update(&state_dir, |s| s.watcher = None);
-                }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => {
@@ -258,7 +242,6 @@ fn main() -> Result<()> {
     // Cleanup
     log::info!("shutting down");
     stop_child("embedder", embedder_child, &embedder_pid_path);
-    stop_child("watcher", watcher_child, &watcher_pid_path);
 
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&pid_path);
@@ -536,9 +519,154 @@ fn sleep_interruptible(duration: std::time::Duration) {
     }
 }
 
+// ─── Watcher thread ─────────────────────────────────────────────
+
+/// Run the file watcher loop. Watches content directories for .md changes
+/// and indexes them directly via the shared DB connection.
+fn run_watcher(conn: &Arc<Mutex<rusqlite::Connection>>, index_root: &Path) -> Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut debouncer =
+        new_debouncer(Duration::from_secs(2), tx).context("Failed to create file watcher")?;
+
+    let mut watched = 0;
+    for full_dir in cli::discover_watch_dirs(index_root) {
+        if full_dir.is_dir() {
+            if let Err(e) = debouncer
+                .watcher()
+                .watch(&full_dir, RecursiveMode::Recursive)
+            {
+                log::warn!("cannot watch {}: {e}", full_dir.display());
+            } else {
+                watched += 1;
+            }
+        }
+    }
+
+    if watched == 0 {
+        anyhow::bail!(
+            "No content directories found to watch under {}",
+            index_root.display()
+        );
+    }
+
+    log::info!(
+        "watching {watched} directories under {}",
+        index_root.display()
+    );
+
+    while !SHUTDOWN.load(Ordering::SeqCst) {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Ok(events)) => {
+                let mut files_to_index: HashSet<String> = HashSet::new();
+                for event in &events {
+                    if event.kind != DebouncedEventKind::Any {
+                        continue;
+                    }
+                    if event.path.extension().is_none_or(|ext| ext != "md") {
+                        continue;
+                    }
+                    match event.path.strip_prefix(index_root) {
+                        Ok(rel) => {
+                            files_to_index.insert(rel.to_string_lossy().into_owned());
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "path {} outside project root, skipping",
+                                event.path.display()
+                            );
+                        }
+                    }
+                }
+
+                if !files_to_index.is_empty() {
+                    let file_paths: Vec<PathBuf> = files_to_index
+                        .iter()
+                        .map(|f| index_root.join(f))
+                        .collect();
+                    let count = file_paths.len();
+                    let mut total_indexed: usize = 0;
+                    let mut total_removed: usize = 0;
+
+                    // Index per-file to release DB lock between files,
+                    // matching the backfill batch-and-yield pattern.
+                    for file_path in &file_paths {
+                        if SHUTDOWN.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let conn = conn
+                            .lock()
+                            .map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+                        match cli::run_index(&conn, std::slice::from_ref(file_path), index_root) {
+                            Ok(stats) => {
+                                total_indexed += stats.indexed;
+                                total_removed += stats.removed;
+                            }
+                            Err(e) => {
+                                log::warn!("index error: {e}");
+                            }
+                        }
+                        // lock dropped here
+                    }
+
+                    if total_indexed > 0 || total_removed > 0 {
+                        log::info!(
+                            "indexed {total_indexed}, removed {total_removed} ({count} file(s))"
+                        );
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                log::warn!("watch error: {e}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                log::warn!("watcher channel disconnected");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn test_run_watcher_no_content_dirs() {
+        // run_watcher should fail if no content directories exist
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = the_space_memory::db::get_memory_connection().unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let result = run_watcher(&conn, dir.path());
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No content directories")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_run_watcher_shutdown() {
+        // run_watcher should exit when SHUTDOWN is set
+        let dir = tempfile::TempDir::new().unwrap();
+        // Create a subdirectory so discover_watch_dirs finds something
+        std::fs::create_dir(dir.path().join("notes")).unwrap();
+        let conn = the_space_memory::db::get_memory_connection().unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        // Pre-set SHUTDOWN so the watcher loop exits immediately
+        SHUTDOWN.store(true, Ordering::SeqCst);
+        let result = run_watcher(&conn, dir.path());
+        // Reset for other tests
+        SHUTDOWN.store(false, Ordering::SeqCst);
+        assert!(result.is_ok());
+    }
 
     #[test]
     fn test_search_active_guard_raii() {

@@ -15,10 +15,6 @@ path = "src/bin/tsmd.rs"
 name = "tsm-embedder"
 path = "src/bin/tsm_embedder.rs"
 
-[[bin]]
-name = "tsm-watcher"
-path = "src/bin/tsm_watcher.rs"
-
 [dependencies]
 rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }
 lindera = { version = "2.3", features = ["embed-ipadic"] }

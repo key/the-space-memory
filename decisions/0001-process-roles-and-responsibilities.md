@@ -1,6 +1,6 @@
 # ADR-0001: プロセスの役割と責務分担
 
-- **Status**: **Accepted（確定）**
+- **Status**: **Deprecated（廃止）** — [ADR-0002](./0002-watcher-thread-integration.md) で置換
 - **Date**: 2026-04-01
 - **Deciders**: key
 - **Related**:
