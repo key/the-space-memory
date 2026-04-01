@@ -1204,13 +1204,7 @@ pub fn cmd_dict_reject(apply: bool, all: bool) -> anyhow::Result<()> {
         }
         eprintln!("=== Rejected Candidates ({} total) ===\n", rejected.len());
         for c in &rejected {
-            eprintln!(
-                "  {:<20} {:>3} hits  (first: {}, last: {})",
-                c.surface,
-                c.frequency,
-                &c.first_seen[..10.min(c.first_seen.len())],
-                &c.last_seen[..10.min(c.last_seen.len())]
-            );
+            print_candidate(c);
         }
         return Ok(());
     }
