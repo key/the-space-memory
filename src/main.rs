@@ -69,7 +69,7 @@ enum DictCommands {
         #[arg(long)]
         apply: bool,
         /// Show all rejected words in DB
-        #[arg(long)]
+        #[arg(long, conflicts_with = "apply")]
         all: bool,
     },
 }

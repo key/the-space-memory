@@ -1105,13 +1105,7 @@ pub fn cmd_dict_update(
     // Interactive TUI output — bypass log system for clean display
     eprintln!("=== Dictionary Update Candidates ===\n");
     for c in &candidates {
-        eprintln!(
-            "  {:<20} {:>3} hits  (first: {}, last: {})",
-            c.surface,
-            c.frequency,
-            &c.first_seen[..10.min(c.first_seen.len())],
-            &c.last_seen[..10.min(c.last_seen.len())]
-        );
+        print_candidate(c);
     }
     eprintln!(
         "\n{} word(s) will be added to user dictionary.",
@@ -1240,13 +1234,7 @@ pub fn cmd_dict_reject(apply: bool, all: bool) -> anyhow::Result<()> {
 
     eprintln!("=== Candidates to Reject ===\n");
     for c in &candidates {
-        eprintln!(
-            "  {:<20} {:>3} hits  (first: {}, last: {})",
-            c.surface,
-            c.frequency,
-            &c.first_seen[..10.min(c.first_seen.len())],
-            &c.last_seen[..10.min(c.last_seen.len())]
-        );
+        print_candidate(c);
     }
     eprintln!("\n{} word(s) will be marked rejected.", candidates.len());
 
@@ -1258,6 +1246,16 @@ pub fn cmd_dict_reject(apply: bool, all: bool) -> anyhow::Result<()> {
     let newly_rejected = user_dict::apply_reject_list(&conn, &reject_words)?;
     log::info!("Rejected {} word(s).", newly_rejected.len());
     Ok(())
+}
+
+fn print_candidate(c: &user_dict::Candidate) {
+    eprintln!(
+        "  {:<20} {:>3} hits  (first: {}, last: {})",
+        c.surface,
+        c.frequency,
+        &c.first_seen[..10.min(c.first_seen.len())],
+        &c.last_seen[..10.min(c.last_seen.len())]
+    );
 }
 
 fn run_command(cmd: &str, args: &[&str]) -> anyhow::Result<()> {

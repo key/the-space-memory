@@ -387,13 +387,18 @@ pub fn apply_reject_list(
         .query_map([], |row| row.get(0))?
         .filter_map(|r| r.ok())
         .collect();
+    let tx = conn.unchecked_transaction()?;
     let mut newly_rejected = Vec::new();
-    for surface in pending {
+    for surface in &pending {
         if reject_words.contains(&surface.to_lowercase()) {
-            mark_rejected(conn, &surface)?;
-            newly_rejected.push(surface);
+            tx.execute(
+                "UPDATE dictionary_candidates SET status = 'rejected' WHERE surface = ?",
+                [surface],
+            )?;
+            newly_rejected.push(surface.clone());
         }
     }
+    tx.commit()?;
     Ok(newly_rejected)
 }
 
