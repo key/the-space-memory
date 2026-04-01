@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -18,6 +19,21 @@ impl From<DictFormatArg> for DictFormat {
         match arg {
             DictFormatArg::Simpledic => DictFormat::Simpledic,
             DictFormatArg::Ipadic => DictFormat::Ipadic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SearchFallbackArg {
+    Error,
+    FtsOnly,
+}
+
+impl fmt::Display for SearchFallbackArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SearchFallbackArg::Error => write!(f, "error"),
+            SearchFallbackArg::FtsOnly => write!(f, "fts_only"),
         }
     }
 }
@@ -73,6 +89,9 @@ enum Commands {
         /// Filter: documents from a specific year
         #[arg(long)]
         year: Option<i32>,
+        /// Embedder fallback mode: error (default) or fts_only
+        #[arg(long, value_enum)]
+        fallback: Option<SearchFallbackArg>,
     },
     /// Ingest a session JSONL file
     IngestSession {
@@ -118,6 +137,8 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Restart the daemon (stop + start)
+    Restart,
     /// Internal: backfill worker subprocess (do not call directly)
     #[command(hide = true)]
     BackfillWorker,
@@ -132,6 +153,10 @@ fn main() -> anyhow::Result<()> {
         Commands::Init => cli::cmd_init()?,
         Commands::Start => cmd_start()?,
         Commands::Stop => cmd_stop()?,
+        Commands::Restart => {
+            cmd_stop()?;
+            cmd_start()?;
+        }
         Commands::Setup => cli::cmd_setup()?,
         Commands::BackfillWorker => cli::cmd_backfill_worker()?,
         Commands::VectorFill { batch_size } => cli::cmd_vector_fill(batch_size)?,
@@ -160,7 +185,14 @@ fn main() -> anyhow::Result<()> {
             before,
             recent,
             year,
+            fallback,
         } => {
+            // Always resolve fallback so the daemon uses the CLI caller's config
+            let fallback = Some(
+                fallback
+                    .map(|f| f.to_string())
+                    .unwrap_or_else(|| config::search_fallback().to_string()),
+            );
             let req = DaemonRequest::Search {
                 query,
                 top_k,
@@ -170,6 +202,7 @@ fn main() -> anyhow::Result<()> {
                 before,
                 recent,
                 year,
+                fallback,
             };
             render_search(send_to_daemon(&req)?, &format)?;
         }

@@ -91,6 +91,7 @@ pub struct SearchOptions<'a> {
     pub before: Option<&'a str>,
     pub recent: Option<&'a str>,
     pub year: Option<i32>,
+    pub fallback: Option<&'a str>,
 }
 
 /// Run search and return structured results (no DB open, no output).
@@ -99,6 +100,23 @@ pub fn run_search(
     opts: &SearchOptions,
 ) -> anyhow::Result<Vec<searcher::SearchResult>> {
     use crate::temporal;
+
+    // Resolve fallback policy: CLI flag > config > default (Error)
+    let fallback = match opts.fallback {
+        Some(s) => s
+            .parse::<config::SearchFallback>()
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        None => config::search_fallback(),
+    };
+
+    let require_vector = fallback == config::SearchFallback::Error;
+
+    if !require_vector {
+        let embedder_socket = config::embedder_socket_path();
+        if !embedder_socket.exists() {
+            log::warn!("Embedder is not running. Falling back to FTS-only search.");
+        }
+    }
 
     let parsed = temporal::parse_temporal(opts.query);
     let filter = temporal::merge_filters(
@@ -109,7 +127,13 @@ pub fn run_search(
         parsed.filter,
     )?;
     let search_query = &parsed.query;
-    searcher::search(conn, search_query, opts.top_k, filter.as_ref())
+    searcher::search(
+        conn,
+        search_query,
+        opts.top_k,
+        filter.as_ref(),
+        require_vector,
+    )
 }
 
 pub fn cmd_search(opts: SearchOptions) -> anyhow::Result<()> {

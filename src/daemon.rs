@@ -33,6 +33,7 @@ pub fn handle_request(
             before,
             recent,
             year,
+            fallback,
         } => {
             let opts = cli::SearchOptions {
                 query: &query,
@@ -43,6 +44,7 @@ pub fn handle_request(
                 before: before.as_deref(),
                 recent: recent.as_deref(),
                 year,
+                fallback: fallback.as_deref(),
             };
             match cli::run_search(conn, &opts) {
                 Ok(results) => {
@@ -166,6 +168,7 @@ mod tests {
             before: None,
             recent: None,
             year: None,
+            fallback: Some("fts_only".into()),
         };
         let resp = handle_request(&conn, req, dir.path(), &flag);
         assert!(resp.ok);
@@ -381,6 +384,7 @@ mod tests {
                 before: None,
                 recent: None,
                 year: None,
+                fallback: Some("fts_only".into()),
             },
         )
         .unwrap();

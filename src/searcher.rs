@@ -26,11 +26,15 @@ pub struct SearchResult {
 }
 
 /// Search for documents matching the query, with optional time filtering.
+///
+/// When `require_vector` is true, returns an error if vector search is
+/// unavailable (embedder not running or vec table missing).
 pub fn search(
     conn: &Connection,
     query: &str,
     top_k: usize,
     time_filter: Option<&TimeFilter>,
+    require_vector: bool,
 ) -> anyhow::Result<Vec<SearchResult>> {
     // Query preprocessing: extract meaningful keywords, skip noise-only queries
     let keywords = extract_search_keywords(query);
@@ -66,6 +70,12 @@ pub fn search(
         fts_results_raw(conn, &expanded, limit)?
     };
     let vec_ranks = vec_results(conn, query, limit)?;
+    if require_vector && vec_ranks.is_empty() && db::has_vec_table(conn) {
+        anyhow::bail!(
+            "Embedder is not running. Vector search unavailable.\n\
+             Run `tsm restart` to restart, or use `--fallback fts_only` for FTS-only search."
+        );
+    }
     let ent_ranks =
         entity::entity_results_by_ids(conn, &cls.matched_entity_ids, limit).unwrap_or_default();
 
@@ -526,7 +536,7 @@ mod tests {
         indexer::index_file(&conn, &full, dir.path()).unwrap();
 
         // Search should find it
-        let results = search(&conn, "射撃", 5, None).unwrap();
+        let results = search(&conn, "射撃", 5, None, false).unwrap();
         assert!(!results.is_empty());
         assert!(results[0].source_file.contains("shooting"));
         assert!(results[0].score > 0.0);
@@ -536,14 +546,14 @@ mod tests {
     #[test]
     fn test_search_empty_query() {
         let conn = db::get_memory_connection().unwrap();
-        let results = search(&conn, "", 5, None).unwrap();
+        let results = search(&conn, "", 5, None, false).unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_search_no_results() {
         let conn = db::get_memory_connection().unwrap();
-        let results = search(&conn, "存在しないキーワード", 5, None).unwrap();
+        let results = search(&conn, "存在しないキーワード", 5, None, false).unwrap();
         assert!(results.is_empty());
     }
 
@@ -568,7 +578,7 @@ mod tests {
             indexer::index_file(&conn, &full, dir.path()).unwrap();
         }
 
-        let results = search(&conn, "テスト", 3, None).unwrap();
+        let results = search(&conn, "テスト", 3, None, false).unwrap();
         assert!(results.len() <= 3);
     }
 
@@ -596,7 +606,7 @@ mod tests {
             after: Some("2020-01-01".to_string()),
             before: Some("2099-01-01".to_string()),
         };
-        let results = search(&conn, "射撃", 5, Some(&filter)).unwrap();
+        let results = search(&conn, "射撃", 5, Some(&filter), false).unwrap();
         assert!(!results.is_empty());
     }
 
@@ -624,7 +634,7 @@ mod tests {
             after: Some("2099-01-01".to_string()),
             before: None,
         };
-        let results = search(&conn, "射撃", 5, Some(&filter)).unwrap();
+        let results = search(&conn, "射撃", 5, Some(&filter), false).unwrap();
         assert!(results.is_empty());
     }
 
@@ -648,7 +658,7 @@ mod tests {
             after: Some("2025-01-01".to_string()),
             before: None,
         };
-        let results = search(&conn, "射撃", 5, Some(&filter)).unwrap();
+        let results = search(&conn, "射撃", 5, Some(&filter), false).unwrap();
         assert!(!results.is_empty());
     }
 
@@ -680,7 +690,7 @@ mod tests {
     fn test_search_noise_query_returns_empty() {
         let conn = db::get_memory_connection().unwrap();
         // Pure interjection/greeting should return empty results
-        let results = search(&conn, "よかったーーー", 5, None).unwrap();
+        let results = search(&conn, "よかったーーー", 5, None, false).unwrap();
         assert!(
             results.is_empty(),
             "Noise query should return empty results"
@@ -690,7 +700,7 @@ mod tests {
     #[test]
     fn test_search_stopword_query_returns_empty() {
         let conn = db::get_memory_connection().unwrap();
-        let results = search(&conn, "なるほど", 5, None).unwrap();
+        let results = search(&conn, "なるほど", 5, None, false).unwrap();
         assert!(
             results.is_empty(),
             "Stopword-only query should return empty results"
@@ -714,7 +724,7 @@ mod tests {
         indexer::index_file(&conn, &full, dir.path()).unwrap();
 
         // A meaningful query should still find results
-        let results = search(&conn, "LoRaモジュール", 5, None).unwrap();
+        let results = search(&conn, "LoRaモジュール", 5, None, false).unwrap();
         assert!(!results.is_empty(), "Meaningful query should find results");
     }
 
@@ -737,7 +747,7 @@ mod tests {
         let _ = conn.execute("DELETE FROM dictionary_candidates", []);
 
         // Search should collect query candidates
-        let _ = search(&conn, "candle framework", 5, None);
+        let _ = search(&conn, "candle framework", 5, None, false);
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM dictionary_candidates", [], |r| {
