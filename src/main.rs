@@ -176,11 +176,11 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Index { files_from_stdin } => {
             let req = if files_from_stdin {
-                let project_root = config::project_root();
-                let paths = cli::read_paths_from_stdin(&project_root);
+                let index_root = config::index_root();
+                let paths = cli::read_paths_from_stdin(&index_root);
                 let rel_paths: Vec<String> = paths
                     .iter()
-                    .filter_map(|p| p.strip_prefix(&project_root).ok())
+                    .filter_map(|p| p.strip_prefix(&index_root).ok())
                     .map(|p| p.to_string_lossy().to_string())
                     .collect();
                 DaemonRequest::Index { files: rel_paths }

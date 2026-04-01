@@ -233,10 +233,10 @@ fn diff_chunks(conn: &Connection, doc_id: i64, new_chunks: &[ChunkInput]) -> any
 pub fn index_file(
     conn: &Connection,
     file_path: &Path,
-    project_root: &Path,
+    index_root: &Path,
 ) -> anyhow::Result<bool> {
     let rel_path = file_path
-        .strip_prefix(project_root)
+        .strip_prefix(index_root)
         .unwrap_or(file_path)
         .to_string_lossy()
         .to_string();
@@ -350,9 +350,9 @@ pub fn index_file(
 pub fn index_all(
     conn: &Connection,
     file_paths: &[PathBuf],
-    project_root: &Path,
+    index_root: &Path,
 ) -> anyhow::Result<IndexStats> {
-    index_all_with_progress(conn, file_paths, project_root, None)
+    index_all_with_progress(conn, file_paths, index_root, None)
 }
 
 /// Progress callback type for index_all_with_progress: (current, total, file_path).
@@ -361,7 +361,7 @@ pub type IndexProgressCb<'a> = &'a dyn Fn(usize, usize, &Path);
 pub fn index_all_with_progress(
     conn: &Connection,
     file_paths: &[PathBuf],
-    project_root: &Path,
+    index_root: &Path,
     progress_cb: Option<IndexProgressCb<'_>>,
 ) -> anyhow::Result<IndexStats> {
     let mut stats = IndexStats::default();
@@ -373,7 +373,7 @@ pub fn index_all_with_progress(
         }
         if !fp.exists() {
             let rel_path = fp
-                .strip_prefix(project_root)
+                .strip_prefix(index_root)
                 .unwrap_or(fp)
                 .to_string_lossy()
                 .to_string();
@@ -391,7 +391,7 @@ pub fn index_all_with_progress(
             continue;
         }
 
-        if index_file(conn, fp, project_root)? {
+        if index_file(conn, fp, index_root)? {
             stats.indexed += 1;
         } else {
             stats.skipped += 1;

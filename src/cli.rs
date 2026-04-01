@@ -19,23 +19,23 @@ pub fn cmd_init() -> anyhow::Result<()> {
 pub fn run_index(
     conn: &rusqlite::Connection,
     file_paths: &[PathBuf],
-    project_root: &Path,
+    index_root: &Path,
 ) -> anyhow::Result<indexer::IndexStats> {
-    indexer::index_all(conn, file_paths, project_root)
+    indexer::index_all(conn, file_paths, index_root)
 }
 
 pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
-    let project_root = config::project_root();
+    let index_root = config::index_root();
 
     let file_paths: Vec<PathBuf> = if files_from_stdin {
-        read_paths_from_stdin(&project_root)
+        read_paths_from_stdin(&index_root)
     } else {
-        collect_content_files(&project_root)
+        collect_content_files(&index_root)
     };
 
-    let stats = run_index(&conn, &file_paths, &project_root)?;
+    let stats = run_index(&conn, &file_paths, &index_root)?;
     log::info!(
         "Indexed: {}, Skipped: {}, Removed: {}",
         stats.indexed, stats.skipped, stats.removed
@@ -43,20 +43,20 @@ pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn read_paths_from_stdin(project_root: &Path) -> Vec<PathBuf> {
+pub fn read_paths_from_stdin(index_root: &Path) -> Vec<PathBuf> {
     std::io::stdin()
         .lock()
         .lines()
         .map_while(Result::ok)
         .filter(|line| !line.trim().is_empty())
-        .map(|line| project_root.join(line.trim()))
+        .map(|line| index_root.join(line.trim()))
         .collect()
 }
 
-pub fn collect_content_files(project_root: &Path) -> Vec<PathBuf> {
+pub fn collect_content_files(index_root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for &(dir, _) in config::CONTENT_DIRS {
-        let full_dir = project_root.join(dir);
+        let full_dir = index_root.join(dir);
         if !full_dir.is_dir() {
             continue;
         }
@@ -161,7 +161,7 @@ fn print_text(results: &[searcher::SearchResult]) {
 pub fn format_json(
     results: &[searcher::SearchResult],
     include_content: Option<usize>,
-    project_root: &Path,
+    index_root: &Path,
 ) -> anyhow::Result<String> {
     let mut json_results: Vec<serde_json::Value> = Vec::new();
 
@@ -190,7 +190,7 @@ pub fn format_json(
 
         if let Some(n) = include_content {
             if i < n {
-                let full_path = project_root.join(&r.source_file);
+                let full_path = index_root.join(&r.source_file);
                 if let Ok(content) = std::fs::read_to_string(&full_path) {
                     obj["content"] = serde_json::Value::String(content);
                 }
@@ -207,8 +207,8 @@ fn print_json(
     results: &[searcher::SearchResult],
     include_content: Option<usize>,
 ) -> anyhow::Result<()> {
-    let project_root = config::project_root();
-    println!("{}", format_json(results, include_content, &project_root)?);
+    let index_root = config::index_root();
+    println!("{}", format_json(results, include_content, &index_root)?);
     Ok(())
 }
 
@@ -293,12 +293,12 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
         std::time::Duration::from_secs(120),
     )?);
     let mut restarts = 0;
-    let data_dir = config::data_dir();
+    let state_dir = config::state_dir();
     let started_at = chrono::Utc::now().to_rfc3339();
 
     // Write initial backfill status
     let started_at_clone = started_at.clone();
-    status::update(&data_dir, |s| {
+    status::update(&state_dir, |s| {
         s.backfill = Some(status::BackfillStatus {
             total: 0,
             filled: 0,
@@ -308,7 +308,7 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
     });
 
     let progress_cb = |total: i64, filled: usize, errors: usize| {
-        status::update(&data_dir, |s| {
+        status::update(&state_dir, |s| {
             if let Some(ref mut b) = s.backfill {
                 b.total = total;
                 b.filled = filled;
@@ -362,7 +362,7 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
     }
 
     // Clear backfill status on completion
-    status::update(&data_dir, |s| {
+    status::update(&state_dir, |s| {
         s.backfill = None;
     });
 
@@ -609,8 +609,8 @@ fn doctor_check_with_conn(
         .unwrap_or(-1);
 
     // Check if backfill is in progress
-    let data_dir = config::data_dir();
-    let sf = crate::status::read(&data_dir);
+    let state_dir = config::state_dir();
+    let sf = crate::status::read(&state_dir);
     let backfill_hint = if let Some(ref bf) = sf.backfill {
         let pct = if bf.total > 0 {
             (bf.filled as f64 / bf.total as f64 * 100.0) as u32
@@ -819,8 +819,8 @@ pub struct BackfillInfo {
 pub fn run_status(conn: Option<&rusqlite::Connection>) -> StatusInfo {
     use crate::status;
 
-    let data_dir = config::data_dir();
-    let sf = status::read(&data_dir);
+    let state_dir = config::state_dir();
+    let sf = status::read(&state_dir);
 
     let daemon_socket_path = config::daemon_socket_path();
     let daemon_running = daemon_socket_path.exists();
@@ -1146,7 +1146,7 @@ fn spawn_background_backfill() {
 
 pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
-    let project_root = config::project_root();
+    let index_root = config::index_root();
     let socket = config::embedder_socket_path();
 
     if !socket.exists() {
@@ -1173,19 +1173,19 @@ pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
 
     // Full index (synchronous, with progress)
     let conn = db::get_connection(&db_path)?;
-    let file_paths = collect_content_files(&project_root);
+    let file_paths = collect_content_files(&index_root);
     let total = file_paths.len();
     log::info!("Indexing {total} files...");
 
     let progress = |current: usize, total: usize, path: &Path| {
         let rel = path
-            .strip_prefix(&project_root)
+            .strip_prefix(&index_root)
             .unwrap_or(path)
             .display();
         log::debug!("  [{current}/{total}] {rel}");
     };
     let stats =
-        indexer::index_all_with_progress(&conn, &file_paths, &project_root, Some(&progress))?;
+        indexer::index_all_with_progress(&conn, &file_paths, &index_root, Some(&progress))?;
     log::info!(
         "Done: Indexed: {}, Skipped: {}, Removed: {}",
         stats.indexed, stats.skipped, stats.removed
@@ -1203,7 +1203,7 @@ pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
     if vecs >= chunks {
         log::info!("Vectors: {vecs} (matches all chunks)");
     } else if socket.exists() && chunks > 0 {
-        let current_status = crate::status::read(&config::data_dir());
+        let current_status = crate::status::read(&config::state_dir());
         if current_status.backfill.is_some() {
             log::info!("Vectors: {vecs} / {chunks} — backfill already in progress");
         } else {

@@ -202,7 +202,7 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
     }
 
     // Write embedder status
-    crate::status::update(&crate::config::data_dir(), |s| {
+    crate::status::update(&crate::config::state_dir(), |s| {
         s.embedder = Some(crate::status::EmbedderStatus {
             started_at: chrono::Utc::now().to_rfc3339(),
             pid: std::process::id(),
@@ -260,7 +260,7 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
     }
 
     log::info!("Shutting down (idle timeout).");
-    crate::status::update(&crate::config::data_dir(), |s| {
+    crate::status::update(&crate::config::state_dir(), |s| {
         s.embedder = None;
     });
     let _ = std::fs::remove_file(socket_path);

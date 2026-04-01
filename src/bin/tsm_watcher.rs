@@ -32,7 +32,7 @@ struct Args {
 
     /// Project root directory
     #[arg(long)]
-    project_root: Option<PathBuf>,
+    index_root: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -43,7 +43,7 @@ fn main() -> Result<()> {
     let daemon_socket = args
         .daemon_socket
         .unwrap_or_else(config::daemon_socket_path);
-    let project_root = args.project_root.unwrap_or_else(config::project_root);
+    let index_root = args.index_root.unwrap_or_else(config::index_root);
 
     // Install signal handlers
     unsafe {
@@ -65,7 +65,7 @@ fn main() -> Result<()> {
     // Watch content directories
     let mut watched = 0;
     for &(dir, _) in config::CONTENT_DIRS {
-        let full_dir = project_root.join(dir);
+        let full_dir = index_root.join(dir);
         if full_dir.is_dir() {
             if let Err(e) =
                 debouncer
@@ -80,12 +80,12 @@ fn main() -> Result<()> {
     }
 
     if watched == 0 {
-        anyhow::bail!("No content directories found to watch under {}", project_root.display());
+        anyhow::bail!("No content directories found to watch under {}", index_root.display());
     }
 
     log::info!(
         "watching {watched} directories under {}",
-        project_root.display()
+        index_root.display()
     );
 
     // Event loop
@@ -100,7 +100,7 @@ fn main() -> Result<()> {
                     if event.path.extension().is_none_or(|ext| ext != "md") {
                         continue;
                     }
-                    match event.path.strip_prefix(&project_root) {
+                    match event.path.strip_prefix(&index_root) {
                         Ok(rel) => {
                             files_to_index.insert(rel.to_string_lossy().into_owned());
                         }

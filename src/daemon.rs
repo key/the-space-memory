@@ -13,7 +13,7 @@ use crate::daemon_protocol::{DaemonRequest, DaemonResponse};
 pub fn handle_request(
     conn: &Connection,
     req: DaemonRequest,
-    project_root: &Path,
+    index_root: &Path,
     shutdown_flag: &AtomicBool,
 ) -> DaemonResponse {
     match req {
@@ -47,7 +47,7 @@ pub fn handle_request(
             match cli::run_search(conn, &opts) {
                 Ok(results) => {
                     let json_str =
-                        cli::format_json(&results, include_content, project_root);
+                        cli::format_json(&results, include_content, index_root);
                     match json_str {
                         Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
                             Ok(v) => DaemonResponse::success(v),
@@ -62,11 +62,11 @@ pub fn handle_request(
 
         DaemonRequest::Index { files } => {
             let file_paths: Vec<PathBuf> = if files.is_empty() {
-                cli::collect_content_files(project_root)
+                cli::collect_content_files(index_root)
             } else {
-                files.iter().map(|f| project_root.join(f)).collect()
+                files.iter().map(|f| index_root.join(f)).collect()
             };
-            match cli::run_index(conn, &file_paths, project_root) {
+            match cli::run_index(conn, &file_paths, index_root) {
                 Ok(stats) => DaemonResponse::success(serde_json::json!({
                     "indexed": stats.indexed,
                     "skipped": stats.skipped,
