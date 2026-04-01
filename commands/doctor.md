@@ -5,10 +5,10 @@ disable-model-invocation: true
 allowed-tools: Bash(tsm *)
 ---
 
-# Doctor
+# The Space Memory — Doctor
 
-以下の JSON はナレッジ検索システム (tsm) のヘルスチェック結果です。
-セクションごとに見やすく整形して表示してください。
+以下の JSON はナレッジ検索システムのヘルスチェック結果です。
+タイトルは「The Space Memory — Doctor」として、セクションごとに見やすく整形して表示してください。
 
 - status が "ok" のアイテムは ✔ を付ける
 - status が "warning" のアイテムは ⚠ を付けて hint を添える
