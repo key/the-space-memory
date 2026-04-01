@@ -49,7 +49,7 @@ pub const SESSION_WEIGHT: f64 = 0.3;
 /// Shape of tsm.toml — all fields optional for partial config files.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
-struct ConfigFile {
+pub(crate) struct ConfigFile {
     data_dir: Option<PathBuf>,
     project_root: Option<PathBuf>,
     embedder_socket_path: Option<PathBuf>,
@@ -110,7 +110,8 @@ impl ResolvedConfig {
     }
 
     /// Resolve from a pre-loaded `ConfigFile` (still reads env vars for overrides).
-    fn from_config_file(file_cfg: &ConfigFile) -> Self {
+    /// Visible within the crate for testing; production code should use `from_env()`.
+    pub(crate) fn from_config_file(file_cfg: &ConfigFile) -> Self {
         let data_dir = env_or("TSM_DATA_DIR", file_cfg.data_dir.as_ref())
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
 
@@ -283,6 +284,10 @@ pub fn daemon_pid_path() -> PathBuf {
 }
 
 // ─── Model cache (XDG) ──────────────────────────────────────────
+// NOTE: model_cache_dir and ensure_model_cache_env are intentionally NOT
+// part of ResolvedConfig. ensure_model_cache_env performs a side-effectful
+// set_var that must run before any threads spawn (including the logger),
+// and HF_HUB_CACHE is consumed by the hf_hub crate, not by tsm itself.
 
 /// Resolve model cache directory: HF_HUB_CACHE env > $XDG_CACHE_HOME/tsm/models/
 pub fn model_cache_dir() -> PathBuf {
@@ -363,12 +368,13 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    // ─── Helper: build ResolvedConfig from a TOML string (no env var) ──
+    // ─── Helper: build ResolvedConfig from a TOML string ──────────────
 
+    /// Build a ResolvedConfig from inline TOML. Does NOT clear env vars —
+    /// callers that need clean defaults must clear TSM_* vars themselves
+    /// or use #[serial].
     fn resolved_from_toml(toml_content: &str) -> ResolvedConfig {
         let file_cfg: ConfigFile = toml::from_str(toml_content).unwrap();
-        // Clear env vars that would interfere, then resolve
-        // (tests using this helper must NOT touch env vars)
         ResolvedConfig::from_config_file(&file_cfg)
     }
 
@@ -392,10 +398,22 @@ mod tests {
         assert_eq!(DICT_CANDIDATE_FREQ_THRESHOLD, 5);
     }
 
-    // ─── ResolvedConfig from config file (no env var access) ────────
+    // ─── ResolvedConfig from config file ─────────────────────────────
+    // These tests construct ResolvedConfig via from_config_file() directly,
+    // bypassing the OnceLock singleton. Tests that touch env vars use #[serial].
+    // Tests with no env var mutation can run in parallel safely IF no TSM_*
+    // env vars are set in the execution environment. test_resolved_defaults
+    // clears them explicitly to be safe in CI.
 
     #[test]
+    #[serial]
     fn test_resolved_defaults() {
+        // Clear all TSM env vars to ensure defaults are tested, not CI overrides.
+        for var in ["TSM_DATA_DIR", "TSM_PROJECT_ROOT", "TSM_EMBEDDER_SOCKET",
+                     "TSM_DAEMON_SOCKET", "TSM_LOG_DIR", "TSM_EMBEDDER_IDLE_TIMEOUT",
+                     "TSM_EMBEDDER_BACKFILL_INTERVAL"] {
+            std::env::remove_var(var);
+        }
         let cfg = resolved_from_toml("");
         assert_eq!(cfg.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
         assert_eq!(cfg.project_root, PathBuf::from(DEFAULT_PROJECT_ROOT));
@@ -592,16 +610,21 @@ project_root = "/low-root"
     }
 
     // ─── Env var integration tests (serialized, minimal) ────────────
-    // These few tests verify that env vars actually override config values
-    // at the ResolvedConfig::from_config_file level. They touch process-global
-    // state and MUST run serially.
+    // These tests verify that env vars override config file values at the
+    // ResolvedConfig::from_config_file level. They call from_config_file()
+    // directly — NOT resolved() — to avoid the OnceLock singleton, which
+    // is initialized once per process and cannot be reset between tests.
 
     #[test]
     #[serial]
     fn test_env_var_overrides_config_data_dir() {
         std::env::set_var("TSM_DATA_DIR", "/env/override");
-        let cfg = ResolvedConfig::from_config_file(&ConfigFile::default());
+        let cfg = ResolvedConfig::from_config_file(&ConfigFile {
+            data_dir: Some(PathBuf::from("/from/config")),
+            ..Default::default()
+        });
         std::env::remove_var("TSM_DATA_DIR");
+        // env wins over config file value
         assert_eq!(cfg.data_dir, PathBuf::from("/env/override"));
     }
 
@@ -612,6 +635,19 @@ project_root = "/low-root"
         let cfg = ResolvedConfig::from_config_file(&ConfigFile::default());
         std::env::remove_var("TSM_EMBEDDER_IDLE_TIMEOUT");
         assert_eq!(cfg.embedder_idle_timeout_secs, 42);
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_var_invalid_integer_falls_back_to_config() {
+        std::env::set_var("TSM_EMBEDDER_IDLE_TIMEOUT", "not_a_number");
+        let cfg = ResolvedConfig::from_config_file(&ConfigFile {
+            embedder_idle_timeout_secs: Some(999),
+            ..Default::default()
+        });
+        std::env::remove_var("TSM_EMBEDDER_IDLE_TIMEOUT");
+        // Invalid env var → falls back to config file value
+        assert_eq!(cfg.embedder_idle_timeout_secs, 999);
     }
 
     #[test]
