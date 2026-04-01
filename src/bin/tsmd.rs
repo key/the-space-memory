@@ -579,10 +579,8 @@ fn run_watcher(conn: &Arc<Mutex<rusqlite::Connection>>, index_root: &Path) -> Re
                 }
 
                 if !files_to_index.is_empty() {
-                    let file_paths: Vec<PathBuf> = files_to_index
-                        .iter()
-                        .map(|f| index_root.join(f))
-                        .collect();
+                    let file_paths: Vec<PathBuf> =
+                        files_to_index.iter().map(|f| index_root.join(f)).collect();
                     let count = file_paths.len();
                     let mut total_indexed: usize = 0;
                     let mut total_removed: usize = 0;
@@ -642,12 +640,10 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
         let result = run_watcher(&conn, dir.path());
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("No content directories")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No content directories"));
     }
 
     #[test]
