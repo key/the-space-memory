@@ -20,4 +20,5 @@ case "$FILE" in
   *.sh)         command -v shellcheck >/dev/null 2>&1 && shellcheck "$FILE" ;;
   *.yml|*.yaml) command -v yamllint >/dev/null 2>&1 && yamllint "$FILE" ;;
   *.toml)       command -v taplo >/dev/null 2>&1 && taplo check "$FILE" ;;
+  *.rs)         command -v cargo >/dev/null 2>&1 && cargo fmt --manifest-path "$CLAUDE_PROJECT_DIR/Cargo.toml" ;;
 esac

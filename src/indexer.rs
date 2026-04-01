@@ -27,6 +27,8 @@ pub struct BackfillStats {
     pub filled: usize,
     pub errors: usize,
     pub panics: usize,
+    /// Keyset pagination cursor (last processed chunk ID).
+    pub last_id: i64,
 }
 
 fn file_hash(path: &Path) -> anyhow::Result<String> {
@@ -692,6 +694,103 @@ fn retry_individually(
     }
 }
 
+/// Process one batch of missing vectors. Returns (stats, has_more).
+/// `last_id` is the keyset pagination cursor — pass 0 for the first call,
+/// then pass the returned `stats.last_id` for subsequent calls.
+pub fn backfill_next_batch(
+    conn: &Connection,
+    encode_fn: EncodeFn,
+    batch_size: usize,
+    last_id: i64,
+) -> anyhow::Result<(BackfillStats, bool)> {
+    if !db::has_vec_table(conn) {
+        return Ok((BackfillStats::default(), false));
+    }
+
+    let batch: Vec<(i64, String, String)> = conn
+        .prepare(
+            "SELECT c.id, c.content, d.file_path
+             FROM chunks c
+             LEFT JOIN chunks_vec v ON c.id = v.rowid
+             LEFT JOIN chunks_vec_skip s ON c.id = s.chunk_id
+             JOIN documents d ON c.document_id = d.id
+             WHERE v.rowid IS NULL AND s.chunk_id IS NULL AND c.id > ?
+             ORDER BY c.id
+             LIMIT ?",
+        )?
+        .query_map(rusqlite::params![last_id, batch_size as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if batch.is_empty() {
+        return Ok((BackfillStats::default(), false));
+    }
+
+    let mut stats = BackfillStats {
+        last_id: batch.last().unwrap().0,
+        ..BackfillStats::default()
+    };
+
+    let texts: Vec<String> = batch
+        .iter()
+        .map(|(_, content, _)| content.clone())
+        .collect();
+
+    match catch_unwind(AssertUnwindSafe(|| encode_fn(&texts))) {
+        Ok(Ok(embeddings)) if embeddings.len() == batch.len() => {
+            let tx = conn.unchecked_transaction()?;
+            for ((chunk_id, _, _), emb) in batch.iter().zip(embeddings.iter()) {
+                if write_vec_row(&tx, *chunk_id, emb) {
+                    stats.filled += 1;
+                } else {
+                    log::warn!("Insert error for chunk {chunk_id} — skipping");
+                    mark_chunk_skip(conn, *chunk_id, "insert_error");
+                    stats.errors += 1;
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(Ok(embeddings)) => {
+            log::warn!(
+                "Embedding count mismatch (got {}, expected {})",
+                embeddings.len(),
+                batch.len()
+            );
+            if batch.len() > 1 {
+                retry_individually(&batch, encode_fn, conn, &mut stats);
+            } else {
+                let chunk_id = batch[0].0;
+                mark_chunk_skip(conn, chunk_id, "embedding_count_mismatch");
+                stats.errors += 1;
+            }
+        }
+        Ok(Err(e)) => {
+            log::warn!("Batch error: {e}");
+            if batch.len() > 1 {
+                retry_individually(&batch, encode_fn, conn, &mut stats);
+            } else {
+                mark_chunk_skip(conn, batch[0].0, "encode_error");
+                stats.errors += 1;
+            }
+        }
+        Err(panic_info) => {
+            let msg = panic_message(&panic_info);
+            log::error!("PANIC in encode: {msg}");
+            stats.panics += 1;
+            if batch.len() > 1 {
+                retry_individually(&batch, encode_fn, conn, &mut stats);
+            } else {
+                mark_chunk_skip(conn, batch[0].0, "panic");
+                stats.errors += 1;
+            }
+        }
+    }
+
+    Ok((stats, true))
+}
+
 /// Fill in missing vectors for chunks that have FTS5 entries but no vector entries.
 /// Uses keyset pagination to avoid loading all missing chunks into memory at once.
 /// Each INSERT auto-commits individually (rusqlite default autocommit mode).
@@ -1318,6 +1417,122 @@ mod tests {
             stats.filled as i64, chunk_count,
             "all chunks should be filled via individual retry after batch panic"
         );
+    }
+
+    // ─── backfill_next_batch tests ────────────────────────────
+
+    #[test]
+    fn test_next_batch_empty_db() {
+        let conn = db::get_memory_connection().unwrap();
+        let (stats, has_more) = backfill_next_batch(&conn, &mock_encode, 8, 0).unwrap();
+        assert_eq!(stats.filled, 0);
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn test_next_batch_keyset_pagination() {
+        let (conn, dir) = setup();
+        for i in 0..3 {
+            let md = format!("# Doc {i}\n\nContent for document number {i}.\n");
+            let path = write_md(dir.path(), &format!("daily/notes/test{i}.md"), &md);
+            index_file(&conn, &path, dir.path()).unwrap();
+        }
+        clear_vectors(&conn);
+
+        let chunks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(chunks >= 3);
+
+        // First batch: batch_size=2
+        let (stats1, has_more1) = backfill_next_batch(&conn, &mock_encode, 2, 0).unwrap();
+        assert_eq!(stats1.filled, 2);
+        assert!(has_more1);
+        assert!(stats1.last_id > 0);
+
+        // Second batch: from last_id
+        let (stats2, has_more2) =
+            backfill_next_batch(&conn, &mock_encode, 2, stats1.last_id).unwrap();
+        assert!(stats2.filled > 0);
+        assert!(stats2.last_id > stats1.last_id);
+
+        // Continue until exhausted
+        let mut last_id = stats2.last_id;
+        loop {
+            let (s, more) = backfill_next_batch(&conn, &mock_encode, 2, last_id).unwrap();
+            if !more {
+                break;
+            }
+            last_id = s.last_id;
+        }
+
+        // All vectors should be filled
+        let vecs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vecs, chunks);
+    }
+
+    #[test]
+    fn test_next_batch_encode_error_marks_skip() {
+        let (conn, dir) = setup();
+        let path = write_md(dir.path(), "daily/notes/test.md", "# Hello\n\nContent.\n");
+        index_file(&conn, &path, dir.path()).unwrap();
+        clear_vectors(&conn);
+
+        let (stats, _) = backfill_next_batch(&conn, &mock_encode_fail, 8, 0).unwrap();
+        assert_eq!(stats.filled, 0);
+        assert!(stats.errors > 0);
+
+        // Skip records should be written
+        let skips: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec_skip", [], |r| r.get(0))
+            .unwrap();
+        assert!(skips > 0);
+
+        // Next call should find nothing (skipped chunks excluded)
+        let (stats2, has_more) = backfill_next_batch(&conn, &mock_encode, 8, 0).unwrap();
+        assert_eq!(stats2.filled, 0);
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn test_next_batch_partial_batch() {
+        let (conn, dir) = setup();
+        for i in 0..3 {
+            let md = format!("# Doc {i}\n\nContent for document number {i}.\n");
+            let path = write_md(dir.path(), &format!("daily/notes/test{i}.md"), &md);
+            index_file(&conn, &path, dir.path()).unwrap();
+        }
+        clear_vectors(&conn);
+
+        let chunks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+
+        // Use a large batch_size that exceeds total chunks
+        let (stats, has_more) =
+            backfill_next_batch(&conn, &mock_encode, chunks as usize + 10, 0).unwrap();
+        assert_eq!(stats.filled as i64, chunks);
+        assert!(has_more); // non-empty batch always returns has_more=true
+
+        // Next call finds nothing
+        let (stats2, has_more2) =
+            backfill_next_batch(&conn, &mock_encode, chunks as usize + 10, stats.last_id).unwrap();
+        assert_eq!(stats2.filled, 0);
+        assert!(!has_more2);
+    }
+
+    #[test]
+    fn test_next_batch_catches_panic() {
+        let (conn, dir) = setup();
+        let path = write_md(dir.path(), "daily/notes/test.md", "# Hello\n\nContent.\n");
+        index_file(&conn, &path, dir.path()).unwrap();
+        clear_vectors(&conn);
+
+        let (stats, _) = backfill_next_batch(&conn, &mock_encode_panic, 8, 0).unwrap();
+        assert!(stats.panics > 0);
+        assert!(stats.errors > 0);
     }
 
     // ─── entity integration tests ────────────────────────────
