@@ -118,20 +118,23 @@ impl ResolvedConfig {
         let index_root = env_or("TSM_INDEX_ROOT", file_cfg.index_root.as_ref())
             .unwrap_or_else(|| PathBuf::from(DEFAULT_INDEX_ROOT));
 
-        let embedder_socket_path =
-            env_or("TSM_EMBEDDER_SOCKET", file_cfg.embedder_socket_path.as_ref())
-                .unwrap_or_else(|| state_dir.join("embedder.sock"));
+        let embedder_socket_path = env_or(
+            "TSM_EMBEDDER_SOCKET",
+            file_cfg.embedder_socket_path.as_ref(),
+        )
+        .unwrap_or_else(|| state_dir.join("embedder.sock"));
 
-        let daemon_socket_path =
-            env_or("TSM_DAEMON_SOCKET", file_cfg.daemon_socket_path.as_ref())
-                .unwrap_or_else(|| state_dir.join("daemon.sock"));
+        let daemon_socket_path = env_or("TSM_DAEMON_SOCKET", file_cfg.daemon_socket_path.as_ref())
+            .unwrap_or_else(|| state_dir.join("daemon.sock"));
 
         let log_dir = env_or("TSM_LOG_DIR", file_cfg.log_dir.as_ref())
             .unwrap_or_else(|| state_dir.join("logs"));
 
-        let embedder_idle_timeout_secs =
-            env_parse_u64("TSM_EMBEDDER_IDLE_TIMEOUT", file_cfg.embedder_idle_timeout_secs)
-                .unwrap_or(DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS);
+        let embedder_idle_timeout_secs = env_parse_u64(
+            "TSM_EMBEDDER_IDLE_TIMEOUT",
+            file_cfg.embedder_idle_timeout_secs,
+        )
+        .unwrap_or(DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS);
 
         let embedder_backfill_interval_secs = env_parse_u64(
             "TSM_EMBEDDER_BACKFILL_INTERVAL",
@@ -190,10 +193,7 @@ fn load_config_from(candidates: &[PathBuf]) -> ConfigFile {
             Ok(c) => c,
             Err(e) => {
                 if explicit_config.as_deref() == Some(path.as_path()) {
-                    log::error!(
-                        "Cannot read TSM_CONFIG file '{}': {e}",
-                        path.display()
-                    );
+                    log::error!("Cannot read TSM_CONFIG file '{}': {e}", path.display());
                 }
                 continue;
             }
@@ -213,8 +213,12 @@ fn load_config_from(candidates: &[PathBuf]) -> ConfigFile {
         merged.embedder_socket_path = merged.embedder_socket_path.or(file.embedder_socket_path);
         merged.daemon_socket_path = merged.daemon_socket_path.or(file.daemon_socket_path);
         merged.log_dir = merged.log_dir.or(file.log_dir);
-        merged.embedder_idle_timeout_secs = merged.embedder_idle_timeout_secs.or(file.embedder_idle_timeout_secs);
-        merged.embedder_backfill_interval_secs = merged.embedder_backfill_interval_secs.or(file.embedder_backfill_interval_secs);
+        merged.embedder_idle_timeout_secs = merged
+            .embedder_idle_timeout_secs
+            .or(file.embedder_idle_timeout_secs);
+        merged.embedder_backfill_interval_secs = merged
+            .embedder_backfill_interval_secs
+            .or(file.embedder_backfill_interval_secs);
     }
     merged
 }
@@ -409,29 +413,46 @@ mod tests {
     #[serial]
     fn test_resolved_defaults() {
         // Clear all TSM env vars to ensure defaults are tested, not CI overrides.
-        for var in ["TSM_STATE_DIR", "TSM_INDEX_ROOT", "TSM_EMBEDDER_SOCKET",
-                     "TSM_DAEMON_SOCKET", "TSM_LOG_DIR", "TSM_EMBEDDER_IDLE_TIMEOUT",
-                     "TSM_EMBEDDER_BACKFILL_INTERVAL"] {
+        for var in [
+            "TSM_STATE_DIR",
+            "TSM_INDEX_ROOT",
+            "TSM_EMBEDDER_SOCKET",
+            "TSM_DAEMON_SOCKET",
+            "TSM_LOG_DIR",
+            "TSM_EMBEDDER_IDLE_TIMEOUT",
+            "TSM_EMBEDDER_BACKFILL_INTERVAL",
+        ] {
             std::env::remove_var(var);
         }
         let cfg = resolved_from_toml("");
         assert_eq!(cfg.state_dir, PathBuf::from(DEFAULT_STATE_DIR));
         assert_eq!(cfg.index_root, PathBuf::from(DEFAULT_INDEX_ROOT));
-        assert_eq!(cfg.embedder_socket_path, PathBuf::from(".tsm/embedder.sock"));
+        assert_eq!(
+            cfg.embedder_socket_path,
+            PathBuf::from(".tsm/embedder.sock")
+        );
         assert_eq!(cfg.daemon_socket_path, PathBuf::from(".tsm/daemon.sock"));
         assert_eq!(cfg.log_dir, PathBuf::from(".tsm/logs"));
-        assert_eq!(cfg.embedder_idle_timeout_secs, DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS);
-        assert_eq!(cfg.embedder_backfill_interval_secs, DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS);
+        assert_eq!(
+            cfg.embedder_idle_timeout_secs,
+            DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            cfg.embedder_backfill_interval_secs,
+            DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS
+        );
     }
 
     #[test]
     fn test_resolved_from_config_file() {
-        let cfg = resolved_from_toml(r#"
+        let cfg = resolved_from_toml(
+            r#"
             state_dir = "/custom/data"
             index_root = "/custom/root"
             embedder_idle_timeout_secs = 0
             embedder_backfill_interval_secs = 60
-        "#);
+        "#,
+        );
         assert_eq!(cfg.state_dir, PathBuf::from("/custom/data"));
         assert_eq!(cfg.index_root, PathBuf::from("/custom/root"));
         assert_eq!(cfg.embedder_idle_timeout_secs, 0);
@@ -441,20 +462,31 @@ mod tests {
     #[test]
     fn test_resolved_socket_paths_follow_state_dir() {
         let cfg = resolved_from_toml(r#"state_dir = "/my/data""#);
-        assert_eq!(cfg.embedder_socket_path, PathBuf::from("/my/data/embedder.sock"));
-        assert_eq!(cfg.daemon_socket_path, PathBuf::from("/my/data/daemon.sock"));
+        assert_eq!(
+            cfg.embedder_socket_path,
+            PathBuf::from("/my/data/embedder.sock")
+        );
+        assert_eq!(
+            cfg.daemon_socket_path,
+            PathBuf::from("/my/data/daemon.sock")
+        );
         assert_eq!(cfg.log_dir, PathBuf::from("/my/data/logs"));
     }
 
     #[test]
     fn test_resolved_explicit_socket_overrides_state_dir() {
-        let cfg = resolved_from_toml(r#"
+        let cfg = resolved_from_toml(
+            r#"
             state_dir = "/my/data"
             embedder_socket_path = "/custom/embedder.sock"
             daemon_socket_path = "/custom/daemon.sock"
             log_dir = "/custom/logs"
-        "#);
-        assert_eq!(cfg.embedder_socket_path, PathBuf::from("/custom/embedder.sock"));
+        "#,
+        );
+        assert_eq!(
+            cfg.embedder_socket_path,
+            PathBuf::from("/custom/embedder.sock")
+        );
         assert_eq!(cfg.daemon_socket_path, PathBuf::from("/custom/daemon.sock"));
         assert_eq!(cfg.log_dir, PathBuf::from("/custom/logs"));
     }
@@ -463,8 +495,14 @@ mod tests {
     fn test_resolved_derived_paths() {
         let cfg = resolved_from_toml(r#"state_dir = "/test""#);
         assert_eq!(cfg.state_dir.join("tsm.db"), PathBuf::from("/test/tsm.db"));
-        assert_eq!(cfg.state_dir.join("user_dict.csv"), PathBuf::from("/test/user_dict.csv"));
-        assert_eq!(cfg.state_dir.join("tsmd.pid"), PathBuf::from("/test/tsmd.pid"));
+        assert_eq!(
+            cfg.state_dir.join("user_dict.csv"),
+            PathBuf::from("/test/user_dict.csv")
+        );
+        assert_eq!(
+            cfg.state_dir.join("tsmd.pid"),
+            PathBuf::from("/test/tsmd.pid")
+        );
     }
 
     // ─── ConfigFile loading (TOML parsing, merge, error handling) ───
@@ -700,10 +738,7 @@ index_root = "/low-root"
     fn test_ensure_model_cache_env_preserves_existing() {
         std::env::set_var("HF_HUB_CACHE", "/my/custom/cache");
         ensure_model_cache_env();
-        assert_eq!(
-            std::env::var("HF_HUB_CACHE").unwrap(),
-            "/my/custom/cache"
-        );
+        assert_eq!(std::env::var("HF_HUB_CACHE").unwrap(), "/my/custom/cache");
         std::env::remove_var("HF_HUB_CACHE");
     }
 }

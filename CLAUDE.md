@@ -93,18 +93,25 @@ src/
 ```
 
 **Ownership:**
+
 - **main process** — sole DB owner. All reads/writes go through here
 - **embedder daemon** — stateless inference server. No DB access
 - **watcher daemon** — stateless file monitor. Enqueues to main, no DB access
 
 ## Design Principles
 
-- **Embedder daemon** — Model inference latency hiding. Responsibility: embedding computation + vector DB writes. Must NOT take on unrelated concerns (file watching, indexing)
-- **Watch daemon** (#27) — File system monitoring via OS-native events (inotify/FSEvents). Separate process from embedder
-- **Vector writes are always async** — Callers enqueue, embedder processes in background. Search reads whatever vectors are available; FTS5 fallback if vectors not yet ready
-- **Incremental over full rebuild** — Chunk-level content hashing for diff-based index updates. Avoid full DELETE+INSERT on every change
-- **Transactions for batch DB writes** — Wrap inserts in transactions to avoid per-statement fsync in WAL mode. Use small batch sizes (per-file or per-session), not one giant transaction across all files
-- **Doctor as single observability surface** — All daemon health, queue status, and data integrity checks visible via `tsm doctor`
+- **Embedder daemon** — Model inference latency hiding.
+  Must NOT take on unrelated concerns (file watching, indexing)
+- **Watch daemon** (#27) — File system monitoring via OS-native events
+  (inotify/FSEvents). Separate process from embedder
+- **Vector writes are always async** — Callers enqueue, embedder
+  processes in background. FTS5 fallback if vectors not yet ready
+- **Incremental over full rebuild** — Chunk-level content hashing
+  for diff-based index updates
+- **Transactions for batch DB writes** — Wrap inserts in transactions
+  to avoid per-statement fsync in WAL mode
+- **Doctor as single observability surface** — All daemon health,
+  queue status, and data integrity checks via `tsm doctor`
 
 ## Testing
 
@@ -137,7 +144,9 @@ docker build -t the-space-memory /path/to/the-space-memory
 
 ## Gotchas
 
-- **Hook stdin JSON key is `prompt`** (not `user_prompt`). Hook output must wrap `additionalContext` in `hookSpecificOutput: { hookEventName, additionalContext }`
+- **Hook stdin JSON key is `prompt`** (not `user_prompt`).
+  Hook output must wrap `additionalContext` in
+  `hookSpecificOutput: { hookEventName, additionalContext }`
 - ruri safetensors have no tensor name prefix.
   candle's ModernBert::load expects `model.` prefix — key names are remapped at load time
 - Use `rusqlite`'s bundled feature (don't depend on system SQLite)

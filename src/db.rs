@@ -156,13 +156,11 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
 
 /// Ensure the `content_hash` column exists on the `chunks` table (migration for older DBs).
 pub fn ensure_chunk_hash_column(conn: &Connection) -> anyhow::Result<()> {
-    let has: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('chunks') WHERE name='content_hash'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?
-        > 0;
+    let has: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('chunks') WHERE name='content_hash'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? > 0;
     if !has {
         conn.execute("ALTER TABLE chunks ADD COLUMN content_hash TEXT", [])?;
     }

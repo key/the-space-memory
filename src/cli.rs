@@ -38,7 +38,9 @@ pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     let stats = run_index(&conn, &file_paths, &index_root)?;
     log::info!(
         "Indexed: {}, Skipped: {}, Removed: {}",
-        stats.indexed, stats.skipped, stats.removed
+        stats.indexed,
+        stats.skipped,
+        stats.removed
     );
     Ok(())
 }
@@ -255,8 +257,7 @@ pub fn cmd_backfill_worker() -> anyhow::Result<()> {
 }
 
 /// Guard to prevent concurrent backfill runs (startup + periodic).
-static BACKFILL_RUNNING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static BACKFILL_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// RAII guard that resets `BACKFILL_RUNNING` on drop (including panic unwind).
 struct BackfillGuard;
@@ -641,17 +642,21 @@ fn doctor_check_with_conn(
         emb_section.items.push(CheckItem {
             status: CheckStatus::Warning,
             message: format!("Vectors: 0 / {chunks} chunks"),
-            hint: Some(backfill_hint.unwrap_or_else(|| {
-                "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
-            })),
+            hint: Some(
+                backfill_hint.unwrap_or_else(|| {
+                    "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
+                }),
+            ),
         });
     } else if vecs < chunks {
         emb_section.items.push(CheckItem {
             status: CheckStatus::Warning,
             message: format!("Vectors: {vecs} / {chunks} chunks (mismatch)"),
-            hint: Some(backfill_hint.unwrap_or_else(|| {
-                "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
-            })),
+            hint: Some(
+                backfill_hint.unwrap_or_else(|| {
+                    "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
+                }),
+            ),
         });
     } else {
         emb_section.items.push(CheckItem {
@@ -713,7 +718,9 @@ pub fn render_doctor_report(report: &DoctorReport) {
     let use_color = std::env::var("NO_COLOR").is_err();
 
     let (green, yellow, red, bold, dim, reset) = if use_color {
-        ("\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[1m", "\x1b[2m", "\x1b[0m")
+        (
+            "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[1m", "\x1b[2m", "\x1b[0m",
+        )
     } else {
         ("", "", "", "", "", "")
     };
@@ -729,12 +736,15 @@ pub fn render_doctor_report(report: &DoctorReport) {
         body_lines.push(format!("{bold}  {}{reset}", section.name));
         for item in &section.items {
             let (icon, color) = match item.status {
-                CheckStatus::Ok => ("\u{2714}", green),      // ✔
+                CheckStatus::Ok => ("\u{2714}", green),       // ✔
                 CheckStatus::Warning => ("\u{26a0}", yellow), // ⚠
                 CheckStatus::Error => ("\u{2718}", red),      // ✘
             };
             let line = match &item.hint {
-                Some(hint) => format!("    {color}{icon}{reset} {}  {dim}{hint}{reset}", item.message),
+                Some(hint) => format!(
+                    "    {color}{icon}{reset} {}  {dim}{hint}{reset}",
+                    item.message
+                ),
                 None => format!("    {color}{icon}{reset} {}", item.message),
             };
             body_lines.push(line);
@@ -777,18 +787,32 @@ pub fn render_doctor_report(report: &DoctorReport) {
     let box_width = content_width + 2; // padding
 
     // Render box
-    println!("{dim}\u{256d}\u{2500} {reset}{bold}{title}{reset} {dim}{}\u{256e}{reset}",
-        "\u{2500}".repeat(box_width - title.len() - 3));
-    println!("{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}", " ".repeat(box_width));
+    println!(
+        "{dim}\u{256d}\u{2500} {reset}{bold}{title}{reset} {dim}{}\u{256e}{reset}",
+        "\u{2500}".repeat(box_width - title.len() - 3)
+    );
+    println!(
+        "{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}",
+        " ".repeat(box_width)
+    );
 
     for line in &body_lines {
         let visible_len = strip_ansi(line).chars().count();
         let pad = box_width.saturating_sub(visible_len);
-        println!("{dim}\u{2502}{reset}{line}{}{dim}\u{2502}{reset}", " ".repeat(pad));
+        println!(
+            "{dim}\u{2502}{reset}{line}{}{dim}\u{2502}{reset}",
+            " ".repeat(pad)
+        );
     }
 
-    println!("{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}", " ".repeat(box_width));
-    println!("{dim}\u{2570}{}\u{256f}{reset}", "\u{2500}".repeat(box_width));
+    println!(
+        "{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}",
+        " ".repeat(box_width)
+    );
+    println!(
+        "{dim}\u{2570}{}\u{256f}{reset}",
+        "\u{2500}".repeat(box_width)
+    );
 }
 
 /// Structured status information for the system.
@@ -1178,17 +1202,15 @@ pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
     log::info!("Indexing {total} files...");
 
     let progress = |current: usize, total: usize, path: &Path| {
-        let rel = path
-            .strip_prefix(&index_root)
-            .unwrap_or(path)
-            .display();
+        let rel = path.strip_prefix(&index_root).unwrap_or(path).display();
         log::debug!("  [{current}/{total}] {rel}");
     };
-    let stats =
-        indexer::index_all_with_progress(&conn, &file_paths, &index_root, Some(&progress))?;
+    let stats = indexer::index_all_with_progress(&conn, &file_paths, &index_root, Some(&progress))?;
     log::info!(
         "Done: Indexed: {}, Skipped: {}, Removed: {}",
-        stats.indexed, stats.skipped, stats.removed
+        stats.indexed,
+        stats.skipped,
+        stats.removed
     );
 
     // Report & async backfill

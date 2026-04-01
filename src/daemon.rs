@@ -46,8 +46,7 @@ pub fn handle_request(
             };
             match cli::run_search(conn, &opts) {
                 Ok(results) => {
-                    let json_str =
-                        cli::format_json(&results, include_content, index_root);
+                    let json_str = cli::format_json(&results, include_content, index_root);
                     match json_str {
                         Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
                             Ok(v) => DaemonResponse::success(v),
@@ -104,12 +103,10 @@ pub fn handle_request(
             }
         }
 
-        DaemonRequest::VectorFill { batch_size } => {
-            match cli::run_vector_fill(conn, batch_size) {
-                Ok(()) => DaemonResponse::success_empty(),
-                Err(e) => DaemonResponse::error(format!("{e}")),
-            }
-        }
+        DaemonRequest::VectorFill { batch_size } => match cli::run_vector_fill(conn, batch_size) {
+            Ok(()) => DaemonResponse::success_empty(),
+            Err(e) => DaemonResponse::error(format!("{e}")),
+        },
 
         DaemonRequest::ImportWordnet { wordnet_db } => {
             let path = PathBuf::from(&wordnet_db);
@@ -125,9 +122,9 @@ pub fn handle_request(
             "dict-update cannot run while tsmd is active. Run `tsm stop` first.",
         ),
 
-        DaemonRequest::Rebuild { .. } => DaemonResponse::error(
-            "rebuild cannot run while tsmd is active. Run `tsm stop` first.",
-        ),
+        DaemonRequest::Rebuild { .. } => {
+            DaemonResponse::error("rebuild cannot run while tsmd is active. Run `tsm stop` first.")
+        }
     }
 }
 

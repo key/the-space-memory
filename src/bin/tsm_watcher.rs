@@ -37,7 +37,9 @@ struct Args {
 
 fn main() -> Result<()> {
     config::ensure_model_cache_env();
-    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon { name: "tsm-watcher" })?;
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
+        name: "tsm-watcher",
+    })?;
     let args = Args::parse();
 
     let daemon_socket = args
@@ -67,10 +69,9 @@ fn main() -> Result<()> {
     for &(dir, _) in config::CONTENT_DIRS {
         let full_dir = index_root.join(dir);
         if full_dir.is_dir() {
-            if let Err(e) =
-                debouncer
-                    .watcher()
-                    .watch(&full_dir, RecursiveMode::Recursive)
+            if let Err(e) = debouncer
+                .watcher()
+                .watch(&full_dir, RecursiveMode::Recursive)
             {
                 log::warn!("cannot watch {}: {e}", full_dir.display());
             } else {
@@ -80,7 +81,10 @@ fn main() -> Result<()> {
     }
 
     if watched == 0 {
-        anyhow::bail!("No content directories found to watch under {}", index_root.display());
+        anyhow::bail!(
+            "No content directories found to watch under {}",
+            index_root.display()
+        );
     }
 
     log::info!(
@@ -131,10 +135,7 @@ fn main() -> Result<()> {
                                     }
                                 }
                             } else {
-                                log::warn!(
-                                    "index error: {}",
-                                    resp.error.unwrap_or_default()
-                                );
+                                log::warn!("index error: {}", resp.error.unwrap_or_default());
                             }
                         }
                         Err(e) => {

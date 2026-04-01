@@ -42,7 +42,9 @@ struct Args {
 
 fn main() -> Result<()> {
     config::ensure_model_cache_env();
-    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon { name: "tsmd" })?;
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
+        name: "tsmd",
+    })?;
     let args = Args::parse();
 
     let socket_path = args.socket.unwrap_or_else(config::daemon_socket_path);
@@ -103,7 +105,10 @@ fn main() -> Result<()> {
 
     let mut embedder_child: Option<Child> = if !args.no_embedder {
         if is_process_alive(&embedder_pid_path) {
-            log::info!("embedder already running (PID file: {})", embedder_pid_path.display());
+            log::info!(
+                "embedder already running (PID file: {})",
+                embedder_pid_path.display()
+            );
             None
         } else {
             let _ = std::fs::remove_file(&embedder_pid_path);
@@ -144,7 +149,10 @@ fn main() -> Result<()> {
 
     let mut watcher_child: Option<Child> = if !args.no_watcher {
         if is_process_alive(&watcher_pid_path) {
-            log::info!("watcher already running (PID file: {})", watcher_pid_path.display());
+            log::info!(
+                "watcher already running (PID file: {})",
+                watcher_pid_path.display()
+            );
             None
         } else {
             let _ = std::fs::remove_file(&watcher_pid_path);
@@ -249,8 +257,7 @@ fn start_child(binary: &str, env_vars: &[(&str, &str)]) -> Result<Child> {
     for &(k, v) in env_vars {
         cmd.env(k, v);
     }
-    cmd.spawn()
-        .context(format!("Failed to spawn {binary}"))
+    cmd.spawn().context(format!("Failed to spawn {binary}"))
 }
 
 /// Remove the embedder UNIX socket if it exists.

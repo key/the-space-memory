@@ -59,8 +59,7 @@ fn delete_chunk_side_tables(conn: &Connection, chunk_ids: &[i64]) -> anyhow::Res
         .iter()
         .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
         .collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
     conn.execute(
         &format!("DELETE FROM chunks_fts WHERE rowid IN ({placeholders})"),
@@ -72,21 +71,39 @@ fn delete_chunk_side_tables(conn: &Connection, chunk_ids: &[i64]) -> anyhow::Res
         &format!("DELETE FROM chunks_vec WHERE rowid IN ({placeholders})"),
         param_refs.as_slice(),
     )
-    .or_else(|e| if e.to_string().contains("no such table") { Ok(0) } else { Err(e) })?;
+    .or_else(|e| {
+        if e.to_string().contains("no such table") {
+            Ok(0)
+        } else {
+            Err(e)
+        }
+    })?;
 
     // chunks_vec_skip — may not exist in older DBs
     conn.execute(
         &format!("DELETE FROM chunks_vec_skip WHERE chunk_id IN ({placeholders})"),
         param_refs.as_slice(),
     )
-    .or_else(|e| if e.to_string().contains("no such table") { Ok(0) } else { Err(e) })?;
+    .or_else(|e| {
+        if e.to_string().contains("no such table") {
+            Ok(0)
+        } else {
+            Err(e)
+        }
+    })?;
 
     // chunk_entities — may not exist in older DBs
     conn.execute(
         &format!("DELETE FROM chunk_entities WHERE chunk_id IN ({placeholders})"),
         param_refs.as_slice(),
     )
-    .or_else(|e| if e.to_string().contains("no such table") { Ok(0) } else { Err(e) })?;
+    .or_else(|e| {
+        if e.to_string().contains("no such table") {
+            Ok(0)
+        } else {
+            Err(e)
+        }
+    })?;
 
     Ok(())
 }
@@ -138,15 +155,18 @@ struct DiffResult {
 ///
 /// MUST be called within a transaction — the caller is responsible for wrapping
 /// this in `unchecked_transaction()` to ensure atomicity of the multi-statement diff.
-fn diff_chunks(conn: &Connection, doc_id: i64, new_chunks: &[ChunkInput]) -> anyhow::Result<DiffResult> {
+fn diff_chunks(
+    conn: &Connection,
+    doc_id: i64,
+    new_chunks: &[ChunkInput],
+) -> anyhow::Result<DiffResult> {
     use std::collections::HashMap;
 
     // Load existing chunks: chunk_index → (id, content_hash)
     let mut existing: HashMap<usize, (i64, Option<String>)> = HashMap::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT id, chunk_index, content_hash FROM chunks WHERE document_id = ?",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, chunk_index, content_hash FROM chunks WHERE document_id = ?")?;
         let rows = stmt.query_map([doc_id], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -230,11 +250,7 @@ fn diff_chunks(conn: &Connection, doc_id: i64, new_chunks: &[ChunkInput]) -> any
 }
 
 /// Index a single file. Returns true if the file was (re-)indexed, false if skipped.
-pub fn index_file(
-    conn: &Connection,
-    file_path: &Path,
-    index_root: &Path,
-) -> anyhow::Result<bool> {
+pub fn index_file(conn: &Connection, file_path: &Path, index_root: &Path) -> anyhow::Result<bool> {
     let rel_path = file_path
         .strip_prefix(index_root)
         .unwrap_or(file_path)
@@ -320,7 +336,11 @@ pub fn index_file(
         // Rebuild entity graph (document-level)
         tx.execute("DELETE FROM entity_edges WHERE doc_id = ?", [doc_id])
             .or_else(|e| {
-                if e.to_string().contains("no such table") { Ok(0) } else { Err(e) }
+                if e.to_string().contains("no such table") {
+                    Ok(0)
+                } else {
+                    Err(e)
+                }
             })?;
         if let Err(e) = entity::insert_entities(&tx, doc_id, &diff.all_chunk_entries, &fm.tags) {
             log::warn!("entity extraction warning: {e}");
@@ -452,7 +472,11 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
         })
         .collect();
 
-    let title = jsonl_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let title = jsonl_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
 
     let tx = conn.unchecked_transaction()?;
 
@@ -805,12 +829,15 @@ pub fn backfill_vectors(
     if stats.panics > 0 {
         log::info!(
             "Backfill complete: {} filled, {} errors, {} panics.",
-            stats.filled, stats.errors, stats.panics
+            stats.filled,
+            stats.errors,
+            stats.panics
         );
     } else {
         log::info!(
             "Backfill complete: {} filled, {} errors.",
-            stats.filled, stats.errors
+            stats.filled,
+            stats.errors
         );
     }
     Ok(stats)
@@ -1169,8 +1196,7 @@ mod tests {
         clear_vectors(&conn);
 
         // Always fail
-        let stats =
-            backfill_vectors(&conn, &mock_encode_fail, BACKFILL_BATCH_SIZE, None).unwrap();
+        let stats = backfill_vectors(&conn, &mock_encode_fail, BACKFILL_BATCH_SIZE, None).unwrap();
         assert!(stats.errors > 0);
 
         // Skip records should have been written
@@ -1186,15 +1212,14 @@ mod tests {
         let vec_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(vec_count, 0, "no vectors should be written for failed chunks");
+        assert_eq!(
+            vec_count, 0,
+            "no vectors should be written for failed chunks"
+        );
 
         // A second run should find no missing vectors (skip table excludes them)
-        let stats2 =
-            backfill_vectors(&conn, &mock_encode_fail, BACKFILL_BATCH_SIZE, None).unwrap();
-        assert_eq!(
-            stats2.filled, 0,
-            "no chunks should be retried after skip"
-        );
+        let stats2 = backfill_vectors(&conn, &mock_encode_fail, BACKFILL_BATCH_SIZE, None).unwrap();
+        assert_eq!(stats2.filled, 0, "no chunks should be retried after skip");
         assert_eq!(stats2.errors, 0, "no errors on second run");
     }
 
@@ -1441,8 +1466,7 @@ mod tests {
             calls.borrow_mut().push((current, total));
         };
 
-        let stats =
-            index_all_with_progress(&conn, &files, dir.path(), Some(&cb)).unwrap();
+        let stats = index_all_with_progress(&conn, &files, dir.path(), Some(&cb)).unwrap();
         assert_eq!(stats.indexed, 2);
 
         let calls = calls.into_inner();
@@ -1484,12 +1508,16 @@ mod tests {
     // --- Incremental chunk-level diff tests ---
 
     fn get_chunk_ids(conn: &Connection, doc_id: i64) -> Vec<(i64, i64)> {
-        conn.prepare("SELECT id, chunk_index FROM chunks WHERE document_id = ? ORDER BY chunk_index")
-            .unwrap()
-            .query_map([doc_id], |row| Ok((row.get::<_, i64>(0).unwrap(), row.get::<_, i64>(1).unwrap())))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+        conn.prepare(
+            "SELECT id, chunk_index FROM chunks WHERE document_id = ? ORDER BY chunk_index",
+        )
+        .unwrap()
+        .query_map([doc_id], |row| {
+            Ok((row.get::<_, i64>(0).unwrap(), row.get::<_, i64>(1).unwrap()))
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
     }
 
     fn get_doc_id(conn: &Connection) -> i64 {
@@ -1500,7 +1528,11 @@ mod tests {
     #[test]
     fn test_content_hash_stored() {
         let (conn, dir) = setup();
-        let path = write_md(dir.path(), "daily/notes/test.md", "# Title\n\nSome content here.\n");
+        let path = write_md(
+            dir.path(),
+            "daily/notes/test.md",
+            "# Title\n\nSome content here.\n",
+        );
         index_file(&conn, &path, dir.path()).unwrap();
 
         let hash: String = conn
@@ -1528,7 +1560,10 @@ mod tests {
 
         let ids_after = get_chunk_ids(&conn, doc_id);
         // Chunk IDs should be preserved (not deleted and re-created)
-        assert_eq!(ids_before, ids_after, "unchanged chunk IDs should be preserved");
+        assert_eq!(
+            ids_before, ids_after,
+            "unchanged chunk IDs should be preserved"
+        );
     }
 
     #[test]
@@ -1547,9 +1582,16 @@ mod tests {
         index_file(&conn, &path, dir.path()).unwrap();
 
         let ids_after = get_chunk_ids(&conn, doc_id);
-        assert_eq!(ids_before.len(), ids_after.len(), "chunk count should be same");
+        assert_eq!(
+            ids_before.len(),
+            ids_after.len(),
+            "chunk count should be same"
+        );
         // Section A chunk (index 0) should keep same ID
-        assert_eq!(ids_before[0].0, ids_after[0].0, "unchanged chunk A should keep its ID");
+        assert_eq!(
+            ids_before[0].0, ids_after[0].0,
+            "unchanged chunk A should keep its ID"
+        );
 
         // Verify updated content is searchable in FTS
         let fts_count: i64 = conn
@@ -1571,7 +1613,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(!old_b_content.contains("original"), "updated chunk's FTS should not contain old text");
+        assert!(
+            !old_b_content.contains("original"),
+            "updated chunk's FTS should not contain old text"
+        );
     }
 
     #[test]
@@ -1591,11 +1636,17 @@ mod tests {
         index_file(&conn, &path, dir.path()).unwrap();
 
         let ids_after = get_chunk_ids(&conn, doc_id);
-        assert!(ids_after.len() > count_before, "should have more chunks after adding section");
+        assert!(
+            ids_after.len() > count_before,
+            "should have more chunks after adding section"
+        );
         // Original chunks should keep their IDs
         for (id, idx) in &ids_before {
-            assert!(ids_after.iter().any(|(aid, aidx)| aid == id && aidx == idx),
-                "original chunk at index {} should be preserved", idx);
+            assert!(
+                ids_after.iter().any(|(aid, aidx)| aid == id && aidx == idx),
+                "original chunk at index {} should be preserved",
+                idx
+            );
         }
     }
 
@@ -1608,7 +1659,11 @@ mod tests {
 
         let doc_id = get_doc_id(&conn);
         let count_before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks WHERE document_id = ?", [doc_id], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM chunks WHERE document_id = ?",
+                [doc_id],
+                |r| r.get(0),
+            )
             .unwrap();
 
         // Remove section C
@@ -1617,9 +1672,16 @@ mod tests {
         index_file(&conn, &path, dir.path()).unwrap();
 
         let count_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks WHERE document_id = ?", [doc_id], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM chunks WHERE document_id = ?",
+                [doc_id],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert!(count_after < count_before, "should have fewer chunks after removal");
+        assert!(
+            count_after < count_before,
+            "should have fewer chunks after removal"
+        );
 
         // FTS count should match chunk count
         let fts_count: i64 = conn
@@ -1653,7 +1715,10 @@ mod tests {
         index_session(&conn, &path).unwrap();
 
         let ids_after = get_chunk_ids(&conn, doc_id);
-        assert!(ids_after.len() > count_before, "should have more chunks after append");
+        assert!(
+            ids_after.len() > count_before,
+            "should have more chunks after append"
+        );
         // Original chunk(s) should keep their IDs
         for (id, idx) in &ids_before {
             let found = ids_after.iter().any(|(aid, aidx)| aid == id && aidx == idx);
@@ -1671,21 +1736,38 @@ mod tests {
         let doc_id = get_doc_id(&conn);
 
         // Simulate a pre-migration chunk by clearing content_hash to NULL
-        conn.execute("UPDATE chunks SET content_hash = NULL WHERE document_id = ?", [doc_id])
-            .unwrap();
+        conn.execute(
+            "UPDATE chunks SET content_hash = NULL WHERE document_id = ?",
+            [doc_id],
+        )
+        .unwrap();
         // Force file_hash change to trigger re-index
-        conn.execute("UPDATE documents SET file_hash = 'stale' WHERE id = ?", [doc_id])
-            .unwrap();
+        conn.execute(
+            "UPDATE documents SET file_hash = 'stale' WHERE id = ?",
+            [doc_id],
+        )
+        .unwrap();
 
         // Re-index same content — NULL hash should be treated as changed
         index_file(&conn, &path, dir.path()).unwrap();
 
         // Verify content_hash is now populated
         let hash: Option<String> = conn
-            .query_row("SELECT content_hash FROM chunks WHERE document_id = ? LIMIT 1", [doc_id], |r| r.get(0))
+            .query_row(
+                "SELECT content_hash FROM chunks WHERE document_id = ? LIMIT 1",
+                [doc_id],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert!(hash.is_some(), "content_hash should be populated after re-index");
-        assert_eq!(hash.unwrap().len(), 64, "content_hash should be 64-char hex");
+        assert!(
+            hash.is_some(),
+            "content_hash should be populated after re-index"
+        );
+        assert_eq!(
+            hash.unwrap().len(),
+            64,
+            "content_hash should be 64-char hex"
+        );
     }
 
     #[test]
@@ -1707,8 +1789,11 @@ mod tests {
             .unwrap_or(0);
 
         // Force file_hash to differ (but keep content identical) to trigger re-index
-        conn.execute("UPDATE documents SET file_hash = 'stale' WHERE id = ?", [doc_id])
-            .unwrap();
+        conn.execute(
+            "UPDATE documents SET file_hash = 'stale' WHERE id = ?",
+            [doc_id],
+        )
+        .unwrap();
 
         // Re-index — had_mutations should be false, entities should be preserved
         index_file(&conn, &path, dir.path()).unwrap();
@@ -1720,7 +1805,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        assert_eq!(entity_count, entity_count_after, "entity data should be preserved when chunks unchanged");
+        assert_eq!(
+            entity_count, entity_count_after,
+            "entity data should be preserved when chunks unchanged"
+        );
     }
 
     #[test]
@@ -1737,6 +1825,9 @@ mod tests {
         index_file(&conn, &path, dir.path()).unwrap();
 
         let doc_id_after = get_doc_id(&conn);
-        assert_eq!(doc_id_before, doc_id_after, "doc_id should be preserved across re-indexes");
+        assert_eq!(
+            doc_id_before, doc_id_after,
+            "doc_id should be preserved across re-indexes"
+        );
     }
 }

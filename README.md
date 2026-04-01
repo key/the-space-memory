@@ -37,7 +37,7 @@ tsm rebuild --force
 
 `tsmd` デーモンは `tsm-embedder` と `tsm-watcher` を子プロセスとして管理する。
 
-```
+```text
 ┌─────────────────────────────────────────────────────────┐
 │  tsmd（メインデーモン）                                   │
 │                                                         │
@@ -66,9 +66,13 @@ tsm rebuild --force
 | `tsm-embedder` | テキスト → ベクトル変換（モデル推論）。tsmd からのリクエストをソケットで受け取り結果を返す |
 | `tsm-watcher` | ファイル変更を inotify/FSEvents で監視し、tsmd にインデックス要求を送る |
 
-**子プロセスは自動リスタートしない設計**: ONNX Runtime / ROCm のクラッシュで OOM リスタートループに陥るのを防ぐため、クラッシュした子プロセスは停止したままになる。`tsm doctor` で状態を確認できる。
+**子プロセスは自動リスタートしない設計**:
+OOM リスタートループ防止のため、クラッシュした子プロセスは
+停止したままになる。`tsm doctor` で状態を確認できる。
 
-> **Note**: 現状 `tsm-embedder` は backfill 時に DB を直接読み書きしている。DB アクセスの tsmd 集約は [Issue #45](https://github.com/key/the-space-memory/issues/45) で対応予定。
+> **Note**: 現状 `tsm-embedder` は backfill 時に DB を直接読み書きしている。
+> DB アクセスの tsmd 集約は
+> [Issue #45](https://github.com/key/the-space-memory/issues/45) で対応予定。
 
 ### Data Flow
 

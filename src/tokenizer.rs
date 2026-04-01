@@ -116,11 +116,7 @@ pub fn extract_search_keywords(text: &str) -> Vec<String> {
         if details.is_empty() || details[0] != "名詞" {
             continue;
         }
-        if details.len() >= 2
-            && matches!(
-                details[1],
-                "非自立" | "接尾" | "代名詞" | "数"
-            )
+        if details.len() >= 2 && matches!(details[1], "非自立" | "接尾" | "代名詞" | "数")
         {
             continue;
         }
@@ -138,12 +134,7 @@ pub fn extract_search_keywords(text: &str) -> Vec<String> {
 
         // Skip tokens that are only prolonged sound marks, punctuation, or symbols
         if surface.chars().all(|c| {
-            c == 'ー'
-                || c == '〜'
-                || c == '…'
-                || c == 'w'
-                || c == 'W'
-                || c.is_ascii_punctuation()
+            c == 'ー' || c == '〜' || c == '…' || c == 'w' || c == 'W' || c.is_ascii_punctuation()
         }) {
             continue;
         }

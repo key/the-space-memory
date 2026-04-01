@@ -119,7 +119,9 @@ pub fn try_send_request(socket: &Path, req: &DaemonRequest) -> Option<Result<Dae
         Err(_) => return None, // stale socket or connection refused
     };
     if let Err(e) = stream.set_read_timeout(Some(std::time::Duration::from_secs(300))) {
-        return Some(Err(anyhow::anyhow!("Failed to set socket read timeout: {e}")));
+        return Some(Err(anyhow::anyhow!(
+            "Failed to set socket read timeout: {e}"
+        )));
     }
     let req_bytes = match serde_json::to_vec(req) {
         Ok(b) => b,
