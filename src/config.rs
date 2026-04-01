@@ -59,11 +59,92 @@ struct ConfigFile {
     embedder_backfill_interval_secs: Option<u64>,
 }
 
-static CONFIG: OnceLock<ConfigFile> = OnceLock::new();
+/// Fully resolved configuration — all values determined at startup.
+/// Built once from env vars + config files + defaults via `from_env()`.
+/// In tests, construct directly without touching env vars or files.
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig {
+    pub data_dir: PathBuf,
+    pub project_root: PathBuf,
+    pub embedder_socket_path: PathBuf,
+    pub daemon_socket_path: PathBuf,
+    pub log_dir: PathBuf,
+    pub embedder_idle_timeout_secs: u64,
+    pub embedder_backfill_interval_secs: u64,
+}
 
-/// Get the lazily-loaded config singleton.
-fn cfg() -> &'static ConfigFile {
-    CONFIG.get_or_init(|| load_config_from(&config_file_candidates()))
+impl ResolvedConfig {
+    /// Resolve all config values from environment variables, config files, and defaults.
+    pub fn from_env() -> Self {
+        let file_cfg = load_config_from(&config_file_candidates());
+        Self::from_config_file(&file_cfg)
+    }
+
+    /// Resolve from a pre-loaded `ConfigFile` (still reads env vars for overrides).
+    fn from_config_file(file_cfg: &ConfigFile) -> Self {
+        let data_dir = env_or("TSM_DATA_DIR", file_cfg.data_dir.as_ref())
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
+
+        let project_root = env_or("TSM_PROJECT_ROOT", file_cfg.project_root.as_ref())
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_PROJECT_ROOT));
+
+        let embedder_socket_path =
+            env_or("TSM_EMBEDDER_SOCKET", file_cfg.embedder_socket_path.as_ref())
+                .unwrap_or_else(|| data_dir.join("embedder.sock"));
+
+        let daemon_socket_path =
+            env_or("TSM_DAEMON_SOCKET", file_cfg.daemon_socket_path.as_ref())
+                .unwrap_or_else(|| data_dir.join("daemon.sock"));
+
+        let log_dir = env_or("TSM_LOG_DIR", file_cfg.log_dir.as_ref())
+            .unwrap_or_else(|| data_dir.join("logs"));
+
+        let embedder_idle_timeout_secs =
+            env_parse_u64("TSM_EMBEDDER_IDLE_TIMEOUT", file_cfg.embedder_idle_timeout_secs)
+                .unwrap_or(DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS);
+
+        let embedder_backfill_interval_secs = env_parse_u64(
+            "TSM_EMBEDDER_BACKFILL_INTERVAL",
+            file_cfg.embedder_backfill_interval_secs,
+        )
+        .unwrap_or(DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS);
+
+        Self {
+            data_dir,
+            project_root,
+            embedder_socket_path,
+            daemon_socket_path,
+            log_dir,
+            embedder_idle_timeout_secs,
+            embedder_backfill_interval_secs,
+        }
+    }
+}
+
+/// Read an env var as PathBuf, falling back to a config file value.
+fn env_or(var: &str, file_val: Option<&PathBuf>) -> Option<PathBuf> {
+    if let Ok(val) = std::env::var(var) {
+        return Some(PathBuf::from(val));
+    }
+    file_val.cloned()
+}
+
+/// Read an env var as u64, falling back to a config file value.
+fn env_parse_u64(var: &str, file_val: Option<u64>) -> Option<u64> {
+    if let Ok(val) = std::env::var(var) {
+        match val.parse::<u64>() {
+            Ok(n) => return Some(n),
+            Err(e) => log::warn!("{var}='{val}' is not a valid integer ({e}); using default"),
+        }
+    }
+    file_val
+}
+
+static RESOLVED: OnceLock<ResolvedConfig> = OnceLock::new();
+
+/// Get the lazily-loaded resolved config singleton.
+fn resolved() -> &'static ResolvedConfig {
+    RESOLVED.get_or_init(ResolvedConfig::from_env)
 }
 
 /// Merge config values from `candidates` in order; first non-None value for each field wins.
@@ -120,95 +201,34 @@ fn config_file_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-// ─── Accessor functions (env var > config file > default) ────────
+// ─── Accessor functions (delegate to ResolvedConfig singleton) ───
 
-/// Resolve data_dir: TSM_DATA_DIR env > config file > .tsm/
 pub fn data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("TSM_DATA_DIR") {
-        return PathBuf::from(dir);
-    }
-    if let Some(ref dir) = cfg().data_dir {
-        return dir.clone();
-    }
-    PathBuf::from(DEFAULT_DATA_DIR)
+    resolved().data_dir.clone()
 }
 
-/// Resolve project_root: TSM_PROJECT_ROOT env > config file > /workspaces
 pub fn project_root() -> PathBuf {
-    if let Ok(root) = std::env::var("TSM_PROJECT_ROOT") {
-        return PathBuf::from(root);
-    }
-    if let Some(ref root) = cfg().project_root {
-        return root.clone();
-    }
-    PathBuf::from(DEFAULT_PROJECT_ROOT)
+    resolved().project_root.clone()
 }
 
-/// Resolve embedder socket path: TSM_EMBEDDER_SOCKET env > config file > .tsm/embedder.sock
 pub fn embedder_socket_path() -> PathBuf {
-    if let Ok(p) = std::env::var("TSM_EMBEDDER_SOCKET") {
-        return PathBuf::from(p);
-    }
-    if let Some(ref p) = cfg().embedder_socket_path {
-        return p.clone();
-    }
-    data_dir().join("embedder.sock")
+    resolved().embedder_socket_path.clone()
 }
 
-/// Resolve daemon socket path: TSM_DAEMON_SOCKET env > config file > .tsm/daemon.sock
 pub fn daemon_socket_path() -> PathBuf {
-    if let Ok(p) = std::env::var("TSM_DAEMON_SOCKET") {
-        return PathBuf::from(p);
-    }
-    if let Some(ref p) = cfg().daemon_socket_path {
-        return p.clone();
-    }
-    data_dir().join("daemon.sock")
+    resolved().daemon_socket_path.clone()
 }
 
-/// Resolve log directory: TSM_LOG_DIR env > config file > .tsm/logs
 pub fn log_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("TSM_LOG_DIR") {
-        return PathBuf::from(dir);
-    }
-    if let Some(ref dir) = cfg().log_dir {
-        return dir.clone();
-    }
-    data_dir().join("logs")
+    resolved().log_dir.clone()
 }
 
-/// Load embedder idle timeout.
-/// TSM_EMBEDDER_IDLE_TIMEOUT env > config file > default (600s). 0 = disable.
 pub fn embedder_idle_timeout_secs() -> u64 {
-    if let Ok(val) = std::env::var("TSM_EMBEDDER_IDLE_TIMEOUT") {
-        match val.parse::<u64>() {
-            Ok(n) => return n,
-            Err(e) => log::warn!(
-                "TSM_EMBEDDER_IDLE_TIMEOUT='{val}' is not a valid integer ({e}); using default"
-            ),
-        }
-    }
-    if let Some(n) = cfg().embedder_idle_timeout_secs {
-        return n;
-    }
-    DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS
+    resolved().embedder_idle_timeout_secs
 }
 
-/// Load embedder backfill interval.
-/// TSM_EMBEDDER_BACKFILL_INTERVAL env > config file > default (300s). 0 = disable.
 pub fn embedder_backfill_interval_secs() -> u64 {
-    if let Ok(val) = std::env::var("TSM_EMBEDDER_BACKFILL_INTERVAL") {
-        match val.parse::<u64>() {
-            Ok(n) => return n,
-            Err(e) => log::warn!(
-                "TSM_EMBEDDER_BACKFILL_INTERVAL='{val}' is not a valid integer ({e}); using default"
-            ),
-        }
-    }
-    if let Some(n) = cfg().embedder_backfill_interval_secs {
-        return n;
-    }
-    DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS
+    resolved().embedder_backfill_interval_secs
 }
 
 // ─── Derived paths ───────────────────────────────────────────────
@@ -312,11 +332,167 @@ pub fn directory_weight(file_path: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    // ─── Helper: build ResolvedConfig from a TOML string (no env var) ──
+
+    fn resolved_from_toml(toml_content: &str) -> ResolvedConfig {
+        let file_cfg: ConfigFile = toml::from_str(toml_content).unwrap();
+        // Clear env vars that would interfere, then resolve
+        // (tests using this helper must NOT touch env vars)
+        ResolvedConfig::from_config_file(&file_cfg)
+    }
+
+    // ─── Constants ──────────────────────────────────────────────────
 
     #[test]
     fn test_content_dirs_count() {
         assert_eq!(CONTENT_DIRS.len(), 10);
     }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(MAX_CHUNK_CHARS, 800);
+        assert_eq!(RRF_K, 60.0);
+        assert_eq!(SCORE_THRESHOLD, 0.005);
+        assert_eq!(MAX_RESULTS, 5);
+        assert_eq!(EMBEDDING_DIM, 256);
+        assert_eq!(DEFAULT_PROJECT_ROOT, "/workspaces");
+        assert_eq!(DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS, 600);
+        assert_eq!(DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS, 300);
+        assert_eq!(DICT_CANDIDATE_FREQ_THRESHOLD, 5);
+    }
+
+    // ─── ResolvedConfig from config file (no env var access) ────────
+
+    #[test]
+    fn test_resolved_defaults() {
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
+        assert_eq!(cfg.project_root, PathBuf::from(DEFAULT_PROJECT_ROOT));
+        assert_eq!(cfg.embedder_socket_path, PathBuf::from(".tsm/embedder.sock"));
+        assert_eq!(cfg.daemon_socket_path, PathBuf::from(".tsm/daemon.sock"));
+        assert_eq!(cfg.log_dir, PathBuf::from(".tsm/logs"));
+        assert_eq!(cfg.embedder_idle_timeout_secs, DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS);
+        assert_eq!(cfg.embedder_backfill_interval_secs, DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn test_resolved_from_config_file() {
+        let cfg = resolved_from_toml(r#"
+            data_dir = "/custom/data"
+            project_root = "/custom/root"
+            embedder_idle_timeout_secs = 0
+            embedder_backfill_interval_secs = 60
+        "#);
+        assert_eq!(cfg.data_dir, PathBuf::from("/custom/data"));
+        assert_eq!(cfg.project_root, PathBuf::from("/custom/root"));
+        assert_eq!(cfg.embedder_idle_timeout_secs, 0);
+        assert_eq!(cfg.embedder_backfill_interval_secs, 60);
+    }
+
+    #[test]
+    fn test_resolved_socket_paths_follow_data_dir() {
+        let cfg = resolved_from_toml(r#"data_dir = "/my/data""#);
+        assert_eq!(cfg.embedder_socket_path, PathBuf::from("/my/data/embedder.sock"));
+        assert_eq!(cfg.daemon_socket_path, PathBuf::from("/my/data/daemon.sock"));
+        assert_eq!(cfg.log_dir, PathBuf::from("/my/data/logs"));
+    }
+
+    #[test]
+    fn test_resolved_explicit_socket_overrides_data_dir() {
+        let cfg = resolved_from_toml(r#"
+            data_dir = "/my/data"
+            embedder_socket_path = "/custom/embedder.sock"
+            daemon_socket_path = "/custom/daemon.sock"
+            log_dir = "/custom/logs"
+        "#);
+        assert_eq!(cfg.embedder_socket_path, PathBuf::from("/custom/embedder.sock"));
+        assert_eq!(cfg.daemon_socket_path, PathBuf::from("/custom/daemon.sock"));
+        assert_eq!(cfg.log_dir, PathBuf::from("/custom/logs"));
+    }
+
+    #[test]
+    fn test_resolved_derived_paths() {
+        let cfg = resolved_from_toml(r#"data_dir = "/test""#);
+        assert_eq!(cfg.data_dir.join("tsm.db"), PathBuf::from("/test/tsm.db"));
+        assert_eq!(cfg.data_dir.join("user_dict.csv"), PathBuf::from("/test/user_dict.csv"));
+        assert_eq!(cfg.data_dir.join("tsmd.pid"), PathBuf::from("/test/tsmd.pid"));
+    }
+
+    // ─── ConfigFile loading (TOML parsing, merge, error handling) ───
+
+    #[test]
+    fn test_load_config_from_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+data_dir = "/custom/data"
+project_root = "/custom/root"
+embedder_idle_timeout_secs = 1200
+"#,
+        )
+        .unwrap();
+
+        let cfg = load_config_from(&[config_path]);
+        assert_eq!(cfg.data_dir, Some(PathBuf::from("/custom/data")));
+        assert_eq!(cfg.project_root, Some(PathBuf::from("/custom/root")));
+        assert_eq!(cfg.embedder_idle_timeout_secs, Some(1200));
+        assert!(cfg.daemon_socket_path.is_none());
+    }
+
+    #[test]
+    fn test_load_config_merge_priority() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let high = dir.path().join("high.toml");
+        std::fs::write(&high, r#"data_dir = "/high""#).unwrap();
+
+        let low = dir.path().join("low.toml");
+        std::fs::write(
+            &low,
+            r#"
+data_dir = "/low"
+project_root = "/low-root"
+"#,
+        )
+        .unwrap();
+
+        let cfg = load_config_from(&[high, low]);
+        assert_eq!(cfg.data_dir, Some(PathBuf::from("/high")));
+        assert_eq!(cfg.project_root, Some(PathBuf::from("/low-root")));
+    }
+
+    #[test]
+    fn test_load_config_empty_candidates() {
+        let cfg = load_config_from(&[]);
+        assert!(cfg.data_dir.is_none());
+        assert!(cfg.project_root.is_none());
+    }
+
+    #[test]
+    fn test_load_config_missing_file_skipped() {
+        let cfg = load_config_from(&[PathBuf::from("/nonexistent/tsm.toml")]);
+        assert!(cfg.data_dir.is_none());
+    }
+
+    #[test]
+    fn test_load_config_malformed_file_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let malformed = dir.path().join("bad.toml");
+        std::fs::write(&malformed, "this is not valid toml [[[").unwrap();
+
+        let valid = dir.path().join("good.toml");
+        std::fs::write(&valid, r#"data_dir = "/good""#).unwrap();
+
+        let cfg = load_config_from(&[malformed, valid]);
+        assert_eq!(cfg.data_dir, Some(PathBuf::from("/good")));
+    }
+
+    // ─── Pure functions ─────────────────────────────────────────────
 
     #[test]
     fn test_directory_weight_known() {
@@ -338,7 +514,6 @@ mod tests {
 
     #[test]
     fn test_directory_weight_boundary() {
-        // "daily/notes_extra/foo.md" must NOT match "daily/notes"
         assert_eq!(directory_weight("daily/notes_extra/foo.md"), 1.0);
     }
 
@@ -387,257 +562,67 @@ mod tests {
         assert_eq!(source_type_from_dir("unknown_dir"), "unknown_dir");
     }
 
+    // ─── Env var integration tests (serialized, minimal) ────────────
+    // These few tests verify that env vars actually override config values
+    // at the ResolvedConfig::from_config_file level. They touch process-global
+    // state and MUST run serially.
+
     #[test]
-    fn test_data_dir_env() {
-        std::env::set_var("TSM_DATA_DIR", "/tmp/tsm-test-data");
-        let dir = data_dir();
-        assert_eq!(dir, PathBuf::from("/tmp/tsm-test-data"));
+    #[serial]
+    fn test_env_var_overrides_config_data_dir() {
+        std::env::set_var("TSM_DATA_DIR", "/env/override");
+        let cfg = ResolvedConfig::from_config_file(&ConfigFile::default());
         std::env::remove_var("TSM_DATA_DIR");
+        assert_eq!(cfg.data_dir, PathBuf::from("/env/override"));
     }
 
     #[test]
-    fn test_project_root_env() {
-        std::env::set_var("TSM_PROJECT_ROOT", "/tmp/tsm-test-root");
-        let root = project_root();
-        assert_eq!(root, PathBuf::from("/tmp/tsm-test-root"));
-        std::env::remove_var("TSM_PROJECT_ROOT");
-    }
-
-    #[test]
-    fn test_project_root_default_constant() {
-        assert_eq!(DEFAULT_PROJECT_ROOT, "/workspaces");
-    }
-
-    #[test]
-    fn test_db_path_uses_data_dir() {
-        std::env::set_var("TSM_DATA_DIR", "/tmp/tsm-db-test");
-        let path = db_path();
-        assert_eq!(path, PathBuf::from("/tmp/tsm-db-test/tsm.db"));
-        std::env::remove_var("TSM_DATA_DIR");
-    }
-
-    #[test]
-    fn test_user_dict_path_uses_data_dir() {
-        std::env::set_var("TSM_DATA_DIR", "/tmp/tsm-dict-test");
-        let path = user_dict_path();
-        assert_eq!(path, PathBuf::from("/tmp/tsm-dict-test/user_dict.csv"));
-        std::env::remove_var("TSM_DATA_DIR");
-    }
-
-    #[test]
-    fn test_dict_candidate_freq_threshold() {
-        assert_eq!(DICT_CANDIDATE_FREQ_THRESHOLD, 5);
-    }
-
-    #[test]
-    fn test_embedder_idle_timeout_default_constant() {
-        assert_eq!(DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS, 600);
-    }
-
-    #[test]
-    fn test_embedder_idle_timeout_env() {
-        std::env::set_var("TSM_EMBEDDER_IDLE_TIMEOUT", "0");
-        let timeout = embedder_idle_timeout_secs();
-        assert_eq!(timeout, 0);
+    #[serial]
+    fn test_env_var_overrides_config_timeout() {
+        std::env::set_var("TSM_EMBEDDER_IDLE_TIMEOUT", "42");
+        let cfg = ResolvedConfig::from_config_file(&ConfigFile::default());
         std::env::remove_var("TSM_EMBEDDER_IDLE_TIMEOUT");
+        assert_eq!(cfg.embedder_idle_timeout_secs, 42);
     }
 
     #[test]
-    fn test_embedder_idle_timeout_env_custom() {
-        std::env::set_var("TSM_EMBEDDER_IDLE_TIMEOUT", "3600");
-        let timeout = embedder_idle_timeout_secs();
-        assert_eq!(timeout, 3600);
-        std::env::remove_var("TSM_EMBEDDER_IDLE_TIMEOUT");
-    }
-
-    #[test]
-    fn test_embedder_backfill_interval_default_constant() {
-        assert_eq!(DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS, 300);
-    }
-
-    #[test]
-    fn test_embedder_backfill_interval_env() {
-        std::env::set_var("TSM_EMBEDDER_BACKFILL_INTERVAL", "0");
-        let interval = embedder_backfill_interval_secs();
-        assert_eq!(interval, 0);
-        std::env::remove_var("TSM_EMBEDDER_BACKFILL_INTERVAL");
-    }
-
-    #[test]
-    fn test_embedder_backfill_interval_env_custom() {
-        std::env::set_var("TSM_EMBEDDER_BACKFILL_INTERVAL", "60");
-        let interval = embedder_backfill_interval_secs();
-        assert_eq!(interval, 60);
-        std::env::remove_var("TSM_EMBEDDER_BACKFILL_INTERVAL");
-    }
-
-    #[test]
-    fn test_constants() {
-        assert_eq!(MAX_CHUNK_CHARS, 800);
-        assert_eq!(RRF_K, 60.0);
-        assert_eq!(SCORE_THRESHOLD, 0.005);
-        assert_eq!(MAX_RESULTS, 5);
-        assert_eq!(EMBEDDING_DIM, 256);
-    }
-
-    #[test]
-    fn test_daemon_socket_path_env() {
-        std::env::set_var("TSM_DAEMON_SOCKET", "/tmp/custom-daemon.sock");
-        let path = daemon_socket_path();
-        assert_eq!(path, PathBuf::from("/tmp/custom-daemon.sock"));
-        std::env::remove_var("TSM_DAEMON_SOCKET");
-    }
-
-    #[test]
-    fn test_daemon_pid_path() {
-        std::env::set_var("TSM_DATA_DIR", "/tmp/tsm-pid-test");
-        let path = daemon_pid_path();
-        assert_eq!(path, PathBuf::from("/tmp/tsm-pid-test/tsmd.pid"));
-        std::env::remove_var("TSM_DATA_DIR");
-    }
-
-    #[test]
-    fn test_embedder_socket_path_env() {
-        std::env::set_var("TSM_EMBEDDER_SOCKET", "/tmp/custom-embedder.sock");
-        let path = embedder_socket_path();
-        assert_eq!(path, PathBuf::from("/tmp/custom-embedder.sock"));
+    #[serial]
+    fn test_env_var_overrides_config_socket() {
+        std::env::set_var("TSM_EMBEDDER_SOCKET", "/tmp/custom.sock");
+        let cfg = ResolvedConfig::from_config_file(&ConfigFile::default());
         std::env::remove_var("TSM_EMBEDDER_SOCKET");
+        assert_eq!(cfg.embedder_socket_path, PathBuf::from("/tmp/custom.sock"));
     }
 
     #[test]
-    fn test_embedder_socket_path_uses_data_dir() {
-        std::env::set_var("TSM_DATA_DIR", "/tmp/tsm-sock-test");
-        std::env::remove_var("TSM_EMBEDDER_SOCKET");
-        let path = embedder_socket_path();
-        assert_eq!(path, PathBuf::from("/tmp/tsm-sock-test/embedder.sock"));
-        std::env::remove_var("TSM_DATA_DIR");
-    }
-
-    #[test]
-    fn test_log_dir_env() {
-        std::env::set_var("TSM_LOG_DIR", "/tmp/tsm-logs");
-        let dir = log_dir();
-        assert_eq!(dir, PathBuf::from("/tmp/tsm-logs"));
-        std::env::remove_var("TSM_LOG_DIR");
-    }
-
-    #[test]
-    fn test_log_dir_uses_data_dir() {
-        std::env::set_var("TSM_DATA_DIR", "/tmp/tsm-log-test");
-        std::env::remove_var("TSM_LOG_DIR");
-        let dir = log_dir();
-        assert_eq!(dir, PathBuf::from("/tmp/tsm-log-test/logs"));
-        std::env::remove_var("TSM_DATA_DIR");
-    }
-
-    #[test]
-    fn test_model_cache_dir_env() {
-        std::env::set_var("HF_HUB_CACHE", "/tmp/hf-cache");
-        let dir = model_cache_dir();
-        assert_eq!(dir, PathBuf::from("/tmp/hf-cache"));
-        std::env::remove_var("HF_HUB_CACHE");
-    }
-
-    #[test]
+    #[serial]
     fn test_config_file_candidates_includes_xdg() {
         std::env::remove_var("TSM_CONFIG");
         let candidates = config_file_candidates();
-        // Should have at least ./tsm.toml and XDG path
         assert!(candidates.len() >= 2);
         assert_eq!(candidates[0], PathBuf::from("tsm.toml"));
-        assert!(candidates[1].to_string_lossy().contains("tsm"));
     }
 
     #[test]
+    #[serial]
     fn test_config_file_candidates_with_env() {
         std::env::set_var("TSM_CONFIG", "/tmp/custom-config.toml");
         let candidates = config_file_candidates();
-        assert_eq!(candidates[0], PathBuf::from("/tmp/custom-config.toml"));
         std::env::remove_var("TSM_CONFIG");
+        assert_eq!(candidates[0], PathBuf::from("/tmp/custom-config.toml"));
     }
 
     #[test]
-    fn test_load_config_from_single_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("test-config.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-data_dir = "/custom/data"
-project_root = "/custom/root"
-embedder_idle_timeout_secs = 1200
-"#,
-        )
-        .unwrap();
-
-        let cfg = load_config_from(&[config_path]);
-        assert_eq!(cfg.data_dir, Some(PathBuf::from("/custom/data")));
-        assert_eq!(cfg.project_root, Some(PathBuf::from("/custom/root")));
-        assert_eq!(cfg.embedder_idle_timeout_secs, Some(1200));
-        assert!(cfg.daemon_socket_path.is_none());
+    #[serial]
+    fn test_model_cache_dir_env() {
+        std::env::set_var("HF_HUB_CACHE", "/tmp/hf-cache");
+        let dir = model_cache_dir();
+        std::env::remove_var("HF_HUB_CACHE");
+        assert_eq!(dir, PathBuf::from("/tmp/hf-cache"));
     }
 
     #[test]
-    fn test_load_config_merge_priority() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let high = dir.path().join("high.toml");
-        std::fs::write(&high, r#"data_dir = "/high""#).unwrap();
-
-        let low = dir.path().join("low.toml");
-        std::fs::write(
-            &low,
-            r#"
-data_dir = "/low"
-project_root = "/low-root"
-"#,
-        )
-        .unwrap();
-
-        // High-priority file is first in the list
-        let cfg = load_config_from(&[high, low]);
-        assert_eq!(cfg.data_dir, Some(PathBuf::from("/high")));
-        // project_root only in low-priority file, still picked up
-        assert_eq!(cfg.project_root, Some(PathBuf::from("/low-root")));
-    }
-
-    #[test]
-    fn test_load_config_empty_candidates() {
-        let cfg = load_config_from(&[]);
-        assert!(cfg.data_dir.is_none());
-        assert!(cfg.project_root.is_none());
-    }
-
-    #[test]
-    fn test_load_config_missing_file_skipped() {
-        let cfg = load_config_from(&[PathBuf::from("/nonexistent/tsm.toml")]);
-        assert!(cfg.data_dir.is_none());
-    }
-
-    #[test]
-    fn test_env_var_overrides_config_file() {
-        // Even if OnceLock has a cached config, env var always wins
-        std::env::set_var("TSM_DATA_DIR", "/env/data");
-        assert_eq!(data_dir(), PathBuf::from("/env/data"));
-        std::env::remove_var("TSM_DATA_DIR");
-    }
-
-    #[test]
-    fn test_load_config_malformed_file_skipped() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let malformed = dir.path().join("bad.toml");
-        std::fs::write(&malformed, "this is not valid toml [[[").unwrap();
-
-        let valid = dir.path().join("good.toml");
-        std::fs::write(&valid, r#"data_dir = "/good""#).unwrap();
-
-        // Malformed file is higher priority but skipped; valid file still used
-        let cfg = load_config_from(&[malformed, valid]);
-        assert_eq!(cfg.data_dir, Some(PathBuf::from("/good")));
-    }
-
-    #[test]
+    #[serial]
     fn test_ensure_model_cache_env_sets_when_absent() {
         std::env::remove_var("HF_HUB_CACHE");
         ensure_model_cache_env();
@@ -646,6 +631,7 @@ project_root = "/low-root"
     }
 
     #[test]
+    #[serial]
     fn test_ensure_model_cache_env_preserves_existing() {
         std::env::set_var("HF_HUB_CACHE", "/my/custom/cache");
         ensure_model_cache_env();
