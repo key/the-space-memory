@@ -819,15 +819,8 @@ pub fn backfill_vectors(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
+    use crate::test_utils::setup_db_with_dir as setup;
     use std::io::Write;
-    use tempfile::TempDir;
-
-    fn setup() -> (Connection, TempDir) {
-        let conn = db::get_memory_connection().unwrap();
-        let dir = TempDir::new().unwrap();
-        (conn, dir)
-    }
 
     fn write_md(dir: &Path, rel_path: &str, content: &str) -> PathBuf {
         let full = dir.join(rel_path);

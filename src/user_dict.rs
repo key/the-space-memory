@@ -425,11 +425,7 @@ pub fn export_candidates_to_csv(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
-
-    fn setup() -> Connection {
-        db::get_memory_connection().unwrap()
-    }
+    use crate::test_utils::setup_db as setup;
 
     // ─── enum tests ──────────────────────────────────────────
 

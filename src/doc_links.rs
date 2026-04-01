@@ -206,11 +206,7 @@ fn build_entity_links(conn: &Connection, doc_id: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
-
-    fn setup() -> Connection {
-        db::get_memory_connection().unwrap()
-    }
+    use crate::test_utils::setup_db as setup;
 
     fn insert_doc(conn: &Connection, path: &str, tags: Option<&str>) -> i64 {
         conn.execute(

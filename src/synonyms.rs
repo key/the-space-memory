@@ -320,11 +320,7 @@ pub fn maybe_spawn_cleanup(db_path: std::path::PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
-
-    fn setup() -> Connection {
-        db::get_memory_connection().unwrap()
-    }
+    use crate::test_utils::setup_db as setup;
 
     #[test]
     fn test_upsert_synonym() {

@@ -135,13 +135,8 @@ pub fn handle_request(
 mod tests {
     use super::*;
     use crate::db;
+    use crate::test_utils::setup_db_with_dir as setup;
     use std::sync::atomic::AtomicBool;
-
-    fn setup() -> (Connection, tempfile::TempDir) {
-        let conn = db::get_memory_connection().unwrap();
-        let dir = tempfile::TempDir::new().unwrap();
-        (conn, dir)
-    }
 
     #[test]
     fn test_ping() {
@@ -215,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ingest_session_file_not_found() {
+    fn test_ingest_session_file_not_found_via_daemon() {
         let (conn, dir) = setup();
         let flag = AtomicBool::new(false);
         let req = DaemonRequest::IngestSession {
