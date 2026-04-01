@@ -1518,8 +1518,7 @@ mod tests {
 
         // Next call finds nothing
         let (stats2, has_more2) =
-            backfill_next_batch(&conn, &mock_encode, chunks as usize + 10, stats.last_id)
-                .unwrap();
+            backfill_next_batch(&conn, &mock_encode, chunks as usize + 10, stats.last_id).unwrap();
         assert_eq!(stats2.filled, 0);
         assert!(!has_more2);
     }

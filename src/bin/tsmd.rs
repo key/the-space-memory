@@ -9,7 +9,7 @@ use clap::Parser;
 
 use the_space_memory::config;
 use the_space_memory::daemon;
-use the_space_memory::daemon_protocol::{read_request, DaemonRequest, write_response};
+use the_space_memory::daemon_protocol::{read_request, write_response, DaemonRequest};
 use the_space_memory::db;
 use the_space_memory::status;
 
@@ -234,9 +234,7 @@ fn main() -> Result<()> {
                 let search_active = Arc::clone(&search_active);
 
                 std::thread::spawn(move || {
-                    if let Err(e) =
-                        handle_client(&mut stream, &conn, &index_root, &search_active)
-                    {
+                    if let Err(e) = handle_client(&mut stream, &conn, &index_root, &search_active) {
                         log::warn!("client error: {e}");
                     }
                 });
@@ -421,10 +419,7 @@ fn handle_client(
 
 /// Run one full backfill pass, releasing the DB lock between batches
 /// so search/index requests can proceed.
-fn run_backfill_pass(
-    conn: &Arc<Mutex<rusqlite::Connection>>,
-    search_active: &Arc<AtomicUsize>,
-) {
+fn run_backfill_pass(conn: &Arc<Mutex<rusqlite::Connection>>, search_active: &Arc<AtomicUsize>) {
     let encode_fn = |texts: &[String]| {
         the_space_memory::embedder::embed_via_socket(texts)
             .ok_or_else(|| anyhow::anyhow!("embedder not available"))

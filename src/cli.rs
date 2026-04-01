@@ -317,8 +317,7 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
     };
 
     let encode_fn = |texts: &[String]| {
-        embedder::embed_via_socket(texts)
-            .ok_or_else(|| anyhow::anyhow!("embedder not available"))
+        embedder::embed_via_socket(texts).ok_or_else(|| anyhow::anyhow!("embedder not available"))
     };
 
     let stats = indexer::backfill_vectors(conn, &encode_fn, batch_size, Some(&progress_cb))?;
