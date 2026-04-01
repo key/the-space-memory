@@ -60,16 +60,45 @@ struct ConfigFile {
 }
 
 /// Fully resolved configuration — all values determined at startup.
-/// Built once from env vars + config files + defaults via `from_env()`.
-/// In tests, construct directly without touching env vars or files.
+///
+/// Resolution priority: env var > config file (tsm.toml) > default.
+/// Built once via `from_env()` and stored in a `OnceLock` singleton.
+/// In tests, construct directly via `from_config_file()` without env var mutation.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
+    /// Root directory for all tsm data (DB, dictionaries, PID files, logs).
+    /// Default: `.tsm/` (relative to working directory).
+    /// Env: `TSM_DATA_DIR`. Config: `data_dir`.
     pub data_dir: PathBuf,
+
+    /// Root directory containing content workspaces to index.
+    /// Default: `/workspaces`.
+    /// Env: `TSM_PROJECT_ROOT`. Config: `project_root`.
     pub project_root: PathBuf,
+
+    /// UNIX socket path for tsm-embedder (encode requests).
+    /// Default: `{data_dir}/embedder.sock`.
+    /// Env: `TSM_EMBEDDER_SOCKET`. Config: `embedder_socket_path`.
     pub embedder_socket_path: PathBuf,
+
+    /// UNIX socket path for tsmd (client requests).
+    /// Default: `{data_dir}/daemon.sock`.
+    /// Env: `TSM_DAEMON_SOCKET`. Config: `daemon_socket_path`.
     pub daemon_socket_path: PathBuf,
+
+    /// Directory for daemon log files (tsmd, tsm-embedder, tsm-watcher).
+    /// Default: `{data_dir}/logs`.
+    /// Env: `TSM_LOG_DIR`. Config: `log_dir`.
     pub log_dir: PathBuf,
+
+    /// Seconds of inactivity before tsm-embedder shuts down. 0 = never.
+    /// Default: 600.
+    /// Env: `TSM_EMBEDDER_IDLE_TIMEOUT`. Config: `embedder_idle_timeout_secs`.
     pub embedder_idle_timeout_secs: u64,
+
+    /// Seconds between periodic backfill checks. 0 = disable.
+    /// Default: 300.
+    /// Env: `TSM_EMBEDDER_BACKFILL_INTERVAL`. Config: `embedder_backfill_interval_secs`.
     pub embedder_backfill_interval_secs: u64,
 }
 
