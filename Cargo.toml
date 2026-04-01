@@ -1,6 +1,6 @@
 [package]
 name = "the-space-memory"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [[bin]]
@@ -14,10 +14,6 @@ path = "src/bin/tsmd.rs"
 [[bin]]
 name = "tsm-embedder"
 path = "src/bin/tsm_embedder.rs"
-
-[[bin]]
-name = "tsm-watcher"
-path = "src/bin/tsm_watcher.rs"
 
 [dependencies]
 rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }

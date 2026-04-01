@@ -54,7 +54,11 @@ enum Commands {
     /// Initialize the database
     Init,
     /// Start the daemon (tsmd)
-    Start,
+    Start {
+        /// Skip watcher startup
+        #[arg(long)]
+        no_watcher: bool,
+    },
     /// Stop the daemon (tsmd)
     Stop,
     /// Index documents
@@ -148,11 +152,11 @@ fn main() -> anyhow::Result<()> {
     match args.command {
         // ── Always direct ──
         Commands::Init => cli::cmd_init()?,
-        Commands::Start => cmd_start()?,
+        Commands::Start { no_watcher } => cmd_start(no_watcher)?,
         Commands::Stop => cmd_stop()?,
         Commands::Restart => {
             cmd_stop()?;
-            cmd_start()?;
+            cmd_start(false)?;
         }
         Commands::Setup => cli::cmd_setup()?,
         Commands::VectorFill { batch_size } => cli::cmd_vector_fill(batch_size)?,
@@ -263,7 +267,7 @@ fn send_to_daemon(req: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
     }
 
     // Auto-start tsmd
-    cmd_start()?;
+    cmd_start(false)?;
 
     // Retry after start
     daemon_protocol::send_request(&socket, req)
@@ -387,7 +391,7 @@ fn render_import_wordnet(resp: DaemonResponse) -> anyhow::Result<()> {
 }
 
 /// Start the tsmd daemon as a background process.
-fn cmd_start() -> anyhow::Result<()> {
+fn cmd_start(no_watcher: bool) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
 
     let socket_path = config::daemon_socket_path();
@@ -424,6 +428,9 @@ fn cmd_start() -> anyhow::Result<()> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit());
+    if no_watcher {
+        cmd.arg("--no-watcher");
+    }
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();

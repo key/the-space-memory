@@ -154,7 +154,7 @@ pub struct ResolvedConfig {
     /// Env: `TSM_DAEMON_SOCKET`. Config: `daemon_socket_path`.
     pub daemon_socket_path: PathBuf,
 
-    /// Directory for daemon log files (tsmd, tsm-embedder, tsm-watcher).
+    /// Directory for daemon log files (tsmd, tsm-embedder).
     /// Default: `{state_dir}/logs`.
     /// Env: `TSM_LOG_DIR`. Config: `log_dir`.
     pub log_dir: PathBuf,
