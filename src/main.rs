@@ -140,6 +140,9 @@ enum Commands {
         /// Proceed without confirmation
         #[arg(long)]
         force: bool,
+        /// Rebuild only the FTS5 full-text index (preserves vectors)
+        #[arg(long)]
+        fts_only: bool,
     },
     /// Restart the daemon (stop + start)
     Restart,
@@ -162,9 +165,16 @@ fn main() -> anyhow::Result<()> {
         Commands::VectorFill { batch_size } => cli::cmd_vector_fill(batch_size)?,
 
         // ── Direct-only with daemon guard ──
-        Commands::Rebuild { force } => {
+        Commands::Rebuild { force, fts_only } => {
             guard_daemon_not_running("rebuild")?;
-            cli::cmd_rebuild(force)?;
+            if force && fts_only {
+                anyhow::bail!("--force and --fts-only are mutually exclusive");
+            }
+            if fts_only {
+                cli::cmd_rebuild_fts()?;
+            } else {
+                cli::cmd_rebuild(force)?;
+            }
         }
         Commands::DictUpdate {
             threshold,

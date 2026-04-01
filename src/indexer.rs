@@ -942,6 +942,42 @@ pub fn backfill_vectors(
     Ok(stats)
 }
 
+/// Rebuild only the FTS5 index by re-running wakachi on all chunks.
+/// Vectors, documents, entities, and other data are preserved.
+pub fn rebuild_fts(
+    conn: &Connection,
+    progress_cb: Option<&dyn Fn(usize, usize)>,
+) -> anyhow::Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+
+    let total: i64 = tx.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+    let total = total as usize;
+
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare("SELECT id, content FROM chunks ORDER BY id")?;
+        let mapped = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        mapped
+    };
+
+    tx.execute("DELETE FROM chunks_fts", [])?;
+
+    for (i, (id, content)) in rows.iter().enumerate() {
+        let wakachi_text = wakachi(content);
+        tx.execute(
+            "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
+            rusqlite::params![id, wakachi_text],
+        )?;
+        if let Some(cb) = &progress_cb {
+            cb(i + 1, total);
+        }
+    }
+
+    tx.commit()?;
+    Ok(rows.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2044,5 +2080,131 @@ mod tests {
             doc_id_before, doc_id_after,
             "doc_id should be preserved across re-indexes"
         );
+    }
+
+    #[test]
+    fn test_rebuild_fts_repopulates() {
+        let (conn, dir) = setup();
+        let md = "# Test\n\nSome content here.\n";
+        let path = write_md(dir.path(), "daily/notes/test.md", md);
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let chunk_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(chunk_count > 0);
+
+        // Clear FTS manually
+        conn.execute("DELETE FROM chunks_fts", []).unwrap();
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 0);
+
+        // Rebuild
+        let inserted = rebuild_fts(&conn, None).unwrap();
+        assert_eq!(inserted as i64, chunk_count);
+
+        let fts_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_after, chunk_count);
+
+        // Verify rowids match chunk ids
+        let mismatches: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks c LEFT JOIN chunks_fts f ON c.id = f.rowid WHERE f.rowid IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mismatches, 0);
+    }
+
+    #[test]
+    fn test_rebuild_fts_preserves_vectors() {
+        let (conn, dir) = setup();
+        let md = "# Test\n\nContent for vector test.\n";
+        let path = write_md(dir.path(), "daily/notes/vec.md", md);
+        index_file(&conn, &path, dir.path()).unwrap();
+
+        let chunk_id: i64 = conn
+            .query_row("SELECT id FROM chunks LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+
+        // Insert a fake vector
+        let dim: usize = crate::config::EMBEDDING_DIM;
+        let fake_vec = vec![0.1f32; dim];
+        let vec_bytes: Vec<u8> = fake_vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+        conn.execute(
+            "INSERT INTO chunks_vec(rowid, embedding) VALUES (?, ?)",
+            rusqlite::params![chunk_id, vec_bytes],
+        )
+        .unwrap();
+
+        let vec_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        let doc_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+            .unwrap();
+
+        rebuild_fts(&conn, None).unwrap();
+
+        let vec_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        let doc_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+            .unwrap();
+
+        assert_eq!(vec_before, vec_after, "vectors should be preserved");
+        assert_eq!(doc_before, doc_after, "documents should be preserved");
+    }
+
+    #[test]
+    fn test_rebuild_fts_empty_db() {
+        let (conn, _dir) = setup();
+        let inserted = rebuild_fts(&conn, None).unwrap();
+        assert_eq!(inserted, 0);
+
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 0);
+    }
+
+    #[test]
+    fn test_rebuild_fts_progress_callback() {
+        let (conn, dir) = setup();
+        let md1 = "# One\n\nFirst doc content.\n";
+        let md2 = "# Two\n\nSecond doc content.\n";
+        write_md(dir.path(), "daily/notes/a.md", md1);
+        write_md(dir.path(), "daily/notes/b.md", md2);
+        let paths: Vec<_> = vec![
+            dir.path().join("daily/notes/a.md"),
+            dir.path().join("daily/notes/b.md"),
+        ];
+        index_all_with_progress(&conn, &paths, dir.path(), None).unwrap();
+
+        let chunk_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let cb = |current: usize, total: usize| {
+            calls.borrow_mut().push((current, total));
+        };
+
+        rebuild_fts(&conn, Some(&cb)).unwrap();
+
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), chunk_count as usize);
+        // All calls should have the same total
+        for (_, t) in &calls {
+            assert_eq!(*t, chunk_count as usize);
+        }
+        // Last call should have current == total
+        assert_eq!(calls.last().unwrap().0, chunk_count as usize);
     }
 }
