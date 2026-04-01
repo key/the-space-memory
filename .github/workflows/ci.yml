@@ -43,5 +43,8 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Coverage (90% minimum, excluding binaries and I/O-heavy modules)
-        run: cargo llvm-cov --ignore-filename-regex '(embedder|main|cli|tsmd|tsm_watcher|status|logging)\.rs' --fail-under-lines 90
+      - name: Coverage (90% minimum)
+        run: >-
+          cargo llvm-cov
+          --ignore-filename-regex '(embedder|main|cli|tsmd|tsm_watcher|status|logging)\.rs'
+          --fail-under-lines 90
