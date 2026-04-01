@@ -510,7 +510,8 @@ fn periodic_backfill(
             conn.query_row(
                 "SELECT COUNT(*) FROM chunks c
                  LEFT JOIN chunks_vec v ON c.id = v.rowid
-                 WHERE v.rowid IS NULL",
+                 LEFT JOIN chunks_vec_skip s ON c.id = s.chunk_id
+                 WHERE v.rowid IS NULL AND s.chunk_id IS NULL",
                 [],
                 |r| r.get(0),
             )
@@ -537,5 +538,30 @@ fn sleep_interruptible(duration: std::time::Duration) {
         let sleep_for = step.min(remaining);
         std::thread::sleep(sleep_for);
         remaining = remaining.saturating_sub(sleep_for);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_search_active_guard_raii() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+
+        {
+            let _guard = SearchActiveGuard::new(&counter);
+            assert_eq!(counter.load(Ordering::Acquire), 1);
+
+            {
+                let _guard2 = SearchActiveGuard::new(&counter);
+                assert_eq!(counter.load(Ordering::Acquire), 2);
+            }
+            // guard2 dropped
+            assert_eq!(counter.load(Ordering::Acquire), 1);
+        }
+        // guard dropped
+        assert_eq!(counter.load(Ordering::Acquire), 0);
     }
 }
