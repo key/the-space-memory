@@ -91,8 +91,8 @@ struct RawCandidate {
 
 // ─── Existing surfaces cache ─────────────────────────────────
 
-/// Cached set of surfaces already in user_dict.csv (loaded once per process).
-/// Acceptable because the CSV only changes when dict-update runs (which triggers rebuild).
+/// Cached set of surfaces already in user_dict.simpledic (loaded once per process).
+/// Acceptable because the dict only changes when dict-update runs (which triggers rebuild).
 static EXISTING_SURFACES: OnceLock<HashSet<String>> = OnceLock::new();
 
 fn get_existing_surfaces() -> &'static HashSet<String> {
@@ -105,7 +105,7 @@ fn get_existing_surfaces() -> &'static HashSet<String> {
     })
 }
 
-/// Load existing surface forms from a user_dict.csv file.
+/// Load existing surface forms from a user dictionary file (IPAdic format).
 /// The first column (comma-separated) is the surface form.
 pub fn load_existing_surfaces(csv_path: &Path) -> anyhow::Result<HashSet<String>> {
     let mut surfaces = HashSet::new();
@@ -360,9 +360,10 @@ pub fn format_simpledic_row(surface: &str) -> String {
     format!("{surface},カスタム名詞,{surface}")
 }
 
-/// Format a CSV row in lindera IPADIC format (11 fields).
+/// Format a CSV row in lindera user dictionary format (3 fields: surface, pos, reading).
+/// lindera IPAdic user dictionary expects exactly 3 fields, not the full 13-field system dict format.
 pub fn format_ipadic_row(surface: &str) -> String {
-    format!("{surface},0,0,0,カスタム名詞,*,*,*,{surface},{surface},{surface}")
+    format!("{surface},カスタム名詞,{surface}")
 }
 
 /// Export threshold candidates to a CSV file (appending).
@@ -780,10 +781,7 @@ mod tests {
 
     #[test]
     fn test_format_ipadic_row() {
-        assert_eq!(
-            format_ipadic_row("candle"),
-            "candle,0,0,0,カスタム名詞,*,*,*,candle,candle,candle"
-        );
+        assert_eq!(format_ipadic_row("candle"), "candle,カスタム名詞,candle");
     }
 
     // ─── load_existing_surfaces tests ────────────────────────
@@ -895,7 +893,7 @@ mod tests {
 
         export_candidates_to_csv(&conn, &csv_path, 5, DictFormat::Ipadic).unwrap();
         let content = std::fs::read_to_string(&csv_path).unwrap();
-        assert!(content.contains("lindera,0,0,0,カスタム名詞"));
+        assert!(content.contains("lindera,カスタム名詞,lindera"));
     }
 
     #[test]

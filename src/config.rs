@@ -123,6 +123,7 @@ pub(crate) struct ConfigFile {
     embedder_idle_timeout_secs: Option<u64>,
     embedder_backfill_interval_secs: Option<u64>,
     search_fallback: Option<SearchFallback>,
+    user_dict_path: Option<PathBuf>,
     #[serde(default)]
     index: IndexConfig,
 }
@@ -173,6 +174,11 @@ pub struct ResolvedConfig {
     /// Default: `Error` (refuse to search without vector search).
     /// Env: `TSM_SEARCH_FALLBACK`. Config: `search_fallback`.
     pub search_fallback: SearchFallback,
+
+    /// Path to user dictionary file (lindera IPAdic format).
+    /// Default: `{state_dir}/user_dict.simpledic`.
+    /// Env: `TSM_USER_DICT`. Config: `user_dict_path`.
+    pub user_dict_path: PathBuf,
 
     /// Content directories with scoring weights and half-life.
     /// Empty = auto-discover mode (recursively index all .md under index_root).
@@ -226,6 +232,9 @@ impl ResolvedConfig {
         .unwrap_or(DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS);
 
         let search_fallback = env_parse_fallback(file_cfg.search_fallback);
+
+        let user_dict_path = env_or("TSM_USER_DICT", file_cfg.user_dict_path.as_ref())
+            .unwrap_or_else(|| state_dir.join("user_dict.simpledic"));
 
         let mut content_dirs: Vec<ContentDir> = file_cfg
             .index
@@ -296,6 +305,7 @@ impl ResolvedConfig {
             embedder_idle_timeout_secs,
             embedder_backfill_interval_secs,
             search_fallback,
+            user_dict_path,
             content_dirs,
             session_weight,
             session_half_life_days,
@@ -380,6 +390,7 @@ fn load_config_from(candidates: &[PathBuf]) -> ConfigFile {
             .embedder_backfill_interval_secs
             .or(file.embedder_backfill_interval_secs);
         merged.search_fallback = merged.search_fallback.or(file.search_fallback);
+        merged.user_dict_path = merged.user_dict_path.or(file.user_dict_path);
         if merged.index.content_dirs.is_empty() {
             merged.index.content_dirs = file.index.content_dirs;
         }
@@ -462,7 +473,7 @@ pub fn db_path() -> PathBuf {
 }
 
 pub fn user_dict_path() -> PathBuf {
-    state_dir().join("user_dict.csv")
+    resolved().user_dict_path.clone()
 }
 
 pub fn custom_terms_path() -> PathBuf {
@@ -700,8 +711,8 @@ mod tests {
         let cfg = resolved_from_toml(r#"state_dir = "/test""#);
         assert_eq!(cfg.state_dir.join("tsm.db"), PathBuf::from("/test/tsm.db"));
         assert_eq!(
-            cfg.state_dir.join("user_dict.csv"),
-            PathBuf::from("/test/user_dict.csv")
+            cfg.user_dict_path,
+            PathBuf::from("/test/user_dict.simpledic")
         );
         assert_eq!(
             cfg.state_dir.join("tsmd.pid"),

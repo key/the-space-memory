@@ -1114,7 +1114,7 @@ pub fn cmd_dict_update(
         );
     }
     eprintln!(
-        "\n{} word(s) will be added to user_dict.csv.",
+        "\n{} word(s) will be added to user dictionary.",
         candidates.len()
     );
 

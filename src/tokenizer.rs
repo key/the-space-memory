@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use lindera::dictionary::{load_embedded_dictionary, DictionaryKind};
+use lindera::dictionary::{
+    load_embedded_dictionary, load_user_dictionary_from_csv, DictionaryKind, UserDictionary,
+};
 use lindera::mode::Mode;
 use lindera::segmenter::Segmenter;
 
@@ -14,8 +16,28 @@ pub fn get_segmenter() -> &'static Segmenter {
     SEGMENTER.get_or_init(|| {
         let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC)
             .expect("Failed to load IPADIC dictionary");
-        Segmenter::new(Mode::Normal, dictionary, None)
+        let user_dict = load_user_dict(&dictionary.metadata);
+        Segmenter::new(Mode::Normal, dictionary, user_dict)
     })
+}
+
+fn load_user_dict(metadata: &lindera::dictionary::Metadata) -> Option<UserDictionary> {
+    let path = config::user_dict_path();
+
+    if !path.exists() {
+        return None;
+    }
+
+    match load_user_dictionary_from_csv(metadata, &path) {
+        Ok(ud) => {
+            log::info!("user dictionary loaded: {}", path.display());
+            Some(ud)
+        }
+        Err(e) => {
+            log::warn!("failed to load user dictionary: {e}");
+            None
+        }
+    }
 }
 
 /// A token with surface form and byte positions in the original text.
@@ -333,6 +355,58 @@ mod tests {
         let result = extract_search_keywords("LoRa LoRa LoRa");
         let lora_count = result.iter().filter(|k| k.as_str() == "LoRa").count();
         assert!(lora_count <= 1, "Should deduplicate: {:?}", result);
+    }
+
+    // ─── user dictionary tests ────────────────────────────────
+
+    #[test]
+    fn test_user_dict_loaded_into_segmenter() {
+        use lindera::dictionary::{
+            load_embedded_dictionary, load_user_dictionary_from_csv, DictionaryKind,
+        };
+        use lindera::mode::Mode;
+        use lindera::segmenter::Segmenter;
+
+        // Create a temp user dict with a compound term
+        let dir = tempfile::TempDir::new().unwrap();
+        let dict_path = dir.path().join("test.simpledic");
+        // lindera user dict: 3 fields (surface, part_of_speech, reading)
+        std::fs::write(
+            &dict_path,
+            "ドッグトラッカー,カスタム名詞,ドッグトラッカー\n",
+        )
+        .unwrap();
+
+        let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC).unwrap();
+        let user_dict = load_user_dictionary_from_csv(&dictionary.metadata, &dict_path).unwrap();
+        let segmenter = Segmenter::new(Mode::Normal, dictionary, Some(user_dict));
+
+        // With user dict: "ドッグトラッカー" should be one token
+        let mut tokens = segmenter
+            .segment(std::borrow::Cow::Borrowed("ドッグトラッカーの開発"))
+            .unwrap();
+        let surfaces: Vec<String> = tokens
+            .iter_mut()
+            .map(|t| t.surface.as_ref().to_string())
+            .collect();
+        assert!(
+            surfaces.contains(&"ドッグトラッカー".to_string()),
+            "User dict term should be a single token: {:?}",
+            surfaces
+        );
+    }
+
+    #[test]
+    fn test_load_user_dict_nonexistent() {
+        use lindera::dictionary::{load_embedded_dictionary, DictionaryKind};
+        let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC).unwrap();
+        // load_user_dict uses config::user_dict_path() which may not exist in test
+        // Directly test that nonexistent path returns None
+        let result = load_user_dictionary_from_csv(
+            &dictionary.metadata,
+            std::path::Path::new("/nonexistent/dict.simpledic"),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
