@@ -24,12 +24,12 @@ lindera の内蔵辞書（IPAdic）は一般的な日本語をカバーするが
 ```text
 .tsm/
 ├── tsm.db                  # dictionary_candidates テーブル（候補の蓄積・ステータス管理）
-└── user_dict.ipadic           # lindera に読ませる辞書ファイル（IPAdic 形式）
+└── user_dict.simpledic           # lindera に読ませる辞書ファイル（simpledic 形式）
 ```
 
-### user_dict.ipadic
+### user_dict.simpledic
 
-lindera が形態素解析時に参照する辞書ファイル。IPAdic 形式（11フィールド、カンマ区切り）。
+lindera が形態素解析時に参照する辞書ファイル。simpledic 形式（11フィールド、カンマ区切り）。
 
 ```csv
 tsmd,0,0,0,カスタム名詞,*,*,*,tsmd,tsmd,tsmd
@@ -66,7 +66,7 @@ tsm では全エントリを `カスタム名詞` として登録し、コスト
 | ファイル | 役割 |
 |---|---|
 | `src/user_dict.rs` | 候補収集（`collect_from_text`）、辞書エクスポート、accept/reject 操作 |
-| `src/tokenizer.rs` | lindera の初期化。`user_dict.ipadic` を `load_user_dictionary_from_csv()` で読み込み、`Segmenter` に適用 |
+| `src/tokenizer.rs` | lindera の初期化。`user_dict.simpledic` を `load_user_dictionary_from_csv()` で読み込み、`Segmenter` に適用 |
 | `src/cli.rs` | `dict-update` コマンドの実装（`cmd_dict_update`） |
 | `src/db.rs` | `dictionary_candidates` テーブルのスキーマ定義 |
 
@@ -74,7 +74,7 @@ tsm では全エントリを `カスタム名詞` として登録し、コスト
 
 1. `indexer::index_file()` がドキュメントをインデックスする際、テキストを `user_dict::collect_from_text()` に渡す
 2. lindera で形態素解析し、固有名詞・カタカナ語・ASCII 用語を候補として抽出
-3. 既に `user_dict.ipadic` に存在する語はスキップ
+3. 既に `user_dict.simpledic` に存在する語はスキップ
 4. 1文字・数字のみ・記号のみの語もスキップ
 5. `dictionary_candidates` テーブルに UPSERT（既存なら frequency を +1、rejected なら加算しない）
 
@@ -97,7 +97,7 @@ tsm rebuild --force
 
 - frequency >= 5 かつ status = pending の候補を取得
 - 既に CSV にある語は `accepted` にマークしてスキップ
-- 新規の語を `user_dict.ipadic` に追記し、`accepted` にマーク
+- 新規の語を `user_dict.simpledic` に追記し、`accepted` にマーク
 
 ### 候補を reject する
 
@@ -110,7 +110,7 @@ sqlite3 .tsm/tsm.db "UPDATE dictionary_candidates SET status = 'rejected' WHERE 
 
 ### 辞書から単語を手動削除する
 
-`user_dict.ipadic` をテキストエディタで編集し、不要な行を削除する。
+`user_dict.simpledic` をテキストエディタで編集し、不要な行を削除する。
 変更後は `tsm rebuild --force` が必要。
 
 ### 現在の状態を確認する
@@ -129,5 +129,5 @@ sqlite3 .tsm/tsm.db \
    ORDER BY frequency DESC LIMIT 20"
 
 # 辞書の単語数
-wc -l .tsm/user_dict.ipadic
+wc -l .tsm/user_dict.simpledic
 ```

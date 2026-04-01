@@ -369,7 +369,7 @@ mod tests {
 
         // Create a temp user dict with a compound term
         let dir = tempfile::TempDir::new().unwrap();
-        let dict_path = dir.path().join("test.ipadic");
+        let dict_path = dir.path().join("test.simpledic");
         // lindera user dict: 3 fields (surface, part_of_speech, reading)
         std::fs::write(
             &dict_path,
@@ -404,7 +404,7 @@ mod tests {
         // Directly test that nonexistent path returns None
         let result = load_user_dictionary_from_csv(
             &dictionary.metadata,
-            std::path::Path::new("/nonexistent/dict.ipadic"),
+            std::path::Path::new("/nonexistent/dict.simpledic"),
         );
         assert!(result.is_err());
     }

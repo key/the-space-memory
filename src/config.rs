@@ -176,7 +176,7 @@ pub struct ResolvedConfig {
     pub search_fallback: SearchFallback,
 
     /// Path to user dictionary file (lindera IPAdic format).
-    /// Default: `{state_dir}/user_dict.ipadic`.
+    /// Default: `{state_dir}/user_dict.simpledic`.
     /// Env: `TSM_USER_DICT`. Config: `user_dict_path`.
     pub user_dict_path: PathBuf,
 
@@ -234,7 +234,7 @@ impl ResolvedConfig {
         let search_fallback = env_parse_fallback(file_cfg.search_fallback);
 
         let user_dict_path = env_or("TSM_USER_DICT", file_cfg.user_dict_path.as_ref())
-            .unwrap_or_else(|| state_dir.join("user_dict.ipadic"));
+            .unwrap_or_else(|| state_dir.join("user_dict.simpledic"));
 
         let mut content_dirs: Vec<ContentDir> = file_cfg
             .index
@@ -710,7 +710,10 @@ mod tests {
     fn test_resolved_derived_paths() {
         let cfg = resolved_from_toml(r#"state_dir = "/test""#);
         assert_eq!(cfg.state_dir.join("tsm.db"), PathBuf::from("/test/tsm.db"));
-        assert_eq!(cfg.user_dict_path, PathBuf::from("/test/user_dict.ipadic"));
+        assert_eq!(
+            cfg.user_dict_path,
+            PathBuf::from("/test/user_dict.simpledic")
+        );
         assert_eq!(
             cfg.state_dir.join("tsmd.pid"),
             PathBuf::from("/test/tsmd.pid")
