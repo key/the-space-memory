@@ -151,7 +151,20 @@ docker build -t the-space-memory /path/to/the-space-memory
   candle's ModernBert::load expects `model.` prefix — key names are remapped at load time
 - Use `rusqlite`'s bundled feature (don't depend on system SQLite)
 - Embedder daemon auto-stops after 10 min idle. Check with `doctor`, restart if needed
-- Search works without embedder (FTS5-only fallback)
+- Search errors by default when embedder is down (`search_fallback = "error"`).
+  Use `--fallback fts_only` or config for FTS-only mode
+
+## Design Decisions (ADR)
+
+設計上の判断・ノウハウは以下のディレクトリに記録されている。
+機能追加やアーキテクチャ変更の前に既存の資料を確認すること。
+
+| ディレクトリ | 内容 |
+|---|---|
+| `decisions/` | ADR（設計判断の記録と根拠） |
+
+特にプロセス構成・IPC・障害時挙動に関わる変更は
+ADR-0001 を参照。
 
 ## License Compatibility
 
