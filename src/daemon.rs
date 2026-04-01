@@ -13,7 +13,7 @@ use crate::daemon_protocol::{DaemonRequest, DaemonResponse};
 pub fn handle_request(
     conn: &Connection,
     req: DaemonRequest,
-    project_root: &Path,
+    index_root: &Path,
     shutdown_flag: &AtomicBool,
 ) -> DaemonResponse {
     match req {
@@ -46,8 +46,7 @@ pub fn handle_request(
             };
             match cli::run_search(conn, &opts) {
                 Ok(results) => {
-                    let json_str =
-                        cli::format_json(&results, include_content, project_root);
+                    let json_str = cli::format_json(&results, include_content, index_root);
                     match json_str {
                         Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
                             Ok(v) => DaemonResponse::success(v),
@@ -62,11 +61,11 @@ pub fn handle_request(
 
         DaemonRequest::Index { files } => {
             let file_paths: Vec<PathBuf> = if files.is_empty() {
-                cli::collect_content_files(project_root)
+                cli::collect_content_files(index_root)
             } else {
-                files.iter().map(|f| project_root.join(f)).collect()
+                files.iter().map(|f| index_root.join(f)).collect()
             };
-            match cli::run_index(conn, &file_paths, project_root) {
+            match cli::run_index(conn, &file_paths, index_root) {
                 Ok(stats) => DaemonResponse::success(serde_json::json!({
                     "indexed": stats.indexed,
                     "skipped": stats.skipped,
@@ -104,12 +103,10 @@ pub fn handle_request(
             }
         }
 
-        DaemonRequest::VectorFill { batch_size } => {
-            match cli::run_vector_fill(conn, batch_size) {
-                Ok(()) => DaemonResponse::success_empty(),
-                Err(e) => DaemonResponse::error(format!("{e}")),
-            }
-        }
+        DaemonRequest::VectorFill { batch_size } => match cli::run_vector_fill(conn, batch_size) {
+            Ok(()) => DaemonResponse::success_empty(),
+            Err(e) => DaemonResponse::error(format!("{e}")),
+        },
 
         DaemonRequest::ImportWordnet { wordnet_db } => {
             let path = PathBuf::from(&wordnet_db);
@@ -125,9 +122,9 @@ pub fn handle_request(
             "dict-update cannot run while tsmd is active. Run `tsm stop` first.",
         ),
 
-        DaemonRequest::Rebuild { .. } => DaemonResponse::error(
-            "rebuild cannot run while tsmd is active. Run `tsm stop` first.",
-        ),
+        DaemonRequest::Rebuild { .. } => {
+            DaemonResponse::error("rebuild cannot run while tsmd is active. Run `tsm stop` first.")
+        }
     }
 }
 
@@ -135,13 +132,8 @@ pub fn handle_request(
 mod tests {
     use super::*;
     use crate::db;
+    use crate::test_utils::setup_db_with_dir as setup;
     use std::sync::atomic::AtomicBool;
-
-    fn setup() -> (Connection, tempfile::TempDir) {
-        let conn = db::get_memory_connection().unwrap();
-        let dir = tempfile::TempDir::new().unwrap();
-        (conn, dir)
-    }
 
     #[test]
     fn test_ping() {
@@ -215,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ingest_session_file_not_found() {
+    fn test_ingest_session_file_not_found_via_daemon() {
         let (conn, dir) = setup();
         let flag = AtomicBool::new(false);
         let req = DaemonRequest::IngestSession {

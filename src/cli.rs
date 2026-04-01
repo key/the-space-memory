@@ -19,44 +19,46 @@ pub fn cmd_init() -> anyhow::Result<()> {
 pub fn run_index(
     conn: &rusqlite::Connection,
     file_paths: &[PathBuf],
-    project_root: &Path,
+    index_root: &Path,
 ) -> anyhow::Result<indexer::IndexStats> {
-    indexer::index_all(conn, file_paths, project_root)
+    indexer::index_all(conn, file_paths, index_root)
 }
 
 pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
-    let project_root = config::project_root();
+    let index_root = config::index_root();
 
     let file_paths: Vec<PathBuf> = if files_from_stdin {
-        read_paths_from_stdin(&project_root)
+        read_paths_from_stdin(&index_root)
     } else {
-        collect_content_files(&project_root)
+        collect_content_files(&index_root)
     };
 
-    let stats = run_index(&conn, &file_paths, &project_root)?;
+    let stats = run_index(&conn, &file_paths, &index_root)?;
     log::info!(
         "Indexed: {}, Skipped: {}, Removed: {}",
-        stats.indexed, stats.skipped, stats.removed
+        stats.indexed,
+        stats.skipped,
+        stats.removed
     );
     Ok(())
 }
 
-pub fn read_paths_from_stdin(project_root: &Path) -> Vec<PathBuf> {
+pub fn read_paths_from_stdin(index_root: &Path) -> Vec<PathBuf> {
     std::io::stdin()
         .lock()
         .lines()
         .map_while(Result::ok)
         .filter(|line| !line.trim().is_empty())
-        .map(|line| project_root.join(line.trim()))
+        .map(|line| index_root.join(line.trim()))
         .collect()
 }
 
-pub fn collect_content_files(project_root: &Path) -> Vec<PathBuf> {
+pub fn collect_content_files(index_root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for &(dir, _) in config::CONTENT_DIRS {
-        let full_dir = project_root.join(dir);
+        let full_dir = index_root.join(dir);
         if !full_dir.is_dir() {
             continue;
         }
@@ -161,7 +163,7 @@ fn print_text(results: &[searcher::SearchResult]) {
 pub fn format_json(
     results: &[searcher::SearchResult],
     include_content: Option<usize>,
-    project_root: &Path,
+    index_root: &Path,
 ) -> anyhow::Result<String> {
     let mut json_results: Vec<serde_json::Value> = Vec::new();
 
@@ -190,7 +192,7 @@ pub fn format_json(
 
         if let Some(n) = include_content {
             if i < n {
-                let full_path = project_root.join(&r.source_file);
+                let full_path = index_root.join(&r.source_file);
                 if let Ok(content) = std::fs::read_to_string(&full_path) {
                     obj["content"] = serde_json::Value::String(content);
                 }
@@ -207,8 +209,8 @@ fn print_json(
     results: &[searcher::SearchResult],
     include_content: Option<usize>,
 ) -> anyhow::Result<()> {
-    let project_root = config::project_root();
-    println!("{}", format_json(results, include_content, &project_root)?);
+    let index_root = config::index_root();
+    println!("{}", format_json(results, include_content, &index_root)?);
     Ok(())
 }
 
@@ -255,8 +257,7 @@ pub fn cmd_backfill_worker() -> anyhow::Result<()> {
 }
 
 /// Guard to prevent concurrent backfill runs (startup + periodic).
-static BACKFILL_RUNNING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static BACKFILL_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// RAII guard that resets `BACKFILL_RUNNING` on drop (including panic unwind).
 struct BackfillGuard;
@@ -293,12 +294,12 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
         std::time::Duration::from_secs(120),
     )?);
     let mut restarts = 0;
-    let data_dir = config::data_dir();
+    let state_dir = config::state_dir();
     let started_at = chrono::Utc::now().to_rfc3339();
 
     // Write initial backfill status
     let started_at_clone = started_at.clone();
-    status::update(&data_dir, |s| {
+    status::update(&state_dir, |s| {
         s.backfill = Some(status::BackfillStatus {
             total: 0,
             filled: 0,
@@ -308,7 +309,7 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
     });
 
     let progress_cb = |total: i64, filled: usize, errors: usize| {
-        status::update(&data_dir, |s| {
+        status::update(&state_dir, |s| {
             if let Some(ref mut b) = s.backfill {
                 b.total = total;
                 b.filled = filled;
@@ -362,7 +363,7 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
     }
 
     // Clear backfill status on completion
-    status::update(&data_dir, |s| {
+    status::update(&state_dir, |s| {
         s.backfill = None;
     });
 
@@ -609,8 +610,8 @@ fn doctor_check_with_conn(
         .unwrap_or(-1);
 
     // Check if backfill is in progress
-    let data_dir = config::data_dir();
-    let sf = crate::status::read(&data_dir);
+    let state_dir = config::state_dir();
+    let sf = crate::status::read(&state_dir);
     let backfill_hint = if let Some(ref bf) = sf.backfill {
         let pct = if bf.total > 0 {
             (bf.filled as f64 / bf.total as f64 * 100.0) as u32
@@ -641,17 +642,21 @@ fn doctor_check_with_conn(
         emb_section.items.push(CheckItem {
             status: CheckStatus::Warning,
             message: format!("Vectors: 0 / {chunks} chunks"),
-            hint: Some(backfill_hint.unwrap_or_else(|| {
-                "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
-            })),
+            hint: Some(
+                backfill_hint.unwrap_or_else(|| {
+                    "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
+                }),
+            ),
         });
     } else if vecs < chunks {
         emb_section.items.push(CheckItem {
             status: CheckStatus::Warning,
             message: format!("Vectors: {vecs} / {chunks} chunks (mismatch)"),
-            hint: Some(backfill_hint.unwrap_or_else(|| {
-                "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
-            })),
+            hint: Some(
+                backfill_hint.unwrap_or_else(|| {
+                    "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
+                }),
+            ),
         });
     } else {
         emb_section.items.push(CheckItem {
@@ -713,7 +718,9 @@ pub fn render_doctor_report(report: &DoctorReport) {
     let use_color = std::env::var("NO_COLOR").is_err();
 
     let (green, yellow, red, bold, dim, reset) = if use_color {
-        ("\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[1m", "\x1b[2m", "\x1b[0m")
+        (
+            "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[1m", "\x1b[2m", "\x1b[0m",
+        )
     } else {
         ("", "", "", "", "", "")
     };
@@ -729,12 +736,15 @@ pub fn render_doctor_report(report: &DoctorReport) {
         body_lines.push(format!("{bold}  {}{reset}", section.name));
         for item in &section.items {
             let (icon, color) = match item.status {
-                CheckStatus::Ok => ("\u{2714}", green),      // ✔
+                CheckStatus::Ok => ("\u{2714}", green),       // ✔
                 CheckStatus::Warning => ("\u{26a0}", yellow), // ⚠
                 CheckStatus::Error => ("\u{2718}", red),      // ✘
             };
             let line = match &item.hint {
-                Some(hint) => format!("    {color}{icon}{reset} {}  {dim}{hint}{reset}", item.message),
+                Some(hint) => format!(
+                    "    {color}{icon}{reset} {}  {dim}{hint}{reset}",
+                    item.message
+                ),
                 None => format!("    {color}{icon}{reset} {}", item.message),
             };
             body_lines.push(line);
@@ -777,18 +787,32 @@ pub fn render_doctor_report(report: &DoctorReport) {
     let box_width = content_width + 2; // padding
 
     // Render box
-    println!("{dim}\u{256d}\u{2500} {reset}{bold}{title}{reset} {dim}{}\u{256e}{reset}",
-        "\u{2500}".repeat(box_width - title.len() - 3));
-    println!("{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}", " ".repeat(box_width));
+    println!(
+        "{dim}\u{256d}\u{2500} {reset}{bold}{title}{reset} {dim}{}\u{256e}{reset}",
+        "\u{2500}".repeat(box_width - title.len() - 3)
+    );
+    println!(
+        "{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}",
+        " ".repeat(box_width)
+    );
 
     for line in &body_lines {
         let visible_len = strip_ansi(line).chars().count();
         let pad = box_width.saturating_sub(visible_len);
-        println!("{dim}\u{2502}{reset}{line}{}{dim}\u{2502}{reset}", " ".repeat(pad));
+        println!(
+            "{dim}\u{2502}{reset}{line}{}{dim}\u{2502}{reset}",
+            " ".repeat(pad)
+        );
     }
 
-    println!("{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}", " ".repeat(box_width));
-    println!("{dim}\u{2570}{}\u{256f}{reset}", "\u{2500}".repeat(box_width));
+    println!(
+        "{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}",
+        " ".repeat(box_width)
+    );
+    println!(
+        "{dim}\u{2570}{}\u{256f}{reset}",
+        "\u{2500}".repeat(box_width)
+    );
 }
 
 /// Structured status information for the system.
@@ -819,8 +843,8 @@ pub struct BackfillInfo {
 pub fn run_status(conn: Option<&rusqlite::Connection>) -> StatusInfo {
     use crate::status;
 
-    let data_dir = config::data_dir();
-    let sf = status::read(&data_dir);
+    let state_dir = config::state_dir();
+    let sf = status::read(&state_dir);
 
     let daemon_socket_path = config::daemon_socket_path();
     let daemon_running = daemon_socket_path.exists();
@@ -1146,7 +1170,7 @@ fn spawn_background_backfill() {
 
 pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
-    let project_root = config::project_root();
+    let index_root = config::index_root();
     let socket = config::embedder_socket_path();
 
     if !socket.exists() {
@@ -1173,22 +1197,20 @@ pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
 
     // Full index (synchronous, with progress)
     let conn = db::get_connection(&db_path)?;
-    let file_paths = collect_content_files(&project_root);
+    let file_paths = collect_content_files(&index_root);
     let total = file_paths.len();
     log::info!("Indexing {total} files...");
 
     let progress = |current: usize, total: usize, path: &Path| {
-        let rel = path
-            .strip_prefix(&project_root)
-            .unwrap_or(path)
-            .display();
+        let rel = path.strip_prefix(&index_root).unwrap_or(path).display();
         log::debug!("  [{current}/{total}] {rel}");
     };
-    let stats =
-        indexer::index_all_with_progress(&conn, &file_paths, &project_root, Some(&progress))?;
+    let stats = indexer::index_all_with_progress(&conn, &file_paths, &index_root, Some(&progress))?;
     log::info!(
         "Done: Indexed: {}, Skipped: {}, Removed: {}",
-        stats.indexed, stats.skipped, stats.removed
+        stats.indexed,
+        stats.skipped,
+        stats.removed
     );
 
     // Report & async backfill
@@ -1203,7 +1225,7 @@ pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
     if vecs >= chunks {
         log::info!("Vectors: {vecs} (matches all chunks)");
     } else if socket.exists() && chunks > 0 {
-        let current_status = crate::status::read(&config::data_dir());
+        let current_status = crate::status::read(&config::state_dir());
         if current_status.backfill.is_some() {
             log::info!("Vectors: {vecs} / {chunks} — backfill already in progress");
         } else {

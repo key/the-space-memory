@@ -42,12 +42,14 @@ struct Args {
 
 fn main() -> Result<()> {
     config::ensure_model_cache_env();
-    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon { name: "tsmd" })?;
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
+        name: "tsmd",
+    })?;
     let args = Args::parse();
 
     let socket_path = args.socket.unwrap_or_else(config::daemon_socket_path);
     let db_path = args.db.unwrap_or_else(config::db_path);
-    let project_root = config::project_root();
+    let index_root = config::index_root();
 
     // Open DB connection
     let conn = db::get_connection(&db_path)
@@ -70,9 +72,9 @@ fn main() -> Result<()> {
     std::fs::write(&pid_path, pid.to_string()).context("Failed to write PID file")?;
 
     // Update status
-    let data_dir = config::data_dir();
+    let state_dir = config::state_dir();
     let socket_str = socket_path.to_string_lossy().to_string();
-    status::update(&data_dir, |s| {
+    status::update(&state_dir, |s| {
         s.daemon = Some(status::DaemonStatus {
             started_at: chrono::Utc::now().to_rfc3339(),
             pid,
@@ -98,12 +100,15 @@ fn main() -> Result<()> {
     // Each child is guarded by a PID file: if a previous instance is still
     // alive (orphaned from a prior tsmd), we skip spawning a duplicate.
     // Children are NOT auto-restarted on crash to prevent OOM restart loops.
-    let embedder_pid_path = data_dir.join("embedder.pid");
-    let watcher_pid_path = data_dir.join("watcher.pid");
+    let embedder_pid_path = state_dir.join("embedder.pid");
+    let watcher_pid_path = state_dir.join("watcher.pid");
 
     let mut embedder_child: Option<Child> = if !args.no_embedder {
         if is_process_alive(&embedder_pid_path) {
-            log::info!("embedder already running (PID file: {})", embedder_pid_path.display());
+            log::info!(
+                "embedder already running (PID file: {})",
+                embedder_pid_path.display()
+            );
             None
         } else {
             let _ = std::fs::remove_file(&embedder_pid_path);
@@ -122,7 +127,7 @@ fn main() -> Result<()> {
                         None
                     } else {
                         log::info!("embedder PID file: {}", embedder_pid_path.display());
-                        status::update(&data_dir, |s| {
+                        status::update(&state_dir, |s| {
                             s.embedder = Some(status::EmbedderStatus {
                                 started_at: chrono::Utc::now().to_rfc3339(),
                                 pid: child_pid,
@@ -144,7 +149,10 @@ fn main() -> Result<()> {
 
     let mut watcher_child: Option<Child> = if !args.no_watcher {
         if is_process_alive(&watcher_pid_path) {
-            log::info!("watcher already running (PID file: {})", watcher_pid_path.display());
+            log::info!(
+                "watcher already running (PID file: {})",
+                watcher_pid_path.display()
+            );
             None
         } else {
             let _ = std::fs::remove_file(&watcher_pid_path);
@@ -162,7 +170,7 @@ fn main() -> Result<()> {
                         None
                     } else {
                         log::info!("watcher PID file: {}", watcher_pid_path.display());
-                        status::update(&data_dir, |s| {
+                        status::update(&state_dir, |s| {
                             s.watcher = Some(status::WatcherStatus {
                                 started_at: chrono::Utc::now().to_rfc3339(),
                                 pid: child_pid,
@@ -187,20 +195,20 @@ fn main() -> Result<()> {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let conn = Arc::clone(&conn);
-                let project_root = project_root.clone();
+                let index_root = index_root.clone();
 
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_client(&mut stream, &conn, &project_root) {
+                    if let Err(e) = handle_client(&mut stream, &conn, &index_root) {
                         log::warn!("client error: {e}");
                     }
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if reap_child("embedder", &mut embedder_child, &embedder_pid_path) {
-                    status::update(&data_dir, |s| s.embedder = None);
+                    status::update(&state_dir, |s| s.embedder = None);
                 }
                 if reap_child("watcher", &mut watcher_child, &watcher_pid_path) {
-                    status::update(&data_dir, |s| s.watcher = None);
+                    status::update(&state_dir, |s| s.watcher = None);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
@@ -218,7 +226,7 @@ fn main() -> Result<()> {
 
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&pid_path);
-    status::update(&data_dir, |s| {
+    status::update(&state_dir, |s| {
         s.daemon = None;
         s.embedder = None;
         s.watcher = None;
@@ -249,8 +257,7 @@ fn start_child(binary: &str, env_vars: &[(&str, &str)]) -> Result<Child> {
     for &(k, v) in env_vars {
         cmd.env(k, v);
     }
-    cmd.spawn()
-        .context(format!("Failed to spawn {binary}"))
+    cmd.spawn().context(format!("Failed to spawn {binary}"))
 }
 
 /// Remove the embedder UNIX socket if it exists.
@@ -334,7 +341,7 @@ fn stop_child(label: &str, child: Option<Child>, pid_path: &Path) {
 fn handle_client(
     stream: &mut std::os::unix::net::UnixStream,
     conn: &Arc<Mutex<rusqlite::Connection>>,
-    project_root: &std::path::Path,
+    index_root: &std::path::Path,
 ) -> Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
@@ -342,7 +349,7 @@ fn handle_client(
     let conn = conn
         .lock()
         .map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
-    let resp = daemon::handle_request(&conn, req, project_root, &SHUTDOWN);
+    let resp = daemon::handle_request(&conn, req, index_root, &SHUTDOWN);
     write_response(stream, &resp)?;
     Ok(())
 }

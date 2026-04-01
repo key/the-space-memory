@@ -19,3 +19,6 @@ pub mod synonyms;
 pub mod temporal;
 pub mod tokenizer;
 pub mod user_dict;
+
+#[cfg(test)]
+pub mod test_utils;

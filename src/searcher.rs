@@ -681,7 +681,10 @@ mod tests {
         let conn = db::get_memory_connection().unwrap();
         // Pure interjection/greeting should return empty results
         let results = search(&conn, "よかったーーー", 5, None).unwrap();
-        assert!(results.is_empty(), "Noise query should return empty results");
+        assert!(
+            results.is_empty(),
+            "Noise query should return empty results"
+        );
     }
 
     #[test]
@@ -712,10 +715,7 @@ mod tests {
 
         // A meaningful query should still find results
         let results = search(&conn, "LoRaモジュール", 5, None).unwrap();
-        assert!(
-            !results.is_empty(),
-            "Meaningful query should find results"
-        );
+        assert!(!results.is_empty(), "Meaningful query should find results");
     }
 
     #[test]
@@ -770,7 +770,10 @@ mod tests {
         assert_eq!(decoded.source_file, "daily/notes/test.md");
         assert_eq!(decoded.score, 0.5);
         assert_eq!(decoded.related_docs.len(), 1);
-        assert_eq!(decoded.related_docs[0].file_path, "company/knowledge/related.md");
+        assert_eq!(
+            decoded.related_docs[0].file_path,
+            "company/knowledge/related.md"
+        );
         assert_eq!(decoded.related_docs[0].link_type, "tag");
     }
 }

@@ -43,12 +43,12 @@ pub struct WatcherStatus {
     pub pid: u32,
 }
 
-pub fn status_path(data_dir: &Path) -> std::path::PathBuf {
-    data_dir.join(STATUS_FILENAME)
+pub fn status_path(state_dir: &Path) -> std::path::PathBuf {
+    state_dir.join(STATUS_FILENAME)
 }
 
-pub fn read(data_dir: &Path) -> StatusFile {
-    let path = status_path(data_dir);
+pub fn read(state_dir: &Path) -> StatusFile {
+    let path = status_path(state_dir);
     let Ok(s) = std::fs::read_to_string(&path) else {
         return StatusFile::default(); // File absent is normal
     };
@@ -71,9 +71,9 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// Update the status file by applying a mutation function.
 /// Reads current state, applies the mutation, writes back atomically.
-pub fn update(data_dir: &Path, f: impl FnOnce(&mut StatusFile)) {
-    let path = status_path(data_dir);
-    let mut status = read(data_dir);
+pub fn update(state_dir: &Path, f: impl FnOnce(&mut StatusFile)) {
+    let path = status_path(state_dir);
+    let mut status = read(state_dir);
     f(&mut status);
     match serde_json::to_string_pretty(&status) {
         Ok(json) => {

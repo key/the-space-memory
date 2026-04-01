@@ -1,9 +1,7 @@
 use std::io::Write;
 use std::sync::OnceLock;
 
-use flexi_logger::{
-    Age, Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, Logger, Naming,
-};
+use flexi_logger::{Age, Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, Logger, Naming};
 use log::Record;
 
 use crate::config;
@@ -24,14 +22,12 @@ pub fn init_logger(mode: LogMode) -> anyhow::Result<()> {
             .map_err(|e| format!("failed to parse log spec: {e}"))?
             .use_utc();
         match mode {
-            LogMode::Stderr => {
-                logger
-                    .log_to_stderr()
-                    .format(tsm_log_format)
-                    .start()
-                    .map(|_| ())
-                    .map_err(|e| format!("failed to start stderr logger: {e}"))
-            }
+            LogMode::Stderr => logger
+                .log_to_stderr()
+                .format(tsm_log_format)
+                .start()
+                .map(|_| ())
+                .map_err(|e| format!("failed to start stderr logger: {e}")),
             LogMode::Daemon { name } => {
                 let dir = config::log_dir();
                 std::fs::create_dir_all(&dir)
@@ -88,7 +84,10 @@ mod tests {
 
     #[test]
     fn test_short_module_nested() {
-        assert_eq!(short_module("the_space_memory::indexer::backfill_vectors"), "backfill_vectors");
+        assert_eq!(
+            short_module("the_space_memory::indexer::backfill_vectors"),
+            "backfill_vectors"
+        );
     }
 
     #[test]

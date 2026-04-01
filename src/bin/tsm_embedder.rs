@@ -9,17 +9,15 @@ fn main() -> anyhow::Result<()> {
             // Using Daemon mode here would compete for the same log file and
             // trigger spurious rotation.
             the_space_memory::config::ensure_model_cache_env();
-            the_space_memory::logging::init_logger(
-                the_space_memory::logging::LogMode::Stderr,
-            )?;
+            the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Stderr)?;
             the_space_memory::cli::cmd_backfill_worker()
         }
         None => {
             // No arguments — start the embedder server.
             the_space_memory::config::ensure_model_cache_env();
-            the_space_memory::logging::init_logger(
-                the_space_memory::logging::LogMode::Daemon { name: "tsm-embedder" },
-            )?;
+            the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
+                name: "tsm-embedder",
+            })?;
             the_space_memory::cli::cmd_embedder_start(None)
         }
         Some(other) => {
