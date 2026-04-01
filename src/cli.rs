@@ -1334,7 +1334,8 @@ pub fn cmd_rebuild_fts() -> anyhow::Result<()> {
     let chunk_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
         .unwrap_or(0);
-    log::info!("Rebuilding FTS index for {chunk_count} chunks...");
+    log::warn!("This will clear and repopulate the FTS index ({chunk_count} chunks).");
+    log::info!("Rebuilding FTS index...");
 
     let progress = |current: usize, total: usize| {
         log::debug!("  [{current}/{total}]");

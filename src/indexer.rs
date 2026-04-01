@@ -948,18 +948,19 @@ pub fn rebuild_fts(
     conn: &Connection,
     progress_cb: Option<&dyn Fn(usize, usize)>,
 ) -> anyhow::Result<usize> {
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+    let tx = conn.unchecked_transaction()?;
+
+    let total: i64 = tx.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
     let total = total as usize;
 
     let rows: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare("SELECT id, content FROM chunks ORDER BY id")?;
+        let mut stmt = tx.prepare("SELECT id, content FROM chunks ORDER BY id")?;
         let mapped = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         mapped
     };
 
-    let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM chunks_fts", [])?;
 
     for (i, (id, content)) in rows.iter().enumerate() {
