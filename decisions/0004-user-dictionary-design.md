@@ -52,7 +52,7 @@ lindera の内蔵辞書（IPAdic）は一般的な日本語をカバーするが
 
 ```bash
 tsm dict update             # 候補一覧（ドライラン）
-tsm dict update --apply     # 辞書に追加 + FTS rebuild
+tsm dict update --apply     # 辞書に追加 + FTS rebuild + git commit & PR 作成
 tsm dict reject             # reject 候補一覧
 tsm dict reject --apply     # reject_words.txt → DB 同期
 tsm dict reject --all       # rejected 全件表示
@@ -60,7 +60,7 @@ tsm dict reject --all       # rejected 全件表示
 
 - `--apply` なし = 見るだけ、`--apply` あり = 実行
 - `dict update` と `dict reject` で対称的な構造
-- `dict reject` はデーモン稼働中でも実行可能（FTS に影響しない）
+- `dict reject` はデーモン稼働中でも実行可能（FTS インデックスを変更せず rebuild 不要。rejected 候補は辞書ファイルに存在しないため検索精度にも影響しない）
 - `dict update --apply` はデーモン停止が必要（rebuild のため）
 
 ### データ配置
@@ -68,18 +68,19 @@ tsm dict reject --all       # rejected 全件表示
 | パス | 内容 |
 |---|---|
 | `.tsm/tsm.db` | `dictionary_candidates` テーブル（候補の蓄積・ステータス管理） |
-| `.tsm/user_dict.ipadic` | lindera に読ませる辞書ファイル |
+| `.tsm/user_dict.simpledic` | lindera に読ませる辞書ファイル（`TSM_USER_DICT` で変更可） |
 | `.tsm/reject_words.txt` | reject リスト（1行1語、`#` コメント対応） |
 
 ### 候補のライフサイクル
 
 ```text
-テキスト
-  │ collect_from_text()
-  ▼
+テキスト（インデックス・セッション）  クエリ（検索）
+  │ collect_from_text()              │ collect_from_query()
+  └──────────────┬───────────────────┘
+                 ▼
 dictionary_candidates (status = 'pending')
   │
-  ├─→ tsm dict update --apply → user_dict.ipadic (status = 'accepted')
+  ├─→ tsm dict update --apply → user_dict.simpledic (status = 'accepted')
   │
   └─→ tsm dict reject --apply → status = 'rejected'（frequency 加算停止）
 ```
