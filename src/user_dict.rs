@@ -353,6 +353,89 @@ pub fn mark_rejected(conn: &Connection, surface: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ─── Reject list (reject_words.txt) ─────────────────────────
+
+/// Load the reject list from a text file.
+/// Lines starting with `#` and blank lines are ignored.
+/// All words are lowercased for case-insensitive comparison.
+pub fn load_reject_words(path: &Path) -> anyhow::Result<HashSet<String>> {
+    let mut words = HashSet::new();
+    if !path.exists() {
+        return Ok(words);
+    }
+    for line in std::fs::read_to_string(path)?.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        words.insert(trimmed.to_lowercase());
+    }
+    Ok(words)
+}
+
+/// Sync reject_words.txt → DB: mark matching pending candidates as 'rejected'.
+/// Returns the list of surfaces that were newly rejected.
+pub fn apply_reject_list(
+    conn: &Connection,
+    reject_words: &HashSet<String>,
+) -> anyhow::Result<Vec<String>> {
+    if !db::has_candidates_table(conn) {
+        return Ok(Vec::new());
+    }
+    let pending: Vec<String> = conn
+        .prepare("SELECT surface FROM dictionary_candidates WHERE status = 'pending'")?
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    let mut newly_rejected = Vec::new();
+    for surface in pending {
+        if reject_words.contains(&surface.to_lowercase()) {
+            mark_rejected(conn, &surface)?;
+            newly_rejected.push(surface);
+        }
+    }
+    Ok(newly_rejected)
+}
+
+/// Get all candidates with status = 'rejected', ordered by surface.
+pub fn get_rejected_candidates(conn: &Connection) -> Vec<Candidate> {
+    if !db::has_candidates_table(conn) {
+        return Vec::new();
+    }
+    conn.prepare(
+        "SELECT surface, frequency, pos, source, first_seen, last_seen, status
+         FROM dictionary_candidates
+         WHERE status = 'rejected'
+         ORDER BY surface ASC",
+    )
+    .and_then(|mut stmt| {
+        let rows = stmt.query_map([], |row| {
+            Ok(Candidate {
+                surface: row.get(0)?,
+                frequency: row.get(1)?,
+                pos: row.get(2)?,
+                source: row.get(3)?,
+                first_seen: row.get(4)?,
+                last_seen: row.get(5)?,
+                status: row.get(6)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    })
+    .unwrap_or_default()
+}
+
+/// Get pending candidates whose surface appears in the reject list.
+pub fn get_pending_in_reject_list(
+    conn: &Connection,
+    reject_words: &HashSet<String>,
+) -> Vec<Candidate> {
+    get_threshold_candidates(conn, 0)
+        .into_iter()
+        .filter(|c| reject_words.contains(&c.surface.to_lowercase()))
+        .collect()
+}
+
 // ─── CSV formatting ──────────────────────────────────────────
 
 /// Format a CSV row in janome simpledic format: surface,カスタム名詞,surface
@@ -967,5 +1050,120 @@ mod tests {
             })
             .unwrap();
         assert!(count > 0, "should collect candidates from query");
+    }
+
+    // ─── reject list tests ──────────────────────────────────────
+
+    #[test]
+    fn test_load_reject_words_missing_file() {
+        let result = load_reject_words(Path::new("/nonexistent/reject.txt")).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_load_reject_words_skips_comments_and_blanks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("reject.txt");
+        std::fs::write(&path, "# comment\n\nfoo\n  bar  \n# another\nbaz\n").unwrap();
+        let words = load_reject_words(&path).unwrap();
+        assert_eq!(words.len(), 3);
+        assert!(words.contains("foo"));
+        assert!(words.contains("bar"));
+        assert!(words.contains("baz"));
+    }
+
+    #[test]
+    fn test_load_reject_words_lowercases() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("reject.txt");
+        std::fs::write(&path, "Hello\nWORLD\n").unwrap();
+        let words = load_reject_words(&path).unwrap();
+        assert!(words.contains("hello"));
+        assert!(words.contains("world"));
+        assert!(!words.contains("Hello"));
+    }
+
+    #[test]
+    fn test_apply_reject_list_marks_pending() {
+        let conn = setup();
+        let now = "2026-01-01T00:00:00Z";
+        conn.execute(
+            "INSERT INTO dictionary_candidates VALUES ('foo', 5, 'ascii', 'document', ?, ?, 'pending')",
+            [now, now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO dictionary_candidates VALUES ('bar', 3, 'ascii', 'document', ?, ?, 'pending')",
+            [now, now],
+        ).unwrap();
+
+        let reject_words: HashSet<String> = ["foo".to_string()].into();
+        let rejected = apply_reject_list(&conn, &reject_words).unwrap();
+
+        assert_eq!(rejected, vec!["foo"]);
+        let status: String = conn
+            .query_row("SELECT status FROM dictionary_candidates WHERE surface = 'foo'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "rejected");
+        // bar should remain pending
+        let status: String = conn
+            .query_row("SELECT status FROM dictionary_candidates WHERE surface = 'bar'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "pending");
+    }
+
+    #[test]
+    fn test_apply_reject_list_ignores_non_pending() {
+        let conn = setup();
+        let now = "2026-01-01T00:00:00Z";
+        conn.execute(
+            "INSERT INTO dictionary_candidates VALUES ('accepted_word', 5, 'ascii', 'document', ?, ?, 'accepted')",
+            [now, now],
+        ).unwrap();
+
+        let reject_words: HashSet<String> = ["accepted_word".to_string()].into();
+        let rejected = apply_reject_list(&conn, &reject_words).unwrap();
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn test_get_rejected_candidates() {
+        let conn = setup();
+        let now = "2026-01-01T00:00:00Z";
+        conn.execute(
+            "INSERT INTO dictionary_candidates VALUES ('aaa', 5, 'ascii', 'document', ?, ?, 'rejected')",
+            [now, now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO dictionary_candidates VALUES ('bbb', 3, 'ascii', 'document', ?, ?, 'pending')",
+            [now, now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO dictionary_candidates VALUES ('ccc', 2, 'ascii', 'document', ?, ?, 'rejected')",
+            [now, now],
+        ).unwrap();
+
+        let rejected = get_rejected_candidates(&conn);
+        assert_eq!(rejected.len(), 2);
+        assert_eq!(rejected[0].surface, "aaa");
+        assert_eq!(rejected[1].surface, "ccc");
+    }
+
+    #[test]
+    fn test_get_pending_in_reject_list() {
+        let conn = setup();
+        let now = "2026-01-01T00:00:00Z";
+        conn.execute(
+            "INSERT INTO dictionary_candidates VALUES ('keep', 10, 'ascii', 'document', ?, ?, 'pending')",
+            [now, now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO dictionary_candidates VALUES ('drop', 5, 'ascii', 'document', ?, ?, 'pending')",
+            [now, now],
+        ).unwrap();
+
+        let reject_words: HashSet<String> = ["drop".to_string()].into();
+        let candidates = get_pending_in_reject_list(&conn, &reject_words);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].surface, "drop");
     }
 }

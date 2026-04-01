@@ -121,7 +121,7 @@ pub fn handle_request(
         }
 
         DaemonRequest::DictUpdate { .. } => DaemonResponse::error(
-            "dict-update cannot run while tsmd is active. Run `tsm stop` first.",
+            "dict update --apply cannot run while tsmd is active. Run `tsm stop` first.",
         ),
 
         DaemonRequest::Rebuild { .. } => {
@@ -262,7 +262,7 @@ mod tests {
         let flag = AtomicBool::new(false);
         let req = DaemonRequest::DictUpdate {
             threshold: 5,
-            yes: true,
+            apply: true,
             format: "ipadic".into(),
         };
         let resp = handle_request(&conn, req, dir.path(), &flag);

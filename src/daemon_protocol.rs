@@ -42,7 +42,7 @@ pub enum DaemonRequest {
     },
     DictUpdate {
         threshold: i64,
-        yes: bool,
+        apply: bool,
         format: String,
     },
     ImportWordnet {
@@ -256,7 +256,7 @@ mod tests {
     fn serde_roundtrip_dict_update() {
         let req = DaemonRequest::DictUpdate {
             threshold: 10,
-            yes: true,
+            apply: true,
             format: "ipadic".into(),
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -264,11 +264,11 @@ mod tests {
         match decoded {
             DaemonRequest::DictUpdate {
                 threshold,
-                yes,
+                apply,
                 format,
             } => {
                 assert_eq!(threshold, 10);
-                assert!(yes);
+                assert!(apply);
                 assert_eq!(format, "ipadic");
             }
             _ => panic!("Expected DictUpdate variant"),

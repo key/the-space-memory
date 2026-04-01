@@ -484,6 +484,10 @@ pub fn stopwords_path() -> PathBuf {
     state_dir().join("stopwords.txt")
 }
 
+pub fn reject_words_path() -> PathBuf {
+    state_dir().join("reject_words.txt")
+}
+
 pub fn daemon_pid_path() -> PathBuf {
     state_dir().join("tsmd.pid")
 }

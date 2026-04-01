@@ -50,6 +50,31 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum DictCommands {
+    /// Show dictionary update candidates (dry run) / apply to add words
+    Update {
+        /// Minimum frequency threshold
+        #[arg(long, default_value = "5")]
+        threshold: i64,
+        /// Add words to dict and rebuild FTS
+        #[arg(long)]
+        apply: bool,
+        /// CSV format: simpledic (janome) or ipadic (lindera)
+        #[arg(long, value_enum, default_value = "ipadic")]
+        format: DictFormatArg,
+    },
+    /// Manage reject list (reject_words.txt)
+    Reject {
+        /// Sync reject_words.txt to DB
+        #[arg(long)]
+        apply: bool,
+        /// Show all rejected words in DB
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// Initialize the database
     Init,
@@ -115,17 +140,10 @@ enum Commands {
         /// Path to wnjpn.db
         wordnet_db: PathBuf,
     },
-    /// Update user dictionary from collected candidates
-    DictUpdate {
-        /// Minimum frequency threshold
-        #[arg(long, default_value = "5")]
-        threshold: i64,
-        /// Skip confirmation prompt
-        #[arg(long)]
-        yes: bool,
-        /// CSV format: simpledic (janome) or ipadic (lindera)
-        #[arg(long, value_enum, default_value = "ipadic")]
-        format: DictFormatArg,
+    /// Manage user dictionary
+    Dict {
+        #[command(subcommand)]
+        command: DictCommands,
     },
     /// Show current system status
     Status,
@@ -176,14 +194,21 @@ fn main() -> anyhow::Result<()> {
                 cli::cmd_rebuild(force)?;
             }
         }
-        Commands::DictUpdate {
-            threshold,
-            yes,
-            format,
-        } => {
-            guard_daemon_not_running("dict-update")?;
-            cli::cmd_dict_update(threshold, yes, format.into())?;
-        }
+        Commands::Dict { command } => match command {
+            DictCommands::Update {
+                threshold,
+                apply,
+                format,
+            } => {
+                if apply {
+                    guard_daemon_not_running("dict update --apply")?;
+                }
+                cli::cmd_dict_update(threshold, apply, format.into())?;
+            }
+            DictCommands::Reject { apply, all } => {
+                cli::cmd_dict_reject(apply, all)?;
+            }
+        },
 
         // ── Daemon-routed (auto-starts tsmd if needed) ──
         Commands::Search {
