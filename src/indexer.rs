@@ -27,6 +27,8 @@ pub struct BackfillStats {
     pub filled: usize,
     pub errors: usize,
     pub panics: usize,
+    /// Keyset pagination cursor (last processed chunk ID).
+    pub last_id: i64,
 }
 
 fn file_hash(path: &Path) -> anyhow::Result<String> {
@@ -690,6 +692,103 @@ fn retry_individually(
             }
         }
     }
+}
+
+/// Process one batch of missing vectors. Returns (stats, has_more).
+/// `last_id` is the keyset pagination cursor — pass 0 for the first call,
+/// then pass the returned `stats.last_id` for subsequent calls.
+pub fn backfill_next_batch(
+    conn: &Connection,
+    encode_fn: EncodeFn,
+    batch_size: usize,
+    last_id: i64,
+) -> anyhow::Result<(BackfillStats, bool)> {
+    if !db::has_vec_table(conn) {
+        return Ok((BackfillStats::default(), false));
+    }
+
+    let batch: Vec<(i64, String, String)> = conn
+        .prepare(
+            "SELECT c.id, c.content, d.file_path
+             FROM chunks c
+             LEFT JOIN chunks_vec v ON c.id = v.rowid
+             LEFT JOIN chunks_vec_skip s ON c.id = s.chunk_id
+             JOIN documents d ON c.document_id = d.id
+             WHERE v.rowid IS NULL AND s.chunk_id IS NULL AND c.id > ?
+             ORDER BY c.id
+             LIMIT ?",
+        )?
+        .query_map(rusqlite::params![last_id, batch_size as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if batch.is_empty() {
+        return Ok((BackfillStats::default(), false));
+    }
+
+    let mut stats = BackfillStats {
+        last_id: batch.last().unwrap().0,
+        ..BackfillStats::default()
+    };
+
+    let texts: Vec<String> = batch
+        .iter()
+        .map(|(_, content, _)| content.clone())
+        .collect();
+
+    match catch_unwind(AssertUnwindSafe(|| encode_fn(&texts))) {
+        Ok(Ok(embeddings)) if embeddings.len() == batch.len() => {
+            let tx = conn.unchecked_transaction()?;
+            for ((chunk_id, _, _), emb) in batch.iter().zip(embeddings.iter()) {
+                if write_vec_row(&tx, *chunk_id, emb) {
+                    stats.filled += 1;
+                } else {
+                    log::warn!("Insert error for chunk {chunk_id} — skipping");
+                    mark_chunk_skip(conn, *chunk_id, "insert_error");
+                    stats.errors += 1;
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(Ok(embeddings)) => {
+            log::warn!(
+                "Embedding count mismatch (got {}, expected {})",
+                embeddings.len(),
+                batch.len()
+            );
+            if batch.len() > 1 {
+                retry_individually(&batch, encode_fn, conn, &mut stats);
+            } else {
+                let chunk_id = batch[0].0;
+                mark_chunk_skip(conn, chunk_id, "embedding_count_mismatch");
+                stats.errors += 1;
+            }
+        }
+        Ok(Err(e)) => {
+            log::warn!("Batch error: {e}");
+            if batch.len() > 1 {
+                retry_individually(&batch, encode_fn, conn, &mut stats);
+            } else {
+                mark_chunk_skip(conn, batch[0].0, "encode_error");
+                stats.errors += 1;
+            }
+        }
+        Err(panic_info) => {
+            let msg = panic_message(&panic_info);
+            log::error!("PANIC in encode: {msg}");
+            stats.panics += 1;
+            if batch.len() > 1 {
+                retry_individually(&batch, encode_fn, conn, &mut stats);
+            } else {
+                mark_chunk_skip(conn, batch[0].0, "panic");
+                stats.errors += 1;
+            }
+        }
+    }
+
+    Ok((stats, true))
 }
 
 /// Fill in missing vectors for chunks that have FTS5 entries but no vector entries.

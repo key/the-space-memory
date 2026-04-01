@@ -272,52 +272,26 @@ pub fn cmd_embedder_start(socket_path: Option<&Path>) -> anyhow::Result<()> {
 }
 
 pub fn cmd_vector_fill(batch_size: usize) -> anyhow::Result<()> {
-    let db_path = config::db_path();
-    backfill_with_worker_sized(&db_path, batch_size)
-}
-
-pub fn cmd_backfill_worker() -> anyhow::Result<()> {
-    embedder::run_backfill_worker()
-}
-
-/// Guard to prevent concurrent backfill runs (startup + periodic).
-static BACKFILL_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// RAII guard that resets `BACKFILL_RUNNING` on drop (including panic unwind).
-struct BackfillGuard;
-impl Drop for BackfillGuard {
-    fn drop(&mut self) {
-        BACKFILL_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// Run backfill via a worker subprocess with default batch size.
-/// Skips if another backfill is already running in this process.
-pub fn backfill_with_worker(db_path: &Path) -> anyhow::Result<()> {
-    if BACKFILL_RUNNING
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        )
-        .is_err()
-    {
-        log::info!("Backfill already running, skipping");
+    // Delegate to tsmd if running
+    let sock = config::daemon_socket_path();
+    if sock.exists() {
+        use crate::daemon_protocol::{send_request, DaemonRequest};
+        let resp = send_request(&sock, &DaemonRequest::VectorFill { batch_size })?;
+        if !resp.ok {
+            anyhow::bail!("{}", resp.error.unwrap_or_default());
+        }
         return Ok(());
     }
-    let _guard = BackfillGuard;
-    backfill_with_worker_sized(db_path, indexer::BACKFILL_BATCH_SIZE)
+    // tsmd not running — run directly
+    let db_path = config::db_path();
+    let conn = db::get_connection(&db_path)?;
+    run_vector_fill(&conn, batch_size)
 }
 
-/// Run vector backfill with an existing connection (daemon-safe).
+/// Run vector backfill via the embedder socket (daemon-safe).
 pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow::Result<()> {
     use crate::status;
 
-    let worker = std::cell::RefCell::new(embedder::WorkerHandle::spawn(
-        std::time::Duration::from_secs(120),
-    )?);
-    let mut restarts = 0;
     let state_dir = config::state_dir();
     let started_at = chrono::Utc::now().to_rfc3339();
 
@@ -342,48 +316,20 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
         });
     };
 
-    loop {
-        let encode_fn = |texts: &[String]| {
-            let timeout = std::time::Duration::from_secs(
-                config::WORKER_ENCODE_TIMEOUT_BASE_SECS
-                    + config::WORKER_ENCODE_TIMEOUT_PER_ITEM_SECS * texts.len() as u64,
-            );
-            worker.borrow_mut().encode(texts, timeout)
-        };
-        let stats = indexer::backfill_vectors(conn, &encode_fn, batch_size, Some(&progress_cb))?;
+    let encode_fn = |texts: &[String]| {
+        embedder::embed_via_socket(texts)
+            .ok_or_else(|| anyhow::anyhow!("embedder not available"))
+    };
 
-        if stats.errors == 0 {
-            if stats.filled > 0 {
-                log::info!("Backfilled {} vectors.", stats.filled);
-            } else {
-                log::info!("No missing vectors.");
-            }
-            break;
-        }
+    let stats = indexer::backfill_vectors(conn, &encode_fn, batch_size, Some(&progress_cb))?;
 
-        // Worker may have crashed — check and restart
-        if !worker.borrow_mut().is_alive() {
-            if restarts >= config::MAX_WORKER_RESTARTS {
-                log::error!(
-                    "Worker crashed {} times. {} errors remain.",
-                    restarts + 1,
-                    stats.errors
-                );
-                break;
-            }
-            restarts += 1;
-            log::warn!(
-                "Worker crashed. Restarting ({restarts}/{})...",
-                config::MAX_WORKER_RESTARTS
-            );
-            *worker.borrow_mut() =
-                embedder::WorkerHandle::spawn(std::time::Duration::from_secs(120))?;
-            // Next iteration will pick up remaining unchunked vectors
-        } else {
-            // Worker alive but had encode errors — don't retry
-            log::info!("Done: {} filled, {} errors.", stats.filled, stats.errors);
-            break;
-        }
+    if stats.filled > 0 {
+        log::info!("Backfilled {} vectors.", stats.filled);
+    } else {
+        log::info!("No missing vectors.");
+    }
+    if stats.errors > 0 {
+        log::warn!("{} errors during backfill.", stats.errors);
     }
 
     // Clear backfill status on completion
@@ -392,12 +338,6 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
     });
 
     Ok(())
-}
-
-/// Run backfill via a worker subprocess with specified batch size (opens DB).
-pub fn backfill_with_worker_sized(db_path: &Path, batch_size: usize) -> anyhow::Result<()> {
-    let conn = db::get_connection(db_path)?;
-    run_vector_fill(&conn, batch_size)
 }
 
 pub fn cmd_import_wordnet(wordnet_db: &Path) -> anyhow::Result<()> {

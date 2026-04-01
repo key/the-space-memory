@@ -1,7 +1,7 @@
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -9,7 +9,7 @@ use clap::Parser;
 
 use the_space_memory::config;
 use the_space_memory::daemon;
-use the_space_memory::daemon_protocol::{read_request, write_response};
+use the_space_memory::daemon_protocol::{read_request, DaemonRequest, write_response};
 use the_space_memory::db;
 use the_space_memory::status;
 
@@ -190,15 +190,53 @@ fn main() -> Result<()> {
         None
     };
 
+    // Search-active counter: backfill yields when search requests are in-flight.
+    let search_active = Arc::new(AtomicUsize::new(0));
+
+    // Startup backfill — waits for embedder socket then runs one pass.
+    if !args.no_embedder {
+        let conn = Arc::clone(&conn);
+        let search_active = Arc::clone(&search_active);
+        std::thread::spawn(move || {
+            let sock = config::embedder_socket_path();
+            for _ in 0..120 {
+                if SHUTDOWN.load(Ordering::SeqCst) || sock.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            if !sock.exists() || SHUTDOWN.load(Ordering::SeqCst) {
+                log::warn!("embedder socket not ready; skipping startup backfill");
+                return;
+            }
+            log::info!("starting startup backfill...");
+            run_backfill_pass(&conn, &search_active);
+            log::info!("startup backfill complete");
+        });
+    }
+
+    // Periodic backfill thread
+    let backfill_interval_secs = config::embedder_backfill_interval_secs();
+    if backfill_interval_secs > 0 && !args.no_embedder {
+        let conn = Arc::clone(&conn);
+        let search_active = Arc::clone(&search_active);
+        std::thread::spawn(move || {
+            periodic_backfill(&conn, &search_active, backfill_interval_secs);
+        });
+    }
+
     // Accept loop — children are NOT restarted on crash
     while !SHUTDOWN.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let conn = Arc::clone(&conn);
                 let index_root = index_root.clone();
+                let search_active = Arc::clone(&search_active);
 
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_client(&mut stream, &conn, &index_root) {
+                    if let Err(e) =
+                        handle_client(&mut stream, &conn, &index_root, &search_active)
+                    {
                         log::warn!("client error: {e}");
                     }
                 });
@@ -338,18 +376,166 @@ fn stop_child(label: &str, child: Option<Child>, pid_path: &Path) {
 
 // ─── Client handling ──────────────────────────────────────────────
 
+/// RAII guard that increments a counter on creation and decrements on drop.
+struct SearchActiveGuard(Arc<AtomicUsize>);
+
+impl SearchActiveGuard {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for SearchActiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn handle_client(
     stream: &mut std::os::unix::net::UnixStream,
     conn: &Arc<Mutex<rusqlite::Connection>>,
     index_root: &std::path::Path,
+    search_active: &Arc<AtomicUsize>,
 ) -> Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
     let req = read_request(stream)?;
+
+    // Track active search requests so backfill can yield
+    let _guard = if matches!(req, DaemonRequest::Search { .. }) {
+        Some(SearchActiveGuard::new(search_active))
+    } else {
+        None
+    };
+
     let conn = conn
         .lock()
         .map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
     let resp = daemon::handle_request(&conn, req, index_root, &SHUTDOWN);
     write_response(stream, &resp)?;
     Ok(())
+}
+
+// ─── Backfill orchestration ──────────────────────────────────────────
+
+/// Run one full backfill pass, releasing the DB lock between batches
+/// so search/index requests can proceed.
+fn run_backfill_pass(
+    conn: &Arc<Mutex<rusqlite::Connection>>,
+    search_active: &Arc<AtomicUsize>,
+) {
+    let encode_fn = |texts: &[String]| {
+        the_space_memory::embedder::embed_via_socket(texts)
+            .ok_or_else(|| anyhow::anyhow!("embedder not available"))
+    };
+
+    let mut last_id: i64 = 0;
+    let mut total_filled: usize = 0;
+    let mut total_errors: usize = 0;
+
+    loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Yield while search requests are in-flight (no lock held)
+        for _ in 0..200 {
+            if search_active.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Lock DB only for this one batch
+        let Ok(conn) = conn.lock() else { break };
+        let result = the_space_memory::indexer::backfill_next_batch(
+            &conn,
+            &encode_fn,
+            config::BACKFILL_BATCH_SIZE,
+            last_id,
+        );
+        drop(conn); // release lock immediately after batch
+
+        match result {
+            Ok((stats, has_more)) => {
+                total_filled += stats.filled;
+                total_errors += stats.errors;
+                last_id = stats.last_id;
+                if !has_more {
+                    break;
+                }
+            }
+            Err(e) => {
+                log::warn!("backfill batch error: {e}");
+                break;
+            }
+        }
+    }
+
+    if total_filled > 0 || total_errors > 0 {
+        log::info!("backfill: {total_filled} filled, {total_errors} errors");
+    }
+}
+
+/// Run periodic backfill in tsmd, yielding to search requests.
+fn periodic_backfill(
+    conn: &Arc<Mutex<rusqlite::Connection>>,
+    search_active: &Arc<AtomicUsize>,
+    interval_secs: u64,
+) {
+    let interval = std::time::Duration::from_secs(interval_secs);
+
+    // Wait one full interval before first check (startup backfill handles the initial run)
+    sleep_interruptible(interval);
+
+    loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let sock = config::embedder_socket_path();
+        if !sock.exists() {
+            log::debug!("periodic backfill: embedder socket not found, skipping");
+            sleep_interruptible(interval);
+            continue;
+        }
+
+        // Quick count check (short lock)
+        let missing: i64 = {
+            let Ok(conn) = conn.lock() else { break };
+            conn.query_row(
+                "SELECT COUNT(*) FROM chunks c
+                 LEFT JOIN chunks_vec v ON c.id = v.rowid
+                 WHERE v.rowid IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+        }; // lock released
+
+        if missing > 0 {
+            log::debug!("periodic backfill: {missing} vectors missing");
+            run_backfill_pass(conn, search_active);
+        }
+
+        sleep_interruptible(interval);
+    }
+}
+
+/// Sleep in small increments, checking the shutdown flag.
+fn sleep_interruptible(duration: std::time::Duration) {
+    let step = std::time::Duration::from_secs(10).min(duration);
+    let mut remaining = duration;
+    while remaining > std::time::Duration::ZERO {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            return;
+        }
+        let sleep_for = step.min(remaining);
+        std::thread::sleep(sleep_for);
+        remaining = remaining.saturating_sub(sleep_for);
+    }
 }

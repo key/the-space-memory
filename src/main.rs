@@ -139,9 +139,6 @@ enum Commands {
     },
     /// Restart the daemon (stop + start)
     Restart,
-    /// Internal: backfill worker subprocess (do not call directly)
-    #[command(hide = true)]
-    BackfillWorker,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -158,7 +155,6 @@ fn main() -> anyhow::Result<()> {
             cmd_start()?;
         }
         Commands::Setup => cli::cmd_setup()?,
-        Commands::BackfillWorker => cli::cmd_backfill_worker()?,
         Commands::VectorFill { batch_size } => cli::cmd_vector_fill(batch_size)?,
 
         // ── Direct-only with daemon guard ──

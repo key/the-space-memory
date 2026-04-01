@@ -18,9 +18,6 @@ pub const BACKFILL_BATCH_SIZE: usize = 8;
 pub const MAX_QUERY_EXPANSIONS: usize = 5;
 pub const RECENT_DAYS: i64 = 30;
 pub const DICT_CANDIDATE_FREQ_THRESHOLD: i64 = 5;
-pub const WORKER_ENCODE_TIMEOUT_PER_ITEM_SECS: u64 = 5;
-pub const WORKER_ENCODE_TIMEOUT_BASE_SECS: u64 = 10;
-pub const MAX_WORKER_RESTARTS: usize = 3;
 pub const MIN_QUERY_KEYWORDS: usize = 1;
 
 const DEFAULT_STATE_DIR: &str = ".tsm";
