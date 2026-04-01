@@ -1322,6 +1322,30 @@ pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn cmd_rebuild_fts() -> anyhow::Result<()> {
+    let db_path = config::db_path();
+
+    if !db_path.exists() {
+        anyhow::bail!("Database does not exist. Run `tsm init` first.");
+    }
+
+    let conn = db::get_connection(&db_path)?;
+
+    let chunk_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+        .unwrap_or(0);
+    log::info!("Rebuilding FTS index for {chunk_count} chunks...");
+
+    let progress = |current: usize, total: usize| {
+        log::debug!("  [{current}/{total}]");
+    };
+
+    let inserted = indexer::rebuild_fts(&conn, Some(&progress))?;
+    log::info!("FTS rebuild complete: {inserted} chunks re-indexed.");
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
