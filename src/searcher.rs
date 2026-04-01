@@ -166,7 +166,7 @@ pub fn search(
             rrf += 1.0 / (config::RRF_K + rank as f64);
         }
 
-        let decay = time_decay(updated.as_deref(), &source_type);
+        let decay = time_decay(updated.as_deref(), &file_path, &source_type);
         let penalty = config::status_penalty(status.as_deref());
         let weight = config::directory_weight(&file_path);
         let score = rrf * decay * penalty * weight;
@@ -223,7 +223,7 @@ pub fn search(
     Ok(results)
 }
 
-pub(crate) fn time_decay(updated: Option<&str>, source_type: &str) -> f64 {
+pub(crate) fn time_decay(updated: Option<&str>, file_path: &str, source_type: &str) -> f64 {
     let updated = match updated {
         Some(s) if !s.is_empty() => s,
         _ => return 0.5,
@@ -242,7 +242,7 @@ pub(crate) fn time_decay(updated: Option<&str>, source_type: &str) -> f64 {
 
     let now = Utc::now();
     let days = (now - updated_dt).num_days().max(0) as f64;
-    let half_life = config::half_life_days(source_type);
+    let half_life = config::half_life_days(file_path, source_type);
     0.5_f64.powf(days / half_life)
 }
 
@@ -388,32 +388,35 @@ mod tests {
     #[test]
     fn test_recent_date_high_decay() {
         let now = Utc::now().format("%Y-%m-%d").to_string();
-        let decay = time_decay(Some(&now), "note");
+        let decay = time_decay(Some(&now), "daily/notes/test.md", "note");
         assert!(decay > 0.9);
         assert!(decay <= 1.0);
     }
 
     #[test]
     fn test_none_returns_half() {
-        assert_eq!(time_decay(None, "note"), 0.5);
+        assert_eq!(time_decay(None, "daily/notes/test.md", "note"), 0.5);
     }
 
     #[test]
     fn test_invalid_date_returns_half() {
-        assert_eq!(time_decay(Some("not-a-date"), "note"), 0.5);
+        assert_eq!(
+            time_decay(Some("not-a-date"), "daily/notes/test.md", "note"),
+            0.5
+        );
     }
 
     #[test]
     fn test_old_date_low_decay() {
-        let decay = time_decay(Some("2020-01-01"), "note");
+        let decay = time_decay(Some("2020-01-01"), "daily/notes/test.md", "note");
         assert!(decay < 0.1);
     }
 
     #[test]
     fn test_source_type_half_life() {
         let date = "2025-01-01";
-        let session_decay = time_decay(Some(date), "session");
-        let note_decay = time_decay(Some(date), "note");
+        let session_decay = time_decay(Some(date), "session:abc", "session");
+        let note_decay = time_decay(Some(date), "daily/notes/test.md", "note");
         assert!(session_decay < note_decay);
     }
 

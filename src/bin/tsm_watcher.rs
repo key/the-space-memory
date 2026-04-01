@@ -66,8 +66,7 @@ fn main() -> Result<()> {
 
     // Watch content directories
     let mut watched = 0;
-    for &(dir, _) in config::CONTENT_DIRS {
-        let full_dir = index_root.join(dir);
+    for full_dir in the_space_memory::cli::discover_watch_dirs(&index_root) {
         if full_dir.is_dir() {
             if let Err(e) = debouncer
                 .watcher()

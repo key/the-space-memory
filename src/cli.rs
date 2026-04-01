@@ -56,15 +56,65 @@ pub fn read_paths_from_stdin(index_root: &Path) -> Vec<PathBuf> {
 }
 
 pub fn collect_content_files(index_root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for &(dir, _) in config::CONTENT_DIRS {
-        let full_dir = index_root.join(dir);
-        if !full_dir.is_dir() {
-            continue;
+    let dirs = config::content_dirs();
+    if dirs.is_empty() {
+        // Auto-discover: recursively find all .md files, excluding hidden dirs
+        let mut files = Vec::new();
+        collect_md_files_excluding_hidden(index_root, &mut files);
+        files
+    } else {
+        let mut files = Vec::new();
+        for dir in dirs {
+            let full_dir = index_root.join(&dir.path);
+            if full_dir.is_dir() {
+                collect_md_files(&full_dir, &mut files);
+            }
         }
-        collect_md_files(&full_dir, &mut files);
+        files
     }
-    files
+}
+
+fn collect_md_files_excluding_hidden(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') {
+                continue;
+            }
+            collect_md_files_excluding_hidden(&path, out);
+        } else if path.extension().is_some_and(|e| e == "md") {
+            out.push(path);
+        }
+    }
+}
+
+/// List directories to watch (for tsm-watcher). When content_dirs is configured,
+/// returns those paths. Otherwise discovers non-hidden subdirs under index_root.
+pub fn discover_watch_dirs(index_root: &Path) -> Vec<PathBuf> {
+    let dirs = config::content_dirs();
+    if dirs.is_empty() {
+        // Auto-discover: immediate non-hidden subdirectories
+        let mut result = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(index_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if !name.starts_with('.') {
+                        result.push(path);
+                    }
+                }
+            }
+        }
+        result
+    } else {
+        dirs.iter().map(|d| index_root.join(&d.path)).collect()
+    }
 }
 
 pub fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) {
