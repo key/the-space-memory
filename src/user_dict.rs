@@ -1101,12 +1101,20 @@ mod tests {
 
         assert_eq!(rejected, vec!["foo"]);
         let status: String = conn
-            .query_row("SELECT status FROM dictionary_candidates WHERE surface = 'foo'", [], |r| r.get(0))
+            .query_row(
+                "SELECT status FROM dictionary_candidates WHERE surface = 'foo'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(status, "rejected");
         // bar should remain pending
         let status: String = conn
-            .query_row("SELECT status FROM dictionary_candidates WHERE surface = 'bar'", [], |r| r.get(0))
+            .query_row(
+                "SELECT status FROM dictionary_candidates WHERE surface = 'bar'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(status, "pending");
     }
