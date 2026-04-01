@@ -826,8 +826,14 @@ index_root = "/low-root"
 
     #[test]
     fn test_search_fallback_from_str() {
-        assert_eq!("error".parse::<SearchFallback>().unwrap(), SearchFallback::Error);
-        assert_eq!("fts_only".parse::<SearchFallback>().unwrap(), SearchFallback::FtsOnly);
+        assert_eq!(
+            "error".parse::<SearchFallback>().unwrap(),
+            SearchFallback::Error
+        );
+        assert_eq!(
+            "fts_only".parse::<SearchFallback>().unwrap(),
+            SearchFallback::FtsOnly
+        );
         assert!("invalid".parse::<SearchFallback>().is_err());
     }
 

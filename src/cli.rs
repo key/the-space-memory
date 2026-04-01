@@ -127,7 +127,13 @@ pub fn run_search(
         parsed.filter,
     )?;
     let search_query = &parsed.query;
-    searcher::search(conn, search_query, opts.top_k, filter.as_ref(), require_vector)
+    searcher::search(
+        conn,
+        search_query,
+        opts.top_k,
+        filter.as_ref(),
+        require_vector,
+    )
 }
 
 pub fn cmd_search(opts: SearchOptions) -> anyhow::Result<()> {
