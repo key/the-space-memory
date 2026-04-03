@@ -89,7 +89,11 @@ impl Embedder {
             .iter()
             .map(|t| {
                 if t.len() > MAX_CHARS {
-                    t[..t.floor_char_boundary(MAX_CHARS)].to_string()
+                    let mut end = MAX_CHARS;
+                    while end > 0 && !t.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    t[..end].to_string()
                 } else {
                     t.clone()
                 }
