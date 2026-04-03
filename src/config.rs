@@ -1,6 +1,6 @@
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use directories::ProjectDirs;
 
@@ -343,11 +343,65 @@ fn env_parse_u64(var: &str, file_val: Option<u64>) -> Option<u64> {
     file_val
 }
 
-static RESOLVED: OnceLock<ResolvedConfig> = OnceLock::new();
+static RESOLVED: OnceLock<RwLock<ResolvedConfig>> = OnceLock::new();
 
-/// Get the lazily-loaded resolved config singleton.
-fn resolved() -> &'static ResolvedConfig {
-    RESOLVED.get_or_init(ResolvedConfig::from_env)
+/// Get the lazily-loaded resolved config singleton (cloned).
+fn resolved() -> ResolvedConfig {
+    RESOLVED
+        .get_or_init(|| RwLock::new(ResolvedConfig::from_env()))
+        .read()
+        .expect("config RwLock poisoned")
+        .clone()
+}
+
+/// Reload config from tsm.toml. Returns a list of warnings for fields
+/// that changed but require a daemon restart to take effect.
+pub fn reload() -> Vec<String> {
+    let new_cfg = ResolvedConfig::from_env();
+
+    // Hold write lock for the entire read-compare-write to avoid TOCTOU races
+    let lock = RESOLVED.get_or_init(|| RwLock::new(ResolvedConfig::from_env()));
+    let mut w = lock.write().expect("config RwLock poisoned");
+    let old = w.clone();
+
+    let mut warnings = Vec::new();
+
+    if old.state_dir != new_cfg.state_dir {
+        warnings.push(format!(
+            "state_dir changed ({} → {}); requires `tsm restart`",
+            old.state_dir.display(),
+            new_cfg.state_dir.display()
+        ));
+    }
+    if old.index_root != new_cfg.index_root {
+        warnings.push(format!(
+            "index_root changed ({} → {}); requires `tsm restart`",
+            old.index_root.display(),
+            new_cfg.index_root.display()
+        ));
+    }
+    if old.daemon_socket_path != new_cfg.daemon_socket_path {
+        warnings.push("daemon_socket_path changed; requires `tsm restart`".to_string());
+    }
+    if old.embedder_socket_path != new_cfg.embedder_socket_path {
+        warnings.push("embedder_socket_path changed; requires `tsm restart`".to_string());
+    }
+    if old.log_dir != new_cfg.log_dir {
+        warnings.push("log_dir changed; requires `tsm restart`".to_string());
+    }
+    if old.user_dict_path != new_cfg.user_dict_path {
+        warnings.push("user_dict_path changed; requires `tsm restart`".to_string());
+    }
+
+    *w = new_cfg;
+
+    log::info!("config reloaded from tsm.toml");
+    if !warnings.is_empty() {
+        for w in &warnings {
+            log::warn!("{w}");
+        }
+    }
+    warnings
 }
 
 /// Merge config values from `candidates` in order; first non-None value for each field wins.
@@ -454,8 +508,8 @@ pub fn search_fallback() -> SearchFallback {
     resolved().search_fallback
 }
 
-pub fn content_dirs() -> &'static [ContentDir] {
-    &resolved().content_dirs
+pub fn content_dirs() -> Vec<ContentDir> {
+    resolved().content_dirs
 }
 
 pub fn session_weight() -> f64 {
@@ -536,10 +590,11 @@ pub fn status_penalty(status: Option<&str>) -> f64 {
 /// Half-life in days, resolved from content_dirs config by file path prefix.
 /// Falls back to source_type-based defaults when content_dirs is empty or unmatched.
 pub fn half_life_days(file_path: &str, source_type: &str) -> f64 {
+    let cfg = resolved();
     if file_path.starts_with("session:") {
-        return resolved().session_half_life_days;
+        return cfg.session_half_life_days;
     }
-    for dir in &resolved().content_dirs {
+    for dir in &cfg.content_dirs {
         if file_path.starts_with(dir.path.as_str())
             && file_path.as_bytes().get(dir.path.len()) == Some(&b'/')
         {
@@ -578,10 +633,11 @@ pub fn source_type_from_dir(directory: &str) -> String {
 
 /// Score weight based on directory prefix of file_path.
 pub fn directory_weight(file_path: &str) -> f64 {
+    let cfg = resolved();
     if file_path.starts_with("session:") {
-        return resolved().session_weight;
+        return cfg.session_weight;
     }
-    for dir in &resolved().content_dirs {
+    for dir in &cfg.content_dirs {
         if file_path.starts_with(dir.path.as_str())
             && file_path.as_bytes().get(dir.path.len()) == Some(&b'/')
         {
@@ -1212,5 +1268,19 @@ half_life_days = 180
             .map(|d| d.half_life_days)
             .unwrap_or(DEFAULT_HALF_LIFE_DAYS);
         assert_eq!(hl, 180.0);
+    }
+
+    // ─── reload ──────────────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn test_reload_updates_config() {
+        // Force singleton initialization
+        let _ = resolved();
+
+        // reload should not panic even without tsm.toml changes
+        let warnings = reload();
+        // No structural fields changed, so no warnings
+        assert!(warnings.is_empty());
     }
 }

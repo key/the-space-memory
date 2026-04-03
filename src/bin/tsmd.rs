@@ -3,6 +3,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
 use the_space_memory::cli;
 use the_space_memory::config;
 use the_space_memory::daemon;
-use the_space_memory::daemon_protocol::{read_request, write_response, DaemonRequest};
+use the_space_memory::daemon_protocol::{read_request, write_response, DaemonRequest, DaemonResponse};
 use the_space_memory::db;
 use the_space_memory::status;
 
@@ -152,6 +153,7 @@ fn main() -> Result<()> {
     };
 
     // Start watcher as a thread (not a child process)
+    let (reload_tx, reload_rx) = mpsc::channel::<()>();
     if !args.no_watcher {
         let conn = Arc::clone(&conn);
         let index_root = index_root.clone();
@@ -163,7 +165,7 @@ fn main() -> Result<()> {
         });
         log::info!("starting watcher thread");
         std::thread::spawn(move || {
-            if let Err(e) = run_watcher(&conn, &index_root) {
+            if let Err(e) = run_watcher(&conn, &index_root, reload_rx) {
                 log::error!("watcher thread failed: {e}");
             }
             log::info!("watcher thread stopped");
@@ -220,8 +222,11 @@ fn main() -> Result<()> {
                 let index_root = index_root.clone();
                 let search_active = Arc::clone(&search_active);
 
+                let reload_tx = reload_tx.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_client(&mut stream, &conn, &index_root, &search_active) {
+                    if let Err(e) =
+                        handle_client(&mut stream, &conn, &index_root, &search_active, &reload_tx)
+                    {
                         log::warn!("client error: {e}");
                     }
                 });
@@ -378,10 +383,28 @@ fn handle_client(
     conn: &Arc<Mutex<rusqlite::Connection>>,
     index_root: &std::path::Path,
     search_active: &Arc<AtomicUsize>,
+    reload_tx: &Sender<()>,
 ) -> Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
     let req = read_request(stream)?;
+
+    // Handle Reload directly in tsmd (needs watcher channel, not DB)
+    if matches!(req, DaemonRequest::Reload) {
+        let mut warnings = config::reload();
+        if reload_tx.send(()).is_err() {
+            warnings.push("watcher is not running; watch targets not updated".to_string());
+        }
+        let resp = if warnings.is_empty() {
+            DaemonResponse::success_empty()
+        } else {
+            DaemonResponse::success(serde_json::json!({
+                "warnings": warnings,
+            }))
+        };
+        write_response(stream, &resp)?;
+        return Ok(());
+    }
 
     // Track active search requests so backfill can yield
     let _guard = if matches!(req, DaemonRequest::Search { .. }) {
@@ -523,12 +546,12 @@ fn sleep_interruptible(duration: std::time::Duration) {
 
 /// Run the file watcher loop. Watches content directories for .md changes
 /// and indexes them directly via the shared DB connection.
-fn run_watcher(conn: &Arc<Mutex<rusqlite::Connection>>, index_root: &Path) -> Result<()> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let mut debouncer =
-        new_debouncer(Duration::from_secs(2), tx).context("Failed to create file watcher")?;
-
-    let mut watched = 0;
+/// Set up watch targets and return the set of watched directories.
+fn setup_watches(
+    debouncer: &mut notify_debouncer_mini::Debouncer<notify_debouncer_mini::notify::RecommendedWatcher>,
+    index_root: &Path,
+) -> HashSet<PathBuf> {
+    let mut watched = HashSet::new();
     for full_dir in cli::discover_watch_dirs(index_root) {
         if full_dir.is_dir() {
             if let Err(e) = debouncer
@@ -537,12 +560,56 @@ fn run_watcher(conn: &Arc<Mutex<rusqlite::Connection>>, index_root: &Path) -> Re
             {
                 log::warn!("cannot watch {}: {e}", full_dir.display());
             } else {
-                watched += 1;
+                watched.insert(full_dir);
             }
         }
     }
+    watched
+}
 
-    if watched == 0 {
+/// Update watch targets: unwatch removed dirs, watch added dirs.
+fn update_watches(
+    debouncer: &mut notify_debouncer_mini::Debouncer<notify_debouncer_mini::notify::RecommendedWatcher>,
+    current: &mut HashSet<PathBuf>,
+    index_root: &Path,
+) {
+    let desired: HashSet<PathBuf> = cli::discover_watch_dirs(index_root)
+        .into_iter()
+        .filter(|d| d.is_dir())
+        .collect();
+
+    // Unwatch removed dirs
+    for dir in current.difference(&desired) {
+        log::info!("unwatching {}", dir.display());
+        let _ = debouncer.watcher().unwatch(dir);
+    }
+
+    // Watch new dirs
+    for dir in desired.difference(current) {
+        log::info!("watching {}", dir.display());
+        if let Err(e) = debouncer
+            .watcher()
+            .watch(dir, RecursiveMode::Recursive)
+        {
+            log::warn!("cannot watch {}: {e}", dir.display());
+        }
+    }
+
+    *current = desired;
+}
+
+fn run_watcher(
+    conn: &Arc<Mutex<rusqlite::Connection>>,
+    index_root: &Path,
+    reload_rx: mpsc::Receiver<()>,
+) -> Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut debouncer =
+        new_debouncer(Duration::from_secs(2), tx).context("Failed to create file watcher")?;
+
+    let mut watched = setup_watches(&mut debouncer, index_root);
+
+    if watched.is_empty() {
         anyhow::bail!(
             "No content directories found to watch under {}",
             index_root.display()
@@ -550,11 +617,20 @@ fn run_watcher(conn: &Arc<Mutex<rusqlite::Connection>>, index_root: &Path) -> Re
     }
 
     log::info!(
-        "watching {watched} directories under {}",
+        "watching {} directories under {}",
+        watched.len(),
         index_root.display()
     );
 
     while !SHUTDOWN.load(Ordering::SeqCst) {
+        // Drain all queued reload notifications (coalesce multiple reloads)
+        if reload_rx.try_recv().is_ok() {
+            while reload_rx.try_recv().is_ok() {}
+            log::info!("watcher: reload notification received, updating watch targets");
+            update_watches(&mut debouncer, &mut watched, index_root);
+            log::info!("watcher: now watching {} directories", watched.len());
+        }
+
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(events)) => {
                 let mut files_to_index: HashSet<String> = HashSet::new();
@@ -638,7 +714,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let conn = the_space_memory::db::get_memory_connection().unwrap();
         let conn = Arc::new(Mutex::new(conn));
-        let result = run_watcher(&conn, dir.path());
+        let (_reload_tx, reload_rx) = mpsc::channel::<()>();
+        let result = run_watcher(&conn, dir.path(), reload_rx);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -658,7 +735,8 @@ mod tests {
 
         // Pre-set SHUTDOWN so the watcher loop exits immediately
         SHUTDOWN.store(true, Ordering::SeqCst);
-        let result = run_watcher(&conn, dir.path());
+        let (_reload_tx, reload_rx) = mpsc::channel::<()>();
+        let result = run_watcher(&conn, dir.path(), reload_rx);
         // Reset for other tests
         SHUTDOWN.store(false, Ordering::SeqCst);
         assert!(result.is_ok());

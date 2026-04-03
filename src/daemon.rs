@@ -127,6 +127,17 @@ pub fn handle_request(
         DaemonRequest::Rebuild { .. } => {
             DaemonResponse::error("rebuild cannot run while tsmd is active. Run `tsm stop` first.")
         }
+
+        // Reload is handled directly in tsmd::handle_client before reaching here.
+        // This arm exists for exhaustiveness and testing without a daemon.
+        DaemonRequest::Reload => {
+            let warnings = config::reload();
+            if warnings.is_empty() {
+                DaemonResponse::success_empty()
+            } else {
+                DaemonResponse::success(serde_json::json!({ "warnings": warnings }))
+            }
+        }
     }
 }
 
@@ -278,6 +289,16 @@ mod tests {
         let resp = handle_request(&conn, req, dir.path(), &flag);
         assert!(!resp.ok);
         assert!(resp.error.unwrap().contains("tsm stop"));
+    }
+
+    #[test]
+    fn test_reload() {
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+        let resp = handle_request(&conn, DaemonRequest::Reload, dir.path(), &flag);
+        assert!(resp.ok);
+        // Shutdown flag should NOT be set by reload
+        assert!(!flag.load(Ordering::SeqCst));
     }
 
     #[test]

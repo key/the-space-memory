@@ -51,6 +51,7 @@ pub enum DaemonRequest {
     Rebuild {
         force: bool,
     },
+    Reload,
     Shutdown,
     Ping,
 }
@@ -315,6 +316,14 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, DaemonRequest::Ping));
+    }
+
+    #[test]
+    fn serde_roundtrip_reload() {
+        let req = DaemonRequest::Reload;
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, DaemonRequest::Reload));
     }
 
     #[test]

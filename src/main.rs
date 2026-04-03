@@ -162,6 +162,8 @@ enum Commands {
         #[arg(long)]
         fts_only: bool,
     },
+    /// Reload config (tsm.toml) without restarting the daemon
+    Reload,
     /// Restart the daemon (stop + start)
     Restart,
 }
@@ -281,6 +283,10 @@ fn main() -> anyhow::Result<()> {
                 wordnet_db: wordnet_db.to_string_lossy().to_string(),
             };
             render_import_wordnet(send_to_daemon(&req)?)?;
+        }
+
+        Commands::Reload => {
+            render_reload(send_to_daemon(&DaemonRequest::Reload)?)?;
         }
     }
     Ok(())
@@ -413,6 +419,21 @@ fn render_doctor(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
         )
     })?;
     cli::render_doctor_report(&report);
+    Ok(())
+}
+
+fn render_reload(resp: DaemonResponse) -> anyhow::Result<()> {
+    check_resp(&resp)?;
+    if let Some(payload) = &resp.payload {
+        if let Some(warnings) = payload.get("warnings").and_then(|w| w.as_array()) {
+            for w in warnings {
+                if let Some(s) = w.as_str() {
+                    eprintln!("warning: {s}");
+                }
+            }
+        }
+    }
+    eprintln!("config reloaded");
     Ok(())
 }
 
