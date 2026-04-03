@@ -87,7 +87,7 @@ tsm では全エントリを `カスタム名詞` として登録し、コスト
 tsm stop
 
 # 2. 閾値（5回）以上の候補を辞書ファイル に追加
-tsm dict update --yes
+tsm dict update --apply
 
 # 3. FTS インデックスを再構築（辞書変更を反映）
 tsm rebuild --force
