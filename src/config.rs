@@ -128,10 +128,11 @@ pub(crate) struct ConfigFile {
     index: IndexConfig,
 }
 
-/// Fully resolved configuration — all values determined at startup.
+/// Fully resolved configuration.
 ///
 /// Resolution priority: env var > config file (tsm.toml) > default.
-/// Built once via `from_env()` and stored in a `OnceLock` singleton.
+/// Stored in a `OnceLock<RwLock<ResolvedConfig>>` singleton. Initialized lazily
+/// via `from_env()`; may be updated at runtime by calling `reload()`.
 /// In tests, construct directly via `from_config_file()` without env var mutation.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
@@ -357,10 +358,12 @@ fn resolved() -> ResolvedConfig {
 /// Reload config from tsm.toml. Returns a list of warnings for fields
 /// that changed but require a daemon restart to take effect.
 pub fn reload() -> Vec<String> {
+    // Ensure singleton is initialized before building new config
+    let _ = resolved();
     let new_cfg = ResolvedConfig::from_env();
 
     // Hold write lock for the entire read-compare-write to avoid TOCTOU races
-    let lock = RESOLVED.get_or_init(|| RwLock::new(ResolvedConfig::from_env()));
+    let lock = RESOLVED.get().expect("config not initialized");
     let mut w = lock.write().expect("config RwLock poisoned");
     let old = w.clone();
 
@@ -1282,5 +1285,42 @@ half_life_days = 180
         let warnings = reload();
         // No structural fields changed, so no warnings
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_reload_warns_on_structural_changes() {
+        // Force singleton initialization with current env
+        let _ = resolved();
+
+        // Set env vars to force structural field changes
+        std::env::set_var("TSM_STATE_DIR", "/tmp/reload-test-state");
+        std::env::set_var("TSM_INDEX_ROOT", "/tmp/reload-test-root");
+
+        let warnings = reload();
+
+        // Clean up env vars
+        std::env::remove_var("TSM_STATE_DIR");
+        std::env::remove_var("TSM_INDEX_ROOT");
+
+        // Restore original config
+        reload();
+
+        // Should have warnings for state_dir and index_root (and derived paths)
+        assert!(
+            warnings.iter().any(|w| w.contains("state_dir")),
+            "expected state_dir warning, got: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("index_root")),
+            "expected index_root warning, got: {warnings:?}"
+        );
+        // All warnings should mention tsm restart
+        for w in &warnings {
+            assert!(
+                w.contains("tsm restart"),
+                "warning should mention tsm restart: {w}"
+            );
+        }
     }
 }

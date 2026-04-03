@@ -128,8 +128,9 @@ pub fn handle_request(
             DaemonResponse::error("rebuild cannot run while tsmd is active. Run `tsm stop` first.")
         }
 
-        // Reload is handled directly in tsmd::handle_client before reaching here.
-        // This arm exists for exhaustiveness and testing without a daemon.
+        // In the live daemon, tsmd::handle_client intercepts Reload first
+        // (to access the watcher channel). This arm handles the same logic
+        // for callers without a watcher, including unit tests.
         DaemonRequest::Reload => {
             let warnings = config::reload();
             if warnings.is_empty() {

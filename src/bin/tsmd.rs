@@ -581,7 +581,9 @@ fn update_watches(
     // Unwatch removed dirs
     for dir in current.difference(&desired) {
         log::info!("unwatching {}", dir.display());
-        let _ = debouncer.watcher().unwatch(dir);
+        if let Err(e) = debouncer.watcher().unwatch(dir) {
+            log::warn!("failed to unwatch {}: {e}", dir.display());
+        }
     }
 
     // Watch new dirs
@@ -623,7 +625,8 @@ fn run_watcher(
     );
 
     while !SHUTDOWN.load(Ordering::SeqCst) {
-        // Drain all queued reload notifications (coalesce multiple reloads)
+        // Drain all queued reload notifications. Coalescing avoids redundant
+        // update_watches calls when multiple reload requests arrive in quick succession.
         if reload_rx.try_recv().is_ok() {
             while reload_rx.try_recv().is_ok() {}
             log::info!("watcher: reload notification received, updating watch targets");

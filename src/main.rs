@@ -433,7 +433,7 @@ fn render_reload(resp: DaemonResponse) -> anyhow::Result<()> {
             }
         }
     }
-    eprintln!("config reloaded");
+    println!("config reloaded");
     Ok(())
 }
 
