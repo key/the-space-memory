@@ -1,0 +1,76 @@
+# tsm.toml — The Space Memory configuration
+#
+# Resolution priority: env var > config file > default
+# All fields are optional. Uncomment and modify as needed.
+
+# Root directory for all tsm data (DB, dictionaries, PID files, logs).
+# Default: ".tsm/"
+# Env: TSM_STATE_DIR
+# state_dir = ".tsm"
+
+# Root directory containing content workspaces to index.
+# Default: "/workspaces"
+# Env: TSM_INDEX_ROOT
+# index_root = "/workspaces"
+
+# UNIX socket path for tsm-embedder (encode requests).
+# Default: "{state_dir}/embedder.sock"
+# Env: TSM_EMBEDDER_SOCKET
+# embedder_socket_path = ".tsm/embedder.sock"
+
+# UNIX socket path for tsmd (client requests).
+# Default: "{state_dir}/daemon.sock"
+# Env: TSM_DAEMON_SOCKET
+# daemon_socket_path = ".tsm/daemon.sock"
+
+# Directory for daemon log files (tsmd, tsm-embedder).
+# Default: "{state_dir}/logs"
+# Env: TSM_LOG_DIR
+# log_dir = ".tsm/logs"
+
+# Seconds of inactivity before tsm-embedder shuts down. 0 = never.
+# Default: 600
+# Env: TSM_EMBEDDER_IDLE_TIMEOUT
+# embedder_idle_timeout_secs = 600
+
+# Seconds between periodic backfill checks. 0 = disable.
+# Default: 300
+# Env: TSM_EMBEDDER_BACKFILL_INTERVAL
+# embedder_backfill_interval_secs = 300
+
+# Behavior when the embedder is stopped during search.
+# Options: "error" (refuse to search) | "fts_only" (FTS5 fallback with warning)
+# Default: "error"
+# Env: TSM_SEARCH_FALLBACK
+# search_fallback = "error"
+
+# Path to user dictionary file (lindera IPAdic format).
+# Default: "{state_dir}/user_dict.simpledic"
+# Env: TSM_USER_DICT
+# user_dict_path = ".tsm/user_dict.simpledic"
+
+# ─── Index settings ───────────────────────────────────────────────
+
+[index]
+
+# Content directories to index. Each entry has:
+#   path           — directory path (required)
+#   weight         — scoring weight (default: 1.0)
+#   half_life_days — time decay half-life in days (default: 90.0)
+#
+# Empty = auto-discover mode (recursively index all .md under index_root).
+#
+# content_dirs = [
+#     { path = "/workspaces/notes", weight = 1.0, half_life_days = 90.0 },
+#     { path = "/workspaces/docs",  weight = 0.8, half_life_days = 180.0 },
+# ]
+
+[index.claude_session]
+
+# Score weight for Claude Code session data.
+# Default: 0.3
+# weight = 0.3
+
+# Half-life in days for Claude Code session data time decay.
+# Default: 30.0
+# half_life_days = 30.0
