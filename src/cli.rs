@@ -756,7 +756,7 @@ fn doctor_check_with_conn(
                     summary.ready_count,
                     config::DICT_CANDIDATE_FREQ_THRESHOLD
                 ),
-                hint: Some("Run `dict-update`.".to_string()),
+                hint: Some("Run `tsm dict update`.".to_string()),
             });
         }
 

@@ -11,7 +11,7 @@ lindera の内蔵辞書（IPAdic）は一般的な日本語をカバーするが
 
 - **収集は自動、適用は明示的** ---
   インデックス・検索・セッション取り込み時に未知語を自動収集するが、
-  辞書への追加は `dict-update` コマンドで人間が確認してから行う
+  辞書への追加は `tsm dict update` コマンドで人間が確認してから行う
 - **reject で品質を担保** ---
   候補テーブルに溜まった不要語（ストップワード等）は `rejected` にマークすることで、
   以後カウントされなくなる。辞書ファイル には影響しない
@@ -58,7 +58,7 @@ tsm では全エントリを `カスタム名詞` として登録し、コスト
 ステータスの意味:
 
 - **pending** --- 候補として蓄積中。出現するたびに frequency が加算される
-- **accepted** --- `dict-update` で辞書ファイル に追加済み
+- **accepted** --- `tsm dict update` で辞書ファイル に追加済み
 - **rejected** --- 不要と判断された語。frequency の加算がスキップされる
 
 ## 実装ファイル
@@ -67,7 +67,7 @@ tsm では全エントリを `カスタム名詞` として登録し、コスト
 |---|---|
 | `src/user_dict.rs` | 候補収集（`collect_from_text`）、辞書エクスポート、accept/reject 操作 |
 | `src/tokenizer.rs` | lindera の初期化。`user_dict.simpledic` を `load_user_dictionary_from_csv()` で読み込み、`Segmenter` に適用 |
-| `src/cli.rs` | `dict-update` コマンドの実装（`cmd_dict_update`） |
+| `src/cli.rs` | `tsm dict update` コマンドの実装（`cmd_dict_update`） |
 | `src/db.rs` | `dictionary_candidates` テーブルのスキーマ定義 |
 
 ### 候補収集の流れ
@@ -83,17 +83,17 @@ tsm では全エントリを `カスタム名詞` として登録し、コスト
 ### 辞書に候補を追加する
 
 ```bash
-# 1. デーモンを停止（dict-update は DB を直接操作するため）
+# 1. デーモンを停止（dict update は DB を直接操作するため）
 tsm stop
 
 # 2. 閾値（5回）以上の候補を辞書ファイル に追加
-tsm dict-update --yes
+tsm dict update --yes
 
 # 3. FTS インデックスを再構築（辞書変更を反映）
 tsm rebuild --force
 ```
 
-`dict-update` は以下を行う:
+`tsm dict update` は以下を行う:
 
 - frequency >= 5 かつ status = pending の候補を取得
 - 既に CSV にある語は `accepted` にマークしてスキップ

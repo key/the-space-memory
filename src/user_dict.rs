@@ -92,7 +92,7 @@ struct RawCandidate {
 // ─── Existing surfaces cache ─────────────────────────────────
 
 /// Cached set of surfaces already in user_dict.simpledic (loaded once per process).
-/// Acceptable because the dict only changes when dict-update runs (which triggers rebuild).
+/// Acceptable because the dict only changes when `tsm dict update` runs (which triggers rebuild).
 static EXISTING_SURFACES: OnceLock<HashSet<String>> = OnceLock::new();
 
 fn get_existing_surfaces() -> &'static HashSet<String> {
