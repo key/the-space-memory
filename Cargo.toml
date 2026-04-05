@@ -19,8 +19,8 @@ path = "src/bin/tsm_embedder.rs"
 rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }
 lindera = { version = "2.3", features = ["embed-ipadic"] }
 candle-core = "0.10"
-candle-nn = "0.9"
-candle-transformers = "0.9"
+candle-nn = "0.10"
+candle-transformers = "0.10"
 hf-hub = "0.4"
 sqlite-vec = "0.1.8-alpha.1"
 tokenizers = "0.21"
