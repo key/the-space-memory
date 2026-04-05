@@ -37,7 +37,7 @@ chrono = "0.4"
 sha2 = "0.10"
 libc = "0.2"
 log = "0.4"
-flexi_logger = { version = "0.29", features = ["colors"] }
+flexi_logger = { version = "0.31", features = ["colors"] }
 notify-debouncer-mini = "0.4"
 
 [dev-dependencies]
