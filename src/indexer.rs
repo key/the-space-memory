@@ -1003,6 +1003,20 @@ mod tests {
     }
 
     #[test]
+    fn test_hex_encode() {
+        assert_eq!(hex_encode(&[]), "");
+        assert_eq!(hex_encode(&[0x00]), "00");
+        assert_eq!(hex_encode(&[0xff]), "ff");
+        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+        // SHA-256 of empty input
+        let hash = Sha256::digest(b"");
+        assert_eq!(
+            hex_encode(hash.as_slice()),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
     fn test_index_new_file() {
         let (conn, dir) = setup();
         let md =
