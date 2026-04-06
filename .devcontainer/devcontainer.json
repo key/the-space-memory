@@ -5,7 +5,7 @@
   },
   "runArgs": [
     "--name",
-    "The Space Memory",
+    "the-space-memory",
     "--rm",
     "--env-file",
     ".env"
