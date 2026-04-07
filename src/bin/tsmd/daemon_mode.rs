@@ -75,10 +75,14 @@ pub fn run(args: Args) -> Result<()> {
 
     let mut embedder_child: Option<Child> = if !args.no_embedder {
         if child::is_process_alive(&embedder_pid_path) {
-            log::info!(
-                "embedder already running (PID file: {})",
-                embedder_pid_path.display()
-            );
+            if let Some(pid) = child::read_pid_from_file(&embedder_pid_path) {
+                log::info!("embedder already running (PID {pid})");
+            } else {
+                log::info!(
+                    "embedder already running (PID file: {})",
+                    embedder_pid_path.display()
+                );
+            }
             None
         } else {
             let _ = std::fs::remove_file(&embedder_pid_path);

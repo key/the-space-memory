@@ -44,14 +44,11 @@ pub fn spawn_child(label: &str, extra_args: &[&str], pid_path: &Path) -> Option<
 
 /// Check if a PID file points to a running process.
 pub fn is_process_alive(pid_path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(pid_path) else {
-        return false;
-    };
-    let Ok(pid) = content.trim().parse::<i32>() else {
+    let Some(pid) = read_pid_from_file(pid_path) else {
         return false;
     };
     // kill(pid, 0) checks process existence without sending a signal.
-    unsafe { libc::kill(pid, 0) == 0 }
+    unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 /// Detect child exit. Returns `true` if the child exited.
@@ -118,10 +115,10 @@ pub fn read_pid_from_file(pid_path: &Path) -> Option<u32> {
 
 /// Remove a stale UNIX socket if it exists.
 pub fn remove_stale_socket(path: &Path) {
-    if path.exists() {
-        if let Err(e) = std::fs::remove_file(path) {
-            log::warn!("could not remove stale socket {}: {e}", path.display());
-        }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("could not remove stale socket {}: {e}", path.display()),
     }
 }
 
