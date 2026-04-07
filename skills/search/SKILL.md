@@ -15,7 +15,7 @@ Search the knowledge base using `tsm search`.
 ## Usage
 
 ```bash
-cd "$CLAUDE_PROJECT_DIR" && "${CLAUDE_PLUGIN_ROOT}bin/tsm" search -q "$ARGUMENTS" -k 5 -f json --include-content 3
+cd "$CLAUDE_PROJECT_DIR" && "${CLAUDE_PLUGIN_ROOT}/bin/tsm" search -q "$ARGUMENTS" -k 5 -f json --include-content 3
 ```
 
 ## Options
@@ -44,7 +44,7 @@ cd "$CLAUDE_PROJECT_DIR" && "${CLAUDE_PLUGIN_ROOT}bin/tsm" search -q "$ARGUMENTS
 Parse the JSON results and present them like this:
 
 ```
-### ナレッジ検索結果: "<query>"
+### Knowledge Search: "<query>"
 
 1. **[Section Title]** — `source/file.md`
    > snippet of matching content...
@@ -52,5 +52,5 @@ Parse the JSON results and present them like this:
 2. **[Section Title]** — `source/file.md`
    > snippet of matching content...
 
-_N件ヒット。詳しく調べるなら deep-research エージェントに委任できるよ。_
+_N results found. For deeper investigation, delegate to the deep-research agent._
 ```

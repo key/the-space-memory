@@ -11,7 +11,7 @@ Run `tsm doctor` to check daemon, embedder, database, and vector integrity.
 ## Usage
 
 ```bash
-cd "$CLAUDE_PROJECT_DIR" && "${CLAUDE_PLUGIN_ROOT}bin/tsm" doctor -f json
+cd "$CLAUDE_PROJECT_DIR" && "${CLAUDE_PLUGIN_ROOT}/bin/tsm" doctor -f json
 ```
 
 ## What it checks
