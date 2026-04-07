@@ -246,12 +246,12 @@ EXIT=$?
 assert_json "temporal: --recent 30d excludes old-text" \
     '[.[] | select(.source_file | contains("old-text"))] | length == 0' "$OUTPUT" "$EXIT"
 
-OUTPUT=$(search_json "文学" --year "$LAST_YEAR") || true
+OUTPUT=$(search_json "吾輩 猫" --year "$LAST_YEAR") || true
 EXIT=$?
 assert_json "temporal: --year hits old-text" \
     'any(.[]; .source_file | contains("old-text"))' "$OUTPUT" "$EXIT"
 
-OUTPUT=$(search_json "文学" --after "$THREE_MONTHS_AGO_START" --before "$THREE_MONTHS_AGO_END") || true
+OUTPUT=$(search_json "紳士 料理店" --after "$THREE_MONTHS_AGO_START" --before "$THREE_MONTHS_AGO_END") || true
 EXIT=$?
 assert_json "temporal: --after/--before hits seasonal-text" \
     'any(.[]; .source_file | contains("seasonal-text"))' "$OUTPUT" "$EXIT"
@@ -301,8 +301,8 @@ tsm start 2>/dev/null
 # Wait for daemon ready
 sleep 3
 
-# Search after dict registration
-OUTPUT_AFTER=$(search_json "$DICT_WORD" 2>/dev/null) || true
+# Search after dict registration (use fts_only fallback since embedder may not be ready yet)
+OUTPUT_AFTER=$(search_json "$DICT_WORD" --fallback fts_only 2>/dev/null) || true
 EXIT=$?
 assert_json "dict: $DICT_WORD → $DICT_FILE after dict update" \
     "any(.[]; .source_file | contains(\"$DICT_FILE\"))" "$OUTPUT_AFTER" "$EXIT"
