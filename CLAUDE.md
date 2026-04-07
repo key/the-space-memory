@@ -117,7 +117,10 @@ src/
 
 ## Testing
 
-- **TDD required** — Write tests first, then implement to pass them
+- **TDD required** — Red → Green → Refactor cycle:
+  1. Write a failing test that defines the expected behavior
+  2. Write minimal code to make the test pass
+  3. Refactor while keeping tests green
 - **90%+ coverage** — Enforced via `cargo llvm-cov --fail-under-lines 90` in CI
 - **Unit tests required** — All pub functions must have tests in `#[cfg(test)] mod tests`
 - **AAA pattern** — Arrange (setup + state cleanup like `clear_vectors`) → Act → Assert
@@ -143,6 +146,19 @@ docker build -t the-space-memory /path/to/the-space-memory
 ## MCP
 
 - Serena MCP via Docker (`ghcr.io/oraios/serena:latest`). Config in `.mcp.json`
+
+## Definition of Done
+
+A change is merge-ready when **all** of the following hold:
+
+- [ ] `cargo test` passes (all existing + new tests)
+- [ ] `cargo clippy -- -D warnings` clean
+- [ ] `cargo fmt --check` clean
+- [ ] Coverage ≥ 90% (on covered modules)
+- [ ] New pub functions have unit tests
+- [ ] `bash tests/e2e.sh` passes (if search, index, or IPC changed)
+- [ ] CLAUDE.md updated if architecture or commands changed
+- [ ] README.md / README.ja.md updated in sync (if user-facing change)
 
 ## Gotchas
 
