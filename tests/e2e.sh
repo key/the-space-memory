@@ -246,11 +246,11 @@ EXIT=$?
 assert_json "temporal: --recent 30d excludes old-text" \
     '[.[] | select(.source_file | contains("old-text"))] | length == 0' "$OUTPUT" "$EXIT"
 
-OUTPUT=$(search_json "吾輩 猫" --year "$LAST_YEAR" --fallback fts_only) || true
+THIS_YEAR=$(date +%Y)
+OUTPUT=$(search_json "吾輩 猫" --year "$THIS_YEAR") || true
 EXIT=$?
-log "temporal --year output: $OUTPUT"
-assert_json "temporal: --year hits old-text" \
-    'any(.[]; .source_file | contains("old-text"))' "$OUTPUT" "$EXIT"
+assert_json "temporal: --year THIS_YEAR excludes old-text" \
+    '[.[] | select(.source_file | contains("old-text"))] | length == 0' "$OUTPUT" "$EXIT"
 
 OUTPUT=$(search_json "紳士 料理店" --after "$THREE_MONTHS_AGO_START" --before "$THREE_MONTHS_AGO_END") || true
 EXIT=$?
@@ -277,12 +277,14 @@ assert_json "vector: 宇宙と星の旅 → gingatetsudo" \
 echo ""
 log "=== Dictionary ==="
 
-# Pick a compound word for dict test: "銀河鉄道" (should be in gingatetsudo.md)
-DICT_WORD="銀河鉄道"
-DICT_FILE="gingatetsudo"
+# Dict test: add a word to user dict, rebuild FTS, verify search works with it.
+# Use "セリヌンティウス" — a proper noun only in hashire-melos.md that lindera
+# splits into multiple tokens by default, but as a dict entry becomes one token.
+DICT_WORD="セリヌンティウス"
+DICT_FILE="hashire-melos"
 
-# Search before dict registration
-search_json "$DICT_WORD" >/dev/null 2>&1 || true
+# Search before dict registration — should already hit via constituent tokens
+OUTPUT_BEFORE=$(search_json "$DICT_WORD" --fallback fts_only 2>/dev/null) || true
 
 # Stop daemon, add word to user dict, rebuild FTS, restart
 log "Stopping daemon for dict update..."
@@ -302,13 +304,17 @@ tsm start 2>&1
 # Wait for daemon ready
 sleep 3
 
-log "Searching for '$DICT_WORD' after dict update..."
-# Search after dict registration (use fts_only fallback since embedder may not be ready yet)
+# Search after dict registration — the word should hit after FTS rebuild with new dict
 OUTPUT_AFTER=$(search_json "$DICT_WORD" --fallback fts_only 2>/dev/null) || true
-log "Dict search output: $OUTPUT_AFTER"
 EXIT=$?
-assert_json "dict: $DICT_WORD → $DICT_FILE after dict update" \
+assert_json "dict: $DICT_WORD → $DICT_FILE after dict+rebuild" \
     "any(.[]; .source_file | contains(\"$DICT_FILE\"))" "$OUTPUT_AFTER" "$EXIT"
+
+# Also verify search still works for a basic query after the rebuild cycle
+OUTPUT_POST=$(search_json "メロス 激怒" --fallback fts_only 2>/dev/null) || true
+EXIT=$?
+assert_json "dict: search still works after rebuild" \
+    'any(.[]; .source_file | contains("hashire-melos"))' "$OUTPUT_POST" "$EXIT"
 
 # ── Edge cases ────────────────────────────────────────────────────────
 
