@@ -22,8 +22,8 @@ BOLD='\033[1m'
 RESET='\033[0m'
 
 log()  { echo -e "${BOLD}[e2e]${RESET} $*"; }
-pass() { ((PASS++)); echo -e "  ${GREEN}PASS${RESET} $1"; }
-fail() { ((FAIL++)); ERRORS+=("$1: $2"); echo -e "  ${RED}FAIL${RESET} $1: $2"; }
+pass() { PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${RESET} $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS+=("$1: $2"); echo -e "  ${RED}FAIL${RESET} $1: $2"; }
 
 # Assert: command succeeded (exit 0) and jq expression is truthy
 assert_json() {

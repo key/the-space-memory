@@ -36,7 +36,7 @@ jobs:
       - name: Cache ruri-v3-30m model
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
         with:
-          path: ~/.cache/tsm/models
+          path: ${{ runner.temp }}/tsm-models
           key: ruri-v3-30m-model
 
       - name: Add binaries to PATH
@@ -45,9 +45,9 @@ jobs:
       - name: Download model
         run: tsm setup
         env:
-          HF_HUB_CACHE: ~/.cache/tsm/models
+          HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
 
       - name: Run E2E tests
         run: bash tests/e2e.sh
         env:
-          HF_HUB_CACHE: ~/.cache/tsm/models
+          HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
