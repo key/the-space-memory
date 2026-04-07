@@ -1,5 +1,5 @@
 ---
-name: setup
+name: the-space-memory:setup
 description: Interactive setup wizard to create or update tsm.toml configuration.
 user-invocable: true
 ---
