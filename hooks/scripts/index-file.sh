@@ -10,8 +10,8 @@ FILE=$(jq -r '.tool_input.file_path // empty') || exit 0
 # Prefer system-installed tsm over plugin-bundled one
 if command -v tsm >/dev/null 2>&1; then
   TSM="tsm"
-elif [ -x "${CLAUDE_PLUGIN_ROOT:-}/tsm" ]; then
-  TSM="${CLAUDE_PLUGIN_ROOT:-}/tsm"
+elif [ -x "${CLAUDE_PLUGIN_ROOT:-}/bin/tsm" ]; then
+  TSM="${CLAUDE_PLUGIN_ROOT:-}/bin/tsm"
 else
   exit 0
 fi

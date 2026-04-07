@@ -147,6 +147,29 @@ The PR labeler workflow (`.github/labeler.yml`) maps prefixes to labels:
 | `docs/` | documentation |
 | `perf/` | performance |
 
+## Plugin Structure
+
+This project is a Claude Code plugin (`--plugin-dir` or marketplace install).
+
+```text
+.claude-plugin/
+└── plugin.json            — Plugin manifest
+skills/
+├── search/SKILL.md        — /the-space-memory:search (knowledge search)
+├── doctor/SKILL.md        — /the-space-memory:doctor (health check)
+└── setup/SKILL.md         — /the-space-memory:setup (tsm.toml wizard)
+agents/
+└── deep-research.md       — Deep research sub-agent
+hooks/
+├── hooks.json             — Hook event definitions
+└── scripts/
+    ├── search.sh          — UserPromptSubmit: auto-search
+    ├── index-file.sh      — PostToolUse: auto-index edited .md
+    └── ingest.sh          — Stop: session JSONL ingest
+```
+
+Local testing: `claude --plugin-dir /workspaces/the-space-memory`
+
 ## Build & Deploy
 
 Build from a host container via Docker, then reference the binary from hooks/skills.

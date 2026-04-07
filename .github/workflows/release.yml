@@ -63,13 +63,16 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           DIR="tsm-${TAG}-${ARCHIVE_NAME}"
-          mkdir -p "${DIR}/data" "${DIR}/docs"
-          cp "target/${TARGET}/release/tsm" "${DIR}/"
-          cp "target/${TARGET}/release/tsmd" "${DIR}/"
-          cp README.md LICENSE tsm.toml.sample "${DIR}/"
+          mkdir -p "${DIR}/bin" "${DIR}/data" "${DIR}/docs"
+          cp "target/${TARGET}/release/tsm" "${DIR}/bin/"
+          cp "target/${TARGET}/release/tsmd" "${DIR}/bin/"
+          cp README.md LICENSE tsm.toml.example "${DIR}/"
           cp data/stopwords.txt "${DIR}/data/"
           cp docs/user-dictionary.md "${DIR}/docs/"
           cp -r hooks "${DIR}/"
+          cp -r .claude-plugin "${DIR}/"
+          cp -r skills "${DIR}/"
+          cp -r agents "${DIR}/"
           tar czf "${DIR}.tar.gz" "${DIR}"
 
       - name: Upload archive
