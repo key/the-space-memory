@@ -365,12 +365,6 @@ pub fn cmd_ingest_session(session_file: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn cmd_embedder_start(socket_path: Option<&Path>) -> anyhow::Result<()> {
-    let default_path = config::embedder_socket_path();
-    let path = socket_path.unwrap_or(&default_path);
-    embedder::run_daemon(path)
-}
-
 pub fn cmd_vector_fill(batch_size: usize) -> anyhow::Result<()> {
     // Delegate to tsmd if running
     let sock = config::daemon_socket_path();

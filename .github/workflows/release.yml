@@ -47,7 +47,6 @@ jobs:
           mkdir -p "${DIR}/data" "${DIR}/docs"
           cp "target/${TARGET}/release/tsm" "${DIR}/"
           cp "target/${TARGET}/release/tsmd" "${DIR}/"
-          cp "target/${TARGET}/release/tsm-embedder" "${DIR}/"
           cp README.md LICENSE tsm.toml.sample "${DIR}/"
           cp data/stopwords.txt "${DIR}/data/"
           cp docs/user-dictionary.md "${DIR}/docs/"

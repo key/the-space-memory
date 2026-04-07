@@ -12,5 +12,4 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/tsm /usr/local/bin/tsm
 COPY --from=builder /app/target/release/tsmd /usr/local/bin/tsmd
-COPY --from=builder /app/target/release/tsm-embedder /usr/local/bin/tsm-embedder
 ENTRYPOINT ["tsm"]

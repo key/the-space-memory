@@ -43,7 +43,7 @@ src/
 ├── db.rs               — SQLite (rusqlite) DB init & connection management
 ├── indexer.rs           — Indexer (diff detection, FTS5/vector registration)
 ├── searcher.rs          — FTS5 + vector search, RRF fusion, scoring
-├── embedder.rs          — candle + ruri-v3-30m inference, UNIX socket daemon
+├── embedder.rs          — candle + ruri-v3-30m inference (pure library)
 ├── chunker.rs           — Markdown → H2/H3/paragraph chunking
 ├── session_chunker.rs   — Claude session JSONL → Q&A chunking
 ├── frontmatter.rs       — YAML frontmatter parser
@@ -53,7 +53,14 @@ src/
 ├── doc_links.rs         — Inter-document link analysis
 ├── synonyms.rs          — Synonym expansion, WordNet import
 ├── temporal.rs          — Temporal filter expression parsing
-└── user_dict.rs         — Dictionary candidate collection & CSV export
+├── user_dict.rs         — Dictionary candidate collection & CSV export
+└── bin/tsmd/
+    ├── main.rs          — tsmd entry point, mode dispatch (--embedder / --fs-watcher)
+    ├── daemon_mode.rs   — Daemon mode (accept loop, client handling)
+    ├── embedder_mode.rs — Embedder child process (socket server, model inference)
+    ├── watcher_mode.rs  — FS watcher child process (file change → Index IPC)
+    ├── child.rs         — Child process management (spawn, reap, stop)
+    └── backfill.rs      — Vector backfill orchestration
 ```
 
 - **FTS5**: lindera tokenization + unicode61 tokenizer
@@ -64,46 +71,36 @@ src/
 ## Data Flow
 
 ```text
-                        ┌─────────────────────────────────────────────┐
-                        │              main process                   │
-                        │                                             │
-  index-file ──────────►│  indexer queue ──► chunking ──► FTS5 write  │
-  ingest-session ──────►│       ▲                  │                  │
-                        │       │                  ▼                  │
-  watcher daemon ───────┘       │          vector queue               │
-  (file change notify)         │                  │                  │
-                        │       │                  ▼                  │
-                        │       │     embedder request (socket)       │
-                        │       │                  │                  │
-                        │       │                  ▼                  │
-                        │       │     receive vector → chunks_vec     │
-                        │       │                                     │
-                        │  backfill = enqueue missing to vector queue │
-                        └─────────────────────────────────────────────┘
-                                               │
-                                          socket (text→vec)
-                                               │
-                                               ▼
-                                     ┌──────────────────┐
-                                     │ embedder daemon   │
-                                     │ (pure inference)  │
-                                     │ text in → vec out │
-                                     │ no DB access      │
-                                     └──────────────────┘
+  tsmd (daemon main process)
+  ┌──────────────────────────────────────────────────────┐
+  │  daemon.sock ◄── tsm CLI                             │
+  │     │                                                │
+  │  accept loop ──► handle_request ──► DB read/write    │
+  │                                                      │
+  │  backfill threads ──► embedder.sock ──► chunks_vec   │
+  └──────────────────────────────────────────────────────┘
+        │ spawn                      │ spawn
+        ▼                            ▼
+  ┌──────────────────┐    ┌─────────────────────────┐
+  │ tsmd --embedder  │    │ tsmd --fs-watcher       │
+  │ (pure inference) │    │ (file change → Index)   │
+  │ embedder.sock    │    │ daemon.sock client      │
+  │ no DB access     │    │ no DB access            │
+  └──────────────────┘    └─────────────────────────┘
 ```
 
 **Ownership:**
 
-- **main process** — sole DB owner. All reads/writes go through here
-- **embedder daemon** — stateless inference server. No DB access
-- **watcher daemon** — stateless file monitor. Enqueues to main, no DB access
+- **tsmd (daemon)** — sole DB owner. All reads/writes go through here
+- **tsmd --embedder** — stateless inference server. No DB access
+- **tsmd --fs-watcher** — stateless file monitor. Sends Index requests to daemon via daemon.sock
 
 ## Design Principles
 
-- **Embedder daemon** — Model inference latency hiding.
-  Must NOT take on unrelated concerns (file watching, indexing)
-- **Watch daemon** (#27) — File system monitoring via OS-native events
-  (inotify/FSEvents). Separate process from embedder
+- **Embedder child process** (`tsmd --embedder`) — Model inference
+  latency hiding. Must NOT take on unrelated concerns
+- **Watcher child process** (`tsmd --fs-watcher`) — File system monitoring
+  via OS-native events (inotify/FSEvents). Sends Index requests to daemon
 - **Vector writes are always async** — Callers enqueue, embedder
   processes in background. FTS5 fallback if vectors not yet ready
 - **Incremental over full rebuild** — Chunk-level content hashing

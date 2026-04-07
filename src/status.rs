@@ -40,6 +40,7 @@ pub struct DaemonStatus {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WatcherStatus {
     pub started_at: String,
+    pub pid: u32,
 }
 
 pub fn status_path(state_dir: &Path) -> std::path::PathBuf {

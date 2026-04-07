@@ -9,11 +9,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "tsmd"
-path = "src/bin/tsmd.rs"
-
-[[bin]]
-name = "tsm-embedder"
-path = "src/bin/tsm_embedder.rs"
+path = "src/bin/tsmd/main.rs"
 
 [dependencies]
 rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }
