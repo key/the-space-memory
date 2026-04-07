@@ -1,5 +1,7 @@
 # The Space Memory
 
+<img width="600" alt="image" src="https://github.com/user-attachments/assets/af60871c-3a91-4ee8-b6aa-91aafac0c2bc" />
+
 A cross-workspace knowledge search engine built in Rust.
 
 Indexes Markdown documents across multiple workspaces and provides hybrid search
