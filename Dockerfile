@@ -1,5 +1,10 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /app
+# cmake and clang are required by aws-lc-sys (transitive dep via rustls) on arm64
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake clang \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY tests/ tests/

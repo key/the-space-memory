@@ -36,6 +36,7 @@ combining FTS5 full-text search with vector semantic search (ruri-v3-30m, 256-di
 | Platform | Status |
 |---|---|
 | Linux x86_64 | Primary target, CI tested |
+| Linux arm64 | Supported, CI build-checked |
 | macOS Apple Silicon | Supported |
 | macOS x86_64 | Supported |
 

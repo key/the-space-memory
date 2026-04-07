@@ -15,10 +15,11 @@ cargo test
 cargo test --lib chunker
 cargo test --lib frontmatter
 
-# Coverage (maintain 90%+, excluding embedder/main)
+# Coverage (maintain 90%+, excluding entry points, modes, and infra)
 cargo llvm-cov --html
 cargo llvm-cov \
-  --ignore-filename-regex '(embedder|main|cli|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' \
+  --ignore-filename-regex \
+  '(embedder|main|cli|tsmd|tsm_watcher|status|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' \
   --fail-under-lines 90
 
 # Lint
@@ -59,6 +60,12 @@ src/
 ├── synonyms.rs          — Synonym expansion, WordNet import
 ├── temporal.rs          — Temporal filter expression parsing
 ├── user_dict.rs         — Dictionary candidate collection & CSV export
+├── daemon.rs            — Daemon request handler (server-side dispatch)
+├── daemon_protocol.rs   — IPC message protocol definitions
+├── ipc.rs               — IPC wire framing (length-prefixed message read/write)
+├── logging.rs           — Log initialization & configuration
+├── status.rs            — Daemon status reporting
+├── test_utils.rs        — Shared test helpers
 └── bin/tsmd/
     ├── main.rs          — tsmd entry point, mode dispatch (--embedder / --fs-watcher)
     ├── daemon_mode.rs   — Daemon mode (accept loop, client handling)
@@ -194,6 +201,9 @@ see ADR-0001.
 ## License Compatibility
 
 Verify license compatibility when adding dependencies. This project is **MIT** licensed.
+
+All dependencies in `Cargo.toml` must use exact version pinning.
+GitHub Actions must pin actions by full commit SHA (not tags).
 
 | Project License | Allowed Dependencies | Not Allowed |
 |---|---|---|
