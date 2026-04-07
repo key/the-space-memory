@@ -284,7 +284,7 @@ DICT_WORD="セリヌンティウス"
 DICT_FILE="hashire-melos"
 
 # Search before dict registration — should already hit via constituent tokens
-OUTPUT_BEFORE=$(search_json "$DICT_WORD" --fallback fts_only 2>/dev/null) || true
+OUTPUT_BEFORE=$(search_json "$DICT_WORD" --fallback fts-only 2>/dev/null) || true
 
 # Stop daemon, add word to user dict, rebuild FTS, restart
 log "Stopping daemon for dict update..."
@@ -305,7 +305,7 @@ tsm start 2>&1
 sleep 3
 
 # Verify search still works after the stop→rebuild→start cycle
-OUTPUT_POST=$(tsm search -q "メロス 激怒" -f json --fallback fts_only 2>&1) || true
+OUTPUT_POST=$(tsm search -q "メロス 激怒" -f json --fallback fts-only 2>&1) || true
 EXIT=$?
 log "dict: post-rebuild search output: $OUTPUT_POST"
 assert_json "dict: search works after rebuild" \
