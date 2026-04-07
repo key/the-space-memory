@@ -532,7 +532,7 @@ tsm import-wordnet ~/downloads/wnjpn.db
 Show or apply user dictionary candidates.
 
 ```text
-tsm dict update [--threshold N] [--apply] [--format ipadic|simpledic]
+tsm dict update [--threshold N] [--apply]
 ```
 
 Without `--apply`: dry run — shows candidate words that appear frequently
@@ -549,7 +549,6 @@ a git branch and pull request with the changes.
 |---|---|---|---|
 | `--threshold` | integer | `5` | Minimum frequency for a word to be a candidate |
 | `--apply` | | | Write CSV and rebuild FTS index |
-| `--format` | `ipadic`\|`simpledic` | `ipadic` | Dictionary CSV format |
 
 **Examples:**
 
@@ -562,9 +561,6 @@ tsm dict update --threshold 10
 
 # Apply changes (daemon must be stopped)
 tsm stop && tsm dict update --apply
-
-# Apply in simpledic (janome) format
-tsm stop && tsm dict update --apply --format simpledic
 ```
 
 ---
