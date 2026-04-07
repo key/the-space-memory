@@ -17,7 +17,9 @@ cargo test --lib frontmatter
 
 # Coverage (maintain 90%+, excluding embedder/main)
 cargo llvm-cov --html
-cargo llvm-cov --ignore-filename-regex '(embedder|main|cli|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' --fail-under-lines 90
+cargo llvm-cov \
+  --ignore-filename-regex '(embedder|main|cli|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' \
+  --fail-under-lines 90
 
 # Lint
 cargo clippy -- -D warnings

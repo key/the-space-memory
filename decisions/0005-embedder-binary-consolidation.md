@@ -15,6 +15,7 @@ ADR-0002 では 3 バイナリ構成（tsm, tsmd, tsm-embedder）を維持し、
 watcher のみスレッド化していた。
 
 問題点:
+
 - macOS Gatekeeper で 3 バイナリそれぞれに許可が必要（UX が悪い）
 - tsm-embedder はユーザーから見て tsmd の内部実装詳細
 - docker/dockerd パターンの「CLI + daemon = 2 バイナリ」が自然
