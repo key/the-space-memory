@@ -91,6 +91,7 @@ Use `tsm doctor` to check system health and daemon status.
 
 - [Architecture](docs/architecture.md) — Process architecture and component responsibilities
 - [Data Flow](docs/data-flow.md) — Indexing and search flow diagrams
+- [Configuration](docs/configuration.md) — Environment variables and config file reference
 - [User Dictionary](docs/user-dictionary.md) — Custom dictionary management
 - [Design Decisions](decisions/) — ADR (Architecture Decision Records)
 
