@@ -1,6 +1,6 @@
 # The Space Memory
 
-![image](https://github.com/user-attachments/assets/af60871c-3a91-4ee8-b6aa-91aafac0c2bc)
+![The Space Memory](docs/assets/cover.png)
 
 A cross-workspace knowledge search engine built in Rust.
 
