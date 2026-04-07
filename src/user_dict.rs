@@ -27,40 +27,6 @@ impl CandidatePos {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DictFormat {
-    Simpledic,
-    Ipadic,
-}
-
-impl DictFormat {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Simpledic => "simpledic",
-            Self::Ipadic => "ipadic",
-        }
-    }
-}
-
-impl std::str::FromStr for DictFormat {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "simpledic" => Ok(Self::Simpledic),
-            "ipadic" => Ok(Self::Ipadic),
-            other => Err(format!(
-                "unknown format '{other}'. Supported: simpledic, ipadic"
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for DictFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 // ─── Data types ──────────────────────────────────────────────
 
 /// A dictionary candidate record.
@@ -448,19 +414,13 @@ pub fn format_simpledic_row(surface: &str) -> String {
     format!("{surface},カスタム名詞,{surface}")
 }
 
-/// Format a CSV row in lindera user dictionary format (3 fields: surface, pos, reading).
-/// lindera IPAdic user dictionary expects exactly 3 fields, not the full 13-field system dict format.
-pub fn format_ipadic_row(surface: &str) -> String {
-    format!("{surface},カスタム名詞,{surface}")
-}
-
 /// Export threshold candidates to a CSV file (appending).
 /// Returns the list of newly written candidates.
+/// Output format is simpledic (3 fields: surface, pos, reading).
 pub fn export_candidates_to_csv(
     conn: &Connection,
     csv_path: &Path,
     threshold: i64,
-    format: DictFormat,
 ) -> anyhow::Result<Vec<Candidate>> {
     let candidates = get_threshold_candidates(conn, threshold);
     if candidates.is_empty() {
@@ -497,10 +457,7 @@ pub fn export_candidates_to_csv(
         .open(csv_path)?;
 
     for c in &new_candidates {
-        let row = match format {
-            DictFormat::Ipadic => format_ipadic_row(&c.surface),
-            DictFormat::Simpledic => format_simpledic_row(&c.surface),
-        };
+        let row = format_simpledic_row(&c.surface);
         writeln!(file, "{row}")?;
     }
 
@@ -523,16 +480,6 @@ mod tests {
         assert_eq!(CandidatePos::ProperNoun.as_str(), "proper_noun");
         assert_eq!(CandidatePos::Katakana.as_str(), "katakana");
         assert_eq!(CandidatePos::Ascii.as_str(), "ascii");
-    }
-
-    #[test]
-    fn test_dict_format_parse() {
-        assert_eq!(
-            "simpledic".parse::<DictFormat>().unwrap(),
-            DictFormat::Simpledic
-        );
-        assert_eq!("ipadic".parse::<DictFormat>().unwrap(), DictFormat::Ipadic);
-        assert!("invalid".parse::<DictFormat>().is_err());
     }
 
     // ─── is_valid_candidate tests ────────────────────────────
@@ -867,11 +814,6 @@ mod tests {
         assert_eq!(format_simpledic_row("candle"), "candle,カスタム名詞,candle");
     }
 
-    #[test]
-    fn test_format_ipadic_row() {
-        assert_eq!(format_ipadic_row("candle"), "candle,カスタム名詞,candle");
-    }
-
     // ─── load_existing_surfaces tests ────────────────────────
 
     #[test]
@@ -921,8 +863,7 @@ mod tests {
             [now, now],
         ).unwrap();
 
-        let exported =
-            export_candidates_to_csv(&conn, &csv_path, 5, DictFormat::Simpledic).unwrap();
+        let exported = export_candidates_to_csv(&conn, &csv_path, 5).unwrap();
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0].surface, "candle");
         assert!(csv_path.exists());
@@ -952,8 +893,7 @@ mod tests {
             [now, now],
         ).unwrap();
 
-        let exported1 =
-            export_candidates_to_csv(&conn, &csv_path, 5, DictFormat::Simpledic).unwrap();
+        let exported1 = export_candidates_to_csv(&conn, &csv_path, 5).unwrap();
         assert_eq!(exported1.len(), 1);
 
         conn.execute(
@@ -962,28 +902,11 @@ mod tests {
         )
         .unwrap();
 
-        let exported2 =
-            export_candidates_to_csv(&conn, &csv_path, 5, DictFormat::Simpledic).unwrap();
+        let exported2 = export_candidates_to_csv(&conn, &csv_path, 5).unwrap();
         assert!(exported2.is_empty(), "should not write duplicates");
     }
 
     #[test]
-    fn test_export_candidates_ipadic_format() {
-        let conn = setup();
-        let dir = tempfile::TempDir::new().unwrap();
-        let csv_path = dir.path().join("user_dict.csv");
-
-        let now = "2026-01-01T00:00:00Z";
-        conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('lindera', 10, 'ascii', 'document', ?, ?, 'pending')",
-            [now, now],
-        ).unwrap();
-
-        export_candidates_to_csv(&conn, &csv_path, 5, DictFormat::Ipadic).unwrap();
-        let content = std::fs::read_to_string(&csv_path).unwrap();
-        assert!(content.contains("lindera,カスタム名詞,lindera"));
-    }
-
     #[test]
     fn test_export_candidates_preserves_existing_rows() {
         let conn = setup();
@@ -999,7 +922,7 @@ mod tests {
             [now, now],
         ).unwrap();
 
-        export_candidates_to_csv(&conn, &csv_path, 5, DictFormat::Simpledic).unwrap();
+        export_candidates_to_csv(&conn, &csv_path, 5).unwrap();
 
         let content = std::fs::read_to_string(&csv_path).unwrap();
         assert!(
@@ -1015,8 +938,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let csv_path = dir.path().join("user_dict.csv");
 
-        let exported =
-            export_candidates_to_csv(&conn, &csv_path, 5, DictFormat::Simpledic).unwrap();
+        let exported = export_candidates_to_csv(&conn, &csv_path, 5).unwrap();
         assert!(exported.is_empty());
         assert!(!csv_path.exists());
     }

@@ -333,7 +333,6 @@ mod tests {
         let req = DaemonRequest::DictUpdate {
             threshold: 5,
             apply: true,
-            format: "ipadic".into(),
         };
         let resp = handle_request(&conn, req, dir.path(), &flag);
         assert!(!resp.ok);

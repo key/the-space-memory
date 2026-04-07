@@ -6,23 +6,6 @@ use clap::{Parser, Subcommand, ValueEnum};
 use the_space_memory::cli;
 use the_space_memory::config;
 use the_space_memory::daemon_protocol::{self, DaemonRequest, DaemonResponse};
-use the_space_memory::user_dict::DictFormat;
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum DictFormatArg {
-    Simpledic,
-    Ipadic,
-}
-
-impl From<DictFormatArg> for DictFormat {
-    fn from(arg: DictFormatArg) -> Self {
-        match arg {
-            DictFormatArg::Simpledic => DictFormat::Simpledic,
-            DictFormatArg::Ipadic => DictFormat::Ipadic,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SearchFallbackArg {
     Error,
@@ -59,9 +42,6 @@ enum DictCommands {
         /// Add words to dict and rebuild FTS
         #[arg(long)]
         apply: bool,
-        /// CSV format: simpledic (janome) or ipadic (lindera)
-        #[arg(long, value_enum, default_value = "ipadic")]
-        format: DictFormatArg,
     },
     /// Manage reject list (reject_words.txt)
     Reject {
@@ -200,15 +180,11 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Dict { command } => match command {
-            DictCommands::Update {
-                threshold,
-                apply,
-                format,
-            } => {
+            DictCommands::Update { threshold, apply } => {
                 if apply {
                     guard_daemon_not_running("dict update --apply")?;
                 }
-                cli::cmd_dict_update(threshold, apply, format.into())?;
+                cli::cmd_dict_update(threshold, apply)?;
             }
             DictCommands::Reject { apply, all } => {
                 cli::cmd_dict_reject(apply, all)?;

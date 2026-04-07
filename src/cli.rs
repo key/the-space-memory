@@ -1084,11 +1084,7 @@ fn estimate_eta(started_at: &str, processed: usize, total: usize) -> String {
     }
 }
 
-pub fn cmd_dict_update(
-    threshold: i64,
-    apply: bool,
-    format: user_dict::DictFormat,
-) -> anyhow::Result<()> {
+pub fn cmd_dict_update(threshold: i64, apply: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
 
@@ -1115,7 +1111,7 @@ pub fn cmd_dict_update(
 
     // Export to CSV
     let csv_path = config::user_dict_path();
-    let exported = user_dict::export_candidates_to_csv(&conn, &csv_path, threshold, format)?;
+    let exported = user_dict::export_candidates_to_csv(&conn, &csv_path, threshold)?;
     let count = exported.len();
     log::info!("Wrote {count} word(s) to {}", csv_path.display());
 

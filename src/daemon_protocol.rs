@@ -45,7 +45,6 @@ pub enum DaemonRequest {
     DictUpdate {
         threshold: i64,
         apply: bool,
-        format: String,
     },
     ImportWordnet {
         wordnet_db: String,
@@ -289,19 +288,13 @@ mod tests {
         let req = DaemonRequest::DictUpdate {
             threshold: 10,
             apply: true,
-            format: "ipadic".into(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
         match decoded {
-            DaemonRequest::DictUpdate {
-                threshold,
-                apply,
-                format,
-            } => {
+            DaemonRequest::DictUpdate { threshold, apply } => {
                 assert_eq!(threshold, 10);
                 assert!(apply);
-                assert_eq!(format, "ipadic");
             }
             _ => panic!("Expected DictUpdate variant"),
         }
