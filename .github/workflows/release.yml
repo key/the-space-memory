@@ -34,6 +34,7 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
+      # cross uses Docker-based builds; rust-cache is not applicable here
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         if: ${{ !matrix.use_cross }}
         with:
@@ -45,8 +46,13 @@ jobs:
         with:
           tool: cross
 
+      - name: Build release binaries (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
+
       - name: Build release binaries
-        run: ${{ matrix.use_cross && 'cross' || 'cargo' }} build --release --target ${{ matrix.target }}
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package archive
         env:

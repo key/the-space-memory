@@ -15,7 +15,7 @@ cargo test
 cargo test --lib chunker
 cargo test --lib frontmatter
 
-# Coverage (maintain 90%+, excluding embedder/main)
+# Coverage (maintain 90%+, excluding entry points, modes, and infra)
 cargo llvm-cov --html
 cargo llvm-cov \
   --ignore-filename-regex \
@@ -60,9 +60,9 @@ src/
 ├── synonyms.rs          — Synonym expansion, WordNet import
 ├── temporal.rs          — Temporal filter expression parsing
 ├── user_dict.rs         — Dictionary candidate collection & CSV export
-├── daemon.rs            — Daemon client communication
+├── daemon.rs            — Daemon request handler (server-side dispatch)
 ├── daemon_protocol.rs   — IPC message protocol definitions
-├── ipc.rs               — IPC utilities (socket, serialization)
+├── ipc.rs               — IPC wire framing (length-prefixed message read/write)
 ├── logging.rs           — Log initialization & configuration
 ├── status.rs            — Daemon status reporting
 ├── test_utils.rs        — Shared test helpers

@@ -64,5 +64,6 @@ jobs:
         with:
           tool: cross
 
-      - name: Build check (aarch64-linux)
-        run: cross check --target aarch64-unknown-linux-gnu
+      # cross uses Docker-based builds; rust-cache is not applicable here
+      - name: Build (aarch64-linux)
+        run: cross build --target aarch64-unknown-linux-gnu
