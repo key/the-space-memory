@@ -1,6 +1,10 @@
 ---
 name: the-space-memory:search
-description: Search the cross-workspace knowledge base using hybrid FTS5 + vector search.
+description: |
+  Search the cross-workspace knowledge base using hybrid FTS5 + vector search.
+  Use when: user asks about past research, notes, decisions, or anything that might be in the knowledge base.
+  Examples: "前に調べたLoRaの件どうなってた？", "ナレッジから探して", "〜について調べた記録ある？",
+  "〜あったっけ？", "以前まとめた〜", "Search for anything about X", "What did I write about X?"
 user-invocable: true
 ---
 
