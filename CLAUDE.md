@@ -32,6 +32,9 @@ rumdl check <file>.md
 shellcheck <file>.sh
 yamllint <file>.yml
 taplo check <file>.toml
+
+# E2E tests (requires release build + model download)
+bash tests/e2e.sh
 ```
 
 ## Architecture
@@ -152,19 +155,25 @@ docker build -t the-space-memory /path/to/the-space-memory
 - `tsmd --embedder` spawned by tsmd has idle timeout disabled (`--no-idle-timeout`).
   If run standalone, it auto-stops after 10 min idle (configurable via `TSM_EMBEDDER_IDLE_TIMEOUT`)
 - Search errors by default when embedder is down (`search_fallback = "error"`).
-  Use `--fallback fts_only` or config for FTS-only mode
+  Use `--fallback fts-only` or config for FTS-only mode
 
 ## Design Decisions (ADR)
 
-設計上の判断・ノウハウは以下のディレクトリに記録されている。
-機能追加やアーキテクチャ変更の前に既存の資料を確認すること。
+Design decisions and rationale are recorded in the directory below.
+Review existing records before making architectural changes.
 
-| ディレクトリ | 内容 |
+| Directory | Contents |
 |---|---|
-| `decisions/` | ADR（設計判断の記録と根拠） |
+| `decisions/` | ADR (decision records and rationale) |
 
-特にプロセス構成・IPC・障害時挙動に関わる変更は
-ADR-0001 を参照。
+For changes involving process architecture, IPC, or failure behavior,
+see ADR-0001.
+
+## Language Policy
+
+- Chat with the user in Japanese
+- Documentation and code comments in English
+- README.md (English) and README.ja.md (Japanese) must be kept in sync
 
 ## License Compatibility
 
