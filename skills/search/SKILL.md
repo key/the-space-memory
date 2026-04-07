@@ -11,7 +11,7 @@ Search the knowledge base using `tsm search`.
 ## Usage
 
 ```bash
-cd "$CLAUDE_PROJECT_DIR" && "${CLAUDE_PLUGIN_ROOT}/tsm" search -q "$ARGUMENTS" -k 5 -f json --include-content 3
+cd "$CLAUDE_PROJECT_DIR" && "${CLAUDE_PLUGIN_ROOT}bin/tsm" search -q "$ARGUMENTS" -k 5 -f json --include-content 3
 ```
 
 ## Options
