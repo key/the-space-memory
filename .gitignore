@@ -6,6 +6,7 @@
 
 # Built binary (use Docker build to generate)
 /tsm
+/bin/
 
 # Runtime directory (workspace-local)
 .tsm/
