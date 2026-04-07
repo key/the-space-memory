@@ -6,49 +6,74 @@ user-invocable: true
 
 # Setup — tsm.toml Configuration Wizard
 
-Help the user create or update `tsm.toml` in their project root.
+Create or update `tsm.toml` in the user's project root via step-by-step questions.
 
 ## Process
 
 1. Check if `tsm.toml` already exists in `$CLAUDE_PROJECT_DIR`
-2. Ask the user about their workspace layout
-3. Generate a `tsm.toml` configuration
+   - If yes, read it and ask what to change
+   - If no, start fresh setup
 
-## Key Configuration Options
+2. Ask each question one at a time using AskUserQuestion. Do NOT dump all options at once.
 
-| Field | Description | Default |
-|---|---|---|
-| `index_root` | Root directory containing workspaces to index | `/workspaces` |
-| `state_dir` | Directory for DB, logs, PID files | `.tsm` |
-| `search_fallback` | Behavior when embedder is down (`error` or `fts_only`) | `error` |
-| `embedder_idle_timeout_secs` | Auto-stop embedder after N seconds idle | `600` |
-| `[index] content_dirs` | List of directories to index with weights | auto-discover |
-| `[index.claude_session] weight` | Score weight for session data | `0.3` |
-| `[index.claude_session] half_life_days` | Time decay for session data | `30.0` |
+### Step 1: content_dirs
 
-## content_dirs Format
+First, scan the workspace to suggest directories:
 
-```toml
-[index]
-content_dirs = [
-    { path = "/workspaces/notes", weight = 1.0, half_life_days = 90.0 },
-    { path = "/workspaces/docs",  weight = 0.8, half_life_days = 180.0 },
-]
+```bash
+find "$CLAUDE_PROJECT_DIR"/.. -maxdepth 2 -name "*.md" -type f 2>/dev/null | sed 's|/[^/]*$||' | sort -u | head -20
 ```
 
-- `path` — Directory to index (required)
-- `weight` — Scoring weight, higher = more important (default: 1.0)
-- `half_life_days` — Time decay half-life in days (default: 90.0)
+Then ask:
 
-## Reference
+> Which directories should be indexed? I found these candidates with .md files:
+> (list directories found)
+>
+> You can pick from these or specify your own paths. Separate multiple paths with commas.
 
-See `tsm.toml.sample` in the plugin root for full configuration reference.
+### Step 2: search_fallback
 
-## After Setup
+Ask:
 
-Suggest the user run:
+> When the embedder (vector search) is down, how should search behave?
+> 1. **error** — Refuse to search (default, recommended)
+> 2. **fts_only** — Fall back to text-only search
+
+### Step 3: Session indexing
+
+Ask:
+
+> Should Claude Code session history be indexed for search?
+> (This lets you search past conversations)
+> - **yes** (default) — Index sessions with weight 0.3
+> - **no** — Skip session indexing
+
+3. Generate `tsm.toml` from the answers and write it
+4. Show the generated config and suggest:
 
 ```bash
 tsm rebuild --force   # Initial index build
 tsm doctor            # Verify installation
 ```
+
+## tsm.toml Format Reference
+
+```toml
+# Root directory containing workspaces
+index_root = "/workspaces"
+
+# Behavior when embedder is down: "error" or "fts_only"
+# search_fallback = "error"
+
+[index]
+content_dirs = [
+    { path = "/workspaces/notes", weight = 1.0, half_life_days = 90.0 },
+]
+
+[index.claude_session]
+weight = 0.3
+half_life_days = 30.0
+```
+
+- `weight` — Scoring weight, higher = more important (default: 1.0)
+- `half_life_days` — Time decay half-life in days (default: 90.0)
