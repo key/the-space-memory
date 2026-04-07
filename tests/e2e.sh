@@ -18,28 +18,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
 log()  { echo -e "${BOLD}[e2e]${RESET} $*"; }
 pass() { ((PASS++)); echo -e "  ${GREEN}PASS${RESET} $1"; }
 fail() { ((FAIL++)); ERRORS+=("$1: $2"); echo -e "  ${RED}FAIL${RESET} $1: $2"; }
-
-# run_test NAME COMMAND ASSERTION_FUNC
-#   Runs COMMAND, captures stdout+stderr and exit code,
-#   then calls ASSERTION_FUNC with the captured output.
-run_test() {
-    local name="$1"
-    shift
-    local output exit_code
-    set +e
-    output=$("$@" 2>&1)
-    exit_code=$?
-    set -e
-    echo "$output" | "$@_assert" "$name" "$exit_code" "$output" 2>/dev/null \
-        || true  # assertion func handles pass/fail
-}
 
 # Assert: command succeeded (exit 0) and jq expression is truthy
 assert_json() {
@@ -296,8 +280,8 @@ log "=== Dictionary ==="
 DICT_WORD="銀河鉄道"
 DICT_FILE="gingatetsudo"
 
-# Search before dict registration (record result)
-OUTPUT_BEFORE=$(search_json "$DICT_WORD" 2>/dev/null) || true
+# Search before dict registration
+search_json "$DICT_WORD" >/dev/null 2>&1 || true
 
 # Stop daemon, add word to user dict, rebuild FTS, restart
 log "Stopping daemon for dict update..."
