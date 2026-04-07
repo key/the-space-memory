@@ -907,6 +907,45 @@ mod tests {
     }
 
     #[test]
+    fn test_export_already_in_csv_marks_accepted() {
+        let conn = setup();
+        let dir = tempfile::TempDir::new().unwrap();
+        let csv_path = dir.path().join("user_dict.csv");
+
+        // Write candidate to CSV manually
+        std::fs::write(&csv_path, "candle,カスタム名詞,candle\n").unwrap();
+
+        // Insert same candidate into DB with status = 'pending'
+        let now = "2026-01-01T00:00:00Z";
+        conn.execute(
+            "INSERT INTO dictionary_candidates VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
+            [now, now],
+        ).unwrap();
+
+        let exported = export_candidates_to_csv(&conn, &csv_path, 5).unwrap();
+
+        // No new rows appended
+        assert!(
+            exported.is_empty(),
+            "already_in_csv candidates should not be re-exported"
+        );
+
+        // DB status changed to 'accepted'
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM dictionary_candidates WHERE surface = 'candle'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "accepted");
+
+        // CSV unchanged (no duplicate rows)
+        let content = std::fs::read_to_string(&csv_path).unwrap();
+        let line_count = content.lines().count();
+        assert_eq!(line_count, 1, "CSV should not have new rows appended");
+    }
+
     #[test]
     fn test_export_candidates_preserves_existing_rows() {
         let conn = setup();
