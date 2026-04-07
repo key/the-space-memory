@@ -216,6 +216,28 @@ EXIT=$?
 assert_json "fts5: hashire-melos hit" \
     'any(.[]; .source_file | contains("hashire-melos"))' "$OUTPUT" "$EXIT"
 
+# ── Search options (--top-k, --include-content, text format) ────────
+
+echo ""
+log "=== Search options ==="
+
+# --top-k: request 1 result, verify exactly 1 returned
+OUTPUT=$(search_json "メロス" -k 1) || true
+EXIT=$?
+assert_json "options: -k 1 returns exactly 1 result" \
+    'length == 1' "$OUTPUT" "$EXIT"
+
+# --include-content: verify content field is present
+OUTPUT=$(search_json "メロス" -k 1 --include-content 1) || true
+EXIT=$?
+assert_json "options: --include-content adds content field" \
+    '.[0].content != null and (.[0].content | length > 0)' "$OUTPUT" "$EXIT"
+
+# text format (default): verify human-readable output contains score and file
+OUTPUT=$(tsm search -q "メロス" -k 1 2>/dev/null) || true
+EXIT=$?
+assert_contains "options: text format shows source file" "hashire-melos" "$OUTPUT" "$EXIT"
+
 # ── Entity search (tag boost) ────────────────────────────────────────
 
 echo ""
@@ -304,6 +326,10 @@ tsm start 2>/dev/null
 # Wait for daemon ready
 sleep 3
 
+# Verify search before dict registration found results
+assert_json "dict: '$DICT_WORD' found before dict (via constituent tokens)" \
+    'any(.[]; .source_file | contains("hashire-melos"))' "$OUTPUT_BEFORE" "0"
+
 # Verify search still works after the stop→rebuild→start cycle
 OUTPUT_POST=$(search_json "メロス 激怒" --fallback fts-only) || true
 EXIT=$?
@@ -326,11 +352,11 @@ else
     pass "edge: empty query → handled (exit $EXIT)"
 fi
 
-# EC4: Single character
+# EC4: Single character — must exit 0 and return valid JSON
 OUTPUT=$(search_json "a" 2>/dev/null) || true
 EXIT=$?
-# Should not crash; any exit code is fine as long as it doesn't segfault
-pass "edge: single char 'a' → no crash (exit $EXIT)"
+assert_json "edge: single char 'a' → valid json (exit $EXIT)" \
+    'type == "array"' "$OUTPUT" "$EXIT"
 
 # EC5: Invalid --recent value
 set +e
@@ -338,6 +364,27 @@ OUTPUT=$(tsm search -q "test" --recent garbage 2>&1)
 EXIT=$?
 set -e
 assert_fail "edge: --recent garbage → error" "$EXIT"
+
+# ── Ingest session ─────────────────────────────────────────────────────
+
+echo ""
+log "=== Ingest session ==="
+
+SESSION_FILE="$SCRIPT_DIR/e2e/testdata/sessions/test-session.jsonl"
+OUTPUT=$(tsm ingest-session "$SESSION_FILE" 2>&1) || true
+EXIT=$?
+assert_contains "ingest-session: succeeds" "session indexed" "$OUTPUT" "$EXIT"
+
+# Search for session-specific content (use fts-only; embedder may not be ready)
+OUTPUT=$(search_json "量子もつれ" --fallback fts-only) || true
+EXIT=$?
+assert_json "ingest-session: search hits session content" \
+    'any(.[]; .source_file | contains("test-session"))' "$OUTPUT" "$EXIT"
+
+# Re-ingest same file should be a no-op (already indexed)
+OUTPUT=$(tsm ingest-session "$SESSION_FILE" 2>&1) || true
+EXIT=$?
+assert_contains "ingest-session: re-ingest is no-op" "session unchanged" "$OUTPUT" "$EXIT"
 
 # ── Watcher test ──────────────────────────────────────────────────────
 
