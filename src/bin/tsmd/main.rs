@@ -21,35 +21,35 @@ pub(crate) extern "C" fn signal_handler(_sig: libc::c_int) {
 #[command(name = "tsmd", version, about = "The Space Memory daemon")]
 pub(crate) struct Args {
     /// UNIX socket path
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["embedder", "fs_watcher"])]
     pub socket: Option<PathBuf>,
 
     /// Database path
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["embedder", "fs_watcher"])]
     pub db: Option<PathBuf>,
 
     /// Skip embedder startup
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["embedder", "fs_watcher"])]
     pub no_embedder: bool,
 
     /// Skip watcher startup
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["embedder", "fs_watcher"])]
     pub no_watcher: bool,
 
     /// Run as embedder subprocess (internal)
-    #[arg(long, conflicts_with = "fs_watcher")]
+    #[arg(long, conflicts_with = "fs_watcher", hide = true)]
     embedder: bool,
 
     /// Model directory for embedder mode
-    #[arg(long, requires = "embedder")]
+    #[arg(long, requires = "embedder", hide = true)]
     model: Option<PathBuf>,
 
     /// Disable idle timeout in embedder mode
-    #[arg(long, requires = "embedder")]
+    #[arg(long, requires = "embedder", hide = true)]
     no_idle_timeout: bool,
 
     /// Run as fs-watcher subprocess (internal)
-    #[arg(long, conflicts_with = "embedder")]
+    #[arg(long, conflicts_with = "embedder", hide = true)]
     fs_watcher: bool,
 }
 

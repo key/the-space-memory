@@ -146,7 +146,7 @@ pub struct ResolvedConfig {
     /// Env: `TSM_INDEX_ROOT`. Config: `index_root`.
     pub index_root: PathBuf,
 
-    /// UNIX socket path for tsm-embedder (encode requests).
+    /// UNIX socket path for the embedder child process (encode requests).
     /// Default: `{state_dir}/embedder.sock`.
     /// Env: `TSM_EMBEDDER_SOCKET`. Config: `embedder_socket_path`.
     pub embedder_socket_path: PathBuf,
@@ -156,12 +156,12 @@ pub struct ResolvedConfig {
     /// Env: `TSM_DAEMON_SOCKET`. Config: `daemon_socket_path`.
     pub daemon_socket_path: PathBuf,
 
-    /// Directory for daemon log files (tsmd, tsm-embedder).
+    /// Directory for daemon log files (tsmd, tsmd --embedder, tsmd --fs-watcher).
     /// Default: `{state_dir}/logs`.
     /// Env: `TSM_LOG_DIR`. Config: `log_dir`.
     pub log_dir: PathBuf,
 
-    /// Seconds of inactivity before tsm-embedder shuts down. 0 = never.
+    /// Seconds of inactivity before the embedder child process shuts down. 0 = never.
     /// Default: 600.
     /// Env: `TSM_EMBEDDER_IDLE_TIMEOUT`. Config: `embedder_idle_timeout_secs`.
     pub embedder_idle_timeout_secs: u64,

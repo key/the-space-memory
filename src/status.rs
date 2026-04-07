@@ -40,6 +40,7 @@ pub struct DaemonStatus {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WatcherStatus {
     pub started_at: String,
+    #[serde(default)]
     pub pid: u32,
 }
 

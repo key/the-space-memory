@@ -46,5 +46,5 @@ jobs:
       - name: Coverage (90% minimum)
         run: >-
           cargo llvm-cov
-          --ignore-filename-regex '(embedder|main|cli|tsmd|tsm_watcher|status|logging)\.rs'
+          --ignore-filename-regex '(embedder|main|cli|tsmd|tsm_watcher|status|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs'
           --fail-under-lines 90

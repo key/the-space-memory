@@ -17,14 +17,14 @@ use candle_core::Device;
 /// Entry point for `tsmd --embedder`.
 pub fn run(model: Option<PathBuf>, no_idle_timeout: bool) -> Result<()> {
     config::ensure_model_cache_env();
+    if no_idle_timeout {
+        // Must be set BEFORE init_logger, which triggers config singleton init.
+        // SAFETY: called single-threaded before any thread spawn or logger init.
+        unsafe { std::env::set_var("TSM_EMBEDDER_IDLE_TIMEOUT", "0") };
+    }
     the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
         name: "tsmd-embedder",
     })?;
-    if no_idle_timeout {
-        // Override idle timeout before config singleton is initialized.
-        // SAFETY: called single-threaded before any thread spawn.
-        unsafe { std::env::set_var("TSM_EMBEDDER_IDLE_TIMEOUT", "0") };
-    }
     let socket_path = config::embedder_socket_path();
     run_daemon(&socket_path, model.as_deref())
 }
@@ -84,13 +84,14 @@ fn run_daemon(socket_path: &Path, model_dir: Option<&Path>) -> Result<()> {
             }
             Err(e) => {
                 if running.load(Ordering::Relaxed) {
-                    log::warn!("Accept error: {e}");
+                    log::error!("fatal accept error: {e}; embedder shutting down");
+                    running.store(false, Ordering::Relaxed);
                 }
             }
         }
     }
 
-    log::info!("Shutting down (idle timeout).");
+    log::info!("Shutting down.");
     let _ = std::fs::remove_file(socket_path);
     Ok(())
 }

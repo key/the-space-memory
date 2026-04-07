@@ -9,7 +9,7 @@ use crate::config;
 pub enum LogMode {
     /// CLI (tsm) — log to stderr only
     Stderr,
-    /// Daemon (tsmd, tsm-embedder) — log to file with daily rotation
+    /// Daemon (tsmd, tsmd --embedder, tsmd --fs-watcher) — log to file with daily rotation
     Daemon { name: &'static str },
 }
 

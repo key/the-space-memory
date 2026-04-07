@@ -109,10 +109,12 @@ pub fn run(args: Args) -> Result<()> {
 
     let mut watcher_child: Option<Child> = if !args.no_watcher {
         if child::is_process_alive(&watcher_pid_path) {
-            log::info!(
-                "watcher already running (PID file: {})",
-                watcher_pid_path.display()
-            );
+            if let Some(existing_pid) = child::read_pid_from_file(&watcher_pid_path) {
+                watcher_pid.store(existing_pid, Ordering::Release);
+                log::info!("watcher already running (PID {existing_pid})");
+            } else {
+                log::warn!("watcher PID file unreadable; reload will not reach watcher");
+            }
             None
         } else {
             let _ = std::fs::remove_file(&watcher_pid_path);

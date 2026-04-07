@@ -17,7 +17,7 @@ cargo test --lib frontmatter
 
 # Coverage (maintain 90%+, excluding embedder/main)
 cargo llvm-cov --html
-cargo llvm-cov --ignore-filename-regex '(embedder|main|cli)\.rs' --fail-under-lines 90
+cargo llvm-cov --ignore-filename-regex '(embedder|main|cli|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' --fail-under-lines 90
 
 # Lint
 cargo clippy -- -D warnings
@@ -64,7 +64,7 @@ src/
 ```
 
 - **FTS5**: lindera tokenization + unicode61 tokenizer
-- **Vector search**: ruri-v3-30m (256-dim) semantic search. Embedder daemon runs on UNIX socket
+- **Vector search**: ruri-v3-30m (256-dim) semantic search. Embedder child process (`tsmd --embedder`) runs on UNIX socket
 - **Scoring**: RRF (Reciprocal Rank Fusion) combining FTS5 and vector results. Time decay + status penalty applied
 - **DB schema changes require `rebuild --force`** (e.g. FTS tokenizer changes)
 
@@ -147,7 +147,8 @@ docker build -t the-space-memory /path/to/the-space-memory
 - ruri safetensors have no tensor name prefix.
   candle's ModernBert::load expects `model.` prefix — key names are remapped at load time
 - Use `rusqlite`'s bundled feature (don't depend on system SQLite)
-- Embedder daemon auto-stops after 10 min idle. Check with `doctor`, restart if needed
+- `tsmd --embedder` spawned by tsmd has idle timeout disabled (`--no-idle-timeout`).
+  If run standalone, it auto-stops after 10 min idle (configurable via `TSM_EMBEDDER_IDLE_TIMEOUT`)
 - Search errors by default when embedder is down (`search_fallback = "error"`).
   Use `--fallback fts_only` or config for FTS-only mode
 

@@ -189,6 +189,9 @@ pub fn embed_via_socket_at(socket_path: &Path, texts: &[String]) -> Option<Vec<V
 
     let mut stream = UnixStream::connect(socket_path).ok()?;
     stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .ok()?;
+    stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .ok()?;
 

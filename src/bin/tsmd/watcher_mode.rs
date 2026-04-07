@@ -179,15 +179,18 @@ fn update_watches(
         }
     }
 
-    // Watch new dirs
+    // Watch new dirs (only include successfully watched dirs)
+    let mut actually_watched: HashSet<PathBuf> = current.intersection(&desired).cloned().collect();
     for dir in desired.difference(current) {
         log::info!("watching {}", dir.display());
         if let Err(e) = debouncer.watcher().watch(dir, RecursiveMode::Recursive) {
             log::warn!("cannot watch {}: {e}", dir.display());
+        } else {
+            actually_watched.insert(dir.clone());
         }
     }
 
-    *current = desired;
+    *current = actually_watched;
 }
 
 #[cfg(test)]
