@@ -296,18 +296,17 @@ echo "${DICT_WORD},カスタム名詞,${DICT_WORD}" >> "$USER_DICT_PATH"
 log "Added '$DICT_WORD' to user dictionary"
 
 log "Rebuilding FTS index..."
-tsm rebuild --fts-only 2>&1 || log "WARNING: rebuild --fts-only failed"
+tsm rebuild --fts-only 2>/dev/null
 
 log "Restarting daemon..."
-tsm start 2>&1
+tsm start 2>/dev/null
 
 # Wait for daemon ready
 sleep 3
 
 # Verify search still works after the stop→rebuild→start cycle
-OUTPUT_POST=$(tsm search -q "メロス 激怒" -f json --fallback fts-only 2>&1) || true
+OUTPUT_POST=$(search_json "メロス 激怒" --fallback fts-only) || true
 EXIT=$?
-log "dict: post-rebuild search output: $OUTPUT_POST"
 assert_json "dict: search works after rebuild" \
     'any(.[]; .source_file | contains("hashire-melos"))' "$OUTPUT_POST" "$EXIT"
 
