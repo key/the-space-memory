@@ -50,20 +50,41 @@ cargo build --release
 # 2. Download the ruri-v3-30m model
 tsm setup
 
-# 3. Initialize the database
+# 3. Set the document root directory
+export TSM_INDEX_ROOT=~/my-notes
+
+# 4. Initialize the database
 tsm init
 
-# 4. Start the daemon (embedder + file watcher)
+# 5. Start the daemon (embedder + file watcher)
 tsm start
 
-# 5. Index your documents
+# 6. Index your documents
 tsm index
 
-# 6. Search
+# 7. Search
 tsm search -q "query" -k 5
 ```
 
-Set `TSM_INDEX_ROOT` to specify the root directory containing your documents.
+### What gets indexed
+
+tsm recursively scans `TSM_INDEX_ROOT` for `.md` files.
+A typical directory layout:
+
+```text
+~/my-notes/              ← TSM_INDEX_ROOT
+├── projects/
+│   ├── project-a.md
+│   └── project-b.md
+├── research/
+│   └── notes.md
+└── journal/
+    └── 2026-04.md
+```
+
+All Markdown files under `TSM_INDEX_ROOT` are indexed automatically.
+The file watcher detects additions, modifications, and deletions in real time.
+
 Use `tsm doctor` to check system health and daemon status.
 
 ## Documentation

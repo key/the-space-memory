@@ -47,20 +47,41 @@ cargo build --release
 # 2. ruri-v3-30m モデルのダウンロード
 tsm setup
 
-# 3. データベースの初期化
+# 3. ドキュメントのルートディレクトリを設定
+export TSM_INDEX_ROOT=~/my-notes
+
+# 4. データベースの初期化
 tsm init
 
-# 4. デーモンの起動（embedder + ファイル監視）
+# 5. デーモンの起動（embedder + ファイル監視）
 tsm start
 
-# 5. ドキュメントのインデックス
+# 6. ドキュメントのインデックス
 tsm index
 
-# 6. 検索
+# 7. 検索
 tsm search -q "クエリ" -k 5
 ```
 
-`TSM_INDEX_ROOT` 環境変数でドキュメントのルートディレクトリを指定する。
+### インデックス対象
+
+tsmは `TSM_INDEX_ROOT` 配下の `.md` ファイルを再帰的にスキャンする。
+典型的なディレクトリ構成：
+
+```text
+~/my-notes/              ← TSM_INDEX_ROOT
+├── projects/
+│   ├── project-a.md
+│   └── project-b.md
+├── research/
+│   └── notes.md
+└── journal/
+    └── 2026-04.md
+```
+
+`TSM_INDEX_ROOT` 配下のすべてのMarkdownファイルが自動的にインデックスされる。
+ファイル監視により、追加・変更・削除をリアルタイムに検知する。
+
 `tsm doctor` でシステムの状態とデーモンのステータスを確認できる。
 
 ## ドキュメント
