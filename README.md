@@ -2,10 +2,22 @@
 
 ![The Space Memory](docs/assets/cover.png)
 
-A cross-workspace knowledge search engine built in Rust.
+[日本語](README.ja.md)
 
+## Overview
+
+A cross-workspace knowledge search engine built in Rust.
 Indexes Markdown documents across multiple workspaces and provides hybrid search
 combining FTS5 full-text search with vector semantic search (ruri-v3-30m, 256-dim).
+
+## Concept
+
+- **Cross-workspace search** — Index and search across multiple repositories
+  (personal notes, work projects, tech notes) from a single orchestration repo
+- **Sub-100ms local search** — Both indexing and search run locally
+  with no network overhead, completing in under 100ms
+- **Transparent Claude Code integration** — Hooks intercept prompts,
+  search the knowledge base, and inject relevant context automatically
 
 ## Features
 
@@ -17,143 +29,77 @@ combining FTS5 full-text search with vector semantic search (ruri-v3-30m, 256-di
 - **Session ingestion** — Index Claude Code session transcripts as searchable knowledge
 - **Single binary** — No Python, no external runtime dependencies
 
-## Usage
+## Getting Started
+
+### Platform
+
+| Platform | Status |
+|---|---|
+| Linux x86_64 | Primary target, CI tested |
+| macOS Apple Silicon | Supported |
+| macOS x86_64 | Supported |
+
+File watching uses inotify (Linux) / FSEvents (macOS).
+
+### Setup
 
 ```bash
-# Search
-tsm search -q "query" -k 5
+# 1. Build
+cargo build --release
 
-# Index all documents
+# 2. Download the ruri-v3-30m model
+tsm setup
+
+# 3. Initialize the database
+tsm init
+
+# 4. Start the daemon (embedder + file watcher)
+tsm start
+
+# 5. Index your documents
 tsm index
 
-# Health check
-tsm doctor
-
-# Rebuild database
-tsm rebuild --force
+# 6. Search
+tsm search -q "query" -k 5
 ```
 
-## Architecture
+Set `TSM_INDEX_ROOT` to specify the root directory containing your documents.
+Use `tsm doctor` to check system health and daemon status.
 
-### プロセス構成
+## Documentation
 
-`tsmd` デーモンは `tsm-embedder` を子プロセスとして管理し、ファイル監視（watcher）は内部スレッドとして動作する。
+- [Architecture](docs/architecture.md) — Process architecture and component responsibilities
+- [Data Flow](docs/data-flow.md) — Indexing and search flow diagrams
+- [User Dictionary](docs/user-dictionary.md) — Custom dictionary management
+- [Design Decisions](decisions/) — ADR (Architecture Decision Records)
 
-```text
-┌─────────────────────────────────────────────────────────┐
-│  tsmd（メインデーモン）                                   │
-│                                                         │
-│  ・DB 所有者（全読み書き）                                │
-│  ・クライアント応答（UNIX ソケット）                      │
-│  ・インデクサーキュー / ベクターキュー                    │
-│  ・backfill 管理                                        │
-│  ・ファイル監視（watcher スレッド）                       │
-│                                                         │
-│   ┌──────────────────┐                                  │
-│   │  tsm-embedder    │                                  │
-│   │                  │                                  │
-│   │  モデル推論のみ   │                                  │
-│   │  ステートレス     │                                  │
-│   │  DB アクセスなし  │                                  │
-│   └──────────────────┘                                  │
-│          ↑ text                                         │
-│          ↓ vector                                       │
-└─────────────────────────────────────────────────────────┘
-```
+## Background
 
-| コンポーネント | 役割 |
-|---|---|
-| `tsmd` | DB 管理・クライアント応答・インデックスキュー処理 |
-| `tsm-embedder`（子プロセス） | テキスト → ベクトル変換（モデル推論）。クラッシュ隔離のため独立プロセス |
-| watcher スレッド | ファイル変更を inotify/FSEvents で監視し、DB に直接インデックス |
+The Space Memory was inspired by [sui-memory](https://zenn.dev/noprogllama/articles/7c24b2c2410213),
+which introduced the idea of indexing Claude Code session transcripts into a searchable
+database. tsm extends this concept from session records to entire document repositories,
+enabling cross-workspace knowledge search.
 
-**embedder は自動リスタートしない設計**:
-OOM リスタートループ防止のため、クラッシュした子プロセスは
-停止したままになる。`tsm doctor` で状態を確認できる。
+### Why build from scratch?
 
-### Data Flow
+Existing tools each had critical gaps for this use case:
 
-```mermaid
-flowchart TB
-    subgraph External["External Sources"]
-        IF["index-file / ingest-session"]
-        WD["watcher daemon<br/><i>file change notify</i>"]
-    end
+- **Notion / GitHub search** — Network-bound; too slow for real-time prompt injection
+- **grep** — Sequential scan with no semantic correlation between terms
+- **Obsidian** — Excellent Markdown editor, but not designed for AI agent integration
 
-    subgraph Main["main process (sole DB owner)"]
-        IQ["indexer queue"]
-        CH["chunking"]
-        FTS["FTS5 write"]
-        VQ["vector queue"]
-        VW["receive vector → chunks_vec write"]
-        BF["backfill<br/><i>enqueue missing</i>"]
-    end
+tsm was built to fill these gaps: a local-first, sub-100ms hybrid search engine
+that integrates transparently with Claude Code via hooks. The combination of
+FTS5 and vector search bridges vocabulary gaps (e.g., matching "shooting" with
+"firearms"), and Japanese tokenization via lindera/IPADIC was a key reason to
+build a custom solution rather than adapting English-centric tools.
 
-    subgraph Embedder["embedder daemon"]
-        INF["inference<br/><i>text → vector</i><br/>no DB access"]
-    end
+### Name
 
-    subgraph DB["SQLite DB"]
-        FDB["chunks_fts"]
-        VDB["chunks_vec"]
-    end
-
-    IF --> IQ
-    WD --> IQ
-    IQ --> CH --> FTS --> FDB
-    CH --> VQ
-    BF --> VQ
-    VQ -->|"socket request"| INF
-    INF -->|"socket response"| VW
-    VW --> VDB
-```
-
-### Component Responsibilities
-
-```mermaid
-graph LR
-    subgraph Main["main process"]
-        direction TB
-        M1["DB ownership<br/>All reads & writes"]
-        M2["Indexer queue"]
-        M3["Vector queue"]
-        M4["Backfill coordination"]
-    end
-
-    subgraph Embedder["embedder daemon"]
-        direction TB
-        E1["Model inference only"]
-        E2["Stateless"]
-        E3["No DB access"]
-    end
-
-    subgraph Watcher["watcher daemon"]
-        direction TB
-        W1["File system monitoring"]
-        W2["inotify / FSEvents"]
-        W3["Stateless"]
-        W4["No DB access"]
-    end
-
-    Watcher -->|"file path"| Main
-    Main -->|"text"| Embedder
-    Embedder -->|"vector"| Main
-```
-
-### Search Flow
-
-```mermaid
-flowchart LR
-    Q["query"] --> QP["query preprocessing<br/><i>keyword extraction</i>"]
-    QP --> CL["classifier"]
-    CL --> FTS["FTS5 search"]
-    CL --> VEC["vector search<br/><i>read from chunks_vec</i>"]
-    CL --> ENT["entity search"]
-    FTS --> RRF["RRF fusion<br/><i>+ time decay</i><br/><i>+ status penalty</i>"]
-    VEC --> RRF
-    ENT --> RRF
-    RRF --> R["ranked results"]
-```
+The name follows sui-memory's naming pattern (prefix + memory), with "space"
+representing the multiple repositories treated as a unified search space.
+The cover image is an homage to *Hydlide 3*, whose subtitle is
+*The Space Memories*.
 
 ## License
 
