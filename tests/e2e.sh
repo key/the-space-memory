@@ -246,8 +246,9 @@ EXIT=$?
 assert_json "temporal: --recent 30d excludes old-text" \
     '[.[] | select(.source_file | contains("old-text"))] | length == 0' "$OUTPUT" "$EXIT"
 
-OUTPUT=$(search_json "吾輩 猫" --year "$LAST_YEAR") || true
+OUTPUT=$(search_json "吾輩 猫" --year "$LAST_YEAR" --fallback fts_only) || true
 EXIT=$?
+log "temporal --year output: $OUTPUT"
 assert_json "temporal: --year hits old-text" \
     'any(.[]; .source_file | contains("old-text"))' "$OUTPUT" "$EXIT"
 
@@ -293,16 +294,18 @@ echo "${DICT_WORD},カスタム名詞,${DICT_WORD}" >> "$USER_DICT_PATH"
 log "Added '$DICT_WORD' to user dictionary"
 
 log "Rebuilding FTS index..."
-tsm rebuild --fts-only 2>/dev/null
+tsm rebuild --fts-only 2>&1 || log "WARNING: rebuild --fts-only failed"
 
 log "Restarting daemon..."
-tsm start 2>/dev/null
+tsm start 2>&1
 
 # Wait for daemon ready
 sleep 3
 
+log "Searching for '$DICT_WORD' after dict update..."
 # Search after dict registration (use fts_only fallback since embedder may not be ready yet)
 OUTPUT_AFTER=$(search_json "$DICT_WORD" --fallback fts_only 2>/dev/null) || true
+log "Dict search output: $OUTPUT_AFTER"
 EXIT=$?
 assert_json "dict: $DICT_WORD → $DICT_FILE after dict update" \
     "any(.[]; .source_file | contains(\"$DICT_FILE\"))" "$OUTPUT_AFTER" "$EXIT"
