@@ -6,10 +6,10 @@
 flowchart TB
     subgraph External["External Sources"]
         IF["index-file / ingest-session"]
-        WD["watcher daemon<br/><i>file change notify</i>"]
+        WD["tsmd --fs-watcher<br/><i>file change → Index IPC</i>"]
     end
 
-    subgraph Main["main process (sole DB owner)"]
+    subgraph Main["tsmd daemon (sole DB owner)"]
         IQ["indexer queue"]
         CH["chunking"]
         FTS["FTS5 write"]
@@ -18,7 +18,7 @@ flowchart TB
         BF["backfill<br/><i>enqueue missing</i>"]
     end
 
-    subgraph Embedder["embedder daemon"]
+    subgraph Embedder["tsmd --embedder"]
         INF["inference<br/><i>text → vector</i><br/>no DB access"]
     end
 
@@ -41,7 +41,7 @@ flowchart TB
 
 ```mermaid
 graph LR
-    subgraph Main["main process"]
+    subgraph Main["tsmd daemon"]
         direction TB
         M1["DB ownership<br/>All reads & writes"]
         M2["Indexer queue"]
@@ -49,14 +49,14 @@ graph LR
         M4["Backfill coordination"]
     end
 
-    subgraph Embedder["embedder daemon"]
+    subgraph Embedder["tsmd --embedder"]
         direction TB
         E1["Model inference only"]
         E2["Stateless"]
         E3["No DB access"]
     end
 
-    subgraph Watcher["watcher daemon"]
+    subgraph Watcher["tsmd --fs-watcher"]
         direction TB
         W1["File system monitoring"]
         W2["inotify / FSEvents"]
