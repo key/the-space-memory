@@ -1,6 +1,6 @@
 use std::os::unix::net::UnixListener;
 use std::process::Child;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -54,6 +54,11 @@ pub fn run(args: Args) -> Result<()> {
             pid,
             socket: socket_str.clone(),
         });
+        // Clear stale reindex status from a previous daemon's interrupted run
+        if s.reindex.is_some() {
+            log::info!("clearing stale reindex status from previous run");
+            s.reindex = None;
+        }
     });
 
     log::info!("listening on {} (PID {pid})", socket_path.display());
@@ -141,6 +146,8 @@ pub fn run(args: Args) -> Result<()> {
 
     // Search-active counter: backfill yields when search requests are in-flight.
     let search_active = Arc::new(AtomicUsize::new(0));
+    // Reindex-active flag: at most one reindex runs at a time.
+    let reindex_active = Arc::new(AtomicBool::new(false));
 
     // Startup backfill — waits for embedder socket then runs one pass.
     if !args.no_embedder {
@@ -182,6 +189,8 @@ pub fn run(args: Args) -> Result<()> {
                 let index_root = index_root.clone();
                 let search_active = Arc::clone(&search_active);
                 let watcher_pid = Arc::clone(&watcher_pid);
+                let reindex_active = Arc::clone(&reindex_active);
+                let state_dir = state_dir.clone();
 
                 std::thread::spawn(move || {
                     if let Err(e) = handle_client(
@@ -190,6 +199,8 @@ pub fn run(args: Args) -> Result<()> {
                         &index_root,
                         &search_active,
                         &watcher_pid,
+                        &reindex_active,
+                        &state_dir,
                     ) {
                         log::warn!("client error: {e}");
                     }
@@ -236,10 +247,61 @@ fn handle_client(
     index_root: &std::path::Path,
     search_active: &Arc<AtomicUsize>,
     watcher_pid: &Arc<AtomicU32>,
+    reindex_active: &Arc<AtomicBool>,
+    state_dir: &std::path::Path,
 ) -> Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
     let req = read_request(stream)?;
+
+    // Handle Reindex: spawn background thread and respond immediately
+    if let DaemonRequest::Reindex { kind } = req {
+        use the_space_memory::daemon_protocol::ReindexKind;
+
+        if reindex_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            write_response(
+                stream,
+                &DaemonResponse::error("reindex already in progress"),
+            )?;
+            return Ok(());
+        }
+
+        let conn = Arc::clone(conn);
+        let search_active = Arc::clone(search_active);
+        let reindex_active = Arc::clone(reindex_active);
+        let state_dir = state_dir.to_path_buf();
+        std::thread::spawn(move || {
+            // RAII guard: reset flag even if the thread panics
+            struct ReindexGuard(Arc<AtomicBool>);
+            impl Drop for ReindexGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _guard = ReindexGuard(Arc::clone(&reindex_active));
+
+            match kind {
+                ReindexKind::Fts => {
+                    backfill::run_reindex_fts_pass(&conn, &search_active, &state_dir);
+                }
+                ReindexKind::Vectors => {
+                    backfill::run_reindex_vectors_pass(&conn, &search_active, &state_dir);
+                }
+                ReindexKind::All => {
+                    backfill::run_reindex_fts_pass(&conn, &search_active, &state_dir);
+                    if !SHUTDOWN.load(Ordering::SeqCst) {
+                        backfill::run_reindex_vectors_pass(&conn, &search_active, &state_dir);
+                    }
+                }
+            }
+        });
+
+        write_response(stream, &DaemonResponse::success_empty())?;
+        return Ok(());
+    }
 
     // Handle Reload: notify watcher child via SIGHUP
     if matches!(req, DaemonRequest::Reload) {

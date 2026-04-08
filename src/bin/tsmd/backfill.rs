@@ -1,7 +1,8 @@
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use the_space_memory::{config, embedder, indexer};
+use the_space_memory::{config, embedder, indexer, status, tokenizer};
 
 use crate::SHUTDOWN;
 
@@ -21,6 +22,21 @@ impl Drop for SearchActiveGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// Spin-wait until no search requests are in-flight, checking SHUTDOWN.
+/// Returns `true` if shutdown was requested during the wait.
+fn yield_to_search(search_active: &Arc<AtomicUsize>) -> bool {
+    for _ in 0..200 {
+        if search_active.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
 }
 
 // ─── Backfill ───────────────────────────────────────────────────────
@@ -44,15 +60,8 @@ pub fn run_backfill_pass(
             break;
         }
 
-        // Yield while search requests are in-flight (no lock held)
-        for _ in 0..200 {
-            if search_active.load(Ordering::Acquire) == 0 {
-                break;
-            }
-            if SHUTDOWN.load(Ordering::SeqCst) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        if yield_to_search(search_active) {
+            return;
         }
 
         // Lock DB only for this one batch
@@ -139,6 +148,157 @@ pub fn sleep_interruptible(duration: std::time::Duration) {
         let sleep_for = step.min(remaining);
         std::thread::sleep(sleep_for);
         remaining = remaining.saturating_sub(sleep_for);
+    }
+}
+
+// ─── Reindex passes ────────────────────────────────────────────────
+
+/// Run a full FTS re-tokenization pass, yielding to search between batches.
+///
+/// Resets the lindera segmenter (picks up user dict changes) before starting.
+pub fn run_reindex_fts_pass(
+    conn: &Arc<Mutex<rusqlite::Connection>>,
+    search_active: &Arc<AtomicUsize>,
+    state_dir: &Path,
+) {
+    // Get total chunk count (short lock)
+    let total: i64 = {
+        let Ok(conn) = conn.lock() else {
+            log::error!("reindex fts: DB mutex poisoned; aborting before start");
+            return;
+        };
+        conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap_or(0)
+    };
+
+    // Reset segmenter in daemon process so new user dict is picked up
+    tokenizer::reset_segmenter();
+
+    let started_at = chrono::Utc::now().to_rfc3339();
+    status::update(state_dir, |s| {
+        s.reindex = Some(status::ReindexStatus {
+            kind: the_space_memory::daemon_protocol::ReindexKind::Fts,
+            total,
+            processed: 0,
+            errors: 0,
+            started_at: started_at.clone(),
+        });
+    });
+
+    let batch_size = config::REINDEX_FTS_BATCH_SIZE;
+    let mut last_id: i64 = 0;
+    let mut total_inserted: usize = 0;
+    let mut is_first = true;
+
+    loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            break;
+        }
+
+        yield_to_search(search_active);
+
+        let Ok(conn) = conn.lock() else {
+            log::error!(
+                "reindex fts: DB mutex poisoned mid-batch (last_id={last_id}); \
+                 FTS index is partially rebuilt"
+            );
+            status::update(state_dir, |s| {
+                if let Some(ref mut r) = s.reindex {
+                    r.errors += 1;
+                }
+            });
+            break;
+        };
+        let result = indexer::rebuild_fts_next_batch(&conn, last_id, batch_size, is_first);
+        drop(conn);
+
+        match result {
+            Ok((inserted, new_last_id, has_more)) => {
+                total_inserted += inserted;
+                last_id = new_last_id;
+                is_first = false;
+
+                status::update(state_dir, |s| {
+                    if let Some(ref mut r) = s.reindex {
+                        r.processed = total_inserted as i64;
+                    }
+                });
+
+                if !has_more {
+                    break;
+                }
+            }
+            Err(e) => {
+                log::error!("reindex fts batch error (last_id={last_id}): {e}");
+                status::update(state_dir, |s| {
+                    if let Some(ref mut r) = s.reindex {
+                        r.errors += 1;
+                    }
+                });
+                // Return early — leave s.reindex populated so doctor shows the error state
+                return;
+            }
+        }
+    }
+
+    if SHUTDOWN.load(Ordering::SeqCst) {
+        log::warn!("reindex fts interrupted by shutdown; FTS index is partially rebuilt");
+        // Leave s.reindex populated so doctor can report the incomplete state
+    } else {
+        log::info!("reindex fts: {total_inserted} chunks re-tokenized");
+        status::update(state_dir, |s| s.reindex = None);
+    }
+}
+
+/// Clear all vectors and re-run backfill from scratch.
+///
+/// Vector search results will be unavailable from the moment tables are
+/// cleared until backfill completes. FTS results remain unaffected.
+pub fn run_reindex_vectors_pass(
+    conn: &Arc<Mutex<rusqlite::Connection>>,
+    search_active: &Arc<AtomicUsize>,
+    state_dir: &Path,
+) {
+    if yield_to_search(search_active) {
+        return;
+    }
+
+    // Get total chunk count and clear vector tables (short lock)
+    let total: i64 = {
+        let Ok(conn) = conn.lock() else {
+            log::error!("reindex vectors: DB mutex poisoned; aborting");
+            return;
+        };
+        let count = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap_or(0);
+        if let Err(e) = conn.execute_batch("DELETE FROM chunks_vec; DELETE FROM chunks_vec_skip;") {
+            log::error!("reindex vectors: failed to clear tables: {e}");
+            return;
+        }
+        count
+    };
+
+    let started_at = chrono::Utc::now().to_rfc3339();
+    status::update(state_dir, |s| {
+        s.reindex = Some(status::ReindexStatus {
+            kind: the_space_memory::daemon_protocol::ReindexKind::Vectors,
+            total,
+            processed: 0,
+            errors: 0,
+            started_at,
+        });
+    });
+
+    log::info!("reindex vectors: cleared, starting backfill...");
+    run_backfill_pass(conn, search_active);
+
+    if SHUTDOWN.load(Ordering::SeqCst) {
+        log::warn!("reindex vectors interrupted by shutdown");
+        // Leave s.reindex populated so doctor can report the incomplete state
+    } else {
+        log::info!("reindex vectors: complete");
+        status::update(state_dir, |s| s.reindex = None);
     }
 }
 

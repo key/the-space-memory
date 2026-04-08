@@ -86,6 +86,19 @@ A typical directory layout:
 All Markdown files under `TSM_INDEX_ROOT` are indexed automatically.
 The file watcher detects additions, modifications, and deletions in real time.
 
+### Maintenance
+
+```bash
+# Re-index while daemon is running (non-destructive, background)
+tsm reindex all       # FTS + vectors
+tsm reindex fts       # FTS only (after dictionary changes)
+tsm reindex vectors   # Vectors only (after model changes)
+
+# Rebuild from scratch (destructive, requires daemon stopped)
+tsm rebuild           # Dry run (shows DB stats)
+tsm rebuild --apply   # Delete DB and rebuild
+```
+
 Use `tsm doctor` to check system health and daemon status.
 
 ## Documentation

@@ -6,6 +6,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::ipc::{read_message, write_message};
 
+/// What to re-index.
+///
+/// `All` is equivalent to `Fts` followed by `Vectors`, in that order.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReindexKind {
+    All,
+    Fts,
+    Vectors,
+}
+
+impl std::fmt::Display for ReindexKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReindexKind::All => write!(f, "all"),
+            ReindexKind::Fts => write!(f, "fts"),
+            ReindexKind::Vectors => write!(f, "vectors"),
+        }
+    }
+}
+
 /// Request from tsm CLI to tsmd daemon.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
@@ -49,9 +70,10 @@ pub enum DaemonRequest {
     ImportWordnet {
         wordnet_db: String,
     },
-    Rebuild {
-        force: bool,
+    Reindex {
+        kind: ReindexKind,
     },
+    Rebuild,
     Reload,
     Shutdown,
     Ping,
@@ -317,12 +339,22 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_rebuild() {
-        let req = DaemonRequest::Rebuild { force: true };
+        let req = DaemonRequest::Rebuild;
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
-        match decoded {
-            DaemonRequest::Rebuild { force } => assert!(force),
-            _ => panic!("Expected Rebuild variant"),
+        assert!(matches!(decoded, DaemonRequest::Rebuild));
+    }
+
+    #[test]
+    fn serde_roundtrip_reindex() {
+        for kind in [ReindexKind::All, ReindexKind::Fts, ReindexKind::Vectors] {
+            let req = DaemonRequest::Reindex { kind };
+            let json = serde_json::to_string(&req).unwrap();
+            let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
+            match decoded {
+                DaemonRequest::Reindex { kind: k } => assert_eq!(k, kind),
+                _ => panic!("Expected Reindex variant"),
+            }
         }
     }
 

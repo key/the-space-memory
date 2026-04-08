@@ -15,6 +15,7 @@ pub const DEFAULT_HALF_LIFE_DAYS: f64 = 90.0;
 pub const SNIPPET_MAX_CHARS: usize = 200;
 pub const MIN_SESSION_MESSAGE_LEN: usize = 10;
 pub const BACKFILL_BATCH_SIZE: usize = 8;
+pub const REINDEX_FTS_BATCH_SIZE: usize = 1000;
 pub const MAX_QUERY_EXPANSIONS: usize = 5;
 pub const RECENT_DAYS: i64 = 30;
 pub const DICT_CANDIDATE_FREQ_THRESHOLD: i64 = 5;

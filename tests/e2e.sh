@@ -294,7 +294,7 @@ assert_json "vector: 宇宙と星の旅 → gingatetsudo" \
 echo ""
 log "=== Dictionary ==="
 
-# Dict test: add a word to user dict, rebuild FTS, verify search works with it.
+# Dict test: add a word to user dict, reindex FTS, verify search works with it.
 # Use "セリヌンティウス" — a proper noun only in hashire-melos.md that lindera
 # splits into multiple tokens by default, but as a dict entry becomes one token.
 DICT_WORD="セリヌンティウス"
@@ -303,31 +303,30 @@ DICT_WORD="セリヌンティウス"
 run search_json "$DICT_WORD" --fallback fts-only
 OUTPUT_BEFORE="$CAPTURED_OUTPUT"
 
-# Stop daemon, add word to user dict, rebuild FTS, restart
-log "Stopping daemon for dict update..."
-tsm stop 2>/dev/null
-sleep 1
-
+# Add word to user dict, reindex FTS via daemon
 USER_DICT_PATH="$TSM_STATE_DIR/user_dict.simpledic"
 echo "${DICT_WORD},名詞,${DICT_WORD}" >> "$USER_DICT_PATH"
 log "Added '$DICT_WORD' to user dictionary"
 
-log "Rebuilding FTS index..."
-tsm rebuild --fts-only 2>/dev/null
+log "Reindexing FTS via daemon..."
+tsm reindex fts 2>/dev/null
 
-log "Restarting daemon..."
-tsm start 2>/dev/null
-
-# Wait for daemon ready
-sleep 3
+# Wait for reindex to complete (check doctor until Reindex section disappears)
+for _i in $(seq 1 30); do
+    DOCTOR_JSON=$(tsm doctor -f json 2>/dev/null)
+    if ! echo "$DOCTOR_JSON" | jq -e '.sections[] | select(.name == "Reindex")' >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
 
 # Verify search before dict registration found results
 assert_json "dict: '$DICT_WORD' found before dict (via constituent tokens)" \
     'any(.[]; .source_file | contains("hashire-melos"))' "$OUTPUT_BEFORE" "0"
 
-# Verify search still works after the stop→rebuild→start cycle
+# Verify search still works after reindex
 run search_json "メロス 激怒" --fallback fts-only
-assert_json "dict: search works after rebuild" \
+assert_json "dict: search works after reindex" \
     'any(.[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # Verify dict-registered word works as a standalone search query (#104)

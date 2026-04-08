@@ -78,7 +78,9 @@ src/
 - **FTS5**: lindera tokenization + unicode61 tokenizer
 - **Vector search**: ruri-v3-30m (256-dim) semantic search. Embedder child process (`tsmd --embedder`) runs on UNIX socket
 - **Scoring**: RRF (Reciprocal Rank Fusion) combining FTS5 and vector results. Time decay + status penalty applied
-- **DB schema changes require `rebuild --force`** (e.g. FTS tokenizer changes)
+- **DB schema changes require `rebuild --apply`** (e.g. FTS tokenizer changes)
+- **Live re-indexing**: `tsm reindex {all|fts|vectors}` — daemon runs batched
+  re-index in background, yielding to search between batches
 
 ## Data Flow
 
@@ -217,11 +219,12 @@ A change is merge-ready when **all** of the following hold:
 - **User dictionary POS is `名詞`** — simpledic format: `surface,名詞,reading`.
   Uses standard POS so existing noun filters work without special handling.
   `#` comment lines are stripped before passing to lindera
-- **`rebuild --force` resets reject list** — DB is deleted and recreated,
+- **`rebuild --apply` resets reject list** — DB is deleted and recreated,
   so `dictionary_candidates` table (including rejected status) is lost.
   Run `tsm dict reject --apply` after rebuild to re-sync from `reject_words.txt`
-- **`dict update --apply` requires daemon stopped** — writes simpledic,
-  rebuilds FTS, and attempts git commit. Stop daemon first
+- **`dict update --apply` uses daemon when available** — if daemon running,
+  sends `reindex fts` via IPC (daemon resets its own segmenter).
+  If daemon stopped, resets segmenter locally and rebuilds FTS directly
 - **Segmenter is cached** — `tokenizer::get_segmenter()` caches the Segmenter
   (including user dict). Call `reset_segmenter()` after writing new simpledic
   if rebuilding FTS in the same process

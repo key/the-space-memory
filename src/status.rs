@@ -2,6 +2,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::daemon_protocol::ReindexKind;
+
 const STATUS_FILENAME: &str = "tsm-status.json";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -14,6 +16,8 @@ pub struct StatusFile {
     pub daemon: Option<DaemonStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watcher: Option<WatcherStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reindex: Option<ReindexStatus>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,6 +46,15 @@ pub struct WatcherStatus {
     pub started_at: String,
     #[serde(default)]
     pub pid: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReindexStatus {
+    pub kind: ReindexKind,
+    pub total: i64,
+    pub processed: i64,
+    pub errors: i64,
+    pub started_at: String,
 }
 
 pub fn status_path(state_dir: &Path) -> std::path::PathBuf {
