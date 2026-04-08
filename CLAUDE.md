@@ -247,6 +247,7 @@ see ADR-0001.
 ## Documentation Style
 
 `docs/` guides should follow this section order:
+
 1. Design concept (Why) — background and design decisions
 2. File layout (What) — file structure and formats
 3. Operations guide (How to use) — setup, maintenance, troubleshooting
