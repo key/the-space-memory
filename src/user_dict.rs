@@ -136,7 +136,7 @@ fn extract_raw_candidates(text: &str) -> Vec<RawCandidate> {
 
         let pos = if details.len() >= 2
             && details[0] == crate::tokenizer::POS_NOUN
-            && details[1] == "固有名詞"
+            && details[1] == crate::tokenizer::POS_SUB_PROPER
         {
             Some(CandidatePos::ProperNoun)
         } else if is_all_katakana(&surface) && surface.chars().count() >= 2 {

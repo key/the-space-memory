@@ -9,8 +9,15 @@ use lindera::segmenter::Segmenter;
 
 use crate::config;
 
-/// IPADIC top-level POS label for nouns. Used by POS filters across the codebase.
+// ─── IPADIC POS labels ──────────────────────────────────────
+// Top-level (details[0])
 pub const POS_NOUN: &str = "名詞";
+// Noun subcategories (details[1])
+pub const POS_SUB_PROPER: &str = "固有名詞";
+pub const POS_SUB_DEPENDENT: &str = "非自立";
+pub const POS_SUB_SUFFIX: &str = "接尾";
+pub const POS_SUB_PRONOUN: &str = "代名詞";
+pub const POS_SUB_NUMBER: &str = "数";
 
 static SEGMENTER: Mutex<Option<Arc<Segmenter>>> = Mutex::new(None);
 static STOPWORDS: OnceLock<HashSet<String>> = OnceLock::new();
@@ -192,7 +199,11 @@ pub fn extract_search_keywords(text: &str) -> Vec<String> {
         if details.is_empty() || details[0] != POS_NOUN {
             continue;
         }
-        if details.len() >= 2 && matches!(details[1], "非自立" | "接尾" | "代名詞" | "数")
+        if details.len() >= 2
+            && matches!(
+                details[1],
+                POS_SUB_DEPENDENT | POS_SUB_SUFFIX | POS_SUB_PRONOUN | POS_SUB_NUMBER
+            )
         {
             continue;
         }
@@ -244,7 +255,7 @@ pub fn extract_proper_nouns(text: &str) -> Vec<String> {
         .iter_mut()
         .filter_map(|token| {
             let details = token.details();
-            if details.len() >= 2 && details[0] == POS_NOUN && details[1] == "固有名詞" {
+            if details.len() >= 2 && details[0] == POS_NOUN && details[1] == POS_SUB_PROPER {
                 Some(token.surface.as_ref().to_string())
             } else {
                 None
@@ -515,7 +526,11 @@ mod tests {
             if details.is_empty() || details[0] != POS_NOUN {
                 continue;
             }
-            if details.len() >= 2 && matches!(details[1], "非自立" | "接尾" | "代名詞" | "数")
+            if details.len() >= 2
+                && matches!(
+                    details[1],
+                    POS_SUB_DEPENDENT | POS_SUB_SUFFIX | POS_SUB_PRONOUN | POS_SUB_NUMBER
+                )
             {
                 continue;
             }
