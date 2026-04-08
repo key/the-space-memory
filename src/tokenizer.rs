@@ -13,7 +13,7 @@ static SEGMENTER: Mutex<Option<Arc<Segmenter>>> = Mutex::new(None);
 static STOPWORDS: OnceLock<HashSet<String>> = OnceLock::new();
 
 pub fn get_segmenter() -> Arc<Segmenter> {
-    let mut guard = SEGMENTER.lock().unwrap();
+    let mut guard = SEGMENTER.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(seg) = guard.as_ref() {
         return Arc::clone(seg);
     }
@@ -28,7 +28,7 @@ pub fn get_segmenter() -> Arc<Segmenter> {
 /// Invalidate the cached segmenter so that the next call to
 /// `get_segmenter()` reloads the dictionary (including user dict).
 pub fn reset_segmenter() {
-    let mut guard = SEGMENTER.lock().unwrap();
+    let mut guard = SEGMENTER.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
 
@@ -250,6 +250,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_singleton_cached() {
         let s1 = get_segmenter();
         let s2 = get_segmenter();
@@ -257,6 +258,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_reset_segmenter() {
         let s1 = get_segmenter();
         reset_segmenter();

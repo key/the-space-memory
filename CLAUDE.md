@@ -243,6 +243,15 @@ see ADR-0001.
 - Documentation and code comments in English
 - README.md (English) and README.ja.md (Japanese) must be kept in sync
 
+## Documentation Style
+
+`docs/` guides should follow this section order:
+1. Design concept (Why) — background and design decisions
+2. File layout (What) — file structure and formats
+3. Operations guide (How to use) — setup, maintenance, troubleshooting
+4. Internals (How it works) — collection logic, data flow
+5. Implementation reference (Code) — source files and roles
+
 ## License Compatibility
 
 Verify license compatibility when adding dependencies. This project is **MIT** licensed.
