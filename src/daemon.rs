@@ -126,7 +126,11 @@ pub fn handle_request(
             "dict update --apply cannot run while tsmd is active. Run `tsm stop` first.",
         ),
 
-        DaemonRequest::Rebuild { .. } => {
+        DaemonRequest::Reindex { .. } => DaemonResponse::error(
+            "reindex must be intercepted by daemon_mode. If you see this, it's a bug.",
+        ),
+
+        DaemonRequest::Rebuild => {
             DaemonResponse::error("rebuild cannot run while tsmd is active. Run `tsm stop` first.")
         }
 
@@ -343,10 +347,23 @@ mod tests {
     fn test_rebuild_rejected_by_daemon() {
         let (conn, dir) = setup();
         let flag = AtomicBool::new(false);
-        let req = DaemonRequest::Rebuild { force: true };
+        let req = DaemonRequest::Rebuild;
         let resp = handle_request(&conn, req, dir.path(), &flag);
         assert!(!resp.ok);
         assert!(resp.error.unwrap().contains("tsm stop"));
+    }
+
+    #[test]
+    fn test_reindex_rejected_by_daemon() {
+        use crate::daemon_protocol::ReindexKind;
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+        let req = DaemonRequest::Reindex {
+            kind: ReindexKind::Fts,
+        };
+        let resp = handle_request(&conn, req, dir.path(), &flag);
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().contains("intercepted"));
     }
 
     #[test]

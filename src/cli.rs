@@ -758,6 +758,34 @@ fn doctor_check_with_conn(
 
         report.sections.push(dict_section);
     }
+
+    // ── Reindex section ──
+    if let Some(ref ri) = sf.reindex {
+        let pct = if ri.total > 0 {
+            (ri.processed as f64 / ri.total as f64 * 100.0) as u32
+        } else {
+            0
+        };
+        let processed = ri.processed as usize + ri.errors;
+        let eta = if processed > 0 && ri.total > 0 {
+            estimate_eta(&ri.started_at, processed, ri.total as usize)
+        } else {
+            "calculating...".to_string()
+        };
+        let mut reindex_section = DoctorSection {
+            name: "Reindex".to_string(),
+            items: Vec::new(),
+        };
+        reindex_section.items.push(CheckItem {
+            status: CheckStatus::Warning,
+            message: format!(
+                "Reindex ({}) in progress: {}/{} ({pct}%), ETA {eta}",
+                ri.kind, ri.processed, ri.total
+            ),
+            hint: None,
+        });
+        report.sections.push(reindex_section);
+    }
 }
 
 pub fn cmd_doctor(format: &str) -> anyhow::Result<()> {
@@ -1122,12 +1150,33 @@ pub fn cmd_dict_update(threshold: i64, apply: bool) -> anyhow::Result<()> {
 
     drop(conn);
 
-    // Invalidate cached segmenter so FTS rebuild uses the new dictionary
-    crate::tokenizer::reset_segmenter();
-
-    // Rebuild FTS only (dict changes only affect tokenization, not vectors)
-    log::info!("\nRebuilding FTS index...");
-    cmd_rebuild_fts()?;
+    // Rebuild FTS: if daemon is running, send reindex via IPC (daemon resets
+    // its own segmenter). Otherwise, reset locally and rebuild directly.
+    let daemon_socket = config::daemon_socket_path();
+    if let Some(Ok(resp)) = crate::daemon_protocol::try_send_request(
+        &daemon_socket,
+        &crate::daemon_protocol::DaemonRequest::Ping,
+    ) {
+        if resp.ok {
+            log::info!("\nSending FTS reindex to daemon...");
+            let req = crate::daemon_protocol::DaemonRequest::Reindex {
+                kind: crate::daemon_protocol::ReindexKind::Fts,
+            };
+            let resp = crate::daemon_protocol::send_request(&daemon_socket, &req)?;
+            if !resp.ok {
+                anyhow::bail!("Daemon reindex failed: {}", resp.error.unwrap_or_default());
+            }
+            log::info!("FTS reindex started in background. Run `tsm doctor` to check progress.");
+        } else {
+            crate::tokenizer::reset_segmenter();
+            log::info!("\nRebuilding FTS index...");
+            cmd_rebuild_fts()?;
+        }
+    } else {
+        crate::tokenizer::reset_segmenter();
+        log::info!("\nRebuilding FTS index...");
+        cmd_rebuild_fts()?;
+    }
 
     // Save current branch to return to later
     let original_branch =
@@ -1295,16 +1344,40 @@ fn spawn_background_backfill() {
     }
 }
 
-pub fn cmd_rebuild(force: bool) -> anyhow::Result<()> {
+pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let index_root = config::index_root();
     let socket = config::embedder_socket_path();
 
+    if !apply {
+        // Dry run: show what would happen
+        if db_path.exists() {
+            if let Ok(meta) = std::fs::metadata(&db_path) {
+                let size_mb = meta.len() as f64 / 1024.0 / 1024.0;
+                eprintln!("DB: {} ({size_mb:.1} MB)", db_path.display());
+            }
+            let conn = db::get_connection(&db_path)?;
+            let chunks: i64 = conn
+                .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+                .unwrap_or(0);
+            let vecs: i64 = conn
+                .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+                .unwrap_or(0);
+            let docs: i64 = conn
+                .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+                .unwrap_or(0);
+            eprintln!("Documents: {docs}, Chunks: {chunks}, Vectors: {vecs}");
+        } else {
+            eprintln!("DB does not exist yet.");
+        }
+        eprintln!("\nThis will delete the DB and rebuild from scratch.");
+        eprintln!("Note: reject list (dictionary_candidates) will be lost.");
+        eprintln!("Run with --apply to proceed.");
+        return Ok(());
+    }
+
     if !socket.exists() {
         log::warn!("Embedder is not running. Rebuilding without vectors.");
-        if !force {
-            anyhow::bail!("Use --force to proceed without embedder.");
-        }
     } else {
         log::info!("Embedder: running");
     }

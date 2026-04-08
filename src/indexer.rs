@@ -988,6 +988,50 @@ pub fn rebuild_fts(
     Ok(rows.len())
 }
 
+/// Re-tokenize one batch of chunks into the FTS5 index.
+///
+/// Uses keyset pagination (`WHERE id > last_id ORDER BY id LIMIT batch_size`).
+/// When `is_first_batch` is true, clears the entire FTS table before inserting.
+///
+/// Returns `(inserted_count, new_last_id, has_more)`.
+/// `has_more` is `true` when `batch.len() == batch_size`; callers should
+/// handle the case where the subsequent call returns `inserted_count == 0`.
+pub fn rebuild_fts_next_batch(
+    conn: &Connection,
+    last_id: i64,
+    batch_size: usize,
+    is_first_batch: bool,
+) -> anyhow::Result<(usize, i64, bool)> {
+    let batch: Vec<(i64, String)> = conn
+        .prepare("SELECT id, content FROM chunks WHERE id > ? ORDER BY id LIMIT ?")?
+        .query_map(rusqlite::params![last_id, batch_size as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if batch.is_empty() {
+        return Ok((0, last_id, false));
+    }
+
+    let new_last_id = batch.last().unwrap().0;
+
+    let tx = conn.unchecked_transaction()?;
+    if is_first_batch {
+        tx.execute("DELETE FROM chunks_fts", [])?;
+    }
+    for (id, content) in &batch {
+        let wakachi_text = wakachi(content);
+        tx.execute(
+            "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
+            rusqlite::params![id, wakachi_text],
+        )?;
+    }
+    tx.commit()?;
+
+    let has_more = batch.len() == batch_size;
+    Ok((batch.len(), new_last_id, has_more))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2230,5 +2274,114 @@ mod tests {
         }
         // Last call should have current == total
         assert_eq!(calls.last().unwrap().0, chunk_count as usize);
+    }
+
+    // ─── rebuild_fts_next_batch tests ───────────────────────────────
+
+    #[test]
+    fn test_rebuild_fts_next_batch_empty_db() {
+        let (conn, _dir) = setup();
+        let (inserted, last_id, has_more) = rebuild_fts_next_batch(&conn, 0, 100, true).unwrap();
+        assert_eq!(inserted, 0);
+        assert_eq!(last_id, 0);
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn test_rebuild_fts_next_batch_single_batch() {
+        let (conn, dir) = setup();
+
+        // Index 2 files
+        let md1 = "---\nstatus: current\n---\n\n# Title\n\nContent one.\n";
+        let md2 = "---\nstatus: current\n---\n\n# Title\n\nContent two.\n";
+        let p1 = write_md(dir.path(), "notes/a.md", md1);
+        let p2 = write_md(dir.path(), "notes/b.md", md2);
+        index_file(&conn, &p1, dir.path()).unwrap();
+        index_file(&conn, &p2, dir.path()).unwrap();
+
+        let chunks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(chunks > 0);
+
+        // Clear FTS to simulate needing a rebuild
+        conn.execute("DELETE FROM chunks_fts", []).unwrap();
+
+        // Single batch covers all
+        let (inserted, _last_id, has_more) = rebuild_fts_next_batch(&conn, 0, 1000, true).unwrap();
+        assert_eq!(inserted as i64, chunks);
+        assert!(!has_more);
+
+        // Verify FTS is populated
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, chunks);
+    }
+
+    #[test]
+    fn test_rebuild_fts_next_batch_pagination() {
+        let (conn, dir) = setup();
+
+        // Index 3 files to ensure we have multiple chunks
+        for i in 0..3 {
+            let md = format!("---\nstatus: current\n---\n\n# Title {i}\n\nContent number {i}.\n");
+            let p = write_md(dir.path(), &format!("notes/{i}.md"), &md);
+            index_file(&conn, &p, dir.path()).unwrap();
+        }
+
+        let total_chunks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(total_chunks >= 3);
+
+        // First batch: batch_size = 1 (delete + insert 1)
+        let (inserted, last_id, has_more) = rebuild_fts_next_batch(&conn, 0, 1, true).unwrap();
+        assert_eq!(inserted, 1);
+        assert!(has_more);
+
+        // Subsequent batches: no delete, just insert
+        let mut total_inserted = inserted;
+        let mut cursor = last_id;
+        loop {
+            let (inserted, new_last_id, more) =
+                rebuild_fts_next_batch(&conn, cursor, 1, false).unwrap();
+            total_inserted += inserted;
+            cursor = new_last_id;
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(total_inserted as i64, total_chunks);
+
+        // Verify FTS row count
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, total_chunks);
+    }
+
+    #[test]
+    fn test_rebuild_fts_next_batch_first_batch_clears_fts() {
+        let (conn, dir) = setup();
+
+        let md = "---\nstatus: current\n---\n\n# Title\n\nContent.\n";
+        let p = write_md(dir.path(), "notes/a.md", md);
+        index_file(&conn, &p, dir.path()).unwrap();
+
+        // FTS should have rows from indexing
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert!(before > 0);
+
+        // First batch clears and re-inserts
+        let (inserted, _, _) = rebuild_fts_next_batch(&conn, 0, 1000, true).unwrap();
+        assert_eq!(inserted as i64, before);
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, before);
     }
 }

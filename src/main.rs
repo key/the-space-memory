@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use the_space_memory::cli;
 use the_space_memory::config;
-use the_space_memory::daemon_protocol::{self, DaemonRequest, DaemonResponse};
+use the_space_memory::daemon_protocol::{self, DaemonRequest, DaemonResponse, ReindexKind};
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SearchFallbackArg {
     Error,
@@ -17,6 +18,23 @@ impl fmt::Display for SearchFallbackArg {
         match self {
             SearchFallbackArg::Error => write!(f, "error"),
             SearchFallbackArg::FtsOnly => write!(f, "fts_only"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ReindexKindArg {
+    All,
+    Fts,
+    Vectors,
+}
+
+impl From<ReindexKindArg> for ReindexKind {
+    fn from(arg: ReindexKindArg) -> Self {
+        match arg {
+            ReindexKindArg::All => ReindexKind::All,
+            ReindexKindArg::Fts => ReindexKind::Fts,
+            ReindexKindArg::Vectors => ReindexKind::Vectors,
         }
     }
 }
@@ -138,12 +156,15 @@ enum Commands {
     },
     /// Rebuild database (backup, delete, init, full index)
     Rebuild {
-        /// Proceed without confirmation
+        /// Actually perform the rebuild (without this flag: dry run)
         #[arg(long)]
-        force: bool,
-        /// Rebuild only the FTS5 full-text index (preserves vectors)
-        #[arg(long)]
-        fts_only: bool,
+        apply: bool,
+    },
+    /// Re-index in background (requires running daemon)
+    Reindex {
+        /// What to re-index: all, fts, or vectors
+        #[arg(value_enum)]
+        kind: ReindexKindArg,
     },
     /// Reload config (tsm.toml) without restarting the daemon
     Reload,
@@ -168,22 +189,14 @@ fn main() -> anyhow::Result<()> {
         Commands::VectorFill { batch_size } => cli::cmd_vector_fill(batch_size)?,
 
         // ── Direct-only with daemon guard ──
-        Commands::Rebuild { force, fts_only } => {
-            guard_daemon_not_running("rebuild")?;
-            if force && fts_only {
-                anyhow::bail!("--force and --fts-only are mutually exclusive");
+        Commands::Rebuild { apply } => {
+            if apply {
+                guard_daemon_not_running("rebuild --apply")?;
             }
-            if fts_only {
-                cli::cmd_rebuild_fts()?;
-            } else {
-                cli::cmd_rebuild(force)?;
-            }
+            cli::cmd_rebuild(apply)?;
         }
         Commands::Dict { command } => match command {
             DictCommands::Update { threshold, apply } => {
-                if apply {
-                    guard_daemon_not_running("dict update --apply")?;
-                }
                 cli::cmd_dict_update(threshold, apply)?;
             }
             DictCommands::Reject { apply, all } => {
@@ -192,6 +205,11 @@ fn main() -> anyhow::Result<()> {
         },
 
         // ── Daemon-routed (auto-starts tsmd if needed) ──
+        Commands::Reindex { kind } => {
+            let req = DaemonRequest::Reindex { kind: kind.into() };
+            render_reindex(send_to_daemon(&req)?)?;
+        }
+
         Commands::Search {
             query,
             top_k,
@@ -426,6 +444,12 @@ fn render_reload(resp: DaemonResponse) -> anyhow::Result<()> {
         }
     }
     println!("config reloaded");
+    Ok(())
+}
+
+fn render_reindex(resp: DaemonResponse) -> anyhow::Result<()> {
+    check_resp(&resp)?;
+    println!("reindex started. Run `tsm doctor` to check progress.");
     Ok(())
 }
 

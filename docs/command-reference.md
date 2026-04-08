@@ -20,6 +20,7 @@ Complete reference for all `tsm` CLI subcommands.
   - [tsm status](#tsm-status)
   - [tsm doctor](#tsm-doctor)
 - [Maintenance](#maintenance)
+  - [tsm reindex](#tsm-reindex)
   - [tsm rebuild](#tsm-rebuild)
   - [tsm import-wordnet](#tsm-import-wordnet)
 - [Dictionary Management](#dictionary-management)
@@ -454,46 +455,71 @@ tsm doctor -f json
 
 ## Maintenance
 
-These commands require the daemon to be stopped (`tsm stop`) before running.
+### tsm reindex
+
+Re-index in background while the daemon is running (non-destructive).
+
+```text
+tsm reindex <kind>
+```
+
+Sends a reindex request to the running daemon. The daemon processes the
+reindex in batches, yielding to search requests between batches.
+
+**Arguments:**
+
+| Argument | Description |
+|---|---|
+| `all` | Re-tokenize FTS and re-compute vectors |
+| `fts` | Re-tokenize FTS only (after dictionary changes) |
+| `vectors` | Re-compute vectors only (after model changes) |
+
+**Requires:** Running daemon (`tsm start`).
+
+**Examples:**
+
+```bash
+# Re-index FTS after adding words to user dictionary
+tsm reindex fts
+
+# Re-index everything
+tsm reindex all
+
+# Check progress
+tsm doctor
+```
+
+---
 
 ### tsm rebuild
 
-Rebuild the database from scratch.
+Rebuild the database from scratch (destructive).
 
 ```text
-tsm rebuild [--force] [--fts-only]
+tsm rebuild [--apply]
 ```
 
-Without flags: backs up the database, deletes it, re-initializes, and runs a
-full index. Prompts for confirmation before destructive operations.
+Without `--apply`: dry run showing database size, chunk count, and vector count.
 
-`--force` skips the confirmation prompt.
-
-`--fts-only` rebuilds only the FTS5 index while preserving vector embeddings.
-Useful after tokenizer or dictionary changes.
-
-`--force` and `--fts-only` are mutually exclusive.
+With `--apply`: backs up the database, deletes it, re-initializes, and runs a
+full index.
 
 **Flags:**
 
 | Flag | Description |
 |---|---|
-| `--force` | Proceed without confirmation prompt |
-| `--fts-only` | Rebuild FTS5 index only (preserves vectors) |
+| `--apply` | Actually perform the rebuild (without: dry run) |
 
-**Requires:** Daemon must not be running (`tsm stop` first).
+**Requires:** Daemon must not be running (`tsm stop` first) when using `--apply`.
 
 **Examples:**
 
 ```bash
-# Interactive rebuild (prompts for confirmation)
-tsm stop && tsm rebuild
+# Dry run — see what would be rebuilt
+tsm rebuild
 
-# Force rebuild without prompt
-tsm stop && tsm rebuild --force
-
-# Rebuild FTS index only after dictionary update
-tsm stop && tsm rebuild --fts-only
+# Rebuild
+tsm stop && tsm rebuild --apply
 ```
 
 ---
@@ -538,17 +564,17 @@ tsm dict update [--threshold N] [--apply]
 Without `--apply`: dry run — shows candidate words that appear frequently
 enough to be added to the user dictionary.
 
-With `--apply`: writes the dictionary CSV, rebuilds the FTS index, and creates
-a git branch and pull request with the changes.
-
-**Requires daemon stopped** when `--apply` is used.
+With `--apply`: writes the dictionary CSV, triggers FTS re-index, and creates
+a git branch and pull request with the changes. If the daemon is running, the
+FTS re-index is sent via IPC (no need to stop). If the daemon is stopped, FTS
+is rebuilt directly.
 
 **Flags:**
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--threshold` | integer | `5` | Minimum frequency for a word to be a candidate |
-| `--apply` | | | Write CSV and rebuild FTS index |
+| `--apply` | | | Write CSV and trigger FTS re-index |
 
 **Examples:**
 
@@ -559,8 +585,8 @@ tsm dict update
 # Show candidates with higher threshold
 tsm dict update --threshold 10
 
-# Apply changes (daemon must be stopped)
-tsm stop && tsm dict update --apply
+# Apply changes (works with or without daemon)
+tsm dict update --apply
 ```
 
 ---
