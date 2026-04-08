@@ -8,6 +8,9 @@ use crate::config;
 use crate::db;
 use crate::tokenizer;
 
+/// POS label for user dictionary entries in simpledic format.
+pub const USER_DICT_POS: &str = "カスタム名詞";
+
 // ─── Enums ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,9 +412,9 @@ pub fn get_pending_in_reject_list(
 
 // ─── CSV formatting ──────────────────────────────────────────
 
-/// Format a CSV row in janome simpledic format: surface,カスタム名詞,surface
+/// Format a CSV row in janome simpledic format: surface,{USER_DICT_POS},surface
 pub fn format_simpledic_row(surface: &str) -> String {
-    format!("{surface},カスタム名詞,{surface}")
+    format!("{surface},{},{surface}", USER_DICT_POS)
 }
 
 /// Export threshold candidates to a CSV file (appending).

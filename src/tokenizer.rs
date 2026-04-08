@@ -144,10 +144,12 @@ pub fn extract_search_keywords(text: &str) -> Vec<String> {
         let details = token.details();
 
         // Keep only nouns: 名詞-一般, 名詞-固有名詞, 名詞-サ変接続, 名詞-未知語, etc.
-        // Also keep user dictionary terms (POS = "カスタム名詞").
+        // Also keep user dictionary terms (POS = USER_DICT_POS).
         // Skip 名詞-非自立 (もの, こと, etc.) and 名詞-接尾 (的, 化, etc.)
         // and 名詞-代名詞 (これ, それ, etc.)
-        if details.is_empty() || (details[0] != "名詞" && details[0] != "カスタム名詞") {
+        if details.is_empty()
+            || (details[0] != "名詞" && details[0] != crate::user_dict::USER_DICT_POS)
+        {
             continue;
         }
         if details.len() >= 2 && matches!(details[1], "非自立" | "接尾" | "代名詞" | "数")
@@ -461,7 +463,8 @@ mod tests {
         let mut keywords = Vec::new();
         for token in tokens.iter_mut() {
             let details = token.details();
-            if details.is_empty() || (details[0] != "名詞" && details[0] != "カスタム名詞")
+            if details.is_empty()
+                || (details[0] != "名詞" && details[0] != crate::user_dict::USER_DICT_POS)
             {
                 continue;
             }
