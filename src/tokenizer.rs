@@ -10,9 +10,15 @@ use lindera::segmenter::Segmenter;
 use crate::config;
 
 // ─── IPADIC POS labels ──────────────────────────────────────
+// These constants come from the IPADIC dictionary format used by lindera.
+// lindera returns POS info via token.details(): details[0] is the top-level
+// POS category, details[1..] are subcategories specific to IPADIC's schema.
+// simpledic (user dict) entries only have [pos, reading] — subcategories
+// do not apply to user dictionary tokens.
+//
 // Top-level (details[0])
 pub const POS_NOUN: &str = "名詞";
-// Noun subcategories (details[1])
+// Noun subcategories (details[1]) — IPADIC-specific, not used by simpledic
 pub const POS_SUB_PROPER: &str = "固有名詞";
 pub const POS_SUB_DEPENDENT: &str = "非自立";
 pub const POS_SUB_SUFFIX: &str = "接尾";
