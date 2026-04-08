@@ -1871,9 +1871,9 @@ dependencies = [
 
 [[package]]
 name = "lindera"
-version = "2.3.3"
+version = "2.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40bc2f079a2fdd5abcef86cf99713a5f9f7484985f0eb9bbbcfe0cf4f631f93b"
+checksum = "0bb784bf51d22be2350667c35c0796250ca4dd6888ee98fe8a41f16f400f6c9b"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1904,9 +1904,9 @@ dependencies = [
 
 [[package]]
 name = "lindera-cc-cedict"
-version = "2.3.3"
+version = "2.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7901ea78378eb25f04249be8ccfb3d8b5d5d1caec09e5a3e751c9a707d09e61"
+checksum = "5814a81429c4d04d3becd1513fa62548b3ce22f11062e920911ddb205c1792c6"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1920,9 +1920,9 @@ dependencies = [
 
 [[package]]
 name = "lindera-dictionary"
-version = "2.3.3"
+version = "2.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85201adb783383ff0ea0946c74f407231826bae78c2c25359becb057de9d7640"
+checksum = "5cd0aa640fbefa4b4251f8ab001e47f213fdecf7bbbd0ee4a17a27b2cbff5ef1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1954,9 +1954,9 @@ dependencies = [
 
 [[package]]
 name = "lindera-ipadic"
-version = "2.3.3"
+version = "2.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b64c0585ebdf9f2f59dcfbef57430c62efca7c1d1aa8bd179d4b07ffdb5180d4"
+checksum = "94c8eebbfaee36d6ebd674aa796decbbb186e42c8b7a919f3495ba610cc8fcb6"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1970,9 +1970,9 @@ dependencies = [
 
 [[package]]
 name = "lindera-ipadic-neologd"
-version = "2.3.3"
+version = "2.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf7a039a22e62324757de0e622cc75f0ea437dbe2af831509c537e6b2f63ba15"
+checksum = "1f1742862984f32c110a5ba88880969d5fcc642452678ec2e3346b69b0651546"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1986,9 +1986,9 @@ dependencies = [
 
 [[package]]
 name = "lindera-jieba"
-version = "2.3.3"
+version = "2.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02cf38eb444ad723441dc523ad2aa929ca9c30cc1135e5f7d906980bfc6b2ea6"
+checksum = "9d7cccd7e88ef26c7a31db63079ad226ae7c54325cb3abca1d12ebd97044462d"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2002,9 +2002,9 @@ dependencies = [
 
 [[package]]
 name = "lindera-ko-dic"
-version = "2.3.3"
+version = "2.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f9fb45d278b1ac61c51a053060e75ca254c182060cd5688965666e6dffb52ea"
+checksum = "38f7f33c519e1ad6a9fe66a7520288d4ef117e8ae357fdd64d33c67030e527ea"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2018,9 +2018,9 @@ dependencies = [
 
 [[package]]
 name = "lindera-unidic"
-version = "2.3.3"
+version = "2.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2abb6c91c53d77f339e563b3e28a4964f92b0a10d0ec5738376e65fde22c0881"
+checksum = "65efa76d07bf5ab5b4a81f33238d4c3b8e9dbcf93e0bee96224d21287fb51759"
 dependencies = [
  "anyhow",
  "byteorder",
