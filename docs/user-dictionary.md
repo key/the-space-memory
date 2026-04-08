@@ -14,32 +14,57 @@ lindera の内蔵辞書（IPAdic）は一般的な日本語をカバーするが
   辞書への追加は `tsm dict update` コマンドで人間が確認してから行う
 - **reject で品質を担保** ---
   候補テーブルに溜まった不要語（ストップワード等）は `rejected` にマークすることで、
-  以後カウントされなくなる。辞書ファイル には影響しない
-- **辞書変更は rebuild とセット** ---
+  以後カウントされなくなる。`reject_words.txt` で一括管理できる
+- **辞書変更は FTS 再構築とセット** ---
   FTS5 トークナイザーが辞書を読むため、
-  辞書を変更したら `tsm rebuild --force` で FTS インデックスを再構築する必要がある
+  辞書を変更したら FTS インデックスを再構築する必要がある。
+  `tsm dict update --apply` は自動で FTS 再構築を行う
 
 ## ファイル構成
 
 ```text
 .tsm/
-├── tsm.db                  # dictionary_candidates テーブル（候補の蓄積・ステータス管理）
-└── user_dict.simpledic           # lindera に読ませる辞書ファイル（simpledic 形式）
+├── tsm.db                    # dictionary_candidates テーブル（候補の蓄積・ステータス管理）
+├── user_dict.simpledic       # lindera に読ませる辞書ファイル（simpledic 形式）
+└── reject_words.txt          # リジェクト対象の単語リスト（1行1単語、# でコメント）
 ```
 
 ### user_dict.simpledic
 
-lindera が形態素解析時に参照する辞書ファイル。simpledic 形式（11フィールド、カンマ区切り）。
+lindera が形態素解析時に参照する辞書ファイル。simpledic 形式（3フィールド、カンマ区切り）。
 
 ```csv
-tsmd,0,0,0,カスタム名詞,*,*,*,tsmd,tsmd,tsmd
-lora,0,0,0,カスタム名詞,*,*,*,lora,lora,lora
-ドッグトラッカー,0,0,0,カスタム名詞,*,*,*,ドッグトラッカー,ドッグトラッカー,ドッグトラッカー
+tsmd,カスタム名詞,tsmd
+LoRa,カスタム名詞,LoRa
+ドッグトラッカー,カスタム名詞,ドッグトラッカー
 ```
 
-各フィールド: `表層形,左文脈ID,右文脈ID,コスト,品詞,品詞細分類1,品詞細分類2,品詞細分類3,活用型,活用形,原形`
+各フィールド: `表層形,品詞,読み`
 
-tsm では全エントリを `カスタム名詞` として登録し、コスト 0 で最優先マッチさせる。
+- 品詞は `カスタム名詞`（`user_dict::USER_DICT_POS` 定数で定義）
+- 表層形は元のケースを保持する（`LoRa` は `LoRa` のまま登録）
+- lindera の Aho-Corasick マッチは大文字小文字を区別するため、
+  表層形のケースが原文と一致しないとマッチしない
+
+### reject_words.txt
+
+辞書に登録したくない単語のリスト。`tsm dict reject --apply` でDBに反映する。
+`rebuild --force` でDB がリセットされても、このファイルから再適用できる。
+
+```text
+# English stop words
+the
+and
+to
+in
+
+# Generic terms
+status
+process
+```
+
+- 1行1単語、`#` でコメント、空行は無視
+- `tsm dict reject --apply` で pending 候補を `rejected` にマーク
 
 ### dictionary_candidates テーブル（tsm.db 内）
 
@@ -58,17 +83,94 @@ tsm では全エントリを `カスタム名詞` として登録し、コスト
 ステータスの意味:
 
 - **pending** --- 候補として蓄積中。出現するたびに frequency が加算される
-- **accepted** --- `tsm dict update` で辞書ファイル に追加済み
+- **accepted** --- `tsm dict update --apply` で辞書ファイルに追加済み
 - **rejected** --- 不要と判断された語。frequency の加算がスキップされる
 
-## 実装ファイル
+## 辞書操作ガイド
 
-| ファイル | 役割 |
-|---|---|
-| `src/user_dict.rs` | 候補収集（`collect_from_text`）、辞書エクスポート、accept/reject 操作 |
-| `src/tokenizer.rs` | lindera の初期化。`user_dict.simpledic` を `load_user_dictionary_from_csv()` で読み込み、`Segmenter` に適用 |
-| `src/cli.rs` | `tsm dict update` コマンドの実装（`cmd_dict_update`） |
-| `src/db.rs` | `dictionary_candidates` テーブルのスキーマ定義 |
+### 初回セットアップ
+
+```bash
+# 1. インデックスして候補を蓄積
+tsm index
+
+# 2. 候補の確認（ドライラン）
+tsm dict update
+
+# 3. reject_words.txt を作成してストップワードを除外
+vi .tsm/reject_words.txt
+
+# 4. リジェクトを適用
+tsm dict reject --apply
+
+# 5. 残った候補を確認して辞書に追加
+tsm dict update          # ドライラン — 候補を確認
+tsm stop                 # デーモン停止が必要
+tsm dict update --apply  # 辞書追加 + FTS 再構築
+tsm start
+```
+
+### 定期メンテナンス
+
+`tsm doctor` が `N candidates ready` と報告したら候補が溜まっている。
+
+```bash
+# 1. 候補を確認
+tsm dict update
+
+# 2. 不要な語があれば reject_words.txt に追記して適用
+echo "newstopword" >> .tsm/reject_words.txt
+tsm dict reject --apply
+
+# 3. 辞書に追加
+tsm stop
+tsm dict update --apply
+tsm start
+```
+
+### rebuild 後のリジェクト再適用
+
+`tsm rebuild --force` は DB を削除・再作成するため、
+`dictionary_candidates` テーブルの rejected ステータスが失われる。
+`reject_words.txt` から再適用する:
+
+```bash
+tsm dict reject --apply
+```
+
+### 現在の状態を確認する
+
+```bash
+# doctor で辞書候補の概要を確認
+tsm doctor
+
+# 辞書の単語数
+wc -l .tsm/user_dict.simpledic
+
+# リジェクト済み単語の一覧
+tsm dict reject --all
+```
+
+## 候補収集の仕組み
+
+### 収集元
+
+| 収集タイミング | source 値 | 説明 |
+|---|---|---|
+| `tsm index` | `document` | ドキュメントのインデックス時 |
+| `tsm search` | `query` | 検索クエリの処理時 |
+| `tsm ingest-session` | `session` | セッション取り込み時 |
+
+### 収集される単語の種類
+
+| 種類 | 条件 | 例 |
+|---|---|---|
+| 固有名詞 | IPADIC が `名詞-固有名詞` と判定 | 東京、田中 |
+| カタカナ語 | 全文字カタカナ、2文字以上 | リンデラ、プロセス |
+| ASCII 語 | 英数字+記号、2文字以上、英字を含む | tsm, embedder, LoRa |
+
+**注意**: 英語のストップワード（the, and, is...）も ASCII 語として収集されるため、
+`reject_words.txt` での除外が重要。
 
 ### 候補収集の流れ
 
@@ -78,56 +180,11 @@ tsm では全エントリを `カスタム名詞` として登録し、コスト
 4. 1文字・数字のみ・記号のみの語もスキップ
 5. `dictionary_candidates` テーブルに UPSERT（既存なら frequency を +1、rejected なら加算しない）
 
-## 管理方法
+## 実装ファイル
 
-### 辞書に候補を追加する
-
-```bash
-# 1. デーモンを停止（tsm dict update は DB を直接操作するため）
-tsm stop
-
-# 2. 閾値（5回）以上の候補を辞書ファイル に追加
-tsm dict update --apply
-
-# 3. FTS インデックスを再構築（辞書変更を反映）
-tsm rebuild --force
-```
-
-`tsm dict update` は以下を行う:
-
-- frequency >= 5 かつ status = pending の候補を取得
-- 既に CSV にある語は `accepted` にマークしてスキップ
-- 新規の語を `user_dict.simpledic` に追記し、`accepted` にマーク
-
-### 候補を reject する
-
-不要な候補は rejected にすることで、doctor の報告から消え、今後 frequency も加算されなくなる。
-
-```bash
-# 現時点では CLI コマンドがないため、SQL で直接操作する
-sqlite3 .tsm/tsm.db "UPDATE dictionary_candidates SET status = 'rejected' WHERE surface = 'ストップワード'"
-```
-
-### 辞書から単語を手動削除する
-
-`user_dict.simpledic` をテキストエディタで編集し、不要な行を削除する。
-変更後は `tsm rebuild --force` が必要。
-
-### 現在の状態を確認する
-
-```bash
-# doctor で辞書候補の概要を確認
-tsm doctor
-
-# 候補テーブルの統計
-sqlite3 .tsm/tsm.db "SELECT status, COUNT(*) FROM dictionary_candidates GROUP BY status"
-
-# 閾値以上の pending 候補を表示
-sqlite3 .tsm/tsm.db \
-  "SELECT surface, frequency, pos FROM dictionary_candidates \
-   WHERE status = 'pending' AND frequency >= 5 \
-   ORDER BY frequency DESC LIMIT 20"
-
-# 辞書の単語数
-wc -l .tsm/user_dict.simpledic
-```
+| ファイル | 役割 |
+|---|---|
+| `src/user_dict.rs` | 候補収集（`collect_from_text`）、辞書エクスポート、accept/reject 操作、`USER_DICT_POS` 定数 |
+| `src/tokenizer.rs` | lindera の初期化。`user_dict.simpledic` を `load_user_dictionary_from_csv()` で読み込み、`Segmenter` に適用 |
+| `src/cli.rs` | `tsm dict update` / `tsm dict reject` コマンドの実装 |
+| `src/db.rs` | `dictionary_candidates` テーブルのスキーマ定義 |
