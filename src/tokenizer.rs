@@ -9,6 +9,9 @@ use lindera::segmenter::Segmenter;
 
 use crate::config;
 
+/// IPADIC top-level POS label for nouns. Used by POS filters across the codebase.
+pub const POS_NOUN: &str = "名詞";
+
 static SEGMENTER: Mutex<Option<Arc<Segmenter>>> = Mutex::new(None);
 static STOPWORDS: OnceLock<HashSet<String>> = OnceLock::new();
 
@@ -186,7 +189,7 @@ pub fn extract_search_keywords(text: &str) -> Vec<String> {
         // User dictionary terms also use POS "名詞" so they pass this filter naturally.
         // Skip 名詞-非自立 (もの, こと, etc.) and 名詞-接尾 (的, 化, etc.)
         // and 名詞-代名詞 (これ, それ, etc.)
-        if details.is_empty() || details[0] != "名詞" {
+        if details.is_empty() || details[0] != POS_NOUN {
             continue;
         }
         if details.len() >= 2 && matches!(details[1], "非自立" | "接尾" | "代名詞" | "数")
@@ -241,7 +244,7 @@ pub fn extract_proper_nouns(text: &str) -> Vec<String> {
         .iter_mut()
         .filter_map(|token| {
             let details = token.details();
-            if details.len() >= 2 && details[0] == "名詞" && details[1] == "固有名詞" {
+            if details.len() >= 2 && details[0] == POS_NOUN && details[1] == "固有名詞" {
                 Some(token.surface.as_ref().to_string())
             } else {
                 None
@@ -509,9 +512,7 @@ mod tests {
         let mut keywords = Vec::new();
         for token in tokens.iter_mut() {
             let details = token.details();
-            if details.is_empty()
-                || (details[0] != "名詞" && details[0] != crate::user_dict::USER_DICT_POS)
-            {
+            if details.is_empty() || details[0] != POS_NOUN {
                 continue;
             }
             if details.len() >= 2 && matches!(details[1], "非自立" | "接尾" | "代名詞" | "数")

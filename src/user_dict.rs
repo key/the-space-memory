@@ -9,9 +9,9 @@ use crate::db;
 use crate::tokenizer;
 
 /// POS label for user dictionary entries in simpledic format.
-/// Using standard "名詞" avoids the need for special POS filter handling
-/// everywhere tokens are filtered by part of speech.
-pub const USER_DICT_POS: &str = "名詞";
+/// Re-exports `tokenizer::POS_NOUN` — user dict terms use the standard noun POS
+/// so they pass existing POS filters without special handling.
+pub const USER_DICT_POS: &str = crate::tokenizer::POS_NOUN;
 
 // ─── Enums ───────────────────────────────────────────────────
 
@@ -134,7 +134,10 @@ fn extract_raw_candidates(text: &str) -> Vec<RawCandidate> {
         let surface = token.surface.as_ref().to_string();
         let details = token.details();
 
-        let pos = if details.len() >= 2 && details[0] == "名詞" && details[1] == "固有名詞" {
+        let pos = if details.len() >= 2
+            && details[0] == crate::tokenizer::POS_NOUN
+            && details[1] == "固有名詞"
+        {
             Some(CandidatePos::ProperNoun)
         } else if is_all_katakana(&surface) && surface.chars().count() >= 2 {
             Some(CandidatePos::Katakana)

@@ -244,7 +244,7 @@ pub fn learn_from_message(conn: &Connection, message: &str, source: &str) {
             let surface = t.surface.as_ref().to_string();
             let details = t.details();
             if details.len() >= 2
-                && details[0] == "名詞"
+                && details[0] == crate::tokenizer::POS_NOUN
                 && surface.chars().count() >= 2
                 && !surface.chars().all(|c| c.is_ascii_digit())
             {
