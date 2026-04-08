@@ -330,6 +330,11 @@ run search_json "メロス 激怒" --fallback fts-only
 assert_json "dict: search works after rebuild" \
     'any(.[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
+# Verify dict-registered word works as a standalone search query (#104)
+run search_json "$DICT_WORD" --fallback fts-only
+assert_json "dict: standalone search for dict term '$DICT_WORD' hits hashire-melos" \
+    'any(.[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
 # ── Edge cases ────────────────────────────────────────────────────────
 
 echo ""
