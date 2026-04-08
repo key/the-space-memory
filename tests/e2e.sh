@@ -309,7 +309,7 @@ tsm stop 2>/dev/null
 sleep 1
 
 USER_DICT_PATH="$TSM_STATE_DIR/user_dict.simpledic"
-echo "${DICT_WORD},カスタム名詞,${DICT_WORD}" >> "$USER_DICT_PATH"
+echo "${DICT_WORD},名詞,${DICT_WORD}" >> "$USER_DICT_PATH"
 log "Added '$DICT_WORD' to user dictionary"
 
 log "Rebuilding FTS index..."

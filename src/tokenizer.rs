@@ -32,6 +32,23 @@ pub fn reset_segmenter() {
     *guard = None;
 }
 
+/// Strip comment lines (`#`) and blank lines from simpledic content.
+/// Returns only the data lines joined by newlines, or `None` if empty.
+fn strip_simpledic_comments(content: &str) -> Option<String> {
+    let lines: Vec<&str> = content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .collect();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 fn load_user_dict(metadata: &lindera::dictionary::Metadata) -> Option<UserDictionary> {
     let path = config::user_dict_path();
 
@@ -39,7 +56,29 @@ fn load_user_dict(metadata: &lindera::dictionary::Metadata) -> Option<UserDictio
         return None;
     }
 
-    match load_user_dictionary_from_csv(metadata, &path) {
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("failed to read user dictionary: {e}");
+            return None;
+        }
+    };
+
+    // Strip comments and blank lines before passing to lindera
+    // (lindera's CSV parser does not support comments)
+    let stripped = strip_simpledic_comments(&content)?;
+
+    // Write stripped content to a temp file for lindera
+    let tmp_path = std::env::temp_dir().join("tsm_user_dict.simpledic");
+    if let Err(e) = std::fs::write(&tmp_path, &stripped) {
+        log::warn!("failed to write temp user dictionary: {e}");
+        return None;
+    }
+
+    let result = load_user_dictionary_from_csv(metadata, &tmp_path);
+    let _ = std::fs::remove_file(&tmp_path);
+
+    match result {
         Ok(ud) => {
             log::info!("user dictionary loaded: {}", path.display());
             Some(ud)
@@ -143,13 +182,11 @@ pub fn extract_search_keywords(text: &str) -> Vec<String> {
     for token in tokens.iter_mut() {
         let details = token.details();
 
-        // Keep only nouns: 名詞-一般, 名詞-固有名詞, 名詞-サ変接続, 名詞-未知語, etc.
-        // Also keep user dictionary terms (POS = USER_DICT_POS).
+        // Keep only nouns: 名詞-一般, 名詞-固有名詞, 名詞-サ変接続, etc.
+        // User dictionary terms also use POS "名詞" so they pass this filter naturally.
         // Skip 名詞-非自立 (もの, こと, etc.) and 名詞-接尾 (的, 化, etc.)
         // and 名詞-代名詞 (これ, それ, etc.)
-        if details.is_empty()
-            || (details[0] != "名詞" && details[0] != crate::user_dict::USER_DICT_POS)
-        {
+        if details.is_empty() || details[0] != "名詞" {
             continue;
         }
         if details.len() >= 2 && matches!(details[1], "非自立" | "接尾" | "代名詞" | "数")
@@ -384,6 +421,21 @@ mod tests {
         assert!(lora_count <= 1, "Should deduplicate: {:?}", result);
     }
 
+    // ─── strip_simpledic_comments tests ─────────────────────────
+
+    #[test]
+    fn test_strip_simpledic_comments_removes_comments_and_blanks() {
+        let input = "# date comment\n\nLoRa,名詞,LoRa\n# another\ntsmd,名詞,tsmd\n";
+        let result = strip_simpledic_comments(input).unwrap();
+        assert_eq!(result, "LoRa,名詞,LoRa\ntsmd,名詞,tsmd");
+    }
+
+    #[test]
+    fn test_strip_simpledic_comments_empty_returns_none() {
+        assert!(strip_simpledic_comments("").is_none());
+        assert!(strip_simpledic_comments("# only comments\n\n").is_none());
+    }
+
     // ─── user dictionary tests ────────────────────────────────
 
     #[test]
@@ -398,11 +450,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let dict_path = dir.path().join("test.simpledic");
         // lindera user dict: 3 fields (surface, part_of_speech, reading)
-        std::fs::write(
-            &dict_path,
-            "ドッグトラッカー,カスタム名詞,ドッグトラッカー\n",
-        )
-        .unwrap();
+        std::fs::write(&dict_path, "ドッグトラッカー,名詞,ドッグトラッカー\n").unwrap();
 
         let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC).unwrap();
         let user_dict = load_user_dictionary_from_csv(&dictionary.metadata, &dict_path).unwrap();
@@ -446,11 +494,7 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let dict_path = dir.path().join("test.simpledic");
-        std::fs::write(
-            &dict_path,
-            "ドッグトラッカー,カスタム名詞,ドッグトラッカー\n",
-        )
-        .unwrap();
+        std::fs::write(&dict_path, "ドッグトラッカー,名詞,ドッグトラッカー\n").unwrap();
 
         let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC).unwrap();
         let user_dict = load_user_dictionary_from_csv(&dictionary.metadata, &dict_path).unwrap();
@@ -482,7 +526,7 @@ mod tests {
 
         assert!(
             keywords.contains(&"ドッグトラッカー".to_string()),
-            "User dict term with カスタム名詞 POS should be included in keywords: {:?}",
+            "User dict term with 名詞 POS should be included in keywords: {:?}",
             keywords
         );
     }

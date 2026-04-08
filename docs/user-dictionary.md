@@ -34,17 +34,18 @@ lindera の内蔵辞書（IPAdic）は一般的な日本語をカバーするが
 lindera が形態素解析時に参照する辞書ファイル。simpledic 形式（3フィールド、カンマ区切り）。
 
 ```csv
-tsmd,カスタム名詞,tsmd
-LoRa,カスタム名詞,LoRa
-ドッグトラッカー,カスタム名詞,ドッグトラッカー
+tsmd,名詞,tsmd
+LoRa,名詞,LoRa
+ドッグトラッカー,名詞,ドッグトラッカー
 ```
 
 各フィールド: `表層形,品詞,読み`
 
-- 品詞は `カスタム名詞`（`user_dict::USER_DICT_POS` 定数で定義）
+- 品詞は `名詞`（`user_dict::USER_DICT_POS` 定数で定義）
 - 表層形は元のケースを保持する（`LoRa` は `LoRa` のまま登録）
 - lindera の Aho-Corasick マッチは大文字小文字を区別するため、
   表層形のケースが原文と一致しないとマッチしない
+- `#` で始まる行はコメント、空行は無視される（tsm がロード時に除去してから lindera に渡す）
 
 ### reject_words.txt
 

@@ -9,7 +9,9 @@ use crate::db;
 use crate::tokenizer;
 
 /// POS label for user dictionary entries in simpledic format.
-pub const USER_DICT_POS: &str = "カスタム名詞";
+/// Using standard "名詞" avoids the need for special POS filter handling
+/// everywhere tokens are filtered by part of speech.
+pub const USER_DICT_POS: &str = "名詞";
 
 // ─── Enums ───────────────────────────────────────────────────
 
@@ -829,7 +831,7 @@ mod tests {
 
     #[test]
     fn test_format_simpledic_row() {
-        assert_eq!(format_simpledic_row("candle"), "candle,カスタム名詞,candle");
+        assert_eq!(format_simpledic_row("candle"), "candle,名詞,candle");
     }
 
     // ─── load_existing_surfaces tests ────────────────────────
@@ -844,11 +846,7 @@ mod tests {
     fn test_load_existing_surfaces_reads_csv() {
         let dir = tempfile::TempDir::new().unwrap();
         let csv_path = dir.path().join("dict.csv");
-        std::fs::write(
-            &csv_path,
-            "candle,カスタム名詞,candle\nlindera,カスタム名詞,lindera\n",
-        )
-        .unwrap();
+        std::fs::write(&csv_path, "candle,名詞,candle\nlindera,名詞,lindera\n").unwrap();
 
         let surfaces = load_existing_surfaces(&csv_path).unwrap();
         assert!(surfaces.contains("candle"));
@@ -860,7 +858,7 @@ mod tests {
     fn test_load_existing_surfaces_skips_comments_and_empty() {
         let dir = tempfile::TempDir::new().unwrap();
         let csv_path = dir.path().join("dict.csv");
-        std::fs::write(&csv_path, "# comment\n\ncandle,カスタム名詞,candle\n").unwrap();
+        std::fs::write(&csv_path, "# comment\n\ncandle,名詞,candle\n").unwrap();
 
         let surfaces = load_existing_surfaces(&csv_path).unwrap();
         assert_eq!(surfaces.len(), 1);
@@ -887,7 +885,7 @@ mod tests {
         assert!(csv_path.exists());
 
         let content = std::fs::read_to_string(&csv_path).unwrap();
-        assert!(content.contains("candle,カスタム名詞,candle"));
+        assert!(content.contains("candle,名詞,candle"));
 
         let status: String = conn
             .query_row(
@@ -931,7 +929,7 @@ mod tests {
         let csv_path = dir.path().join("user_dict.csv");
 
         // Write candidate to CSV manually
-        std::fs::write(&csv_path, "candle,カスタム名詞,candle\n").unwrap();
+        std::fs::write(&csv_path, "candle,名詞,candle\n").unwrap();
 
         // Insert same candidate into DB with status = 'pending'
         let now = "2026-01-01T00:00:00Z";
@@ -971,7 +969,7 @@ mod tests {
         let csv_path = dir.path().join("user_dict.csv");
 
         // Write an existing entry
-        std::fs::write(&csv_path, "existing_word,カスタム名詞,existing_word\n").unwrap();
+        std::fs::write(&csv_path, "existing_word,名詞,existing_word\n").unwrap();
 
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
