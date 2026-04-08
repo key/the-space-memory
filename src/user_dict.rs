@@ -140,10 +140,10 @@ fn extract_raw_candidates(text: &str) -> Vec<RawCandidate> {
         };
 
         if let Some(pos) = pos {
-            let normalized = surface.to_lowercase();
-            if seen.insert(normalized.clone()) {
+            let lower = surface.to_lowercase();
+            if seen.insert(lower) {
                 candidates.push(RawCandidate {
-                    surface: normalized,
+                    surface: surface.clone(),
                     pos,
                 });
             }
@@ -579,6 +579,21 @@ mod tests {
                 c.pos == CandidatePos::Ascii || c.pos == CandidatePos::ProperNoun,
                 "should be ascii or proper_noun, got {:?}",
                 c.pos
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_raw_candidates_preserves_case() {
+        let candidates = extract_raw_candidates("LoRa module development");
+        if let Some(c) = candidates
+            .iter()
+            .find(|c| c.surface.to_lowercase() == "lora")
+        {
+            assert_eq!(
+                c.surface, "LoRa",
+                "should preserve original case, got {:?}",
+                c.surface
             );
         }
     }

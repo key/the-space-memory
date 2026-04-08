@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use lindera::dictionary::{
     load_embedded_dictionary, load_user_dictionary_from_csv, DictionaryKind, UserDictionary,
@@ -9,16 +9,27 @@ use lindera::segmenter::Segmenter;
 
 use crate::config;
 
-static SEGMENTER: OnceLock<Segmenter> = OnceLock::new();
+static SEGMENTER: Mutex<Option<Arc<Segmenter>>> = Mutex::new(None);
 static STOPWORDS: OnceLock<HashSet<String>> = OnceLock::new();
 
-pub fn get_segmenter() -> &'static Segmenter {
-    SEGMENTER.get_or_init(|| {
-        let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC)
-            .expect("Failed to load IPADIC dictionary");
-        let user_dict = load_user_dict(&dictionary.metadata);
-        Segmenter::new(Mode::Normal, dictionary, user_dict)
-    })
+pub fn get_segmenter() -> Arc<Segmenter> {
+    let mut guard = SEGMENTER.lock().unwrap();
+    if let Some(seg) = guard.as_ref() {
+        return Arc::clone(seg);
+    }
+    let dictionary =
+        load_embedded_dictionary(DictionaryKind::IPADIC).expect("Failed to load IPADIC dictionary");
+    let user_dict = load_user_dict(&dictionary.metadata);
+    let seg = Arc::new(Segmenter::new(Mode::Normal, dictionary, user_dict));
+    *guard = Some(Arc::clone(&seg));
+    seg
+}
+
+/// Invalidate the cached segmenter so that the next call to
+/// `get_segmenter()` reloads the dictionary (including user dict).
+pub fn reset_segmenter() {
+    let mut guard = SEGMENTER.lock().unwrap();
+    *guard = None;
 }
 
 fn load_user_dict(metadata: &lindera::dictionary::Metadata) -> Option<UserDictionary> {
@@ -133,9 +144,10 @@ pub fn extract_search_keywords(text: &str) -> Vec<String> {
         let details = token.details();
 
         // Keep only nouns: 名詞-一般, 名詞-固有名詞, 名詞-サ変接続, 名詞-未知語, etc.
+        // Also keep user dictionary terms (POS = "カスタム名詞").
         // Skip 名詞-非自立 (もの, こと, etc.) and 名詞-接尾 (的, 化, etc.)
         // and 名詞-代名詞 (これ, それ, etc.)
-        if details.is_empty() || details[0] != "名詞" {
+        if details.is_empty() || (details[0] != "名詞" && details[0] != "カスタム名詞") {
             continue;
         }
         if details.len() >= 2 && matches!(details[1], "非自立" | "接尾" | "代名詞" | "数")
@@ -237,9 +249,20 @@ mod tests {
 
     #[test]
     fn test_singleton_cached() {
-        let s1 = get_segmenter() as *const Segmenter;
-        let s2 = get_segmenter() as *const Segmenter;
-        assert_eq!(s1, s2);
+        let s1 = get_segmenter();
+        let s2 = get_segmenter();
+        assert!(Arc::ptr_eq(&s1, &s2));
+    }
+
+    #[test]
+    fn test_reset_segmenter() {
+        let s1 = get_segmenter();
+        reset_segmenter();
+        let s2 = get_segmenter();
+        assert!(
+            !Arc::ptr_eq(&s1, &s2),
+            "After reset, get_segmenter() should return a new instance"
+        );
     }
 
     // ─── extract_proper_nouns tests ──────────────────────────
@@ -407,6 +430,56 @@ mod tests {
             std::path::Path::new("/nonexistent/dict.simpledic"),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_keywords_includes_user_dict_terms() {
+        use lindera::dictionary::{
+            load_embedded_dictionary, load_user_dictionary_from_csv, DictionaryKind,
+        };
+        use lindera::mode::Mode;
+        use lindera::segmenter::Segmenter;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let dict_path = dir.path().join("test.simpledic");
+        std::fs::write(
+            &dict_path,
+            "ドッグトラッカー,カスタム名詞,ドッグトラッカー\n",
+        )
+        .unwrap();
+
+        let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC).unwrap();
+        let user_dict = load_user_dictionary_from_csv(&dictionary.metadata, &dict_path).unwrap();
+        let segmenter = Segmenter::new(Mode::Normal, dictionary, Some(user_dict));
+
+        // Tokenize and extract keywords using the same logic as extract_search_keywords
+        let stopwords = get_stopwords();
+        let mut tokens = segmenter
+            .segment(std::borrow::Cow::Borrowed("ドッグトラッカーの開発"))
+            .unwrap();
+
+        let mut keywords = Vec::new();
+        for token in tokens.iter_mut() {
+            let details = token.details();
+            if details.is_empty() || (details[0] != "名詞" && details[0] != "カスタム名詞")
+            {
+                continue;
+            }
+            if details.len() >= 2 && matches!(details[1], "非自立" | "接尾" | "代名詞" | "数")
+            {
+                continue;
+            }
+            let surface = token.surface.as_ref();
+            if !stopwords.contains(surface) {
+                keywords.push(surface.to_string());
+            }
+        }
+
+        assert!(
+            keywords.contains(&"ドッグトラッカー".to_string()),
+            "User dict term with カスタム名詞 POS should be included in keywords: {:?}",
+            keywords
+        );
     }
 
     #[test]

@@ -1122,6 +1122,9 @@ pub fn cmd_dict_update(threshold: i64, apply: bool) -> anyhow::Result<()> {
 
     drop(conn);
 
+    // Invalidate cached segmenter so FTS rebuild uses the new dictionary
+    crate::tokenizer::reset_segmenter();
+
     // Rebuild FTS only (dict changes only affect tokenization, not vectors)
     log::info!("\nRebuilding FTS index...");
     cmd_rebuild_fts()?;
