@@ -1,0 +1,45 @@
+name: Code Metrics
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+  pull_request:
+    paths:
+      - "src/**"
+
+jobs:
+  complexity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.x"
+
+      - run: pip install lizard
+
+      - name: Cyclomatic complexity (baseline 13)
+        run: |
+          count=$(lizard src/ --language rust -Tcyclomatic_complexity=15 -w 2>&1 \
+            | grep -c ": warning:" || true)
+          echo "High-complexity functions: $count (baseline: 13)"
+          if [ "$count" -gt 13 ]; then
+            echo "::error::New high-complexity functions detected ($count > 13 baseline)"
+            lizard src/ --language rust -Tcyclomatic_complexity=15 -w 2>&1
+            exit 1
+          fi
+
+  duplication:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Duplicate detection (threshold 5%)
+        run: npx jscpd
