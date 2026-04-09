@@ -1,0 +1,9 @@
+{
+  "path": ["src/"],
+  "language": ["rust"],
+  "minLines": 10,
+  "minTokens": 50,
+  "threshold": 5,
+  "reporters": ["console"],
+  "ignore": ["**/*test*"]
+}

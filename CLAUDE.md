@@ -34,6 +34,10 @@ shellcheck <file>.sh
 yamllint <file>.yml
 taplo check <file>.toml
 
+# Code metrics
+lizard src/ --language rust -Tcyclomatic_complexity=15 -w  # CCN warnings
+npx jscpd                                                  # Duplicate detection
+
 # E2E tests (requires release build + model download)
 bash tests/e2e.sh
 ```
@@ -200,6 +204,8 @@ A change is merge-ready when **all** of the following hold:
 - [ ] `cargo fmt --check` clean
 - [ ] Coverage ≥ 90% (on covered modules)
 - [ ] New pub functions have unit tests
+- [ ] `npx jscpd` duplication ≤ 5%
+- [ ] `lizard src/ --language rust -Tcyclomatic_complexity=15 -w` no new warnings
 - [ ] `bash tests/e2e.sh` passes (if search, index, or IPC changed)
 - [ ] CLAUDE.md updated if architecture or commands changed
 - [ ] README.md / README.ja.md updated in sync (if user-facing change)
