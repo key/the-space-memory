@@ -34,6 +34,10 @@ shellcheck <file>.sh
 yamllint <file>.yml
 taplo check <file>.toml
 
+# Code metrics
+lizard src/ --language rust -Tcyclomatic_complexity=15 -w  # CCN warnings
+npx jscpd                                                  # Duplicate detection
+
 # E2E tests (requires release build + model download)
 bash tests/e2e.sh
 ```
