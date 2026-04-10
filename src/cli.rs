@@ -254,11 +254,7 @@ pub fn format_text(results: &[searcher::SearchResult], total_hits: usize) -> Str
     if results.is_empty() {
         return "No results found.".to_string();
     }
-    let mut out = format!(
-        "Showing {} of {} results\n\n",
-        results.len(),
-        total_hits
-    );
+    let mut out = format!("Showing {} of {} results\n\n", results.len(), total_hits);
     for (i, r) in results.iter().enumerate() {
         out.push_str(&format!(
             "{}. [{}] {} — {} (score: {:.4})\n",
