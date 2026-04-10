@@ -151,9 +151,16 @@ pub fn upsert_synonym(
     Ok(())
 }
 
+/// Progress callback type for import_wordnet: (imported_so_far, total).
+pub type WordnetProgressCb<'a> = &'a dyn Fn(usize, usize);
+
 /// Import synonym pairs from a Japanese WordNet SQLite database.
 /// Extracts pairs of Japanese words that share a synset.
-pub fn import_wordnet(conn: &Connection, wordnet_path: &std::path::Path) -> anyhow::Result<usize> {
+pub fn import_wordnet(
+    conn: &Connection,
+    wordnet_path: &std::path::Path,
+    progress_cb: Option<WordnetProgressCb<'_>>,
+) -> anyhow::Result<usize> {
     if !db::has_synonyms_table(conn) {
         anyhow::bail!("synonyms table not found");
     }
@@ -199,12 +206,10 @@ pub fn import_wordnet(conn: &Connection, wordnet_path: &std::path::Path) -> anyh
         }
         tx.commit()?;
         imported += chunk.len();
-        if imported % 10000 == 0 {
-            eprint!("\r  {imported}/{total}");
+        if let Some(cb) = progress_cb {
+            cb(imported, total);
         }
     }
-
-    eprint!("\r                              \r"); // clear progress line
     log::info!("{imported}/{total} synonym pairs imported.");
     Ok(imported)
 }
@@ -600,5 +605,90 @@ mod tests {
             score < 0.1,
             "never-hit entry should decay from creation date"
         );
+    }
+
+    /// Create a minimal WordNet-schema SQLite DB with the given pairs.
+    fn create_mock_wordnet(pairs: &[(&str, &str)]) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let wn = rusqlite::Connection::open(file.path()).unwrap();
+        wn.execute_batch(
+            "CREATE TABLE word (wordid INTEGER PRIMARY KEY, lemma TEXT, lang TEXT);
+             CREATE TABLE synset (synset TEXT PRIMARY KEY);
+             CREATE TABLE sense (synset TEXT, wordid INTEGER);",
+        )
+        .unwrap();
+        let mut word_id = 1i64;
+        let mut synset_id = 1;
+        for (a, b) in pairs {
+            let sid = format!("syn{synset_id:04}");
+            wn.execute(
+                "INSERT INTO synset (synset) VALUES (?)",
+                rusqlite::params![sid],
+            )
+            .unwrap();
+            wn.execute(
+                "INSERT INTO word (wordid, lemma, lang) VALUES (?, ?, 'jpn')",
+                rusqlite::params![word_id, a],
+            )
+            .unwrap();
+            wn.execute(
+                "INSERT INTO sense (synset, wordid) VALUES (?, ?)",
+                rusqlite::params![sid, word_id],
+            )
+            .unwrap();
+            word_id += 1;
+            wn.execute(
+                "INSERT INTO word (wordid, lemma, lang) VALUES (?, ?, 'jpn')",
+                rusqlite::params![word_id, b],
+            )
+            .unwrap();
+            wn.execute(
+                "INSERT INTO sense (synset, wordid) VALUES (?, ?)",
+                rusqlite::params![sid, word_id],
+            )
+            .unwrap();
+            word_id += 1;
+            synset_id += 1;
+        }
+        file
+    }
+
+    #[test]
+    fn test_import_wordnet_with_callback() {
+        let conn = setup();
+        let wn_file = create_mock_wordnet(&[("狩猟", "ハンティング"), ("射撃", "シューティング")]);
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let cb = |imported: usize, total: usize| {
+            calls.borrow_mut().push((imported, total));
+        };
+
+        let count = import_wordnet(&conn, wn_file.path(), Some(&cb)).unwrap();
+        assert_eq!(count, 2);
+
+        let calls = calls.into_inner();
+        assert!(!calls.is_empty(), "callback should be called at least once");
+        let last = calls.last().unwrap();
+        assert_eq!(last.0, 2, "last call should report all imported");
+        assert_eq!(last.1, 2, "total should match");
+    }
+
+    #[test]
+    fn test_import_wordnet_without_callback() {
+        let conn = setup();
+        let wn_file = create_mock_wordnet(&[("狩猟", "ハンティング")]);
+
+        let count = import_wordnet(&conn, wn_file.path(), None).unwrap();
+        assert_eq!(count, 1);
+
+        // Verify pair was inserted
+        let stored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM synonyms WHERE source = 'wordnet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1);
     }
 }

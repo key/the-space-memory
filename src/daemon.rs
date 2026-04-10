@@ -114,7 +114,7 @@ pub fn handle_request(
 
         DaemonRequest::ImportWordnet { wordnet_db } => {
             let path = PathBuf::from(&wordnet_db);
-            match crate::synonyms::import_wordnet(conn, &path) {
+            match crate::synonyms::import_wordnet(conn, &path, None) {
                 Ok(count) => DaemonResponse::success(serde_json::json!({
                     "imported": count,
                 })),

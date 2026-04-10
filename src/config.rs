@@ -546,6 +546,10 @@ pub fn reject_words_path() -> PathBuf {
     state_dir().join("reject_words.txt")
 }
 
+pub fn wordnet_db_path() -> PathBuf {
+    state_dir().join("wnjpn.db")
+}
+
 pub fn daemon_pid_path() -> PathBuf {
     state_dir().join("tsmd.pid")
 }

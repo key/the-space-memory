@@ -3401,6 +3401,7 @@ dependencies = [
  "chrono",
  "clap",
  "directories",
+ "flate2",
  "flexi_logger",
  "hf-hub",
  "libc",
@@ -3419,6 +3420,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenizers",
  "toml",
+ "ureq",
 ]
 
 [[package]]

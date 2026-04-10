@@ -130,18 +130,21 @@ tsm restart
 
 ### tsm setup
 
-Download ruri-v3-30m model files from HuggingFace Hub.
+Download model files and Japanese WordNet synonym database.
 
 ```text
 tsm setup
 ```
 
-Downloads `config.json`, `tokenizer.json`, and `model.safetensors` for
-`cl-nagoya/ruri-v3-30m` into the local model cache. Must be run before
-starting the daemon for the first time.
+Performs initial setup required before starting the daemon:
 
-Model files are cached in the HuggingFace cache directory
-(`$HF_HOME` or `~/.cache/huggingface`).
+1. Downloads `cl-nagoya/ruri-v3-30m` model files (`config.json`,
+   `tokenizer.json`, `model.safetensors`) from HuggingFace Hub
+   and copies them to `.tsm/models/ruri-v3-30m/`.
+2. Downloads Japanese WordNet (`wnjpn.db.gz`) from GitHub and
+   decompresses it to `.tsm/wnjpn.db`.
+3. If the database is already initialized (`tsm init`), imports
+   WordNet synonym pairs automatically.
 
 **Flags:** none
 
@@ -532,10 +535,11 @@ Import Japanese WordNet synonyms into the database.
 tsm import-wordnet <wnjpn.db>
 ```
 
-Imports synonym pairs from the Japanese WordNet SQLite database (`wnjpn.db`)
+Imports synonym pairs from a Japanese WordNet SQLite database (`wnjpn.db`)
 into the local synonyms table. Used for query expansion during search.
 
-Download `wnjpn.db` from the [Japanese WordNet project](http://compling.hss.ntu.edu.sg/wnja/).
+`tsm setup` downloads and imports WordNet automatically. This command is
+for manual import from a custom path.
 
 **Arguments:**
 
