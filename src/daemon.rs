@@ -49,8 +49,13 @@ pub fn handle_request(
                 paths: paths.as_deref(),
             };
             match cli::run_search(conn, &opts) {
-                Ok(results) => {
-                    let json_str = cli::format_json(&results, include_content, index_root);
+                Ok(output) => {
+                    let json_str = cli::format_json(
+                        &output.results,
+                        output.total_hits,
+                        include_content,
+                        index_root,
+                    );
                     match json_str {
                         Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
                             Ok(v) => DaemonResponse::success(v),
@@ -191,10 +196,10 @@ mod tests {
         };
         let resp = handle_request(&conn, req, dir.path(), &flag);
         assert!(resp.ok);
-        // Empty DB returns empty array
+        // Empty DB returns envelope with empty results
         let payload = resp.payload.unwrap();
-        assert!(payload.is_array());
-        assert_eq!(payload.as_array().unwrap().len(), 0);
+        assert_eq!(payload["total_hits"], 0);
+        assert_eq!(payload["results"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -241,8 +246,8 @@ mod tests {
         };
         let resp = handle_request(&conn, req, dir.path(), &flag);
         assert!(resp.ok);
-        let results = resp.payload.unwrap();
-        let arr = results.as_array().unwrap();
+        let payload = resp.payload.unwrap();
+        let arr = payload["results"].as_array().unwrap();
         for item in arr {
             let path = item["source_file"].as_str().unwrap();
             assert!(
@@ -486,7 +491,9 @@ mod tests {
         )
         .unwrap();
         assert!(resp.ok);
-        assert!(resp.payload.unwrap().is_array());
+        let payload = resp.payload.unwrap();
+        assert!(payload["results"].is_array());
+        assert!(payload["total_hits"].is_number());
 
         server.join().unwrap();
     }

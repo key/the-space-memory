@@ -199,7 +199,7 @@ pub struct SearchOptions<'a> {
 pub fn run_search(
     conn: &rusqlite::Connection,
     opts: &SearchOptions,
-) -> anyhow::Result<Vec<searcher::SearchResult>> {
+) -> anyhow::Result<searcher::SearchOutput> {
     use crate::temporal;
 
     // Resolve fallback policy: CLI flag > config > default (Error)
@@ -242,19 +242,23 @@ pub fn cmd_search(opts: SearchOptions) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
 
-    let results = run_search(&conn, &opts)?;
+    let output = run_search(&conn, &opts)?;
     match opts.format {
-        "json" => print_json(&results, opts.include_content)?,
-        _ => print_text(&results),
+        "json" => print_json(&output.results, output.total_hits, opts.include_content)?,
+        _ => print_text(&output.results, output.total_hits),
     }
     Ok(())
 }
 
-pub fn format_text(results: &[searcher::SearchResult]) -> String {
+pub fn format_text(results: &[searcher::SearchResult], total_hits: usize) -> String {
     if results.is_empty() {
         return "No results found.".to_string();
     }
-    let mut out = String::new();
+    let mut out = format!(
+        "Showing {} of {} results\n\n",
+        results.len(),
+        total_hits
+    );
     for (i, r) in results.iter().enumerate() {
         out.push_str(&format!(
             "{}. [{}] {} — {} (score: {:.4})\n",
@@ -282,12 +286,13 @@ pub fn format_text(results: &[searcher::SearchResult]) -> String {
     out
 }
 
-fn print_text(results: &[searcher::SearchResult]) {
-    print!("{}", format_text(results));
+fn print_text(results: &[searcher::SearchResult], total_hits: usize) {
+    print!("{}", format_text(results, total_hits));
 }
 
 pub fn format_json(
     results: &[searcher::SearchResult],
+    total_hits: usize,
     include_content: Option<usize>,
     index_root: &Path,
 ) -> anyhow::Result<String> {
@@ -328,15 +333,24 @@ pub fn format_json(
         json_results.push(obj);
     }
 
-    Ok(serde_json::to_string_pretty(&json_results)?)
+    let envelope = serde_json::json!({
+        "total_hits": total_hits,
+        "results": json_results,
+    });
+
+    Ok(serde_json::to_string_pretty(&envelope)?)
 }
 
 fn print_json(
     results: &[searcher::SearchResult],
+    total_hits: usize,
     include_content: Option<usize>,
 ) -> anyhow::Result<()> {
     let index_root = config::index_root();
-    println!("{}", format_json(results, include_content, &index_root)?);
+    println!(
+        "{}",
+        format_json(results, total_hits, include_content, &index_root)?
+    );
     Ok(())
 }
 
@@ -1595,7 +1609,7 @@ mod tests {
 
     #[test]
     fn test_format_text_empty() {
-        let result = format_text(&[]);
+        let result = format_text(&[], 0);
         assert_eq!(result, "No results found.");
     }
 
@@ -1610,7 +1624,7 @@ mod tests {
             status: Some("current".to_string()),
             related_docs: vec![],
         }];
-        let text = format_text(&results);
+        let text = format_text(&results, results.len());
         assert!(text.contains("1. [note]"));
         assert!(text.contains("daily/notes/test.md"));
         assert!(text.contains("0.5000"));
@@ -1628,14 +1642,16 @@ mod tests {
             status: None,
             related_docs: vec![],
         }];
-        let text = format_text(&results);
+        let text = format_text(&results, results.len());
         assert!(!text.contains("status:"));
     }
 
     #[test]
     fn test_format_json_empty() {
-        let result = format_json(&[], None, Path::new("/tmp")).unwrap();
-        assert_eq!(result, "[]");
+        let result = format_json(&[], 0, None, Path::new("/tmp")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["total_hits"], 0);
+        assert_eq!(parsed["results"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -1649,13 +1665,15 @@ mod tests {
             status: None,
             related_docs: vec![],
         }];
-        let json = format_json(&results, None, Path::new("/tmp")).unwrap();
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0]["source_file"], "test.md");
-        assert_eq!(parsed[0]["score"], 0.5);
+        let json = format_json(&results, 10, None, Path::new("/tmp")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["total_hits"], 10);
+        let arr = parsed["results"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["source_file"], "test.md");
+        assert_eq!(arr[0]["score"], 0.5);
         // No content field when include_content is None
-        assert!(parsed[0].get("content").is_none());
+        assert!(arr[0].get("content").is_none());
     }
 
     #[test]
@@ -1673,9 +1691,9 @@ mod tests {
             status: None,
             related_docs: vec![],
         }];
-        let json = format_json(&results, Some(1), dir.path()).unwrap();
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed[0]["content"], "# Hello\n\nWorld.");
+        let json = format_json(&results, 1, Some(1), dir.path()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["results"][0]["content"], "# Hello\n\nWorld.");
     }
 
     #[test]
@@ -1741,9 +1759,9 @@ mod tests {
             related_docs: vec![],
         }];
         // File doesn't exist, so content field should not be present
-        let json = format_json(&results, Some(1), Path::new("/tmp/empty")).unwrap();
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
-        assert!(parsed[0].get("content").is_none());
+        let json = format_json(&results, 1, Some(1), Path::new("/tmp/empty")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["results"][0].get("content").is_none());
     }
 
     #[test]
@@ -1773,10 +1791,11 @@ mod tests {
             },
         ];
         // include_content=1, so only first result gets content
-        let json = format_json(&results, Some(1), dir.path()).unwrap();
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed[0]["content"], "aaa");
-        assert!(parsed[1].get("content").is_none());
+        let json = format_json(&results, 2, Some(1), dir.path()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed["results"].as_array().unwrap();
+        assert_eq!(arr[0]["content"], "aaa");
+        assert!(arr[1].get("content").is_none());
     }
 
     #[test]
@@ -1801,7 +1820,7 @@ mod tests {
                 related_docs: vec![],
             },
         ];
-        let text = format_text(&results);
+        let text = format_text(&results, results.len());
         assert!(text.contains("1. [note]"));
         assert!(text.contains("2. [research]"));
         assert!(text.contains("status: outdated"));

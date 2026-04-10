@@ -383,10 +383,11 @@ fn render_search(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
     match format {
         "json" => print_json(&payload),
         _ => {
+            let total_hits = payload["total_hits"].as_u64().unwrap_or(0) as usize;
             let results: Vec<the_space_memory::searcher::SearchResult> =
-                serde_json::from_value(payload)
+                serde_json::from_value(payload["results"].clone())
                     .map_err(|e| anyhow::anyhow!("Failed to parse search results: {e}"))?;
-            print!("{}", cli::format_text(&results));
+            print!("{}", cli::format_text(&results, total_hits));
         }
     }
     Ok(())
