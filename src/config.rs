@@ -1367,6 +1367,7 @@ half_life_days = 180
         let dir = models_dir();
         assert_eq!(dir, tmp.path().join("models/ruri-v3-30m"));
         std::env::remove_var("TSM_STATE_DIR");
+        reload();
     }
 
     #[test]
@@ -1379,6 +1380,7 @@ half_life_days = 180
         std::fs::create_dir_all(&dir).unwrap();
         assert!(models_dir_complete().is_none());
         std::env::remove_var("TSM_STATE_DIR");
+        reload();
     }
 
     #[test]
@@ -1392,6 +1394,7 @@ half_life_days = 180
         std::fs::write(dir.join("config.json"), "{}").unwrap();
         assert!(models_dir_complete().is_none());
         std::env::remove_var("TSM_STATE_DIR");
+        reload();
     }
 
     #[test]
@@ -1409,5 +1412,6 @@ half_life_days = 180
         assert!(result.is_some());
         assert_eq!(result.unwrap(), dir);
         std::env::remove_var("TSM_STATE_DIR");
+        reload();
     }
 }

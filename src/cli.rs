@@ -1915,6 +1915,7 @@ mod tests {
             "expected model warning, got: {issues:?}"
         );
         std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
     }
 
     #[test]
@@ -1940,6 +1941,7 @@ mod tests {
             "expected model OK, got: {ok:?}"
         );
         std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
     }
 
     #[test]
@@ -1969,5 +1971,6 @@ mod tests {
             "expected missing file name, got: {issues:?}"
         );
         std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
     }
 }
