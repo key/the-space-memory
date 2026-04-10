@@ -468,9 +468,10 @@ pub fn cmd_synonym_sync() -> anyhow::Result<()> {
     let conn = db::get_connection(&db_path)?;
     let result = crate::synonyms::sync_user_synonyms(&conn, &csv_path)?;
     log::info!(
-        "User synonyms synced: {} pairs ({} deleted)",
+        "User synonyms synced: {} pairs ({} deleted, {} skipped)",
         result.total,
-        result.deleted
+        result.deleted,
+        result.skipped,
     );
     Ok(())
 }
