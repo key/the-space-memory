@@ -38,12 +38,23 @@ fn run_daemon(socket_path: &Path, model_dir: Option<&Path>) -> Result<()> {
 
     log::info!("Loading model...");
     let embedder = if let Some(dir) = model_dir {
-        Embedder::load_from_paths(
-            &dir.join("config.json"),
-            &dir.join("tokenizer.json"),
-            &dir.join("model.safetensors"),
-            &Device::Cpu,
-        )?
+        let has_all_files = ["config.json", "tokenizer.json", "model.safetensors"]
+            .iter()
+            .all(|f| dir.join(f).is_file());
+        if has_all_files {
+            Embedder::load_from_paths(
+                &dir.join("config.json"),
+                &dir.join("tokenizer.json"),
+                &dir.join("model.safetensors"),
+                &Device::Cpu,
+            )?
+        } else {
+            log::warn!(
+                "Model files incomplete in {}; falling back to default load",
+                dir.display()
+            );
+            Embedder::load(&Device::Cpu)?
+        }
     } else {
         Embedder::load(&Device::Cpu)?
     };

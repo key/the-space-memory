@@ -463,6 +463,20 @@ pub fn cmd_setup() -> anyhow::Result<()> {
     log::info!("  config:    {}", config_path.display());
     log::info!("  tokenizer: {}", tokenizer_path.display());
     log::info!("  weights:   {}", weights_path.display());
+
+    // Copy to models_dir for local access
+    let dest = config::models_dir();
+    std::fs::create_dir_all(&dest)?;
+    for (src, name) in [
+        (&config_path, "config.json"),
+        (&tokenizer_path, "tokenizer.json"),
+        (&weights_path, "model.safetensors"),
+    ] {
+        let dst = dest.join(name);
+        std::fs::copy(src, &dst)?;
+        log::info!("  copied: {}", dst.display());
+    }
+    log::info!("Model files installed to {}", dest.display());
     Ok(())
 }
 
@@ -661,6 +675,39 @@ fn doctor_check_with_conn(
             status: CheckStatus::Warning,
             message: "Stopped".to_string(),
             hint: Some("Run `tsmd` to start the daemon (includes embedder).".to_string()),
+        });
+    }
+
+    // Check local model files
+    let models_dir = config::models_dir();
+    let model_files = ["config.json", "tokenizer.json", "model.safetensors"];
+    let present: Vec<&str> = model_files
+        .iter()
+        .filter(|f| models_dir.join(f).is_file())
+        .copied()
+        .collect();
+    if present.len() == model_files.len() {
+        emb_section.items.push(CheckItem {
+            status: CheckStatus::Ok,
+            message: format!("Model: {}", models_dir.display()),
+            hint: None,
+        });
+    } else if present.is_empty() {
+        emb_section.items.push(CheckItem {
+            status: CheckStatus::Warning,
+            message: format!("Model: not found in {}", models_dir.display()),
+            hint: Some("Run `tsm setup` to download and install model files.".to_string()),
+        });
+    } else {
+        let missing: Vec<&str> = model_files
+            .iter()
+            .filter(|f| !present.contains(f))
+            .copied()
+            .collect();
+        emb_section.items.push(CheckItem {
+            status: CheckStatus::Warning,
+            message: format!("Model: incomplete (missing: {})", missing.join(", ")),
+            hint: Some("Run `tsm setup` to re-download model files.".to_string()),
         });
     }
 
@@ -1837,5 +1884,45 @@ mod tests {
             .collect();
         assert!(names.contains(&"note.md"));
         assert!(!names.contains(&"secret.md"));
+    }
+
+    #[test]
+    fn test_doctor_model_files_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        db::init_db(&db_path).unwrap();
+
+        let report = doctor_check(&db_path);
+        // models_dir points to default .tsm/models/ruri-v3-30m which won't exist
+        let issues = report.issues();
+        assert!(
+            issues.iter().any(|s| s.contains("Model:")),
+            "expected model warning, got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_doctor_model_files_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        db::init_db(&db_path).unwrap();
+
+        // Create model files in the default models_dir (.tsm/models/ruri-v3-30m)
+        let models_dir = config::models_dir();
+        std::fs::create_dir_all(&models_dir).unwrap();
+        for f in ["config.json", "tokenizer.json", "model.safetensors"] {
+            std::fs::write(models_dir.join(f), "dummy").unwrap();
+        }
+
+        let conn = db::get_connection(&db_path).unwrap();
+        let report = run_doctor(&conn, &db_path);
+        let ok = report.ok();
+        assert!(
+            ok.iter().any(|s| s.contains("Model:")),
+            "expected model OK, got: {ok:?}"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(models_dir.parent().unwrap());
     }
 }

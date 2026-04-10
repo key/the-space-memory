@@ -92,9 +92,10 @@ pub fn run(args: Args) -> Result<()> {
         } else {
             let _ = std::fs::remove_file(&embedder_pid_path);
             child::remove_stale_socket(&config::embedder_socket_path());
+            let model_arg = format!("--model={}", config::models_dir().display());
             let spawned = child::spawn_child(
                 "embedder",
-                &["--embedder", "--no-idle-timeout"],
+                &["--embedder", "--no-idle-timeout", &model_arg],
                 &embedder_pid_path,
             );
             if let Some(ref c) = spawned {
