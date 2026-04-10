@@ -550,6 +550,28 @@ pub fn daemon_pid_path() -> PathBuf {
     state_dir().join("tsmd.pid")
 }
 
+// ─── Local model directory ──────────────────────────────────────
+
+/// Canonical list of required model files. Used by `models_dir_complete()`,
+/// `embedder_mode::load_model()`, and `doctor_check_with_conn()`.
+pub const MODEL_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+
+/// Directory for locally cached model files: `{state_dir}/models/ruri-v3-30m/`.
+pub fn models_dir() -> PathBuf {
+    state_dir().join("models/ruri-v3-30m")
+}
+
+/// Check if all required model files exist in `models_dir()`.
+/// Returns `Some(path)` if all files in `MODEL_FILES` are present, `None` otherwise.
+pub fn models_dir_complete() -> Option<PathBuf> {
+    let dir = models_dir();
+    if MODEL_FILES.iter().all(|f| dir.join(f).is_file()) {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
 // ─── Model cache (XDG) ──────────────────────────────────────────
 // NOTE: model_cache_dir and ensure_model_cache_env are intentionally NOT
 // part of ResolvedConfig. ensure_model_cache_env performs a side-effectful
@@ -1323,5 +1345,73 @@ half_life_days = 180
                 "warning should mention tsm restart: {w}"
             );
         }
+    }
+
+    // ─── models_dir / models_dir_complete ──────────────────────────
+
+    #[test]
+    #[serial]
+    fn test_models_dir_default() {
+        std::env::remove_var("TSM_STATE_DIR");
+        reload();
+        let dir = models_dir();
+        assert_eq!(dir, PathBuf::from(".tsm/models/ruri-v3-30m"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_models_dir_with_custom_state_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        reload();
+        let dir = models_dir();
+        assert_eq!(dir, tmp.path().join("models/ruri-v3-30m"));
+        std::env::remove_var("TSM_STATE_DIR");
+        reload();
+    }
+
+    #[test]
+    #[serial]
+    fn test_models_dir_complete_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        reload();
+        let dir = models_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(models_dir_complete().is_none());
+        std::env::remove_var("TSM_STATE_DIR");
+        reload();
+    }
+
+    #[test]
+    #[serial]
+    fn test_models_dir_complete_partial() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        reload();
+        let dir = models_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        assert!(models_dir_complete().is_none());
+        std::env::remove_var("TSM_STATE_DIR");
+        reload();
+    }
+
+    #[test]
+    #[serial]
+    fn test_models_dir_complete_all_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        reload();
+        let dir = models_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in &MODEL_FILES {
+            std::fs::write(dir.join(f), "dummy").unwrap();
+        }
+        let result = models_dir_complete();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), dir);
+        std::env::remove_var("TSM_STATE_DIR");
+        reload();
     }
 }

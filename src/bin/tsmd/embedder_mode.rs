@@ -29,6 +29,27 @@ pub fn run(model: Option<PathBuf>, no_idle_timeout: bool) -> Result<()> {
     run_daemon(&socket_path, model.as_deref())
 }
 
+/// Load model from explicit directory or fall back to default resolution.
+fn load_model(model_dir: Option<&Path>) -> Result<Embedder> {
+    if let Some(dir) = model_dir {
+        let has_all_files = config::MODEL_FILES.iter().all(|f| dir.join(f).is_file());
+        if has_all_files {
+            return Embedder::load_from_paths(
+                &dir.join("config.json"),
+                &dir.join("tokenizer.json"),
+                &dir.join("model.safetensors"),
+                &Device::Cpu,
+            );
+        }
+        log::warn!(
+            "Model files incomplete in {}; falling back to HF Hub cache. \
+             Run `tsm setup` to install model files locally.",
+            dir.display()
+        );
+    }
+    Embedder::load(&Device::Cpu)
+}
+
 /// Run the embedder socket server loop.
 fn run_daemon(socket_path: &Path, model_dir: Option<&Path>) -> Result<()> {
     // Clean up stale socket
@@ -37,16 +58,7 @@ fn run_daemon(socket_path: &Path, model_dir: Option<&Path>) -> Result<()> {
     }
 
     log::info!("Loading model...");
-    let embedder = if let Some(dir) = model_dir {
-        Embedder::load_from_paths(
-            &dir.join("config.json"),
-            &dir.join("tokenizer.json"),
-            &dir.join("model.safetensors"),
-            &Device::Cpu,
-        )?
-    } else {
-        Embedder::load(&Device::Cpu)?
-    };
+    let embedder = load_model(model_dir)?;
     log::info!("Model loaded.");
 
     log::info!("Listening on {}", socket_path.display());

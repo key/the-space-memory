@@ -22,8 +22,28 @@ pub struct Embedder {
 }
 
 impl Embedder {
-    /// Load the ruri-v3-30m model from HuggingFace Hub cache.
+    /// Load the ruri-v3-30m model.
+    ///
+    /// Resolution order:
+    /// 1. `{state_dir}/models/ruri-v3-30m/` — if all 3 files are present
+    /// 2. HuggingFace Hub cache — fallback for backward compatibility
     pub fn load(device: &Device) -> Result<Self> {
+        // Try local models_dir first
+        if let Some(dir) = config::models_dir_complete() {
+            log::info!("Loading model from {}", dir.display());
+            return Self::load_from_paths(
+                &dir.join("config.json"),
+                &dir.join("tokenizer.json"),
+                &dir.join("model.safetensors"),
+                device,
+            );
+        }
+
+        // Fallback to HF Hub cache
+        log::warn!(
+            "Local model not found in {}; falling back to HF Hub cache (requires network)",
+            config::models_dir().display()
+        );
         let api = hf_hub::api::sync::Api::new()?;
         let repo = api.repo(hf_hub::Repo::new(
             MODEL_ID.to_string(),
