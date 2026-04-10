@@ -550,6 +550,10 @@ pub fn wordnet_db_path() -> PathBuf {
     state_dir().join("wnjpn.db")
 }
 
+pub fn user_synonyms_path() -> PathBuf {
+    state_dir().join("synonyms.csv")
+}
+
 pub fn daemon_pid_path() -> PathBuf {
     state_dir().join("tsmd.pid")
 }

@@ -455,6 +455,26 @@ pub fn cmd_import_wordnet(wordnet_db: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn cmd_synonym_sync() -> anyhow::Result<()> {
+    let csv_path = config::user_synonyms_path();
+    if !csv_path.is_file() {
+        log::info!(
+            "No user synonyms file found at {}. Create it to define custom synonym pairs.",
+            csv_path.display()
+        );
+        return Ok(());
+    }
+    let db_path = config::db_path();
+    let conn = db::get_connection(&db_path)?;
+    let result = crate::synonyms::sync_user_synonyms(&conn, &csv_path)?;
+    log::info!(
+        "User synonyms synced: {} pairs ({} deleted)",
+        result.total,
+        result.deleted
+    );
+    Ok(())
+}
+
 pub fn cmd_setup() -> anyhow::Result<()> {
     // Download model files from HuggingFace Hub
     let api = hf_hub::api::sync::Api::new()?;
@@ -499,6 +519,9 @@ pub fn cmd_setup() -> anyhow::Result<()> {
 
     // Download and import Japanese WordNet
     setup_wordnet()?;
+
+    // Sync user-defined synonyms (if file exists)
+    cmd_synonym_sync()?;
 
     Ok(())
 }

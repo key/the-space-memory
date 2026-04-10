@@ -70,6 +70,17 @@ enum DictCommands {
         #[arg(long, conflicts_with = "apply")]
         all: bool,
     },
+    /// Manage user-defined synonyms (.tsm/synonyms.csv)
+    Synonym {
+        #[command(subcommand)]
+        command: SynonymCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SynonymCommands {
+    /// Sync synonyms.csv to database
+    Sync,
 }
 
 #[derive(Subcommand)]
@@ -202,6 +213,11 @@ fn main() -> anyhow::Result<()> {
             DictCommands::Reject { apply, all } => {
                 cli::cmd_dict_reject(apply, all)?;
             }
+            DictCommands::Synonym { command } => match command {
+                SynonymCommands::Sync => {
+                    cli::cmd_synonym_sync()?;
+                }
+            },
         },
 
         // ── Daemon-routed (auto-starts tsmd if needed) ──
