@@ -497,27 +497,18 @@ pub fn cmd_setup() -> anyhow::Result<()> {
     }
     log::info!("Model files installed to {}", dest.display());
 
-    // Download Japanese WordNet DB
+    // Download and import Japanese WordNet
+    setup_wordnet()?;
+
+    Ok(())
+}
+
+fn setup_wordnet() -> anyhow::Result<()> {
     let wordnet_dest = config::wordnet_db_path();
     if wordnet_dest.is_file() {
         log::info!("WordNet DB already exists at {}", wordnet_dest.display());
     } else {
-        const WORDNET_URL: &str =
-            "https://github.com/bond-lab/wnja/releases/download/v1.1/wnjpn.db.gz";
-        log::info!("Downloading WordNet DB from {WORDNET_URL}...");
-        let resp = ureq::get(WORDNET_URL).call()?;
-        let mut gz_data = Vec::new();
-        resp.into_body()
-            .as_reader()
-            .read_to_end(&mut gz_data)?;
-        let mut decoder = flate2::read::GzDecoder::new(&gz_data[..]);
-        let parent = wordnet_dest.parent().expect("wordnet_dest has parent");
-        std::fs::create_dir_all(parent)?;
-        let tmp_path = wordnet_dest.with_extension("db.tmp");
-        let mut out = std::fs::File::create(&tmp_path)?;
-        std::io::copy(&mut decoder, &mut out)?;
-        std::fs::rename(&tmp_path, &wordnet_dest)?;
-        log::info!("WordNet DB installed to {}", wordnet_dest.display());
+        download_wordnet(&wordnet_dest)?;
     }
 
     // Import WordNet synonyms if DB is initialized
@@ -531,7 +522,23 @@ pub fn cmd_setup() -> anyhow::Result<()> {
             wordnet_dest.display()
         );
     }
+    Ok(())
+}
 
+fn download_wordnet(dest: &Path) -> anyhow::Result<()> {
+    const WORDNET_URL: &str = "https://github.com/bond-lab/wnja/releases/download/v1.1/wnjpn.db.gz";
+    log::info!("Downloading WordNet DB from {WORDNET_URL}...");
+    let resp = ureq::get(WORDNET_URL).call()?;
+    let mut gz_data = Vec::new();
+    resp.into_body().as_reader().read_to_end(&mut gz_data)?;
+    let mut decoder = flate2::read::GzDecoder::new(&gz_data[..]);
+    let parent = dest.parent().expect("dest has parent");
+    std::fs::create_dir_all(parent)?;
+    let tmp_path = dest.with_extension("db.tmp");
+    let mut out = std::fs::File::create(&tmp_path)?;
+    std::io::copy(&mut decoder, &mut out)?;
+    std::fs::rename(&tmp_path, dest)?;
+    log::info!("WordNet DB installed to {}", dest.display());
     Ok(())
 }
 
