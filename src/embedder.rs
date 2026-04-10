@@ -40,7 +40,10 @@ impl Embedder {
         }
 
         // Fallback to HF Hub cache
-        log::info!("Local model not found; falling back to HF Hub cache");
+        log::warn!(
+            "Local model not found in {}; falling back to HF Hub cache (requires network)",
+            config::models_dir().display()
+        );
         let api = hf_hub::api::sync::Api::new()?;
         let repo = api.repo(hf_hub::Repo::new(
             MODEL_ID.to_string(),

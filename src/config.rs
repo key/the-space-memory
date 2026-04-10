@@ -552,7 +552,9 @@ pub fn daemon_pid_path() -> PathBuf {
 
 // ─── Local model directory ──────────────────────────────────────
 
-const MODEL_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+/// Canonical list of required model files. Used by `models_dir_complete()`,
+/// `embedder_mode::load_model()`, and `doctor_check_with_conn()`.
+pub const MODEL_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
 
 /// Directory for locally cached model files: `{state_dir}/models/ruri-v3-30m/`.
 pub fn models_dir() -> PathBuf {
@@ -560,7 +562,7 @@ pub fn models_dir() -> PathBuf {
 }
 
 /// Check if all required model files exist in `models_dir()`.
-/// Returns `Some(path)` if all 3 files are present, `None` otherwise.
+/// Returns `Some(path)` if all files in `MODEL_FILES` are present, `None` otherwise.
 pub fn models_dir_complete() -> Option<PathBuf> {
     let dir = models_dir();
     if MODEL_FILES.iter().all(|f| dir.join(f).is_file()) {
@@ -1351,48 +1353,61 @@ half_life_days = 180
     #[serial]
     fn test_models_dir_default() {
         std::env::remove_var("TSM_STATE_DIR");
+        reload();
         let dir = models_dir();
         assert_eq!(dir, PathBuf::from(".tsm/models/ruri-v3-30m"));
     }
 
     #[test]
+    #[serial]
+    fn test_models_dir_with_custom_state_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        reload();
+        let dir = models_dir();
+        assert_eq!(dir, tmp.path().join("models/ruri-v3-30m"));
+        std::env::remove_var("TSM_STATE_DIR");
+    }
+
+    #[test]
+    #[serial]
     fn test_models_dir_complete_empty() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dir = tmp.path().join("models/ruri-v3-30m");
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        reload();
+        let dir = models_dir();
         std::fs::create_dir_all(&dir).unwrap();
-        // No files — should return None
-        let check = MODEL_FILES.iter().all(|f| dir.join(f).is_file());
-        assert!(!check);
+        assert!(models_dir_complete().is_none());
+        std::env::remove_var("TSM_STATE_DIR");
     }
 
     #[test]
+    #[serial]
     fn test_models_dir_complete_partial() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dir = tmp.path().join("models/ruri-v3-30m");
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        reload();
+        let dir = models_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.json"), "{}").unwrap();
-        // Only 1 of 3 — should not be complete
-        let check = MODEL_FILES.iter().all(|f| dir.join(f).is_file());
-        assert!(!check);
+        assert!(models_dir_complete().is_none());
+        std::env::remove_var("TSM_STATE_DIR");
     }
 
     #[test]
+    #[serial]
     fn test_models_dir_complete_all_present() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dir = tmp.path().join("models/ruri-v3-30m");
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        reload();
+        let dir = models_dir();
         std::fs::create_dir_all(&dir).unwrap();
         for f in &MODEL_FILES {
             std::fs::write(dir.join(f), "dummy").unwrap();
         }
-        let check = MODEL_FILES.iter().all(|f| dir.join(f).is_file());
-        assert!(check);
-    }
-
-    #[test]
-    fn test_model_files_constant() {
-        assert_eq!(MODEL_FILES.len(), 3);
-        assert!(MODEL_FILES.contains(&"config.json"));
-        assert!(MODEL_FILES.contains(&"tokenizer.json"));
-        assert!(MODEL_FILES.contains(&"model.safetensors"));
+        let result = models_dir_complete();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), dir);
+        std::env::remove_var("TSM_STATE_DIR");
     }
 }

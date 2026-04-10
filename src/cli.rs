@@ -467,14 +467,27 @@ pub fn cmd_setup() -> anyhow::Result<()> {
     // Copy to models_dir for local access
     let dest = config::models_dir();
     std::fs::create_dir_all(&dest)?;
-    for (src, name) in [
+    let sources = [
         (&config_path, "config.json"),
         (&tokenizer_path, "tokenizer.json"),
         (&weights_path, "model.safetensors"),
-    ] {
-        let dst = dest.join(name);
-        std::fs::copy(src, &dst)?;
-        log::info!("  copied: {}", dst.display());
+    ];
+    let mut copied: Vec<std::path::PathBuf> = Vec::new();
+    let copy_result = (|| -> anyhow::Result<()> {
+        for (src, name) in &sources {
+            let dst = dest.join(name);
+            std::fs::copy(src, &dst)?;
+            copied.push(dst.clone());
+            log::info!("  copied: {}", dst.display());
+        }
+        Ok(())
+    })();
+    if let Err(e) = copy_result {
+        log::warn!("Setup failed; cleaning up partial files");
+        for f in &copied {
+            let _ = std::fs::remove_file(f);
+        }
+        return Err(e);
     }
     log::info!("Model files installed to {}", dest.display());
     Ok(())
@@ -680,7 +693,7 @@ fn doctor_check_with_conn(
 
     // Check local model files
     let models_dir = config::models_dir();
-    let model_files = ["config.json", "tokenizer.json", "model.safetensors"];
+    let model_files = config::MODEL_FILES;
     let present: Vec<&str> = model_files
         .iter()
         .filter(|f| models_dir.join(f).is_file())
@@ -705,7 +718,7 @@ fn doctor_check_with_conn(
             .copied()
             .collect();
         emb_section.items.push(CheckItem {
-            status: CheckStatus::Warning,
+            status: CheckStatus::Error,
             message: format!("Model: incomplete (missing: {})", missing.join(", ")),
             hint: Some("Run `tsm setup` to re-download model files.".to_string()),
         });
@@ -1887,30 +1900,35 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_doctor_model_files_missing() {
         let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
         let db_path = dir.path().join("test.db");
         db::init_db(&db_path).unwrap();
 
         let report = doctor_check(&db_path);
-        // models_dir points to default .tsm/models/ruri-v3-30m which won't exist
         let issues = report.issues();
         assert!(
             issues.iter().any(|s| s.contains("Model:")),
             "expected model warning, got: {issues:?}"
         );
+        std::env::remove_var("TSM_STATE_DIR");
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_doctor_model_files_present() {
         let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
         let db_path = dir.path().join("test.db");
         db::init_db(&db_path).unwrap();
 
-        // Create model files in the default models_dir (.tsm/models/ruri-v3-30m)
         let models_dir = config::models_dir();
         std::fs::create_dir_all(&models_dir).unwrap();
-        for f in ["config.json", "tokenizer.json", "model.safetensors"] {
+        for f in config::MODEL_FILES {
             std::fs::write(models_dir.join(f), "dummy").unwrap();
         }
 
@@ -1921,8 +1939,35 @@ mod tests {
             ok.iter().any(|s| s.contains("Model:")),
             "expected model OK, got: {ok:?}"
         );
+        std::env::remove_var("TSM_STATE_DIR");
+    }
 
-        // Clean up
-        let _ = std::fs::remove_dir_all(models_dir.parent().unwrap());
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_model_files_partial() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
+        let db_path = dir.path().join("test.db");
+        db::init_db(&db_path).unwrap();
+
+        let models_dir = config::models_dir();
+        std::fs::create_dir_all(&models_dir).unwrap();
+        // Only create 2 of 3 files
+        std::fs::write(models_dir.join("config.json"), "{}").unwrap();
+        std::fs::write(models_dir.join("tokenizer.json"), "{}").unwrap();
+
+        let conn = db::get_connection(&db_path).unwrap();
+        let report = run_doctor(&conn, &db_path);
+        let issues = report.issues();
+        assert!(
+            issues.iter().any(|s| s.contains("incomplete")),
+            "expected incomplete warning, got: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|s| s.contains("model.safetensors")),
+            "expected missing file name, got: {issues:?}"
+        );
+        std::env::remove_var("TSM_STATE_DIR");
     }
 }
