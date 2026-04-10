@@ -1001,4 +1001,96 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "user pairs should not be cleaned");
     }
+
+    // ─── parse_synonym_csv unit tests ────────────────────────────
+
+    #[test]
+    fn test_parse_synonym_csv_basic() {
+        let (pairs, skipped) = parse_synonym_csv("猟銃,散弾銃\nLoRa,LPWAN\n");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn test_parse_synonym_csv_normalizes_order() {
+        // "b,a" should be normalized to (a, b) regardless of input order
+        let (pairs1, _) = parse_synonym_csv("bbb,aaa\n");
+        let (pairs2, _) = parse_synonym_csv("aaa,bbb\n");
+        assert_eq!(pairs1, pairs2);
+        assert!(pairs1.contains(&("aaa".into(), "bbb".into())));
+    }
+
+    #[test]
+    fn test_parse_synonym_csv_deduplicates_reversed() {
+        let (pairs, _) = parse_synonym_csv("a,b\nb,a\n");
+        assert_eq!(pairs.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_synonym_csv_skips_invalid() {
+        let (pairs, skipped) = parse_synonym_csv("# comment\ngood,pair\nbad\n,empty\nself,self\n");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(skipped, 3);
+    }
+
+    #[test]
+    fn test_parse_synonym_csv_lowercases() {
+        let (pairs, _) = parse_synonym_csv("LoRa,LPWAN\n");
+        assert!(pairs.contains(&("lora".into(), "lpwan".into())));
+    }
+
+    #[test]
+    fn test_parse_synonym_csv_empty() {
+        let (pairs, skipped) = parse_synonym_csv("");
+        assert_eq!(pairs.len(), 0);
+        assert_eq!(skipped, 0);
+    }
+
+    // ─── delete_stale_user_pairs unit tests ──────────────────────
+
+    #[test]
+    fn test_delete_stale_user_pairs_removes_missing() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO synonyms (word_a, word_b, score, source, hits, created)
+             VALUES ('aa', 'bb', 0.7, 'user', 0, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let keep = HashSet::new(); // empty — should delete everything
+        let deleted = delete_stale_user_pairs(&conn, &keep).unwrap();
+        assert_eq!(deleted, 1);
+    }
+
+    #[test]
+    fn test_delete_stale_user_pairs_keeps_matching() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO synonyms (word_a, word_b, score, source, hits, created)
+             VALUES ('aa', 'bb', 0.7, 'user', 0, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let mut keep = HashSet::new();
+        keep.insert(("aa".into(), "bb".into()));
+        let deleted = delete_stale_user_pairs(&conn, &keep).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn test_delete_stale_user_pairs_ignores_other_sources() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO synonyms (word_a, word_b, score, source, hits, created)
+             VALUES ('aa', 'bb', 0.5, 'wordnet', 0, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let keep = HashSet::new();
+        let deleted = delete_stale_user_pairs(&conn, &keep).unwrap();
+        assert_eq!(deleted, 0, "should not delete wordnet pairs");
+    }
 }

@@ -25,7 +25,7 @@ combining FTS5 full-text search with vector semantic search (ruri-v3-30m, 256-di
 - **Morphological analysis** — Japanese tokenization via lindera (IPADIC)
 - **Semantic search** — ruri-v3-30m embeddings computed locally with candle (no ONNX Runtime)
 - **Entity graph** — Automatic entity extraction and link inference
-- **Synonym expansion** — WordNet-based query expansion
+- **Synonym expansion** — WordNet + user-defined CSV for query expansion
 - **Session ingestion** — Index Claude Code session transcripts as searchable knowledge
 - **Single binary** — No Python, no external runtime dependencies
 

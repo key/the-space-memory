@@ -634,6 +634,46 @@ tsm dict reject --all
 
 ---
 
+### tsm dict synonym sync
+
+Sync user-defined synonym pairs from a CSV file to the database.
+
+```text
+tsm dict synonym sync
+```
+
+Reads `.tsm/synonyms.csv` and syncs its contents to the synonyms table.
+The CSV file is the source of truth:
+
+- Pairs in the file are inserted with `source = 'user'` (score 0.7, no decay)
+- Pairs removed from the file are deleted from the database
+- Pairs from other sources (e.g. WordNet) are not affected
+
+`tsm setup` runs this automatically when the file exists.
+
+**CSV format:**
+
+```csv
+# Comments start with #
+猟銃,散弾銃
+猟銃,鉄砲
+LoRa,LPWAN
+```
+
+Two columns, no header. Lines starting with `#` are ignored.
+
+**Example:**
+
+```bash
+# Create synonyms file
+echo "猟銃,散弾銃" > .tsm/synonyms.csv
+
+# Sync to database
+tsm dict synonym sync
+```
+
+---
+
 ## Temporal Query Syntax
 
 Temporal expressions embedded in search queries are automatically extracted and

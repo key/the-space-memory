@@ -61,7 +61,7 @@ src/
 ├── entity.rs            — Entity graph (link inference)
 ├── classifier.rs        — Query classification (entity extraction)
 ├── doc_links.rs         — Inter-document link analysis
-├── synonyms.rs          — Synonym expansion, WordNet import
+├── synonyms.rs          — Synonym expansion, WordNet import, user CSV sync
 ├── temporal.rs          — Temporal filter expression parsing
 ├── user_dict.rs         — Dictionary candidate collection & CSV export
 ├── daemon.rs            — Daemon request handler (server-side dispatch)
