@@ -1,24 +1,23 @@
-# プロンプトフォーマット仕様
+# Prompt Format Specification
 
-Claude Code プラグインの UserPromptSubmit フックが出力する
-ナレッジ検索結果の XML フォーマット仕様。
+XML format specification for knowledge search results injected by the
+Claude Code plugin's UserPromptSubmit hook.
 
-関連: [ADR-0011](https://github.com/KenosInc/company/blob/main/decisions/0011-tsm-output-layer-separation.md)、[Issue #128](https://github.com/key/the-space-memory/issues/128)
+Related: [ADR-0011](https://github.com/KenosInc/company/blob/main/decisions/0011-tsm-output-layer-separation.md), [Issue #128](https://github.com/key/the-space-memory/issues/128)
 
-## 設計方針
+## Design Principles
 
-- [Anthropic プロンプティングベストプラクティス][prompting]の XML 構造化に準拠する
-- snake_case タグ名（公式パターン: `document_content`, `frontend_aesthetics` 等）
-- 公式の `<documents>` → `<document index="n">` パターンを踏襲する
-- 注入はトリガー（きっかけ）として機能する。
-  詳細が必要なら Claude が `tsm search` スキルや `Read` で深掘りする
-- snippet は「関連ありそう」と判断できる程度に短くてよい
+- Follow [Anthropic Prompting Best Practices][prompting] XML structuring
+- Use snake_case tag names (matching official patterns: `document_content`, `frontend_aesthetics`, etc.)
+- Follow the official `<documents>` → `<document index="n">` pattern
+- Injection acts as a **trigger** — Claude digs deeper via `tsm search` skill or `Read` when needed
+- Snippets should be just enough to judge relevance
 
 [prompting]: https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices
 
-## 出力フォーマット
+## Output Format
 
-### 通常（結果あり）
+### Normal (with results)
 
 ```xml
 <knowledge_search query="LoRa モジュール" count="5" total="12">
@@ -40,13 +39,13 @@ Claude Code プラグインの UserPromptSubmit フックが出力する
 </knowledge_search>
 ```
 
-### 結果なし
+### No results
 
 ```xml
-<knowledge_search query="存在しないトピック" count="0" total="0"/>
+<knowledge_search query="nonexistent topic" count="0" total="0"/>
 ```
 
-### トークン予算超過時（下位の snippet を省略）
+### Token budget exceeded (lower-ranked snippets omitted)
 
 ```xml
 <knowledge_search query="LoRa" count="5" total="20">
@@ -57,7 +56,7 @@ Claude Code プラグインの UserPromptSubmit フックが出力する
 LoRa通信モジュールの選定基準と各製品の比較...
 </snippet>
 </result>
-<!-- ... 中間の result ... -->
+<!-- ... intermediate results ... -->
 <result index="5" score="0.008">
 <source type="daily">daily/daily/intel/2026-03-09.md</source>
 <section>情報収集ログ > LoRa関連</section>
@@ -66,66 +65,66 @@ LoRa通信モジュールの選定基準と各製品の比較...
 </knowledge_search>
 ```
 
-## 公式パターンとの対応
+## Mapping to Official Patterns
 
-| 公式パターン | 本仕様 | 対応 |
+| Official pattern | This spec | Role |
 |---|---|---|
-| `<documents>` | `<knowledge_search>` | コンテナ要素 |
-| `<document index="n">` | `<result index="n">` | アイテム（index 属性） |
-| `<source>` | `<source type="..." status="...">` | ファイルパス + メタデータ |
-| `<document_content>` | `<snippet>` | 内容プレビュー |
-| snake_case タグ名 | snake_case タグ名 | 命名規則統一 |
+| `<documents>` | `<knowledge_search>` | Container element |
+| `<document index="n">` | `<result index="n">` | Item (index attribute) |
+| `<source>` | `<source type="..." status="...">` | File path + metadata |
+| `<document_content>` | `<snippet>` | Content preview |
+| snake_case tag names | snake_case tag names | Naming convention |
 
-## フィールド設計
+## Field Design
 
-### コンテナ属性（`<knowledge_search>`）
+### Container attributes (`<knowledge_search>`)
 
-| 属性 | 説明 |
+| Attribute | Description |
 |---|---|
-| `query` | 検索クエリ文字列 |
-| `count` | 表示件数 |
-| `total` | 全ヒット数（トークン予算で絞った透明性を確保） |
+| `query` | Search query string |
+| `count` | Number of results displayed |
+| `total` | Total hit count (transparency for token budget trimming) |
 
-### アイテム属性（`<result>`）
+### Item attributes (`<result>`)
 
-| 属性 | 説明 |
+| Attribute | Description |
 |---|---|
-| `index` | 順位（1-based、公式 `<document index>` に準拠） |
-| `score` | RRF スコア（関連度の判断材料） |
+| `index` | Rank (1-based, follows official `<document index>`) |
+| `score` | RRF score (relevance indicator) |
 
-### ソース属性（`<source>`）
+### Source attributes (`<source>`)
 
-| 属性 | 説明 | 省略条件 |
+| Attribute | Description | Omission rule |
 |---|---|---|
-| `type` | daily / knowledge / session 等 | 常に出力 |
-| `status` | current / draft 等 | null なら省略 |
+| `type` | daily / knowledge / session, etc. | Always present |
+| `status` | current / draft, etc. | Omitted when null |
 
-### 子要素
+### Child elements
 
-| 要素 | 説明 | 省略条件 |
+| Element | Description | Omission rule |
 |---|---|---|
-| `<source>` | ファイルパス（Read で直接読める導線、最重要） | 常に出力 |
-| `<section>` | セクションパス | 常に出力 |
-| `<snippet>` | 短いプレビュー（判断材料） | 予算超過時は `<snippet/>` |
-| `<related>` | 関連ファイルのカンマ区切り | 0 件なら省略 |
+| `<source>` | File path (primary entry point for `Read`) | Always present |
+| `<section>` | Section path | Always present |
+| `<snippet>` | Short preview for relevance judgment | `<snippet/>` when budget exceeded |
+| `<related>` | Comma-separated related file paths | Omitted when empty |
 
-## トークン予算
+## Token Budget
 
-snippet 合計の上限は環境変数 `TSM_SNIPPET_BUDGET` で制御する。
+The total snippet budget is controlled by the `TSM_SNIPPET_BUDGET` environment variable.
 
 ```bash
-TSM_SNIPPET_BUDGET=1000  # デフォルト: 1000 文字
+TSM_SNIPPET_BUDGET=1000  # Default: 1000 characters
 ```
 
-- search.sh 内で `${TSM_SNIPPET_BUDGET:-1000}` として参照する
-- 上限超過時は下位の result から snippet を省略し `<snippet/>` とする
-- プラグイン本体に手を入れずに、ユーザーごとの調整やモデルごとの最適化が可能
+- Referenced as `${TSM_SNIPPET_BUDGET:-1000}` in search.sh
+- When exceeded, lower-ranked results get `<snippet/>` (self-closing, no content)
+- Allows per-user or per-model tuning without modifying the plugin itself
 
-## tsm CLI との責務分離
+## Separation of Concerns with tsm CLI
 
-tsm CLI は人間向けテキストと構造化 JSON の出力に責任を持つ（ADR-0011）。
-本仕様のフォーマット変換は Claude Code プラグイン側（`hooks/scripts/search.sh`）で行う。
+tsm CLI is responsible for human-readable text and structured JSON output (ADR-0011).
+The format conversion defined here is handled by the Claude Code plugin (`hooks/scripts/search.sh`).
 
-- tsm に `--format claude` のような LLM 固有オプションは追加しない
-- search.sh が `tsm search --format json` の出力を受け取り、本仕様の XML に変換する
-- tsm の JSON スキーマ変更時はプラグイン側も追従が必要
+- No LLM-specific options (e.g., `--format claude`) will be added to tsm
+- search.sh receives `tsm search --format json` output and converts it to this XML format
+- Plugin must track tsm JSON schema changes
