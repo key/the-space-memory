@@ -32,9 +32,7 @@ pub fn run(model: Option<PathBuf>, no_idle_timeout: bool) -> Result<()> {
 /// Load model from explicit directory or fall back to default resolution.
 fn load_model(model_dir: Option<&Path>) -> Result<Embedder> {
     if let Some(dir) = model_dir {
-        let has_all_files = config::MODEL_FILES
-            .iter()
-            .all(|f| dir.join(f).is_file());
+        let has_all_files = config::MODEL_FILES.iter().all(|f| dir.join(f).is_file());
         if has_all_files {
             return Embedder::load_from_paths(
                 &dir.join("config.json"),
