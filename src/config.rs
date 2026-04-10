@@ -705,10 +705,9 @@ mod tests {
 
     // ─── ResolvedConfig from config file ─────────────────────────────
     // These tests construct ResolvedConfig via from_config_file() directly,
-    // bypassing the OnceLock singleton. Tests that touch env vars use #[serial].
-    // Tests with no env var mutation can run in parallel safely IF no TSM_*
-    // env vars are set in the execution environment. test_resolved_defaults
-    // clears them explicitly to be safe in CI.
+    // bypassing the OnceLock singleton. Tests that set TOML fields overridden
+    // by env vars (state_dir, index_root, etc.) must use #[serial] to avoid
+    // races with other tests that mutate those env vars.
 
     #[test]
     #[serial]
@@ -745,6 +744,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolved_from_config_file() {
         let cfg = resolved_from_toml(
             r#"
@@ -761,6 +761,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolved_socket_paths_follow_state_dir() {
         let cfg = resolved_from_toml(r#"state_dir = "/my/data""#);
         assert_eq!(
@@ -793,6 +794,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolved_derived_paths() {
         let cfg = resolved_from_toml(r#"state_dir = "/test""#);
         assert_eq!(cfg.state_dir.join("tsm.db"), PathBuf::from("/test/tsm.db"));
