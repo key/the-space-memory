@@ -10,6 +10,12 @@ QUERY=$(echo "$INPUT" | jq -r '.prompt // .user_prompt // empty' 2>/dev/null || 
 
 echo "[$(date -Iseconds)] query='${QUERY:0:80}' PLUGIN_ROOT='${CLAUDE_PLUGIN_ROOT:-}' PROJECT_DIR='${CLAUDE_PROJECT_DIR:-}'" >> "$LOG"
 
+# Skip system-generated prompts (task notifications, XML tags)
+if [[ "$QUERY" == "<"* ]]; then
+  echo "[$(date -Iseconds)] SKIP: system tag detected" >> "$LOG"
+  exit 0
+fi
+
 # クエリが短すぎる場合はスキップ
 if [ ${#QUERY} -lt 3 ]; then
   echo "[$(date -Iseconds)] SKIP: query too short (${#QUERY} chars)" >> "$LOG"
