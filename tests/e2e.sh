@@ -87,7 +87,7 @@ poll_search_hit() {
     local query="$1" file="$2" timeout="$3"
     local elapsed=0
     while [[ $elapsed -lt $timeout ]]; do
-        if search_json "$query" 2>/dev/null | jq -e "any(.[]; .source_file | contains(\"$file\"))" >/dev/null 2>&1; then
+        if search_json "$query" 2>/dev/null | jq -e "any(.results[]; .source_file | contains(\"$file\"))" >/dev/null 2>&1; then
             return 0
         fi
         sleep 2
@@ -101,7 +101,7 @@ poll_search_miss() {
     local query="$1" file="$2" timeout="$3"
     local elapsed=0
     while [[ $elapsed -lt $timeout ]]; do
-        if ! search_json "$query" 2>/dev/null | jq -e "any(.[]; .source_file | contains(\"$file\"))" >/dev/null 2>&1; then
+        if ! search_json "$query" 2>/dev/null | jq -e "any(.results[]; .source_file | contains(\"$file\"))" >/dev/null 2>&1; then
             return 0
         fi
         sleep 2
@@ -207,7 +207,7 @@ log "=== Index → Search round-trip ==="
 
 run search_json "親譲り 無鉄砲"
 assert_json "index-search: botchan hit" \
-    'any(.[]; .source_file | contains("botchan"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    'any(.results[]; .source_file | contains("botchan"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # ── FTS5 search ───────────────────────────────────────────────────────
 
@@ -216,11 +216,11 @@ log "=== FTS5 search ==="
 
 run search_json "ジョバンニ カムパネルラ"
 assert_json "fts5: gingatetsudo hit" \
-    'any(.[]; .source_file | contains("gingatetsudo"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    'any(.results[]; .source_file | contains("gingatetsudo"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 run search_json "メロス 激怒"
 assert_json "fts5: hashire-melos hit" \
-    'any(.[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # ── Search options (--top-k, --include-content, text format) ────────
 
@@ -230,12 +230,12 @@ log "=== Search options ==="
 # --top-k: request 1 result, verify exactly 1 returned
 run search_json "メロス" -k 1
 assert_json "options: -k 1 returns exactly 1 result" \
-    'length == 1' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    '.results | length == 1' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # --include-content: verify content field is present
 run search_json "メロス" -k 1 --include-content 1
 assert_json "options: --include-content adds content field" \
-    '.[0].content != null and (.[0].content | length > 0)' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    '.results[0].content != null and (.results[0].content | length > 0)' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # text format (default): verify human-readable output contains score and file
 set +e; CAPTURED_OUTPUT=$(tsm search -q "メロス" -k 1 2>/dev/null); CAPTURED_EXIT=$?; set -e
@@ -248,15 +248,15 @@ log "=== Entity search ==="
 
 run search_json "漱石"
 assert_json "entity: 漱石 → botchan" \
-    'any(.[]; .source_file | contains("botchan"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    'any(.results[]; .source_file | contains("botchan"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 run search_json "賢治"
 assert_json "entity: 賢治 → gingatetsudo" \
-    'any(.[]; .source_file | contains("gingatetsudo"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    'any(.results[]; .source_file | contains("gingatetsudo"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 run search_json "太宰"
 assert_json "entity: 太宰 → hashire-melos" \
-    'any(.[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # ── Temporal search ───────────────────────────────────────────────────
 
@@ -265,16 +265,16 @@ log "=== Temporal search ==="
 
 run search_json "猫" --recent 30d
 assert_json "temporal: --recent 30d excludes old-text" \
-    '[.[] | select(.source_file | contains("old-text"))] | length == 0' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    '[.results[] | select(.source_file | contains("old-text"))] | length == 0' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 THIS_YEAR=$(date +%Y)
 run search_json "吾輩 猫" --year "$THIS_YEAR"
 assert_json "temporal: --year THIS_YEAR excludes old-text" \
-    '[.[] | select(.source_file | contains("old-text"))] | length == 0' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    '[.results[] | select(.source_file | contains("old-text"))] | length == 0' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 run search_json "紳士 料理店" --after "$THREE_MONTHS_AGO_START" --before "$THREE_MONTHS_AGO_END"
 assert_json "temporal: --after/--before hits seasonal-text" \
-    'any(.[]; .source_file | contains("seasonal-text"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    'any(.results[]; .source_file | contains("seasonal-text"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # ── Vector search (semantic similarity) ───────────────────────────────
 
@@ -283,11 +283,11 @@ log "=== Vector search ==="
 
 run search_json "学校の先生と生徒"
 assert_json "vector: 学校の先生と生徒 → botchan" \
-    'any(.[]; .source_file | contains("botchan"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    'any(.results[]; .source_file | contains("botchan"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 run search_json "宇宙と星の旅"
 assert_json "vector: 宇宙と星の旅 → gingatetsudo" \
-    'any(.[]; .source_file | contains("gingatetsudo"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    'any(.results[]; .source_file | contains("gingatetsudo"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # ── Dictionary test ───────────────────────────────────────────────────
 
@@ -322,17 +322,17 @@ done
 
 # Verify search before dict registration found results
 assert_json "dict: '$DICT_WORD' found before dict (via constituent tokens)" \
-    'any(.[]; .source_file | contains("hashire-melos"))' "$OUTPUT_BEFORE" "0"
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$OUTPUT_BEFORE" "0"
 
 # Verify search still works after reindex
 run search_json "メロス 激怒" --fallback fts-only
 assert_json "dict: search works after reindex" \
-    'any(.[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # Verify dict-registered word works as a standalone search query (#104)
 run search_json "$DICT_WORD" --fallback fts-only
 assert_json "dict: standalone search for dict term '$DICT_WORD' hits hashire-melos" \
-    'any(.[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # ── Edge cases ────────────────────────────────────────────────────────
 
@@ -343,7 +343,7 @@ log "=== Edge cases ==="
 run search_json ""
 if [[ "$CAPTURED_EXIT" -eq 0 ]]; then
     assert_json "edge: empty query → 0 results or valid json" \
-        'if type == "array" then true else false end' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+        '.results | type == "array"' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 else
     # Empty query might be rejected by clap, that's OK too
     pass "edge: empty query → handled (exit $CAPTURED_EXIT)"
@@ -352,7 +352,7 @@ fi
 # EC4: Single character — must exit 0 and return valid JSON
 run search_json "a"
 assert_json "edge: single char 'a' → valid json (exit $CAPTURED_EXIT)" \
-    'type == "array"' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    '.results | type == "array"' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # EC5: Invalid --recent value
 set +e; CAPTURED_OUTPUT=$(tsm search -q "test" --recent garbage 2>&1); CAPTURED_EXIT=$?; set -e
@@ -370,7 +370,7 @@ assert_contains "ingest-session: succeeds" "session indexed" "$CAPTURED_OUTPUT" 
 # Search for session-specific content (use fts-only; embedder may not be ready)
 run search_json "量子もつれ" --fallback fts-only
 assert_json "ingest-session: search hits session content" \
-    'any(.[]; .source_file | contains("test-session"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    'any(.results[]; .source_file | contains("test-session"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # Re-ingest same file should be a no-op (already indexed)
 set +e; CAPTURED_OUTPUT=$(tsm ingest-session "$SESSION_FILE" 2>&1); CAPTURED_EXIT=$?; set -e
@@ -403,7 +403,7 @@ else
     tsm index 2>/dev/null
     sleep 2
     run search_json "幻想水滸伝"
-    if echo "$CAPTURED_OUTPUT" | jq -e 'any(.[]; .source_file | contains("watcher-test"))' >/dev/null 2>&1; then
+    if echo "$CAPTURED_OUTPUT" | jq -e 'any(.results[]; .source_file | contains("watcher-test"))' >/dev/null 2>&1; then
         pass "watcher: new file indexed (after manual index fallback)"
     else
         fail "watcher: new file not detected" "watcher-test.md not found in search results"
@@ -420,7 +420,7 @@ else
     tsm index 2>/dev/null
     sleep 2
     run search_json "幻想水滸伝"
-    if ! echo "$CAPTURED_OUTPUT" | jq -e 'any(.[]; .source_file | contains("watcher-test"))' >/dev/null 2>&1; then
+    if ! echo "$CAPTURED_OUTPUT" | jq -e 'any(.results[]; .source_file | contains("watcher-test"))' >/dev/null 2>&1; then
         pass "watcher: deleted file removed (after manual index fallback)"
     else
         fail "watcher: deleted file still in index" "watcher-test.md still appears in search results"

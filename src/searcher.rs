@@ -25,6 +25,13 @@ pub struct SearchResult {
     pub related_docs: Vec<doc_links::RelatedDoc>,
 }
 
+/// Search output with total hit count (before top_k truncation).
+#[derive(Debug)]
+pub struct SearchOutput {
+    pub results: Vec<SearchResult>,
+    pub total_hits: usize,
+}
+
 /// Search for documents matching the query, with optional time filtering.
 ///
 /// When `require_vector` is true, returns an error if vector search is
@@ -36,11 +43,14 @@ pub fn search(
     time_filter: Option<&TimeFilter>,
     require_vector: bool,
     path_prefixes: Option<&[String]>,
-) -> anyhow::Result<Vec<SearchResult>> {
+) -> anyhow::Result<SearchOutput> {
     // Query preprocessing: extract meaningful keywords, skip noise-only queries
     let keywords = extract_search_keywords(query);
     if keywords.len() < config::MIN_QUERY_KEYWORDS {
-        return Ok(Vec::new());
+        return Ok(SearchOutput {
+            results: Vec::new(),
+            total_hits: 0,
+        });
     }
     let query = &keywords.join(" ");
 
@@ -90,7 +100,10 @@ pub fn search(
         .collect();
 
     if all_chunk_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(SearchOutput {
+            results: Vec::new(),
+            total_hits: 0,
+        });
     }
 
     let placeholders = all_chunk_ids
@@ -210,6 +223,7 @@ pub fn search(
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    let total_hits = results.len();
     results.truncate(top_k);
 
     // Enrich with related documents
@@ -239,7 +253,10 @@ pub fn search(
         }
     }
 
-    Ok(results)
+    Ok(SearchOutput {
+        results,
+        total_hits,
+    })
 }
 
 pub(crate) fn time_decay(updated: Option<&str>, file_path: &str, source_type: &str) -> f64 {
@@ -558,7 +575,7 @@ mod tests {
         indexer::index_file(&conn, &full, dir.path()).unwrap();
 
         // Search should find it
-        let results = search(&conn, "射撃", 5, None, false, None).unwrap();
+        let SearchOutput { results, .. } = search(&conn, "射撃", 5, None, false, None).unwrap();
         assert!(!results.is_empty());
         assert!(results[0].source_file.contains("shooting"));
         assert!(results[0].score > 0.0);
@@ -568,14 +585,15 @@ mod tests {
     #[test]
     fn test_search_empty_query() {
         let conn = db::get_memory_connection().unwrap();
-        let results = search(&conn, "", 5, None, false, None).unwrap();
+        let SearchOutput { results, .. } = search(&conn, "", 5, None, false, None).unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_search_no_results() {
         let conn = db::get_memory_connection().unwrap();
-        let results = search(&conn, "存在しないキーワード", 5, None, false, None).unwrap();
+        let SearchOutput { results, .. } =
+            search(&conn, "存在しないキーワード", 5, None, false, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -600,7 +618,7 @@ mod tests {
             indexer::index_file(&conn, &full, dir.path()).unwrap();
         }
 
-        let results = search(&conn, "テスト", 3, None, false, None).unwrap();
+        let SearchOutput { results, .. } = search(&conn, "テスト", 3, None, false, None).unwrap();
         assert!(results.len() <= 3);
     }
 
@@ -628,7 +646,8 @@ mod tests {
             after: Some("2020-01-01".to_string()),
             before: Some("2099-01-01".to_string()),
         };
-        let results = search(&conn, "射撃", 5, Some(&filter), false, None).unwrap();
+        let SearchOutput { results, .. } =
+            search(&conn, "射撃", 5, Some(&filter), false, None).unwrap();
         assert!(!results.is_empty());
     }
 
@@ -656,7 +675,8 @@ mod tests {
             after: Some("2099-01-01".to_string()),
             before: None,
         };
-        let results = search(&conn, "射撃", 5, Some(&filter), false, None).unwrap();
+        let SearchOutput { results, .. } =
+            search(&conn, "射撃", 5, Some(&filter), false, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -680,7 +700,8 @@ mod tests {
             after: Some("2025-01-01".to_string()),
             before: None,
         };
-        let results = search(&conn, "射撃", 5, Some(&filter), false, None).unwrap();
+        let SearchOutput { results, .. } =
+            search(&conn, "射撃", 5, Some(&filter), false, None).unwrap();
         assert!(!results.is_empty());
     }
 
@@ -712,7 +733,8 @@ mod tests {
     fn test_search_noise_query_returns_empty() {
         let conn = db::get_memory_connection().unwrap();
         // Pure interjection/greeting should return empty results
-        let results = search(&conn, "よかったーーー", 5, None, false, None).unwrap();
+        let SearchOutput { results, .. } =
+            search(&conn, "よかったーーー", 5, None, false, None).unwrap();
         assert!(
             results.is_empty(),
             "Noise query should return empty results"
@@ -722,7 +744,7 @@ mod tests {
     #[test]
     fn test_search_stopword_query_returns_empty() {
         let conn = db::get_memory_connection().unwrap();
-        let results = search(&conn, "なるほど", 5, None, false, None).unwrap();
+        let SearchOutput { results, .. } = search(&conn, "なるほど", 5, None, false, None).unwrap();
         assert!(
             results.is_empty(),
             "Stopword-only query should return empty results"
@@ -746,7 +768,8 @@ mod tests {
         indexer::index_file(&conn, &full, dir.path()).unwrap();
 
         // A meaningful query should still find results
-        let results = search(&conn, "LoRaモジュール", 5, None, false, None).unwrap();
+        let SearchOutput { results, .. } =
+            search(&conn, "LoRaモジュール", 5, None, false, None).unwrap();
         assert!(!results.is_empty(), "Meaningful query should find results");
     }
 
@@ -777,7 +800,8 @@ mod tests {
 
         // Filter to daily/ only
         let paths = vec!["daily/".to_string()];
-        let results = search(&conn, "MTG", 5, None, false, Some(&paths)).unwrap();
+        let SearchOutput { results, .. } =
+            search(&conn, "MTG", 5, None, false, Some(&paths)).unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert!(
@@ -805,7 +829,8 @@ mod tests {
 
         // Filter to projects/ — should exclude daily/
         let paths = vec!["projects/".to_string()];
-        let results = search(&conn, "MTG", 5, None, false, Some(&paths)).unwrap();
+        let SearchOutput { results, .. } =
+            search(&conn, "MTG", 5, None, false, Some(&paths)).unwrap();
         assert!(results.is_empty());
     }
 
@@ -833,7 +858,8 @@ mod tests {
 
         // Filter to daily/ and docs/ (OR)
         let paths = vec!["daily/".to_string(), "docs/".to_string()];
-        let results = search(&conn, "MTG", 10, None, false, Some(&paths)).unwrap();
+        let SearchOutput { results, .. } =
+            search(&conn, "MTG", 10, None, false, Some(&paths)).unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert!(
@@ -862,7 +888,7 @@ mod tests {
         }
 
         // No path filter — should return results from both directories
-        let results = search(&conn, "MTG", 10, None, false, None).unwrap();
+        let SearchOutput { results, .. } = search(&conn, "MTG", 10, None, false, None).unwrap();
         assert!(results.len() >= 2);
     }
 
@@ -888,7 +914,8 @@ mod tests {
 
         // Filter to a specific file
         let paths = vec!["docs/api.md".to_string()];
-        let results = search(&conn, "Authentication", 10, None, false, Some(&paths)).unwrap();
+        let SearchOutput { results, .. } =
+            search(&conn, "Authentication", 10, None, false, Some(&paths)).unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert_eq!(r.source_file, "docs/api.md");
@@ -919,7 +946,8 @@ mod tests {
 
         // _ in path must be literal, not a wildcard
         let paths = vec!["daily_notes/".to_string()];
-        let results = search(&conn, "MTG", 10, None, false, Some(&paths)).unwrap();
+        let SearchOutput { results, .. } =
+            search(&conn, "MTG", 10, None, false, Some(&paths)).unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert!(
@@ -961,7 +989,8 @@ mod tests {
             after: Some("2025-01-01".to_string()),
             before: None,
         };
-        let results = search(&conn, "MTG", 10, Some(&filter), false, Some(&paths)).unwrap();
+        let SearchOutput { results, .. } =
+            search(&conn, "MTG", 10, Some(&filter), false, Some(&paths)).unwrap();
         for r in &results {
             assert!(
                 r.source_file.starts_with("daily/"),
