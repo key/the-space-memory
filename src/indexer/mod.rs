@@ -15,6 +15,10 @@ use crate::session_chunker::parse_session_jsonl;
 use crate::tokenizer::wakachi;
 use crate::user_dict;
 
+pub mod walker;
+
+pub use walker::ContentWalker;
+
 #[derive(Debug, Default)]
 pub struct IndexStats {
     pub indexed: usize,
