@@ -54,7 +54,8 @@ tsm setup
 # 3. Set the document root directory
 export TSM_INDEX_ROOT=~/my-notes
 
-# 4. Initialize the database
+# 4. Initialize the database (also writes a default .tsmignore at the
+#    project root if one does not already exist — edit to taste)
 tsm init
 
 # 5. Start the daemon (embedder + file watcher)

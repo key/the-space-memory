@@ -51,7 +51,8 @@ tsm setup
 # 3. ドキュメントのルートディレクトリを設定
 export TSM_INDEX_ROOT=~/my-notes
 
-# 4. データベースの初期化
+# 4. データベースの初期化（プロジェクトルートに default .tsmignore を
+#    同時に配置する。既存ファイルがある場合は上書きしない）
 tsm init
 
 # 5. デーモンの起動（embedder + ファイル監視）

@@ -1,4 +1,4 @@
-use std::io::{BufRead, Read};
+use std::io::{BufRead, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config;
@@ -33,28 +33,53 @@ dist/
 *.db
 ";
 
+/// Convenience wrapper that pulls `db_path` and `project_root` from the
+/// config singleton and forwards to `cmd_init_with`. Tests bypass this by
+/// calling `cmd_init_with` directly with a tempdir, so the dispatch from
+/// `main.rs` stays trivial here.
 pub fn cmd_init() -> anyhow::Result<()> {
-    let db_path = config::db_path();
-    db::init_db(&db_path)?;
+    cmd_init_with(&config::db_path(), &config::project_root())
+}
+
+/// Initialize the DB and install the default `.tsmignore`. Both arguments
+/// are explicit so the function is testable end-to-end without touching the
+/// config singleton — the regression "someone removes the .tsmignore step
+/// from cmd_init" is caught by the integration test below.
+pub fn cmd_init_with(db_path: &Path, project_root: &Path) -> anyhow::Result<()> {
+    db::init_db(db_path)?;
     log::info!("Database initialized at {}", db_path.display());
-    install_default_tsmignore(&config::project_root())?;
+    install_default_tsmignore(project_root)?;
     Ok(())
 }
 
 /// Write `DEFAULT_TSMIGNORE` to `<project_root>/.tsmignore` if no file
 /// exists there. Idempotent — re-running `tsm init` never overwrites a
 /// user-customized file. Returns Ok in both the wrote-it and skipped-it
-/// cases; only filesystem errors propagate.
+/// cases; only unexpected filesystem errors propagate.
+///
+/// Uses `OpenOptions::create_new` rather than `exists()` + `write()` so the
+/// no-overwrite guarantee holds atomically — if `.tsmignore` is created by
+/// another process between the check and the write, `create_new` returns
+/// `AlreadyExists` and we treat that as the skip case rather than silently
+/// clobbering the file.
 fn install_default_tsmignore(project_root: &Path) -> anyhow::Result<()> {
     let tsmignore_path = project_root.join(".tsmignore");
-    if tsmignore_path.exists() {
-        log::info!(
-            ".tsmignore already exists at {} — leaving untouched",
-            tsmignore_path.display()
-        );
-    } else {
-        std::fs::write(&tsmignore_path, DEFAULT_TSMIGNORE)?;
-        log::info!("Wrote default .tsmignore to {}", tsmignore_path.display());
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tsmignore_path)
+    {
+        Ok(mut f) => {
+            f.write_all(DEFAULT_TSMIGNORE.as_bytes())?;
+            log::info!("Wrote default .tsmignore to {}", tsmignore_path.display());
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            log::info!(
+                ".tsmignore already exists at {} — leaving untouched",
+                tsmignore_path.display()
+            );
+        }
+        Err(e) => return Err(e.into()),
     }
     Ok(())
 }
@@ -1649,6 +1674,24 @@ mod tests {
         assert!(written.contains(".*/"));
         assert!(written.contains("target/"));
         assert!(written.contains("*.parquet"));
+    }
+
+    #[test]
+    fn cmd_init_with_creates_db_and_tsmignore() {
+        // End-to-end regression test: cmd_init_with must run BOTH steps
+        // (db init AND .tsmignore install). Without this test, removing the
+        // install_default_tsmignore call from cmd_init would still leave
+        // unit tests passing — silently shipping installs without the
+        // default ignore file.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let project_root = dir.path();
+        super::cmd_init_with(&db_path, project_root).unwrap();
+        assert!(db_path.is_file(), "DB file was not created");
+        assert!(
+            project_root.join(".tsmignore").is_file(),
+            ".tsmignore was not created"
+        );
     }
 
     #[test]
