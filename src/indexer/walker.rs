@@ -55,13 +55,11 @@ impl ContentWalker {
     /// Core constructor taking raw values. Every other `from_*` constructor
     /// funnels through this — there is exactly one place where a walker is
     /// assembled, and exactly one place that owns the `.tsmignore` lookup
-    /// against `project_root`.
-    ///
-    /// Centralizing here lets `from_env_with_index_root` build a walker
-    /// whose `index_root` differs from the loaded config without mutating
-    /// `ResolvedConfig` through its `pub` fields — that mutation pattern
-    /// silently broke whenever a new field (like `project_root`) needed
-    /// to stay coherent with `index_root`.
+    /// against `project_root`. The `.tsmignore` file is read from
+    /// `project_root` (the directory containing `tsm.toml`); a missing file
+    /// is silently treated as empty — the common case for users who have
+    /// not opted in. See the module-level doc for the rationale on routing
+    /// every constructor through `new` instead of mutating `ResolvedConfig`.
     pub fn new(
         index_root: PathBuf,
         project_root: &Path,
@@ -79,12 +77,9 @@ impl ContentWalker {
         }
     }
 
-    /// Construct a walker from a fully-resolved config.
-    ///
-    /// The `.tsmignore` file is read from `cfg.project_root` — the directory
-    /// containing `tsm.toml`, resolved at config-load time (see
-    /// `ResolvedConfig::from_env`). Missing files are silently treated as
-    /// empty — this is the common case for users who have not opted in.
+    /// Construct a walker from a fully-resolved config. Thin wrapper that
+    /// unpacks `cfg` and forwards to `new`. See `new` for `.tsmignore`
+    /// lookup semantics.
     pub fn from_config(cfg: &ResolvedConfig) -> Self {
         Self::new(
             cfg.index_root.clone(),
@@ -130,8 +125,9 @@ impl ContentWalker {
     /// Crate-internal because the combined gate — ignore rules *and*
     /// extension allowlist — is exposed via the `IngestPolicy::accepts`
     /// impl. Bypassing that composition (e.g. calling only `is_ignored`)
-    /// would silently re-introduce the drift this PR set out to fix, so
-    /// production callers must go through `accepts()`.
+    /// would let a path skip the extension allowlist — the historical
+    /// drift fixed in #134 / #135. Production callers must go through
+    /// `accepts()`.
     pub(crate) fn is_ignored(&self, path: &Path) -> bool {
         let Ok(rel) = path.strip_prefix(&self.index_root) else {
             return true;

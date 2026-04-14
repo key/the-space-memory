@@ -1591,8 +1591,9 @@ mod tests {
         assert_eq!(parsed["results"][0]["content"], "# Hello\n\nWorld.");
     }
 
-    // Walker behavior is covered by indexer::walker::tests. Callers in this
-    // module construct ContentWalker directly via from_env_with_index_root.
+    // Walker behavior is covered by indexer::walker::tests. In this module
+    // `cmd_rebuild` constructs ContentWalker via from_env_with_index_root
+    // (explicit index_root override); other commands use from_env().
 
     #[test]
     fn test_format_json_include_content_file_missing() {
