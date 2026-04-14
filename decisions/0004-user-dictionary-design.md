@@ -1,11 +1,20 @@
 # ADR-0004: ユーザー辞書の設計方針
 
-- **Status**: **Accepted**
-- **Date**: 2026-04-01
+- **Status**: **Accepted（2026-04-14 改訂）**
+- **Date**: 2026-04-01（初版） / 2026-04-14（改訂）
 - **Deciders**: key
 - **Related**:
   [Issue #59](https://github.com/key/the-space-memory/issues/59),
   [PR #63](https://github.com/key/the-space-memory/pull/63)
+
+## 改訂履歴
+
+- **2026-04-14**: CLI 設計から「git commit & PR 作成」を削除。辞書更新は
+  DB + 辞書ファイルの操作のみに限定し、git 操作はユーザーに委ねる。
+  `.tsm/user_dict.simpledic` はプロジェクトによって gitignore されるケースが
+  あり、ツール側で git 管理を仮定するのは誤り。辞書を git 管理したい場合は
+  ユーザー自身が `git add` / commit する（運用判断の問題であって、ツールが
+  強制すべきことではない）。
 
 ## Context
 
@@ -52,7 +61,7 @@ lindera の内蔵辞書（IPAdic）は一般的な日本語をカバーするが
 
 ```bash
 tsm dict update             # 候補一覧（ドライラン）
-tsm dict update --apply     # 辞書に追加 + FTS rebuild + git commit & PR 作成
+tsm dict update --apply     # 辞書に追加 + FTS rebuild
 tsm dict reject             # reject 候補一覧
 tsm dict reject --apply     # reject_words.txt → DB 同期
 tsm dict reject --all       # rejected 全件表示
@@ -61,7 +70,9 @@ tsm dict reject --all       # rejected 全件表示
 - `--apply` なし = 見るだけ、`--apply` あり = 実行
 - `dict update` と `dict reject` で対称的な構造
 - `dict reject` はデーモン稼働中でも実行可能（FTS インデックスを変更せず rebuild 不要。rejected 候補は辞書ファイルに存在しないため検索精度にも影響しない）
-- `dict update --apply` はデーモン停止が必要（rebuild のため）
+- `dict update --apply` は FTS 再構築を伴うが、デーモン稼働中なら IPC で
+  reindex 要求を投げて非同期に完了する
+- 辞書ファイルの git 管理は運用判断。ツールは git を触らない
 
 ### データ配置
 
