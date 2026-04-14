@@ -74,17 +74,6 @@ pub fn read_paths_from_stdin(index_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Collect all files under `index_root` that should be indexed.
-///
-/// The `index_root` argument overrides the value that would otherwise be
-/// read from `tsm.toml` — important in tests that exercise `cmd_rebuild`
-/// with a tempdir. All other config fields are still resolved fresh from
-/// disk via `ResolvedConfig::from_env()`; neither this function nor the
-/// walker it builds consults the `config::RESOLVED` singleton.
-pub fn collect_content_files(index_root: &Path) -> Vec<PathBuf> {
-    indexer::ContentWalker::from_env_with_index_root(index_root).collect_files()
-}
-
 pub struct SearchOptions<'a> {
     pub query: &'a str,
     pub top_k: usize,
@@ -1602,9 +1591,8 @@ mod tests {
         assert_eq!(parsed["results"][0]["content"], "# Hello\n\nWorld.");
     }
 
-    // Walker behavior is now covered by indexer::walker::tests. The
-    // `collect_content_files` wrapper in this file is a thin forward that
-    // builds a ContentWalker from the passed `index_root`.
+    // Walker behavior is covered by indexer::walker::tests. Callers in this
+    // module construct ContentWalker directly via from_env_with_index_root.
 
     #[test]
     fn test_format_json_include_content_file_missing() {
