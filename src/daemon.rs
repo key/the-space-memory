@@ -310,6 +310,84 @@ mod tests {
         assert_eq!(payload["indexed"], 1);
     }
 
+    /// Caller-supplied files that match `.tsmignore` must be dropped before
+    /// reaching the indexer. This is the stdin / fs-watcher safety net.
+    #[test]
+    #[serial_test::serial]
+    fn test_index_filters_caller_paths_by_tsmignore() {
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+
+        // .tsmignore lives next to tsm.toml — the walker resolves it relative
+        // to CWD, so we temporarily point CWD at the tempdir.
+        std::fs::write(dir.path().join(".tsmignore"), "private/\n").unwrap();
+
+        let daily = dir.path().join("daily");
+        let private = dir.path().join("private");
+        std::fs::create_dir_all(&daily).unwrap();
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(daily.join("ok.md"), "# OK\n\nbody").unwrap();
+        std::fs::write(private.join("secret.md"), "# Secret\n\nbody").unwrap();
+
+        std::env::set_current_dir(dir.path()).unwrap();
+        let req = DaemonRequest::Index {
+            files: vec!["daily/ok.md".into(), "private/secret.md".into()],
+        };
+        let resp = handle_request(&conn, req, dir.path(), &flag);
+        assert!(resp.ok);
+        let payload = resp.payload.unwrap();
+        // Only daily/ok.md survives the ignore filter.
+        assert_eq!(payload["indexed"], 1);
+    }
+
+    /// Non-allowlisted extensions must be dropped even when explicitly
+    /// supplied via the files list (e.g. from a misconfigured hook).
+    #[test]
+    #[serial_test::serial]
+    fn test_index_filters_caller_paths_by_extension() {
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+
+        let notes = dir.path().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("a.md"), "# A\n\nbody").unwrap();
+        std::fs::write(notes.join("b.csv"), "x,y\n1,2\n").unwrap();
+
+        std::env::set_current_dir(dir.path()).unwrap();
+        let req = DaemonRequest::Index {
+            files: vec!["notes/a.md".into(), "notes/b.csv".into()],
+        };
+        let resp = handle_request(&conn, req, dir.path(), &flag);
+        assert!(resp.ok);
+        let payload = resp.payload.unwrap();
+        // b.csv is not in the default ["md"] allowlist.
+        assert_eq!(payload["indexed"], 1);
+    }
+
+    /// `files: []` triggers a full walk via ContentWalker — verify the
+    /// ignore rules apply to that path too, not just to caller-supplied lists.
+    #[test]
+    #[serial_test::serial]
+    fn test_index_empty_full_walk_respects_tsmignore() {
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+
+        std::fs::write(dir.path().join(".tsmignore"), "skip/\n").unwrap();
+        let daily = dir.path().join("daily");
+        let skip = dir.path().join("skip");
+        std::fs::create_dir_all(&daily).unwrap();
+        std::fs::create_dir_all(&skip).unwrap();
+        std::fs::write(daily.join("keep.md"), "# Keep\n\nbody").unwrap();
+        std::fs::write(skip.join("drop.md"), "# Drop\n\nbody").unwrap();
+
+        std::env::set_current_dir(dir.path()).unwrap();
+        let req = DaemonRequest::Index { files: vec![] };
+        let resp = handle_request(&conn, req, dir.path(), &flag);
+        assert!(resp.ok);
+        let payload = resp.payload.unwrap();
+        assert_eq!(payload["indexed"], 1);
+    }
+
     #[test]
     fn test_ingest_session_file_not_found_via_daemon() {
         let (conn, dir) = setup();

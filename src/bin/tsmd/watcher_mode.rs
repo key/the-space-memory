@@ -267,4 +267,45 @@ mod tests {
         SHUTDOWN.store(false, Ordering::SeqCst);
         unsafe { std::env::remove_var("TSM_INDEX_ROOT") };
     }
+
+    /// The event loop in `run()` drops an event iff
+    /// `walker.is_ignored(path) || !walker.extension_allowed(path)`. Verify
+    /// that predicate directly against realistic paths — covering the
+    /// .tsmignore, forced-exclude, and extension-allowlist legs of the OR.
+    #[test]
+    #[serial_test::serial]
+    fn test_event_filter_predicate_matches_implementation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("daily")).unwrap();
+        std::fs::create_dir_all(dir.path().join("private")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".tsmignore"), "private/\n").unwrap();
+
+        std::env::set_current_dir(dir.path()).unwrap();
+        unsafe { std::env::set_var("TSM_INDEX_ROOT", dir.path().as_os_str()) };
+        let walker = ContentWalker::from_env();
+
+        // Helper mirroring the condition at the top of the event loop.
+        let drop_event =
+            |p: &std::path::Path| -> bool { walker.is_ignored(p) || !walker.extension_allowed(p) };
+
+        assert!(
+            !drop_event(&dir.path().join("daily/keep.md")),
+            "normal .md under a non-ignored dir must pass the event filter"
+        );
+        assert!(
+            drop_event(&dir.path().join("private/secret.md")),
+            ".tsmignore-excluded path must be dropped by the event filter"
+        );
+        assert!(
+            drop_event(&dir.path().join(".git/HEAD.md")),
+            "forced-excluded dir must be dropped by the event filter"
+        );
+        assert!(
+            drop_event(&dir.path().join("daily/notes.csv")),
+            "extension outside [index].extensions must be dropped"
+        );
+
+        unsafe { std::env::remove_var("TSM_INDEX_ROOT") };
+    }
 }
