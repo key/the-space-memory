@@ -568,12 +568,22 @@ fn load_config_from(candidates: &[PathBuf]) -> (ConfigFile, Option<PathBuf>) {
 
 /// Resolve `path` to the parent directory of the config file. Handles
 /// both absolute paths (e.g. `TSM_CONFIG=/foo/tsm.toml` → `/foo`) and
-/// relative ones (bare `"tsm.toml"` → canonicalized CWD). Returns `None`
-/// only for pathological cases where even canonicalization fails.
+/// relative ones (bare `"tsm.toml"` → CWD-joined parent).
+///
+/// Avoids `canonicalize` — it's a syscall that can race the preceding
+/// `read_to_string` (file disappears, symlink breaks) and losing it
+/// silently breaks the invariant "config values and project_root come
+/// from the same file". Since we already read the file successfully,
+/// we know its parent deterministically from the path we were given.
 fn project_root_from(path: &Path) -> Option<PathBuf> {
-    // canonicalize() resolves relative paths against CWD and follows
-    // symlinks, giving callers a stable absolute directory.
-    let abs = std::fs::canonicalize(path).ok()?;
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        // Relative path — resolve against CWD. `current_dir()` failure
+        // is the only way we return None here; the file read already
+        // succeeded so the parent exists on disk.
+        std::env::current_dir().ok()?.join(path)
+    };
     abs.parent().map(|p| p.to_path_buf())
 }
 
@@ -995,11 +1005,9 @@ embedder_idle_timeout_secs = 1200
         assert_eq!(cfg.index_root, Some(PathBuf::from("/custom/root")));
         assert_eq!(cfg.embedder_idle_timeout_secs, Some(1200));
         assert!(cfg.daemon_socket_path.is_none());
-        // project_root derives from the loaded file's parent.
-        assert_eq!(
-            root.unwrap(),
-            std::fs::canonicalize(config_path.parent().unwrap()).unwrap()
-        );
+        // project_root derives from the loaded file's parent — the same
+        // absolute path that was passed in, no canonicalization applied.
+        assert_eq!(root.as_deref(), config_path.parent());
     }
 
     #[test]
@@ -1024,10 +1032,7 @@ index_root = "/low-root"
         assert_eq!(cfg.index_root, Some(PathBuf::from("/low-root")));
         // project_root comes from the FIRST successfully-loaded candidate,
         // regardless of which fields subsequent files contribute.
-        assert_eq!(
-            root.unwrap(),
-            std::fs::canonicalize(high.parent().unwrap()).unwrap()
-        );
+        assert_eq!(root.as_deref(), high.parent());
     }
 
     #[test]
@@ -1036,6 +1041,27 @@ index_root = "/low-root"
         assert!(cfg.state_dir.is_none());
         assert!(cfg.index_root.is_none());
         assert!(root.is_none(), "no config loaded → no project_root");
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_config_relative_path_resolves_against_cwd() {
+        // A bare relative candidate like "tsm.toml" must yield a
+        // project_root derived from CWD (not a bare empty path), with no
+        // canonicalize syscall in the picture. Avoids the race where the
+        // file could change between read and canonicalize.
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::write(dir.path().join("tsm.toml"), r#"state_dir = "/rel""#).unwrap();
+
+        let (cfg, root) = load_config_from(&[PathBuf::from("tsm.toml")]);
+
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert_eq!(cfg.state_dir, Some(PathBuf::from("/rel")));
+        // project_root should be CWD (tempdir), not empty / None.
+        assert_eq!(root.unwrap(), dir.path());
     }
 
     #[test]
@@ -1058,10 +1084,7 @@ index_root = "/low-root"
         let (cfg, root) = load_config_from(&[malformed, valid.clone()]);
         assert_eq!(cfg.state_dir, Some(PathBuf::from("/good")));
         // project_root is derived from the VALID file, not the malformed one.
-        assert_eq!(
-            root.unwrap(),
-            std::fs::canonicalize(valid.parent().unwrap()).unwrap()
-        );
+        assert_eq!(root.as_deref(), valid.parent());
     }
 
     // ─── Pure functions ─────────────────────────────────────────────
