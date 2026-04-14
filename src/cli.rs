@@ -15,13 +15,18 @@ pub fn cmd_init() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run indexing on given file paths and return stats (no DB open, no output).
+/// Run indexing on given file paths under a policy. Returns stats.
+///
+/// The policy is the non-bypassable correctness gate applied by the
+/// indexer — no caller-side pre-filter is required (or permitted, per
+/// design: duplicated filter logic was a bug-magnet, see #134).
 pub fn run_index(
     conn: &rusqlite::Connection,
     file_paths: &[PathBuf],
     index_root: &Path,
+    policy: &dyn indexer::IngestPolicy,
 ) -> anyhow::Result<indexer::IndexStats> {
-    indexer::index_all(conn, file_paths, index_root)
+    indexer::index_all(conn, file_paths, index_root, policy)
 }
 
 pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
@@ -31,12 +36,12 @@ pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
 
     let walker = indexer::ContentWalker::from_env();
     let file_paths: Vec<PathBuf> = if files_from_stdin {
-        read_paths_from_stdin(&index_root, &walker)
+        read_paths_from_stdin(&index_root)
     } else {
         walker.collect_files()
     };
 
-    let stats = run_index(&conn, &file_paths, &index_root)?;
+    let stats = run_index(&conn, &file_paths, &index_root, &walker)?;
     log::info!(
         "Indexed: {}, Skipped: {}, Removed: {}",
         stats.indexed,
@@ -46,11 +51,11 @@ pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read one-path-per-line from stdin, resolve against `index_root`, and drop
-/// anything the walker says to ignore. The #134 spec routes all four
-/// traversal paths through the same ignore rules, including stdin — a hook
-/// that accidentally hands us `.git/HEAD.md` won't silently pollute the DB.
-pub fn read_paths_from_stdin(index_root: &Path, walker: &indexer::ContentWalker) -> Vec<PathBuf> {
+/// Read one-path-per-line from stdin and resolve each against `index_root`.
+/// No ignore/extension filtering is performed here — the indexer applies
+/// the policy gate itself, so duplicating the check here would add code
+/// surface with no behavioral benefit.
+pub fn read_paths_from_stdin(index_root: &Path) -> Vec<PathBuf> {
     // `filter_map` (not `map_while`) so a transient stdin I/O error on one
     // line is logged and skipped rather than silently truncating the rest of
     // the input — matters when a post-save hook pipes many paths.
@@ -66,20 +71,6 @@ pub fn read_paths_from_stdin(index_root: &Path, walker: &indexer::ContentWalker)
         })
         .filter(|line| !line.trim().is_empty())
         .map(|line| index_root.join(line.trim()))
-        .filter(|path| {
-            if walker.is_ignored(path) {
-                log::warn!("skipping {} (excluded by ignore rules)", path.display());
-                return false;
-            }
-            if !walker.extension_allowed(path) {
-                log::warn!(
-                    "skipping {} (extension not in [index].extensions)",
-                    path.display()
-                );
-                return false;
-            }
-            true
-        })
         .collect()
 }
 
@@ -1442,7 +1433,8 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
 
     // Full index (synchronous, with progress)
     let conn = db::get_connection(&db_path)?;
-    let file_paths = collect_content_files(&index_root);
+    let walker = indexer::ContentWalker::from_env_with_index_root(&index_root);
+    let file_paths = walker.collect_files();
     let total = file_paths.len();
     log::info!("Indexing {total} files...");
 
@@ -1450,7 +1442,13 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
         let rel = path.strip_prefix(&index_root).unwrap_or(path).display();
         log::debug!("  [{current}/{total}] {rel}");
     };
-    let stats = indexer::index_all_with_progress(&conn, &file_paths, &index_root, Some(&progress))?;
+    let stats = indexer::index_all_with_progress(
+        &conn,
+        &file_paths,
+        &index_root,
+        &walker,
+        Some(&progress),
+    )?;
     log::info!(
         "Done: Indexed: {}, Skipped: {}, Removed: {}",
         stats.indexed,

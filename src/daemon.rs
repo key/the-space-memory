@@ -69,34 +69,18 @@ pub fn handle_request(
         }
 
         DaemonRequest::Index { files } => {
+            // Single source of truth for "should this file be indexed": the
+            // walker doubles as the IngestPolicy passed into the indexer.
+            // No explicit filter loop here — the indexer's entry point
+            // enforces the policy for both the full-walk and
+            // caller-supplied-paths cases.
             let walker = crate::indexer::ContentWalker::from_env_with_index_root(index_root);
             let file_paths: Vec<PathBuf> = if files.is_empty() {
                 walker.collect_files()
             } else {
-                // Filter caller-supplied paths (from stdin or the fs-watcher)
-                // through the same ignore rules, per the #134 spec. Anything
-                // that should not be in the DB must never reach the indexer,
-                // even if a misconfigured hook streams it in.
-                files
-                    .iter()
-                    .map(|f| index_root.join(f))
-                    .filter(|p| {
-                        if walker.is_ignored(p) {
-                            log::warn!("skipping {} (excluded by ignore rules)", p.display());
-                            return false;
-                        }
-                        if !walker.extension_allowed(p) {
-                            log::warn!(
-                                "skipping {} (extension not in [index].extensions)",
-                                p.display()
-                            );
-                            return false;
-                        }
-                        true
-                    })
-                    .collect()
+                files.iter().map(|f| index_root.join(f)).collect()
             };
-            match cli::run_index(conn, &file_paths, index_root) {
+            match cli::run_index(conn, &file_paths, index_root, &walker) {
                 Ok(stats) => DaemonResponse::success(serde_json::json!({
                     "indexed": stats.indexed,
                     "skipped": stats.skipped,

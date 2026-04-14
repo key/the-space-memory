@@ -86,12 +86,11 @@ pub fn run() -> Result<()> {
                     if event.kind != DebouncedEventKind::Any {
                         continue;
                     }
-                    // Single predicate replaces the old hard-coded .md check.
-                    // Ignore rules + extension allowlist now run through one
-                    // code path shared with the full-index walker.
-                    if walker.is_ignored(&event.path) || !walker.extension_allowed(&event.path) {
-                        continue;
-                    }
+                    // No per-event filter here: the daemon's indexer
+                    // applies the IngestPolicy at ingest time. Keeping a
+                    // duplicate predicate in the watcher was a bug-magnet
+                    // (see #134 review), so every event is forwarded and
+                    // the indexer makes the final call.
                     match event.path.strip_prefix(&index_root) {
                         Ok(rel) => {
                             files_to_index.insert(rel.to_string_lossy().into_owned());
@@ -206,6 +205,30 @@ fn update_watches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// RAII guard restoring CWD on drop. The walker reads `.tsmignore`
+    /// relative to CWD and loads `tsm.toml` from CWD; tests that want a
+    /// clean default config must CD into a directory where no `tsm.toml`
+    /// exists. Using a guard keeps later tests from inheriting this CWD.
+    struct CwdGuard {
+        original: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn change_to(new_cwd: &Path) -> Self {
+            let original = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+            std::env::set_current_dir(new_cwd).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original)
+                .or_else(|_| std::env::set_current_dir("/"));
+        }
+    }
 
     #[test]
     fn test_sighup_handler_sets_flag() {
@@ -220,7 +243,9 @@ mod tests {
     #[serial_test::serial]
     fn test_run_watcher_no_content_dirs() {
         let dir = tempfile::TempDir::new().unwrap();
-        // Override index root to the empty temp dir
+        // CD into the tempdir so ContentWalker::from_env() sees no
+        // tsm.toml and falls back to default empty content_dirs.
+        let _cwd = CwdGuard::change_to(dir.path());
         unsafe { std::env::set_var("TSM_INDEX_ROOT", dir.path().as_os_str()) };
         the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
             name: "test",
@@ -244,6 +269,10 @@ mod tests {
 
         SHUTDOWN.store(true, Ordering::SeqCst);
 
+        // Tempdir has no tsm.toml, so walker auto-discovers subdirs under
+        // TSM_INDEX_ROOT (which is the same tempdir). Guards ensure the
+        // next test doesn't inherit this CWD.
+        let _cwd = CwdGuard::change_to(dir.path());
         unsafe { std::env::set_var("TSM_INDEX_ROOT", dir.path().as_os_str()) };
         the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
             name: "test",
@@ -265,47 +294,6 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_millis(10)).is_err());
 
         SHUTDOWN.store(false, Ordering::SeqCst);
-        unsafe { std::env::remove_var("TSM_INDEX_ROOT") };
-    }
-
-    /// The event loop in `run()` drops an event iff
-    /// `walker.is_ignored(path) || !walker.extension_allowed(path)`. Verify
-    /// that predicate directly against realistic paths — covering the
-    /// .tsmignore, forced-exclude, and extension-allowlist legs of the OR.
-    #[test]
-    #[serial_test::serial]
-    fn test_event_filter_predicate_matches_implementation() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("daily")).unwrap();
-        std::fs::create_dir_all(dir.path().join("private")).unwrap();
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        std::fs::write(dir.path().join(".tsmignore"), "private/\n").unwrap();
-
-        std::env::set_current_dir(dir.path()).unwrap();
-        unsafe { std::env::set_var("TSM_INDEX_ROOT", dir.path().as_os_str()) };
-        let walker = ContentWalker::from_env();
-
-        // Helper mirroring the condition at the top of the event loop.
-        let drop_event =
-            |p: &std::path::Path| -> bool { walker.is_ignored(p) || !walker.extension_allowed(p) };
-
-        assert!(
-            !drop_event(&dir.path().join("daily/keep.md")),
-            "normal .md under a non-ignored dir must pass the event filter"
-        );
-        assert!(
-            drop_event(&dir.path().join("private/secret.md")),
-            ".tsmignore-excluded path must be dropped by the event filter"
-        );
-        assert!(
-            drop_event(&dir.path().join(".git/HEAD.md")),
-            "forced-excluded dir must be dropped by the event filter"
-        );
-        assert!(
-            drop_event(&dir.path().join("daily/notes.csv")),
-            "extension outside [index].extensions must be dropped"
-        );
-
         unsafe { std::env::remove_var("TSM_INDEX_ROOT") };
     }
 }

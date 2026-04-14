@@ -19,6 +19,30 @@ pub mod walker;
 
 pub use walker::ContentWalker;
 
+/// Decides whether a single path is allowed through the ingest pipeline.
+///
+/// This is the **correctness boundary** for "should this file reach the
+/// index?" — it runs at the indexer's entry point (`index_all`) so no
+/// caller can accidentally bypass it, and no future traversal source has
+/// to remember to re-implement the check.
+///
+/// Caller-side pre-filters (the CLI stdin reader, the fs-watcher event
+/// loop) exist purely as optimizations — to avoid IPC round-trips and
+/// unnecessary work — not as correctness. If a caller forgets to
+/// pre-filter, the indexer still enforces the policy.
+///
+/// Current impl: [`ContentWalker`] (forced excludes + `.tsmignore` +
+/// extension allowlist). Future impls are expected for visibility layers
+/// (see `products/the-space-memory/visibility.md`), plugin-provided
+/// indexers (e.g. code/pdf/session), and content-type routing. When a
+/// second implementation arrives, composition (chain-of-policies, all
+/// must accept) becomes the natural next step.
+pub trait IngestPolicy {
+    /// Return true if `path` should proceed to indexing.
+    /// Implementations must be side-effect-free and cheap to call.
+    fn accepts(&self, path: &Path) -> bool;
+}
+
 #[derive(Debug, Default)]
 pub struct IndexStats {
     pub indexed: usize,
@@ -382,13 +406,20 @@ pub fn index_file(conn: &Connection, file_path: &Path, index_root: &Path) -> any
     Ok(true)
 }
 
-/// Index all given files. Returns stats.
+/// Index all given files under `policy`. Returns stats.
+///
+/// `policy` is applied as the **correctness boundary** — any path for
+/// which `policy.accepts(path) == false` is counted as skipped without
+/// touching the file or the DB. Callers upstream may also pre-filter
+/// (CLI stdin, fs-watcher) for latency, but that's optimization; this
+/// is the non-bypassable gate.
 pub fn index_all(
     conn: &Connection,
     file_paths: &[PathBuf],
     index_root: &Path,
+    policy: &dyn IngestPolicy,
 ) -> anyhow::Result<IndexStats> {
-    index_all_with_progress(conn, file_paths, index_root, None)
+    index_all_with_progress(conn, file_paths, index_root, policy, None)
 }
 
 /// Progress callback type for index_all_with_progress: (current, total, file_path).
@@ -398,6 +429,7 @@ pub fn index_all_with_progress(
     conn: &Connection,
     file_paths: &[PathBuf],
     index_root: &Path,
+    policy: &dyn IngestPolicy,
     progress_cb: Option<IndexProgressCb<'_>>,
 ) -> anyhow::Result<IndexStats> {
     let mut stats = IndexStats::default();
@@ -407,6 +439,17 @@ pub fn index_all_with_progress(
         if let Some(cb) = progress_cb {
             cb(i + 1, total, fp);
         }
+
+        // Policy gate: applied BEFORE the existence check so paths the
+        // user excluded can't trigger DB-side cleanup as a side effect
+        // (existing orphans from newly-added ignore rules are handled
+        // explicitly by `tsm rebuild`, not implicitly here).
+        if !policy.accepts(fp) {
+            log::debug!("policy rejected {}; skipping", fp.display());
+            stats.skipped += 1;
+            continue;
+        }
+
         if !fp.exists() {
             let rel_path = fp
                 .strip_prefix(index_root)
@@ -1039,6 +1082,18 @@ pub fn rebuild_fts_next_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test-only policy that accepts every path.
+    /// Used by tests whose focus is indexer internals (chunking, FTS,
+    /// vector backfill, etc.), not the policy gate itself. Policy
+    /// behavior is covered by `indexer::walker::tests` and the daemon
+    /// integration tests.
+    struct AcceptAll;
+    impl IngestPolicy for AcceptAll {
+        fn accepts(&self, _: &Path) -> bool {
+            true
+        }
+    }
     use crate::test_utils::setup_db_with_dir as setup;
     use std::io::Write;
 
@@ -1142,7 +1197,7 @@ mod tests {
 
         // Delete the file
         std::fs::remove_file(&path).unwrap();
-        let stats = index_all(&conn, &[path], dir.path()).unwrap();
+        let stats = index_all(&conn, &[path], dir.path(), &AcceptAll).unwrap();
         assert_eq!(stats.removed, 1);
 
         let count: i64 = conn
@@ -1789,7 +1844,8 @@ mod tests {
             calls.borrow_mut().push((current, total));
         };
 
-        let stats = index_all_with_progress(&conn, &files, dir.path(), Some(&cb)).unwrap();
+        let stats =
+            index_all_with_progress(&conn, &files, dir.path(), &AcceptAll, Some(&cb)).unwrap();
         assert_eq!(stats.indexed, 2);
 
         let calls = calls.into_inner();
@@ -1804,7 +1860,7 @@ mod tests {
         write_md(dir.path(), "daily/notes/c.md", "# C\n\nContent C.\n");
 
         let files = vec![dir.path().join("daily/notes/c.md")];
-        let stats = index_all_with_progress(&conn, &files, dir.path(), None).unwrap();
+        let stats = index_all_with_progress(&conn, &files, dir.path(), &AcceptAll, None).unwrap();
         assert_eq!(stats.indexed, 1);
     }
 
@@ -2257,7 +2313,7 @@ mod tests {
             dir.path().join("daily/notes/a.md"),
             dir.path().join("daily/notes/b.md"),
         ];
-        index_all_with_progress(&conn, &paths, dir.path(), None).unwrap();
+        index_all_with_progress(&conn, &paths, dir.path(), &AcceptAll, None).unwrap();
 
         let chunk_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))

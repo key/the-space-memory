@@ -273,8 +273,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Index { files_from_stdin } => {
             let req = if files_from_stdin {
                 let index_root = config::index_root();
-                let walker = the_space_memory::indexer::ContentWalker::from_env();
-                let paths = cli::read_paths_from_stdin(&index_root, &walker);
+                let paths = cli::read_paths_from_stdin(&index_root);
                 let rel_paths: Vec<String> = paths
                     .iter()
                     .filter_map(|p| p.strip_prefix(&index_root).ok())

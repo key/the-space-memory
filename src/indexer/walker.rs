@@ -33,6 +33,7 @@ use std::path::{Component, Path, PathBuf};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use crate::config::{ContentDir, ResolvedConfig};
+use crate::indexer::IngestPolicy;
 
 /// Directory names that must never be indexed, regardless of configuration.
 /// Prevents DB corruption (`.tsm/tsm.db`) and git metadata pollution.
@@ -239,6 +240,17 @@ impl ContentWalker {
                 out.push(path);
             }
         }
+    }
+}
+
+impl IngestPolicy for ContentWalker {
+    /// A path is accepted iff it passes both the ignore matcher and the
+    /// extension allowlist. This is the single definition of "should the
+    /// indexer take this file"; the indexer calls it at its entry point,
+    /// and the CLI stdin reader + watcher event loop use it as a
+    /// pre-filter.
+    fn accepts(&self, path: &Path) -> bool {
+        !self.is_ignored(path) && self.extension_allowed(path)
     }
 }
 
