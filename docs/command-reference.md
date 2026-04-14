@@ -576,10 +576,10 @@ tsm dict update [--threshold N] [--apply]
 Without `--apply`: dry run — shows candidate words that appear frequently
 enough to be added to the user dictionary.
 
-With `--apply`: writes the dictionary CSV, triggers FTS re-index, and creates
-a git branch and pull request with the changes. If the daemon is running, the
-FTS re-index is sent via IPC (no need to stop). If the daemon is stopped, FTS
-is rebuilt directly.
+With `--apply`: writes the dictionary file and triggers FTS re-index. If the
+daemon is running, the FTS re-index is sent via IPC (no need to stop). If the
+daemon is stopped, FTS is rebuilt directly. No git operations are performed —
+if you want the dictionary under version control, commit the file yourself.
 
 **Flags:**
 
