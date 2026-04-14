@@ -1,9 +1,10 @@
 //! Unified path filtering and file collection for indexing.
 //!
 //! `ContentWalker` is the single source of truth for "which files should tsm
-//! index?" It replaces the ad-hoc walker logic that used to be scattered
-//! across `cli::collect_content_files`, `cli::discover_watch_dirs`, the
-//! watcher event filter, and the stdin path.
+//! index?" It centralizes the ad-hoc walker logic that used to be split
+//! across `cli::discover_watch_dirs` (now deleted), the watcher event
+//! filter, and the stdin path. `cli::collect_content_files` is retained as
+//! a thin wrapper for callers that supply an explicit `index_root`.
 //!
 //! ## Ignore resolution
 //!
@@ -82,9 +83,10 @@ impl ContentWalker {
 
     /// Convenience constructor that rebuilds `ResolvedConfig` from disk + env.
     /// Note: this does NOT consult the `config::RESOLVED` singleton — it reads
-    /// `tsm.toml` fresh each call. In the common case the two views agree, but
-    /// the fs-watcher rebuilds both singleton and walker on SIGHUP so that
-    /// they stay consistent across reloads.
+    /// `tsm.toml` fresh each call. In the common case the two views agree; the
+    /// fs-watcher calls `config::reload()` and rebuilds the walker in sequence
+    /// on SIGHUP, so both reflect the same on-disk state under normal
+    /// conditions (a concurrent edit between the two reads is not atomic).
     pub fn from_env() -> Self {
         Self::from_config(&crate::config::ResolvedConfig::from_env())
     }
@@ -265,11 +267,13 @@ fn build_matcher(
 
     if tsmignore_exists {
         if let Some(err) = builder.add(&tsmignore_path) {
-            // `.tsmignore` is a user-owned config file; a parse error here
-            // means their exclusions are not being applied. Log at ERROR so
-            // it shows up without requiring log-level tuning.
+            // `GitignoreBuilder::add` returns `Some(err)` on the first
+            // problem line but still applies the parseable patterns above
+            // it. Word the log accordingly so users don't assume the whole
+            // file was dropped. ERROR level so it surfaces without log
+            // tuning — their exclusions may be partially applied.
             log::error!(
-                "{} has a parse error and will be ignored: {err}",
+                "{}: parse error — some patterns may not have been applied: {err}",
                 tsmignore_path.display()
             );
         }
@@ -324,14 +328,37 @@ state_dir = "/tmp/unused-state"
         ResolvedConfig::from_config_file(&file_cfg)
     }
 
+    /// RAII guard that restores CWD on drop. Any panicking test still puts
+    /// the process back in a known-good directory before the next test runs,
+    /// preventing order-dependent flakes from accumulating.
+    struct CwdGuard {
+        original: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn change_to(new_cwd: &Path) -> Self {
+            let original = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+            std::env::set_current_dir(new_cwd).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            // Best-effort: if the original dir was since deleted, fall back
+            // to `/` so subsequent tests still start from a valid CWD.
+            let _ = std::env::set_current_dir(&self.original)
+                .or_else(|_| std::env::set_current_dir("/"));
+        }
+    }
+
     /// Build a walker where the project root (for `.tsmignore` lookup) and
     /// `index_root` are the same directory — the common single-repo case.
-    fn walker_in(tempdir: &TempDir) -> ContentWalker {
-        // Mutate current_dir so `.tsmignore` is found in `tempdir`. Tests that
-        // touch CWD must be serial; these are.
-        std::env::set_current_dir(tempdir.path()).unwrap();
+    /// Returns the guard so the caller's scope controls CWD lifetime.
+    fn walker_in(tempdir: &TempDir) -> (ContentWalker, CwdGuard) {
+        let guard = CwdGuard::change_to(tempdir.path());
         let cfg = cfg_for(tempdir.path());
-        ContentWalker::from_config(&cfg)
+        (ContentWalker::from_config(&cfg), guard)
     }
 
     // ─── Forced excludes ──────────────────────────────────────────────
@@ -342,7 +369,7 @@ state_dir = "/tmp/unused-state"
         let tmp = TempDir::new().unwrap();
         write_file(tmp.path(), "notes/keep.md", "keep");
         write_file(tmp.path(), ".git/config.md", "no");
-        let walker = walker_in(&tmp);
+        let (walker, _cwd) = walker_in(&tmp);
         let files = walker.collect_files();
         assert!(files.iter().any(|p| p.ends_with("notes/keep.md")));
         assert!(!files
@@ -356,7 +383,7 @@ state_dir = "/tmp/unused-state"
         let tmp = TempDir::new().unwrap();
         write_file(tmp.path(), "notes/keep.md", "keep");
         write_file(tmp.path(), ".tsm/state.md", "no");
-        let walker = walker_in(&tmp);
+        let (walker, _cwd) = walker_in(&tmp);
         let files = walker.collect_files();
         assert!(!files
             .iter()
@@ -376,7 +403,7 @@ state_dir = "/tmp/unused-state"
         // Without file_type()-based symlink rejection the walker would
         // descend and read .git/HEAD.md under the disguised component.
         symlink(tmp.path().join(".git"), tmp.path().join("notes/gitshadow")).unwrap();
-        let walker = walker_in(&tmp);
+        let (walker, _cwd) = walker_in(&tmp);
         let files = walker.collect_files();
         assert!(files.iter().any(|p| p.ends_with("notes/real.md")));
         assert!(!files
@@ -394,7 +421,7 @@ state_dir = "/tmp/unused-state"
         write_file(tmp.path(), "notes/keep.md", "keep");
         write_file(tmp.path(), ".git/inside.md", "no");
         write_file(tmp.path(), ".tsmignore", "!.git/\n");
-        let walker = walker_in(&tmp);
+        let (walker, _cwd) = walker_in(&tmp);
         let files = walker.collect_files();
         // .git/ must still be excluded even with an explicit negation pattern.
         assert!(!files
@@ -411,7 +438,7 @@ state_dir = "/tmp/unused-state"
         write_file(tmp.path(), "daily/keep.md", "a");
         write_file(tmp.path(), "private/secret.md", "b");
         write_file(tmp.path(), ".tsmignore", "private/\n");
-        let walker = walker_in(&tmp);
+        let (walker, _cwd) = walker_in(&tmp);
         let files = walker.collect_files();
         assert!(files.iter().any(|p| p.ends_with("daily/keep.md")));
         assert!(!files
@@ -426,7 +453,7 @@ state_dir = "/tmp/unused-state"
         write_file(tmp.path(), "notes/a.md", "a");
         write_file(tmp.path(), "notes/b-draft.md", "b");
         write_file(tmp.path(), ".tsmignore", "**/*-draft.md\n");
-        let walker = walker_in(&tmp);
+        let (walker, _cwd) = walker_in(&tmp);
         let files = walker.collect_files();
         assert!(files.iter().any(|p| p.ends_with("notes/a.md")));
         assert!(!files.iter().any(|p| p.ends_with("b-draft.md")));
@@ -439,7 +466,7 @@ state_dir = "/tmp/unused-state"
         write_file(tmp.path(), "public/ok.md", "a");
         write_file(tmp.path(), "private/secret.md", "b");
         write_file(tmp.path(), ".tsmignore", "private/\n");
-        let walker = walker_in(&tmp);
+        let (walker, _cwd) = walker_in(&tmp);
         assert!(!walker.is_ignored(&tmp.path().join("public/ok.md")));
         assert!(walker.is_ignored(&tmp.path().join("private/secret.md")));
         // Outside index_root → ignored.
@@ -455,7 +482,7 @@ state_dir = "/tmp/unused-state"
         write_file(tmp.path(), "notes/a.md", "a");
         write_file(tmp.path(), ".obsidian/plugin.md", "b");
         // No .tsmignore on disk — the synthetic `.*/` fallback must cover .obsidian.
-        let walker = walker_in(&tmp);
+        let (walker, _cwd) = walker_in(&tmp);
         let files = walker.collect_files();
         assert!(files.iter().any(|p| p.ends_with("notes/a.md")));
         assert!(!files
@@ -471,7 +498,7 @@ state_dir = "/tmp/unused-state"
         write_file(tmp.path(), ".obsidian/plugin.md", "b");
         // Empty .tsmignore means: user has taken control, no synthetic fallback.
         write_file(tmp.path(), ".tsmignore", "");
-        let walker = walker_in(&tmp);
+        let (walker, _cwd) = walker_in(&tmp);
         let files = walker.collect_files();
         assert!(files.iter().any(|p| p.ends_with(".obsidian/plugin.md")));
     }
@@ -501,7 +528,7 @@ respect_gitignore = {}
         write_file(tmp.path(), "build/out.md", "b");
         write_file(tmp.path(), ".gitignore", "build/\n");
         write_file(tmp.path(), ".tsmignore", ""); // disable hidden-dir fallback
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _cwd = CwdGuard::change_to(tmp.path());
         let walker = ContentWalker::from_config(&cfg_with_gitignore(tmp.path(), true));
         let files = walker.collect_files();
         assert!(!files
@@ -516,7 +543,7 @@ respect_gitignore = {}
         write_file(tmp.path(), "build/out.md", "b");
         write_file(tmp.path(), ".gitignore", "build/\n");
         write_file(tmp.path(), ".tsmignore", "");
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _cwd = CwdGuard::change_to(tmp.path());
         let walker = ContentWalker::from_config(&cfg_with_gitignore(tmp.path(), false));
         let files = walker.collect_files();
         assert!(files.iter().any(|p| p.ends_with("build/out.md")));
@@ -530,7 +557,7 @@ respect_gitignore = {}
         let tmp = TempDir::new().unwrap();
         write_file(tmp.path(), "notes/a.md", "md");
         write_file(tmp.path(), "notes/b.txt", "txt");
-        let walker = walker_in(&tmp);
+        let (walker, _cwd) = walker_in(&tmp);
         let files = walker.collect_files();
         assert!(files.iter().any(|p| p.ends_with("a.md")));
         assert!(!files.iter().any(|p| p.ends_with("b.txt")));
@@ -553,7 +580,7 @@ extensions = ["md", "txt"]
         );
         let file_cfg: crate::config::ConfigFile = toml::from_str(&toml).unwrap();
         let cfg = ResolvedConfig::from_config_file(&file_cfg);
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _cwd = CwdGuard::change_to(tmp.path());
         let walker = ContentWalker::from_config(&cfg);
         let files = walker.collect_files();
         assert!(files.iter().any(|p| p.ends_with("a.md")));
@@ -570,10 +597,122 @@ extensions = ["md", "txt"]
         std::fs::create_dir_all(tmp.path().join("private")).unwrap();
         std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
         write_file(tmp.path(), ".tsmignore", "private/\n");
-        let walker = walker_in(&tmp);
+        let (walker, _cwd) = walker_in(&tmp);
         let dirs = walker.watch_dirs();
         assert!(dirs.iter().any(|p| p.ends_with("notes")));
         assert!(!dirs.iter().any(|p| p.ends_with("private")));
         assert!(!dirs.iter().any(|p| p.ends_with(".git")));
+    }
+
+    // ─── content_dirs mode × .tsmignore ───────────────────────────────
+
+    /// Build a ResolvedConfig with explicit `content_dirs`. All the tests
+    /// above implicitly run in auto-discover mode; this helper exercises the
+    /// other branch of `collection_roots()`.
+    fn cfg_with_content_dirs(root: &Path, dirs: &[&str]) -> ResolvedConfig {
+        let entries: String = dirs
+            .iter()
+            .map(|d| format!("[[index.content_dirs]]\npath = \"{d}\"\n"))
+            .collect();
+        let toml = format!(
+            r#"index_root = "{}"
+state_dir = "/tmp/unused-state"
+{}"#,
+            root.display(),
+            entries
+        );
+        let file_cfg: crate::config::ConfigFile = toml::from_str(&toml).unwrap();
+        ResolvedConfig::from_config_file(&file_cfg)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn content_dirs_mode_respects_tsmignore() {
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "keep/a.md", "a");
+        write_file(tmp.path(), "keep/nested/b.md", "b");
+        write_file(tmp.path(), "drop/c.md", "c");
+        write_file(tmp.path(), ".tsmignore", "drop/\n");
+        let _cwd = CwdGuard::change_to(tmp.path());
+        let walker =
+            ContentWalker::from_config(&cfg_with_content_dirs(tmp.path(), &["keep", "drop"]));
+        let files = walker.collect_files();
+        assert!(files.iter().any(|p| p.ends_with("keep/a.md")));
+        assert!(files.iter().any(|p| p.ends_with("keep/nested/b.md")));
+        // The `drop/` content_dir is silently skipped because its path is
+        // covered by .tsmignore — verify nothing under it is collected.
+        assert!(!files
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == "drop")));
+    }
+
+    // ─── project_root != index_root ───────────────────────────────────
+    //
+    // `.tsmignore` lives in project_root (CWD, next to tsm.toml) but its
+    // patterns resolve relative to index_root. These tests exercise the
+    // split — they're the #134 spec checklist items.
+
+    #[test]
+    #[serial_test::serial]
+    fn tsmignore_patterns_resolve_relative_to_index_root_not_cwd() {
+        // Two independent tempdirs: project_root (CWD) holds .tsmignore,
+        // index_root is the separate tree being scanned.
+        let project = TempDir::new().unwrap();
+        let index = TempDir::new().unwrap();
+        // A pattern-confusion trap: same name exists under both roots.
+        // If the matcher were (wrongly) anchored at CWD, it would exclude
+        // `project/private/` (invisible to us) while `index/private/` would
+        // slip through.
+        write_file(project.path(), ".tsmignore", "private/\n");
+        write_file(
+            project.path(),
+            "private/unrelated.md",
+            "should-never-be-scanned",
+        );
+        write_file(index.path(), "public/ok.md", "a");
+        write_file(index.path(), "private/secret.md", "b");
+
+        let _cwd = CwdGuard::change_to(project.path());
+        let walker = ContentWalker::from_config(&cfg_for(index.path()));
+        let files = walker.collect_files();
+        assert!(files.iter().any(|p| p.ends_with("public/ok.md")));
+        assert!(!files
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == "private")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tsmignore_placed_in_index_root_is_ignored() {
+        // Spec checklist: ".tsmignore in index_root (when different from
+        // project root) is ignored". project_root (CWD) has no .tsmignore,
+        // so the synthetic hidden-dir fallback is the only active rule —
+        // the index_root/.tsmignore must NOT be picked up.
+        let project = TempDir::new().unwrap();
+        let index = TempDir::new().unwrap();
+        // This .tsmignore would drop public/ok.md IF it were honored.
+        write_file(index.path(), ".tsmignore", "public/\n");
+        write_file(index.path(), "public/ok.md", "a");
+
+        let _cwd = CwdGuard::change_to(project.path());
+        let walker = ContentWalker::from_config(&cfg_for(index.path()));
+        let files = walker.collect_files();
+        // File is still collected → index_root/.tsmignore was not loaded.
+        assert!(files.iter().any(|p| p.ends_with("public/ok.md")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tsmignore_in_subdirectory_has_no_effect() {
+        // Spec checklist: ".tsmignore files in subdirectories are correctly
+        // ignored". Only the root-level .tsmignore is consulted — no
+        // hierarchical merging à la git.
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "notes/a.md", "a");
+        // A nested .tsmignore that WOULD exclude a.md if it were honored.
+        write_file(tmp.path(), "notes/.tsmignore", "a.md\n");
+        let (walker, _cwd) = walker_in(&tmp);
+        let files = walker.collect_files();
+        assert!(files.iter().any(|p| p.ends_with("notes/a.md")));
     }
 }
