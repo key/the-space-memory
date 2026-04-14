@@ -37,14 +37,22 @@ These commands run directly (not routed through the daemon).
 
 ### tsm init
 
-Initialize the database.
+Initialize the database and write a default `.tsmignore`.
 
 ```text
 tsm init
 ```
 
-Creates the SQLite database at the location specified by `TSM_DB_PATH`
-(default: `$TSM_INDEX_ROOT/.tsm/tsm.db`). Must be run once before indexing.
+Performs two steps:
+
+1. Creates the SQLite database at the location specified by `TSM_DB_PATH`
+   (default: `$TSM_INDEX_ROOT/.tsm/tsm.db`). Must be run once before indexing.
+2. Writes a default `.tsmignore` to the project root (the directory
+   containing `tsm.toml`) if one does not already exist. The default
+   excludes hidden directories (`.git/`, `.obsidian/`, `.venv/`, etc.),
+   common build directories (`target/`, `node_modules/`, `dist/`), and
+   large binary artifacts (`*.parquet`, `*.zip`, `*.db`). An existing
+   `.tsmignore` is never overwritten — re-running `tsm init` is safe.
 
 **Flags:** none
 

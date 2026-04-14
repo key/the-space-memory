@@ -16,11 +16,10 @@
 //! 2. **`.tsmignore` patterns** — read from the tsm project root (the
 //!    directory containing `tsm.toml`). Patterns are resolved relative
 //!    to `index_root`, not relative to the physical `.tsmignore` file.
+//!    When `.tsmignore` is absent, no exclusion patterns are applied —
+//!    run `tsm init` to create the default file (which excludes hidden
+//!    dirs and common build artifacts).
 //! 3. **Root `.gitignore`** — only when `respect_gitignore = true`.
-//! 4. **Backward-compat default** — when `.tsmignore` is absent, a
-//!    synthetic `.*/` pattern is injected so hidden directories like
-//!    `.obsidian` keep the pre-#134 behavior without user action. Once
-//!    a user creates `.tsmignore`, they take full control.
 //!
 //! ## Extension filter
 //!
@@ -38,11 +37,6 @@ use crate::indexer::IngestPolicy;
 /// Directory names that must never be indexed, regardless of configuration.
 /// Prevents DB corruption (`.tsm/tsm.db`) and git metadata pollution.
 const FORCED_EXCLUDED_DIRS: &[&str] = &[".git", ".tsm"];
-
-/// Injected when `.tsmignore` is absent. Preserves the pre-#134 behavior of
-/// skipping hidden directories across all traversal paths without forcing
-/// existing users to create an ignore file.
-const FALLBACK_HIDDEN_DIR_PATTERN: &str = ".*/";
 
 pub struct ContentWalker {
     index_root: PathBuf,
@@ -267,10 +261,12 @@ impl IngestPolicy for ContentWalker {
     }
 }
 
-/// Build the combined `.tsmignore` + (optional) `.gitignore` + fallback
-/// matcher. The builder is anchored at `index_root` so pattern resolution
-/// matches the spec, even when `.tsmignore` physically lives in a different
-/// directory (the tsm project root).
+/// Build the combined `.tsmignore` + (optional) `.gitignore` matcher. The
+/// builder is anchored at `index_root` so pattern resolution matches the
+/// spec, even when `.tsmignore` physically lives in a different directory
+/// (the tsm project root). When `.tsmignore` is absent, no patterns from
+/// it are loaded — `tsm init` is the migration path for users coming from
+/// the old fallback.
 fn build_matcher(
     index_root: &Path,
     project_root: &Path,
@@ -278,8 +274,6 @@ fn build_matcher(
     respect_gitignore: bool,
 ) -> Gitignore {
     let mut builder = GitignoreBuilder::new(index_root);
-    let tsmignore_path = project_root.join(ignore_file);
-    let tsmignore_exists = tsmignore_path.is_file();
 
     if respect_gitignore {
         let gi = index_root.join(".gitignore");
@@ -290,7 +284,8 @@ fn build_matcher(
         }
     }
 
-    if tsmignore_exists {
+    let tsmignore_path = project_root.join(ignore_file);
+    if tsmignore_path.is_file() {
         if let Some(err) = builder.add(&tsmignore_path) {
             // `GitignoreBuilder::add` returns `Some(err)` on the first
             // problem line but still applies the parseable patterns above
@@ -302,9 +297,6 @@ fn build_matcher(
                 tsmignore_path.display()
             );
         }
-    } else if let Err(err) = builder.add_line(None, FALLBACK_HIDDEN_DIR_PATTERN) {
-        // This should never fail for a hard-coded literal pattern.
-        log::warn!("failed to install fallback hidden-dir pattern: {err}");
     }
 
     builder.build().unwrap_or_else(|err| {
@@ -545,34 +537,42 @@ state_dir = "/tmp/unused-state"
         assert!(walker.is_ignored(Path::new("/etc/passwd")));
     }
 
-    // ─── Backward compatibility with hidden dirs ──────────────────────
+    // ─── No synthetic fallback (post-#136 item 7) ──────────────────────
 
     #[test]
     #[serial_test::serial]
-    fn fallback_excludes_hidden_dirs_when_no_tsmignore() {
+    fn hidden_dirs_are_indexed_when_no_tsmignore() {
+        // Inverted from the pre-#136-item-7 behavior: when `.tsmignore` is
+        // absent, no exclusion patterns are loaded. Hidden directories like
+        // `.obsidian` are now traversed. Users opt back in to the historical
+        // exclusion by running `tsm init`, which writes a default `.tsmignore`
+        // containing `.*/` (and other common ignores).
         let tmp = TempDir::new().unwrap();
         write_file(tmp.path(), "notes/a.md", "a");
         write_file(tmp.path(), ".obsidian/plugin.md", "b");
-        // No .tsmignore on disk — the synthetic `.*/` fallback must cover .obsidian.
+        let walker = walker_in(&tmp);
+        let files = walker.collect_files();
+        assert!(files.iter().any(|p| p.ends_with("notes/a.md")));
+        assert!(files.iter().any(|p| p.ends_with(".obsidian/plugin.md")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn user_tsmignore_with_hidden_pattern_excludes_hidden_dirs() {
+        // Demonstrates the migration target: a user-supplied `.tsmignore`
+        // with `.*/` (the pattern that `tsm init` ships by default)
+        // restores the old fallback behavior. This is the contract the
+        // default-template install in `cmd_init` is built on.
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "notes/a.md", "a");
+        write_file(tmp.path(), ".obsidian/plugin.md", "b");
+        write_file(tmp.path(), ".tsmignore", ".*/\n");
         let walker = walker_in(&tmp);
         let files = walker.collect_files();
         assert!(files.iter().any(|p| p.ends_with("notes/a.md")));
         assert!(!files
             .iter()
             .any(|p| p.components().any(|c| c.as_os_str() == ".obsidian")));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn tsmignore_presence_disables_hidden_fallback() {
-        let tmp = TempDir::new().unwrap();
-        write_file(tmp.path(), "notes/a.md", "a");
-        write_file(tmp.path(), ".obsidian/plugin.md", "b");
-        // Empty .tsmignore means: user has taken control, no synthetic fallback.
-        write_file(tmp.path(), ".tsmignore", "");
-        let walker = walker_in(&tmp);
-        let files = walker.collect_files();
-        assert!(files.iter().any(|p| p.ends_with(".obsidian/plugin.md")));
     }
 
     // ─── respect_gitignore ────────────────────────────────────────────

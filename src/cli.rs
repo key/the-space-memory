@@ -8,10 +8,54 @@ use crate::indexer;
 use crate::searcher;
 use crate::user_dict;
 
+/// Default `.tsmignore` shipped by `tsm init`. Patterns are
+/// `.gitignore`-syntax and resolve relative to `index_root`.
+///
+/// Hidden directories (`.*/`) and common build/dependency directories are
+/// excluded by default — the historical "fallback hidden-dir pattern"
+/// behavior is now expressed here, where users can see and edit it.
+const DEFAULT_TSMIGNORE: &str = "\
+# tsm default ignore patterns. Edit to taste — `tsm init` will not
+# overwrite an existing file.
+
+# Hidden directories (.git/, .obsidian/, .venv/, etc.)
+.*/
+
+# Build / dependency directories
+target/
+node_modules/
+.venv/
+dist/
+
+# Large binary artifacts that bloat the index
+*.parquet
+*.zip
+*.db
+";
+
 pub fn cmd_init() -> anyhow::Result<()> {
     let db_path = config::db_path();
     db::init_db(&db_path)?;
     log::info!("Database initialized at {}", db_path.display());
+    install_default_tsmignore(&config::project_root())?;
+    Ok(())
+}
+
+/// Write `DEFAULT_TSMIGNORE` to `<project_root>/.tsmignore` if no file
+/// exists there. Idempotent — re-running `tsm init` never overwrites a
+/// user-customized file. Returns Ok in both the wrote-it and skipped-it
+/// cases; only filesystem errors propagate.
+fn install_default_tsmignore(project_root: &Path) -> anyhow::Result<()> {
+    let tsmignore_path = project_root.join(".tsmignore");
+    if tsmignore_path.exists() {
+        log::info!(
+            ".tsmignore already exists at {} — leaving untouched",
+            tsmignore_path.display()
+        );
+    } else {
+        std::fs::write(&tsmignore_path, DEFAULT_TSMIGNORE)?;
+        log::info!("Wrote default .tsmignore to {}", tsmignore_path.display());
+    }
     Ok(())
 }
 
@@ -1594,6 +1638,28 @@ mod tests {
     // Walker behavior is covered by indexer::walker::tests. In this module
     // `cmd_rebuild` constructs ContentWalker via from_env_with_index_root
     // (explicit index_root override); other commands use from_env().
+
+    #[test]
+    fn install_default_tsmignore_writes_when_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        super::install_default_tsmignore(dir.path()).unwrap();
+        let written = std::fs::read_to_string(dir.path().join(".tsmignore")).unwrap();
+        // Spot-check a few patterns from the shipped template — full byte
+        // match would be brittle.
+        assert!(written.contains(".*/"));
+        assert!(written.contains("target/"));
+        assert!(written.contains("*.parquet"));
+    }
+
+    #[test]
+    fn install_default_tsmignore_does_not_overwrite_existing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tsmignore = dir.path().join(".tsmignore");
+        std::fs::write(&tsmignore, "user_custom_pattern/\n").unwrap();
+        super::install_default_tsmignore(dir.path()).unwrap();
+        let after = std::fs::read_to_string(&tsmignore).unwrap();
+        assert_eq!(after, "user_custom_pattern/\n");
+    }
 
     #[test]
     fn test_format_json_include_content_file_missing() {
