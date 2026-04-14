@@ -13,7 +13,7 @@
 # Env: TSM_INDEX_ROOT
 # index_root = "/workspaces"
 
-# UNIX socket path for tsm-embedder (encode requests).
+# UNIX socket path for the embedder child process (encode requests).
 # Default: "{state_dir}/embedder.sock"
 # Env: TSM_EMBEDDER_SOCKET
 # embedder_socket_path = ".tsm/embedder.sock"
@@ -23,12 +23,12 @@
 # Env: TSM_DAEMON_SOCKET
 # daemon_socket_path = ".tsm/daemon.sock"
 
-# Directory for daemon log files (tsmd, tsm-embedder).
+# Directory for daemon log files (tsmd, tsmd --embedder, tsmd --fs-watcher).
 # Default: "{state_dir}/logs"
 # Env: TSM_LOG_DIR
 # log_dir = ".tsm/logs"
 
-# Seconds of inactivity before tsm-embedder shuts down. 0 = never.
+# Seconds of inactivity before the embedder child shuts down. 0 = never.
 # Default: 600
 # Env: TSM_EMBEDDER_IDLE_TIMEOUT
 # embedder_idle_timeout_secs = 600
