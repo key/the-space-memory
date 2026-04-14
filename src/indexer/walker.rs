@@ -56,7 +56,16 @@ impl ContentWalker {
     /// directory containing `tsm.toml`). Missing files are silently treated as
     /// empty — this is the common case for users who have not opted in.
     pub fn from_config(cfg: &ResolvedConfig) -> Self {
-        let project_root = std::env::current_dir().unwrap_or_else(|_| cfg.index_root.clone());
+        let project_root = std::env::current_dir().unwrap_or_else(|e| {
+            // This only happens if the CWD has been deleted / unmounted.
+            // Warn loudly so users notice when `.tsmignore` lookup silently
+            // shifts to `index_root`, which is usually not what they want.
+            log::warn!(
+                "current_dir() failed ({e}); using index_root as the .tsmignore lookup path — \
+                 ignore rules may not resolve correctly"
+            );
+            cfg.index_root.clone()
+        });
         let matcher = build_matcher(
             &cfg.index_root,
             &project_root,
@@ -71,7 +80,11 @@ impl ContentWalker {
         }
     }
 
-    /// Convenience constructor that reads the current config singleton.
+    /// Convenience constructor that rebuilds `ResolvedConfig` from disk + env.
+    /// Note: this does NOT consult the `config::RESOLVED` singleton — it reads
+    /// `tsm.toml` fresh each call. In the common case the two views agree, but
+    /// the fs-watcher rebuilds both singleton and walker on SIGHUP so that
+    /// they stay consistent across reloads.
     pub fn from_env() -> Self {
         Self::from_config(&crate::config::ResolvedConfig::from_env())
     }
@@ -98,12 +111,18 @@ impl ContentWalker {
         if has_forced_excluded_component(rel) {
             return true;
         }
-        // is_dir() is a best-effort check (may fail for deleted events from the
-        // watcher); treat unknown as file, which is the conservative match.
-        let is_dir = path.is_dir();
+        // path.is_dir() returns false for paths that no longer exist (watcher
+        // delete events). For directory-only patterns like `private/` we want
+        // the path rejected whether or not the filesystem currently reports a
+        // directory — so check both interpretations. A match in either form is
+        // enough to exclude.
         self.matcher
-            .matched_path_or_any_parents(rel, is_dir)
+            .matched_path_or_any_parents(rel, false)
             .is_ignore()
+            || self
+                .matcher
+                .matched_path_or_any_parents(rel, true)
+                .is_ignore()
     }
 
     /// Returns true when `path`'s extension is in the allowlist.
@@ -202,9 +221,19 @@ impl ContentWalker {
             if self.is_ignored(&path) {
                 continue;
             }
-            if path.is_dir() {
+            // Use file_type() which, unlike path.is_dir(), does NOT follow
+            // symlinks. A symlink like `notes/data → ../../.git/` must not
+            // allow traversal into the forced-excluded tree under a disguised
+            // component name. Missing file_type (rare) is treated as "skip".
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 self.walk_dir(&path, out);
-            } else if self.extension_allowed(&path) {
+            } else if file_type.is_file() && self.extension_allowed(&path) {
                 out.push(path);
             }
         }
@@ -236,8 +265,11 @@ fn build_matcher(
 
     if tsmignore_exists {
         if let Some(err) = builder.add(&tsmignore_path) {
-            log::warn!(
-                "ignoring {} due to parse error: {err}",
+            // `.tsmignore` is a user-owned config file; a parse error here
+            // means their exclusions are not being applied. Log at ERROR so
+            // it shows up without requiring log-level tuning.
+            log::error!(
+                "{} has a parse error and will be ignored: {err}",
                 tsmignore_path.display()
             );
         }
@@ -247,7 +279,9 @@ fn build_matcher(
     }
 
     builder.build().unwrap_or_else(|err| {
-        log::warn!("failed to build ignore matcher: {err}; no patterns applied");
+        // Pattern compilation failed after all add()s succeeded. Rare but
+        // leaves the walker with no exclusions — ERROR level so it's noticed.
+        log::error!("failed to build ignore matcher: {err}; no patterns applied");
         Gitignore::empty()
     })
 }
@@ -327,6 +361,30 @@ state_dir = "/tmp/unused-state"
         assert!(!files
             .iter()
             .any(|p| p.components().any(|c| c.as_os_str() == ".tsm")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn symlink_into_forced_excluded_dir_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        write_file(tmp.path(), ".git/HEAD.md", "no");
+        write_file(tmp.path(), "notes/real.md", "yes");
+        // Symlink under an innocent-looking name that points into .git/.
+        // Without file_type()-based symlink rejection the walker would
+        // descend and read .git/HEAD.md under the disguised component.
+        symlink(tmp.path().join(".git"), tmp.path().join("notes/gitshadow")).unwrap();
+        let walker = walker_in(&tmp);
+        let files = walker.collect_files();
+        assert!(files.iter().any(|p| p.ends_with("notes/real.md")));
+        assert!(!files
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == "gitshadow")));
+        assert!(!files
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == ".git")));
     }
 
     #[test]

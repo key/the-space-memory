@@ -83,10 +83,16 @@ pub fn handle_request(
                     .filter(|p| {
                         if walker.is_ignored(p) {
                             log::warn!("skipping {} (excluded by ignore rules)", p.display());
-                            false
-                        } else {
-                            true
+                            return false;
                         }
+                        if !walker.extension_allowed(p) {
+                            log::warn!(
+                                "skipping {} (extension not in [index].extensions)",
+                                p.display()
+                            );
+                            return false;
+                        }
+                        true
                     })
                     .collect()
             };

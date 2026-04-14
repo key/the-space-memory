@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -7,7 +7,6 @@ use anyhow::{Context, Result};
 use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
 
-use the_space_memory::cli;
 use the_space_memory::config;
 use the_space_memory::daemon_protocol::{self, DaemonRequest};
 use the_space_memory::indexer::ContentWalker;
@@ -48,8 +47,10 @@ pub fn run() -> Result<()> {
     let mut debouncer =
         new_debouncer(Duration::from_secs(2), tx).context("Failed to create file watcher")?;
 
-    let mut watched = setup_watches(&mut debouncer, &index_root);
+    // Single walker instance governs both directory-registration and
+    // event-filtering so both views cannot drift under config reload.
     let mut walker = ContentWalker::from_env();
+    let mut watched = setup_watches(&mut debouncer, &walker);
 
     if watched.is_empty() {
         anyhow::bail!(
@@ -74,7 +75,7 @@ pub fn run() -> Result<()> {
             // Rebuild the walker so .tsmignore / .gitignore / extensions
             // edits take effect without a daemon restart.
             walker = ContentWalker::from_env();
-            update_watches(&mut debouncer, &mut watched, &index_root);
+            update_watches(&mut debouncer, &mut watched, &walker);
             log::info!("now watching {} directories", watched.len());
         }
 
@@ -148,10 +149,10 @@ fn setup_watches(
     debouncer: &mut notify_debouncer_mini::Debouncer<
         notify_debouncer_mini::notify::RecommendedWatcher,
     >,
-    index_root: &Path,
+    walker: &ContentWalker,
 ) -> HashSet<PathBuf> {
     let mut watched = HashSet::new();
-    for full_dir in cli::discover_watch_dirs(index_root) {
+    for full_dir in walker.watch_dirs() {
         if full_dir.is_dir() {
             if let Err(e) = debouncer
                 .watcher()
@@ -172,9 +173,10 @@ fn update_watches(
         notify_debouncer_mini::notify::RecommendedWatcher,
     >,
     current: &mut HashSet<PathBuf>,
-    index_root: &Path,
+    walker: &ContentWalker,
 ) {
-    let desired: HashSet<PathBuf> = cli::discover_watch_dirs(index_root)
+    let desired: HashSet<PathBuf> = walker
+        .watch_dirs()
         .into_iter()
         .filter(|d| d.is_dir())
         .collect();
@@ -227,7 +229,8 @@ mod tests {
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut debouncer = new_debouncer(Duration::from_secs(2), tx).unwrap();
-        let watched = setup_watches(&mut debouncer, dir.path());
+        let walker = ContentWalker::from_env();
+        let watched = setup_watches(&mut debouncer, &walker);
         assert!(watched.is_empty());
 
         unsafe { std::env::remove_var("TSM_INDEX_ROOT") };
@@ -251,7 +254,8 @@ mod tests {
         // We test the individual pieces rather than run() which also inits logger
         let (tx, rx) = std::sync::mpsc::channel();
         let mut debouncer = new_debouncer(Duration::from_secs(2), tx).unwrap();
-        let watched = setup_watches(&mut debouncer, dir.path());
+        let walker = ContentWalker::from_env();
+        let watched = setup_watches(&mut debouncer, &walker);
         assert!(!watched.is_empty());
 
         // The main loop condition checks SHUTDOWN

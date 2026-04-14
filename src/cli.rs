@@ -51,34 +51,44 @@ pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
 /// traversal paths through the same ignore rules, including stdin — a hook
 /// that accidentally hands us `.git/HEAD.md` won't silently pollute the DB.
 pub fn read_paths_from_stdin(index_root: &Path, walker: &indexer::ContentWalker) -> Vec<PathBuf> {
+    // `filter_map` (not `map_while`) so a transient stdin I/O error on one
+    // line is logged and skipped rather than silently truncating the rest of
+    // the input — matters when a post-save hook pipes many paths.
     std::io::stdin()
         .lock()
         .lines()
-        .map_while(Result::ok)
+        .filter_map(|res| match res {
+            Ok(line) => Some(line),
+            Err(e) => {
+                log::warn!("stdin read error (line skipped): {e}");
+                None
+            }
+        })
         .filter(|line| !line.trim().is_empty())
         .map(|line| index_root.join(line.trim()))
         .filter(|path| {
             if walker.is_ignored(path) {
                 log::warn!("skipping {} (excluded by ignore rules)", path.display());
-                false
-            } else {
-                true
+                return false;
             }
+            if !walker.extension_allowed(path) {
+                log::warn!(
+                    "skipping {} (extension not in [index].extensions)",
+                    path.display()
+                );
+                return false;
+            }
+            true
         })
         .collect()
 }
 
 /// Collect all files under `index_root` that should be indexed.
 ///
-/// Kept as a thin wrapper so daemon and rebuild call sites don't need to
-/// know about `ContentWalker` directly.
-pub fn collect_content_files(_index_root: &Path) -> Vec<PathBuf> {
-    indexer::ContentWalker::from_env().collect_files()
-}
-
-/// Top-level directories the fs-watcher should register for inotify.
-pub fn discover_watch_dirs(_index_root: &Path) -> Vec<PathBuf> {
-    indexer::ContentWalker::from_env().watch_dirs()
+/// The `index_root` argument takes precedence over the config singleton's
+/// value, which matters in tests that exercise `cmd_rebuild` with a tempdir.
+pub fn collect_content_files(index_root: &Path) -> Vec<PathBuf> {
+    indexer::ContentWalker::from_env_with_index_root(index_root).collect_files()
 }
 
 pub struct SearchOptions<'a> {
@@ -1591,9 +1601,9 @@ mod tests {
         assert_eq!(parsed["results"][0]["content"], "# Hello\n\nWorld.");
     }
 
-    // Walker behavior is now covered by indexer::walker::tests. The wrapper
-    // functions in this file (collect_content_files, discover_watch_dirs) are
-    // thin forwards that read the config singleton.
+    // Walker behavior is now covered by indexer::walker::tests. The
+    // `collect_content_files` wrapper in this file is a thin forward that
+    // builds a ContentWalker from the passed `index_root`.
 
     #[test]
     fn test_format_json_include_content_file_missing() {
