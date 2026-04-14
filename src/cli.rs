@@ -15,13 +15,18 @@ pub fn cmd_init() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run indexing on given file paths and return stats (no DB open, no output).
+/// Run indexing on given file paths under a policy. Returns stats.
+///
+/// The policy is the non-bypassable correctness gate applied by the
+/// indexer — no caller-side pre-filter is required (or permitted, per
+/// design: duplicated filter logic was a bug-magnet, see #134).
 pub fn run_index(
     conn: &rusqlite::Connection,
     file_paths: &[PathBuf],
     index_root: &Path,
+    policy: &dyn indexer::IngestPolicy,
 ) -> anyhow::Result<indexer::IndexStats> {
-    indexer::index_all(conn, file_paths, index_root)
+    indexer::index_all(conn, file_paths, index_root, policy)
 }
 
 pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
@@ -29,13 +34,14 @@ pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     let conn = db::get_connection(&db_path)?;
     let index_root = config::index_root();
 
+    let walker = indexer::ContentWalker::from_env();
     let file_paths: Vec<PathBuf> = if files_from_stdin {
         read_paths_from_stdin(&index_root)
     } else {
-        collect_content_files(&index_root)
+        walker.collect_files()
     };
 
-    let stats = run_index(&conn, &file_paths, &index_root)?;
+    let stats = run_index(&conn, &file_paths, &index_root, &walker)?;
     log::info!(
         "Indexed: {}, Skipped: {}, Removed: {}",
         stats.indexed,
@@ -45,141 +51,38 @@ pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Read one-path-per-line from stdin and resolve each against `index_root`.
+/// No ignore/extension filtering is performed here — the indexer applies
+/// the policy gate itself, so duplicating the check here would add code
+/// surface with no behavioral benefit.
 pub fn read_paths_from_stdin(index_root: &Path) -> Vec<PathBuf> {
+    // `filter_map` (not `map_while`) so a transient stdin I/O error on one
+    // line is logged and skipped rather than silently truncating the rest of
+    // the input — matters when a post-save hook pipes many paths.
     std::io::stdin()
         .lock()
         .lines()
-        .map_while(Result::ok)
+        .filter_map(|res| match res {
+            Ok(line) => Some(line),
+            Err(e) => {
+                log::warn!("stdin read error (line skipped): {e}");
+                None
+            }
+        })
         .filter(|line| !line.trim().is_empty())
         .map(|line| index_root.join(line.trim()))
         .collect()
 }
 
+/// Collect all files under `index_root` that should be indexed.
+///
+/// The `index_root` argument overrides the value that would otherwise be
+/// read from `tsm.toml` — important in tests that exercise `cmd_rebuild`
+/// with a tempdir. All other config fields are still resolved fresh from
+/// disk via `ResolvedConfig::from_env()`; neither this function nor the
+/// walker it builds consults the `config::RESOLVED` singleton.
 pub fn collect_content_files(index_root: &Path) -> Vec<PathBuf> {
-    let dirs = config::content_dirs();
-    if dirs.is_empty() {
-        // Auto-discover: recursively find .md in non-hidden subdirs of index_root
-        let mut files = Vec::new();
-        for subdir in discover_subdirs(index_root) {
-            collect_md_files_excluding_hidden(&subdir, &mut files);
-        }
-        files
-    } else {
-        let mut files = Vec::new();
-        for dir in dirs {
-            let full_dir = index_root.join(&dir.path);
-            if full_dir.is_dir() {
-                collect_md_files(&full_dir, &mut files);
-            } else {
-                log::warn!(
-                    "content_dir '{}' not found at {}; skipping",
-                    dir.path,
-                    full_dir.display()
-                );
-            }
-        }
-        files
-    }
-}
-
-fn collect_md_files_excluding_hidden(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            log::warn!("cannot read directory {}: {e}", dir.display());
-            return;
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                log::warn!("cannot read entry in {}: {e}", dir.display());
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path.is_dir() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') {
-                continue;
-            }
-            collect_md_files_excluding_hidden(&path, out);
-        } else if path.extension().is_some_and(|e| e == "md") {
-            out.push(path);
-        }
-    }
-}
-
-/// Discover immediate non-hidden subdirectories of a directory.
-fn discover_subdirs(dir: &Path) -> Vec<PathBuf> {
-    let mut result = Vec::new();
-    match std::fs::read_dir(dir) {
-        Err(e) => {
-            log::warn!(
-                "cannot read {}: {e}; no subdirectories discovered",
-                dir.display()
-            );
-        }
-        Ok(entries) => {
-            for entry in entries {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(e) => {
-                        log::warn!("cannot read entry in {}: {e}", dir.display());
-                        continue;
-                    }
-                };
-                let path = entry.path();
-                if path.is_dir() {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if !name.starts_with('.') {
-                        result.push(path);
-                    }
-                }
-            }
-        }
-    }
-    result
-}
-
-/// List directories to watch (for the watcher thread). When content_dirs is configured,
-/// returns those paths. Otherwise discovers non-hidden subdirs under index_root.
-pub fn discover_watch_dirs(index_root: &Path) -> Vec<PathBuf> {
-    let dirs = config::content_dirs();
-    if dirs.is_empty() {
-        discover_subdirs(index_root)
-    } else {
-        let mut result = Vec::new();
-        for dir in dirs {
-            let full_dir = index_root.join(&dir.path);
-            if full_dir.is_dir() {
-                result.push(full_dir);
-            } else {
-                log::warn!(
-                    "content_dir '{}' not found at {}; will not be watched",
-                    dir.path,
-                    full_dir.display()
-                );
-            }
-        }
-        result
-    }
-}
-
-pub fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_md_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "md") {
-            out.push(path);
-        }
-    }
+    indexer::ContentWalker::from_env_with_index_root(index_root).collect_files()
 }
 
 pub struct SearchOptions<'a> {
@@ -1530,7 +1433,8 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
 
     // Full index (synchronous, with progress)
     let conn = db::get_connection(&db_path)?;
-    let file_paths = collect_content_files(&index_root);
+    let walker = indexer::ContentWalker::from_env_with_index_root(&index_root);
+    let file_paths = walker.collect_files();
     let total = file_paths.len();
     log::info!("Indexing {total} files...");
 
@@ -1538,7 +1442,13 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
         let rel = path.strip_prefix(&index_root).unwrap_or(path).display();
         log::debug!("  [{current}/{total}] {rel}");
     };
-    let stats = indexer::index_all_with_progress(&conn, &file_paths, &index_root, Some(&progress))?;
+    let stats = indexer::index_all_with_progress(
+        &conn,
+        &file_paths,
+        &index_root,
+        &walker,
+        Some(&progress),
+    )?;
     log::info!(
         "Done: Indexed: {}, Skipped: {}, Removed: {}",
         stats.indexed,
@@ -1692,56 +1602,9 @@ mod tests {
         assert_eq!(parsed["results"][0]["content"], "# Hello\n\nWorld.");
     }
 
-    #[test]
-    fn test_collect_md_files() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let sub = dir.path().join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(dir.path().join("a.md"), "test").unwrap();
-        std::fs::write(sub.join("b.md"), "test").unwrap();
-        std::fs::write(dir.path().join("c.txt"), "test").unwrap();
-
-        let mut files = Vec::new();
-        collect_md_files(dir.path(), &mut files);
-        assert_eq!(files.len(), 2);
-        assert!(files.iter().all(|f| f.extension().unwrap() == "md"));
-    }
-
-    #[test]
-    fn test_collect_md_files_empty_dir() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut files = Vec::new();
-        collect_md_files(dir.path(), &mut files);
-        assert!(files.is_empty());
-    }
-
-    #[test]
-    fn test_collect_md_files_nonexistent() {
-        let mut files = Vec::new();
-        collect_md_files(Path::new("/nonexistent/path"), &mut files);
-        assert!(files.is_empty());
-    }
-
-    #[test]
-    fn test_collect_content_files() {
-        let dir = tempfile::TempDir::new().unwrap();
-        // Create one CONTENT_DIR
-        let notes_dir = dir.path().join("daily/notes");
-        std::fs::create_dir_all(&notes_dir).unwrap();
-        std::fs::write(notes_dir.join("test.md"), "# Test").unwrap();
-        std::fs::write(notes_dir.join("ignore.txt"), "not md").unwrap();
-
-        let files = collect_content_files(dir.path());
-        assert_eq!(files.len(), 1);
-        assert!(files[0].to_string_lossy().contains("test.md"));
-    }
-
-    #[test]
-    fn test_collect_content_files_empty() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let files = collect_content_files(dir.path());
-        assert!(files.is_empty());
-    }
+    // Walker behavior is now covered by indexer::walker::tests. The
+    // `collect_content_files` wrapper in this file is a thin forward that
+    // builds a ContentWalker from the passed `index_root`.
 
     #[test]
     fn test_format_json_include_content_file_missing() {
@@ -1946,45 +1809,6 @@ mod tests {
         assert_eq!(parsed["issue_count"], 0);
         assert_eq!(parsed["sections"][0]["name"], "Test");
         assert_eq!(parsed["sections"][0]["items"][0]["status"], "ok");
-    }
-
-    #[test]
-    fn test_discover_subdirs_excludes_hidden() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir(dir.path().join("visible")).unwrap();
-        std::fs::create_dir(dir.path().join(".hidden")).unwrap();
-        std::fs::create_dir(dir.path().join("another")).unwrap();
-
-        let dirs = super::discover_subdirs(dir.path());
-        let names: Vec<&str> = dirs
-            .iter()
-            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
-            .collect();
-        assert!(names.contains(&"visible"));
-        assert!(names.contains(&"another"));
-        assert!(!names.contains(&".hidden"));
-    }
-
-    #[test]
-    fn test_collect_md_files_excluding_hidden() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let visible = dir.path().join("visible");
-        std::fs::create_dir(&visible).unwrap();
-        std::fs::write(visible.join("note.md"), "# Note").unwrap();
-
-        let hidden = dir.path().join(".hidden");
-        std::fs::create_dir(&hidden).unwrap();
-        std::fs::write(hidden.join("secret.md"), "# Secret").unwrap();
-
-        let mut files = Vec::new();
-        super::collect_md_files_excluding_hidden(dir.path(), &mut files);
-
-        let names: Vec<&str> = files
-            .iter()
-            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
-            .collect();
-        assert!(names.contains(&"note.md"));
-        assert!(!names.contains(&"secret.md"));
     }
 
     #[test]

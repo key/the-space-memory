@@ -77,6 +77,8 @@ impl std::str::FromStr for SearchFallback {
 
 const DEFAULT_SESSION_WEIGHT: f64 = 0.3;
 const DEFAULT_SESSION_HALF_LIFE_DAYS: f64 = 30.0;
+const DEFAULT_IGNORE_FILE: &str = ".tsmignore";
+const DEFAULT_INDEX_EXTENSION: &str = "md";
 
 // ─── Config struct ───────────────────────────────────────────────
 
@@ -110,6 +112,9 @@ pub(crate) struct ClaudeSessionConfig {
 pub(crate) struct IndexConfig {
     pub content_dirs: Vec<ContentDirConfig>,
     pub claude_session: ClaudeSessionConfig,
+    pub respect_gitignore: Option<bool>,
+    pub ignore_file: Option<String>,
+    pub extensions: Option<Vec<String>>,
 }
 
 /// Shape of tsm.toml — all fields optional for partial config files.
@@ -191,6 +196,20 @@ pub struct ResolvedConfig {
 
     /// Half-life in days for Claude Code session data time decay.
     pub session_half_life_days: f64,
+
+    /// Whether to also apply the root `.gitignore` under `index_root` during indexing.
+    /// Default: true. Config: `[index].respect_gitignore`.
+    pub respect_gitignore: bool,
+
+    /// Filename of the project-level ignore file, resolved relative to the tsm
+    /// project root (the directory containing `tsm.toml`). Its patterns are
+    /// applied relative to `index_root`.
+    /// Default: `.tsmignore`. Config: `[index].ignore_file`.
+    pub ignore_file: String,
+
+    /// File extensions to include during indexing (without leading dot).
+    /// Default: `["md"]`. Config: `[index].extensions`.
+    pub extensions: Vec<String>,
 }
 
 impl ResolvedConfig {
@@ -298,6 +317,23 @@ impl ResolvedConfig {
             .half_life_days
             .unwrap_or(DEFAULT_SESSION_HALF_LIFE_DAYS);
 
+        let respect_gitignore = file_cfg.index.respect_gitignore.unwrap_or(true);
+
+        let ignore_file = file_cfg
+            .index
+            .ignore_file
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_IGNORE_FILE.to_string());
+
+        let extensions = file_cfg
+            .index
+            .extensions
+            .clone()
+            .map(|v| v.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec![DEFAULT_INDEX_EXTENSION.to_string()]);
+
         Self {
             state_dir,
             index_root,
@@ -311,6 +347,9 @@ impl ResolvedConfig {
             content_dirs,
             session_weight,
             session_half_life_days,
+            respect_gitignore,
+            ignore_file,
+            extensions,
         }
     }
 }
@@ -462,6 +501,14 @@ fn load_config_from(candidates: &[PathBuf]) -> ConfigFile {
             .claude_session
             .half_life_days
             .or(file.index.claude_session.half_life_days);
+        merged.index.respect_gitignore = merged
+            .index
+            .respect_gitignore
+            .or(file.index.respect_gitignore);
+        merged.index.ignore_file = merged.index.ignore_file.or(file.index.ignore_file);
+        if merged.index.extensions.is_none() {
+            merged.index.extensions = file.index.extensions;
+        }
     }
     merged
 }
@@ -522,6 +569,18 @@ pub fn session_weight() -> f64 {
 
 pub fn session_half_life_days() -> f64 {
     resolved().session_half_life_days
+}
+
+pub fn respect_gitignore() -> bool {
+    resolved().respect_gitignore
+}
+
+pub fn ignore_file() -> String {
+    resolved().ignore_file.clone()
+}
+
+pub fn index_extensions() -> Vec<String> {
+    resolved().extensions.clone()
 }
 
 // ─── Derived paths ───────────────────────────────────────────────
@@ -749,6 +808,36 @@ mod tests {
             cfg.embedder_backfill_interval_secs,
             DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS
         );
+        assert!(cfg.respect_gitignore);
+        assert_eq!(cfg.ignore_file, DEFAULT_IGNORE_FILE);
+        assert_eq!(cfg.extensions, vec![DEFAULT_INDEX_EXTENSION.to_string()]);
+    }
+
+    #[test]
+    fn test_index_ignore_settings_from_toml() {
+        let cfg = resolved_from_toml(
+            r#"
+            [index]
+            respect_gitignore = false
+            ignore_file = ".myignore"
+            extensions = ["md", "txt"]
+        "#,
+        );
+        assert!(!cfg.respect_gitignore);
+        assert_eq!(cfg.ignore_file, ".myignore");
+        assert_eq!(cfg.extensions, vec!["md".to_string(), "txt".to_string()]);
+    }
+
+    #[test]
+    fn test_index_ignore_empty_extensions_falls_back() {
+        // Empty list in TOML falls back to defaults, not an empty list.
+        let cfg = resolved_from_toml(
+            r#"
+            [index]
+            extensions = []
+        "#,
+        );
+        assert_eq!(cfg.extensions, vec![DEFAULT_INDEX_EXTENSION.to_string()]);
     }
 
     #[test]
