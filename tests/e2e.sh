@@ -131,7 +131,8 @@ log "TSM_STATE_DIR=$TSM_STATE_DIR"
 log "TSM_INDEX_ROOT=$TSM_INDEX_ROOT"
 log "TODAY=$TODAY  1Y_AGO=$ONE_YEAR_AGO  3M_AGO=$THREE_MONTHS_AGO"
 
-# Cleanup on exit
+# Cleanup on exit (invoked via trap below)
+# shellcheck disable=SC2329
 cleanup() {
     log "Cleaning up..."
     tsm stop 2>/dev/null || true
@@ -425,6 +426,102 @@ else
     else
         fail "watcher: deleted file still in index" "watcher-test.md still appears in search results"
     fi
+fi
+
+# ── Parallel ingest race ─────────────────────────────────────────────
+#
+# Verifies that concurrent file creations all land in the index without
+# dedup drops or lost events. Watcher debounces at 2s (watcher_mode.rs:47),
+# so 20 parallel writes should coalesce into one batch.
+# Also checks the reverse direction: concurrent deletions remove all entries.
+
+echo ""
+log "=== 並列投入 race ==="
+
+RACE_COUNT=20
+RACE_DIR="$TSM_INDEX_ROOT/notes"
+
+# Parallel create
+for i in $(seq 1 "$RACE_COUNT"); do
+    cat > "$RACE_DIR/race-$i.md" <<HEREDOC &
+---
+status: current
+updated: $TODAY
+tags: [race]
+---
+
+# race-$i
+
+unique-marker-$i — 並列投入テスト用のユニークコンテンツ。
+HEREDOC
+done
+wait
+
+log "Created $RACE_COUNT files in parallel, waiting for debounced batch..."
+
+# Give the 2s debounce + indexer a head start before polling.
+sleep 5
+
+# Poll all files with a shared budget. Each iteration checks every missing
+# file once; we stop as soon as all are indexed.
+RACE_TIMEOUT=60
+RACE_ELAPSED=0
+MISSING_CREATE=()
+while [[ $RACE_ELAPSED -lt $RACE_TIMEOUT ]]; do
+    MISSING_CREATE=()
+    for i in $(seq 1 "$RACE_COUNT"); do
+        if ! search_json "unique-marker-$i" 2>/dev/null \
+             | jq -e "any(.results[]; .source_file | contains(\"race-$i.md\"))" \
+               >/dev/null 2>&1; then
+            MISSING_CREATE+=("$i")
+        fi
+    done
+    if [[ ${#MISSING_CREATE[@]} -eq 0 ]]; then
+        break
+    fi
+    sleep 2
+    RACE_ELAPSED=$((RACE_ELAPSED + 2))
+done
+
+if [[ ${#MISSING_CREATE[@]} -eq 0 ]]; then
+    pass "race: all $RACE_COUNT parallel files indexed"
+else
+    fail "race: parallel ingest missed ${#MISSING_CREATE[@]}/$RACE_COUNT files" \
+         "not indexed: ${MISSING_CREATE[*]}"
+fi
+
+# Parallel delete — verifies concurrent removals also coalesce correctly.
+for i in $(seq 1 "$RACE_COUNT"); do
+    rm -f "$RACE_DIR/race-$i.md" &
+done
+wait
+
+log "Deleted $RACE_COUNT files in parallel, waiting for index removal..."
+sleep 5
+
+RACE_ELAPSED=0
+STILL_PRESENT=()
+while [[ $RACE_ELAPSED -lt $RACE_TIMEOUT ]]; do
+    STILL_PRESENT=()
+    for i in $(seq 1 "$RACE_COUNT"); do
+        if search_json "unique-marker-$i" 2>/dev/null \
+           | jq -e "any(.results[]; .source_file | contains(\"race-$i.md\"))" \
+             >/dev/null 2>&1; then
+            STILL_PRESENT+=("$i")
+        fi
+    done
+    if [[ ${#STILL_PRESENT[@]} -eq 0 ]]; then
+        break
+    fi
+    sleep 2
+    RACE_ELAPSED=$((RACE_ELAPSED + 2))
+done
+
+if [[ ${#STILL_PRESENT[@]} -eq 0 ]]; then
+    pass "race: all $RACE_COUNT parallel deletions removed from index"
+else
+    fail "race: parallel delete left ${#STILL_PRESENT[@]}/$RACE_COUNT entries" \
+         "still indexed: ${STILL_PRESENT[*]}"
 fi
 
 # ══════════════════════════════════════════════════════════════════════
