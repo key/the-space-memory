@@ -111,7 +111,9 @@ poll_search_miss() {
 }
 
 # Wait until `tsm status` reports the embedder as running.
-# wait_embedder_ready TIMEOUT_SECS → exit 0 if ready, 1 on timeout.
+# wait_embedder_ready TIMEOUT_SECS → returns 0 if ready, 1 on timeout.
+# Callers should surface a final `tsm status` on timeout for diagnostics
+# (this function suppresses stderr so the poll loop stays quiet).
 wait_embedder_ready() {
     local timeout="$1"
     local elapsed=0
@@ -543,9 +545,14 @@ fi  # end TSM_E2E_RUN_RACE gate
 # ── Embedder crash recovery ──────────────────────────────────────────
 #
 # Verifies embedder lifecycle edge cases:
-#   1. Default `tsm search` errors when embedder is down.
-#   2. `--fallback fts-only` still returns results (FTS5-only degraded mode).
-#   3. `tsm restart` brings the embedder back; default search recovers.
+#   1. Baseline: default search succeeds with embedder up.
+#   2. After kill: default search fails with an embedder-specific error.
+#   3. After kill: --fallback fts-only still returns FTS5 results (degraded).
+#   4. After `tsm restart`: embedder ready + default search recovers.
+#
+# Uses SIGTERM (default). The embedder has no SIGTERM handler, so this
+# simulates a hard crash for our purposes — the socket file persists
+# until `tsm restart` cleans it up.
 #
 # Kept last (before Summary) so the forced embedder kill doesn't leak
 # into earlier tests.
@@ -558,34 +565,74 @@ if [[ ! -f "$EMBEDDER_PID_FILE" ]]; then
     fail "embedder-crash: PID file missing" "expected $EMBEDDER_PID_FILE"
 else
     EMBEDDER_PID=$(cat "$EMBEDDER_PID_FILE")
-    log "Killing embedder (PID $EMBEDDER_PID)..."
-    kill "$EMBEDDER_PID" 2>/dev/null || true
-
-    # Give tsmd's child reaper a moment to notice the dead process.
-    sleep 2
-
-    # (1) Default search must fail when the embedder is down.
-    set +e; tsm search -q "メロス" -f json >/dev/null 2>&1; CAPTURED_EXIT=$?; set -e
-    assert_fail "embedder-crash: default search fails without embedder" "$CAPTURED_EXIT"
-
-    # (2) FTS-only fallback still returns results.
-    run search_json "メロス" --fallback fts-only
-    assert_json "embedder-crash: --fallback fts-only returns FTS results" \
-        '.results | type == "array" and length > 0' \
-        "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
-
-    # (3) Restart recovers the embedder.
-    log "Restarting daemon to recover embedder..."
-    tsm restart >/dev/null 2>&1
-
-    if wait_embedder_ready 60; then
-        pass "embedder-crash: embedder ready after restart"
+    if [[ -z "$EMBEDDER_PID" ]]; then
+        # PID file exists but is empty — possible race with tsmd's reaper
+        # clearing contents between our `-f` check and `cat`.
+        fail "embedder-crash: PID file is empty" "$EMBEDDER_PID_FILE"
+    else
+        # (1) Baseline — prove default search works before the kill.
+        # Without this, (2) and (4) could trivially pass if the embedder
+        # was already broken due to a prior test or flaky startup.
         run search_json "メロス"
-        assert_json "embedder-crash: default search recovers after restart" \
+        assert_json "embedder-crash: baseline default search succeeds" \
             '.results | type == "array" and length > 0' \
             "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
-    else
-        fail "embedder-crash: embedder not ready after restart" "timeout 60s"
+
+        log "Killing embedder (PID $EMBEDDER_PID)..."
+        # Swallowing errors: the process may already be gone if tsmd's
+        # reaper noticed first. The next assertions verify the consequence.
+        kill "$EMBEDDER_PID" 2>/dev/null || true
+
+        # Give tsmd's child reaper a moment to notice the dead process.
+        # The accept loop polls `try_wait()` every 100ms, so 2s is ample.
+        sleep 2
+
+        # (2) Default search must fail *with* an embedder-specific error.
+        # Inline `set +e` (rather than the `run` helper) because we need
+        # stderr separately from stdout to assert on the error message —
+        # exit code alone could false-pass on DB/socket/parse errors.
+        set +e
+        CAPTURED_ERR=$(tsm search -q "メロス" -f json 2>&1 >/dev/null)
+        CAPTURED_EXIT=$?
+        set -e
+        assert_fail "embedder-crash: default search fails without embedder" \
+            "$CAPTURED_EXIT"
+        assert_contains "embedder-crash: error mentions embedder" \
+            "Embedder is not running" "$CAPTURED_ERR" 0
+
+        # (3) FTS-only fallback still returns results.
+        run search_json "メロス" --fallback fts-only
+        assert_json "embedder-crash: --fallback fts-only returns FTS results" \
+            '.results | type == "array" and length > 0' \
+            "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+        # (4) tsm restart recovers the embedder. Let stderr surface so a
+        # restart failure is diagnosable — otherwise `set -e` would abort
+        # the script and skip the summary + daemon-log dump at the end.
+        log "Restarting daemon to recover embedder..."
+        if ! tsm restart >/dev/null; then
+            fail "embedder-crash: tsm restart failed" "exit $?"
+        elif wait_embedder_ready 60; then
+            # 60s rather than initial 180s: the model file is already
+            # warm in the OS page cache; restart only respawns the
+            # process, not the model weights.
+            pass "embedder-crash: embedder ready after restart"
+            run search_json "メロス"
+            assert_json "embedder-crash: default search recovers after restart" \
+                '.results | type == "array" and length > 0' \
+                "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+        else
+            # Surface a final `tsm status` for diagnostics — the poll loop
+            # inside wait_embedder_ready silences stderr to stay quiet.
+            DAEMON_STATUS=$(tsm status 2>&1 || true)
+            fail "embedder-crash: embedder not ready after restart" \
+                 "timeout 60s — daemon status: $DAEMON_STATUS"
+        fi
+
+        # Note on `tsm status`: it reports "Embedder: running" based on
+        # socket-file existence, not process liveness. Between the kill
+        # and the restart the socket lingers, so status would spuriously
+        # say "running". We rely on search exit code / error instead.
     fi
 fi
 
