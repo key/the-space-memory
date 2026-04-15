@@ -597,6 +597,10 @@ else
         set -e
         assert_fail "embedder-crash: default search fails without embedder" \
             "$CAPTURED_EXIT"
+        # Pass `0` (not `$CAPTURED_EXIT`) as the 4th arg: assert_contains
+        # short-circuits to fail when its exit_code arg is non-zero, which
+        # would mask the string check here. The non-zero exit is already
+        # asserted above by assert_fail, so we only need the message check.
         assert_contains "embedder-crash: error mentions embedder" \
             "Embedder is not running" "$CAPTURED_ERR" 0
 
@@ -610,8 +614,15 @@ else
         # restart failure is diagnosable — otherwise `set -e` would abort
         # the script and skip the summary + daemon-log dump at the end.
         log "Restarting daemon to recover embedder..."
-        if ! tsm restart >/dev/null; then
-            fail "embedder-crash: tsm restart failed" "exit $?"
+        # Capture exit code explicitly: `if ! tsm restart` consumes $? so
+        # inside the then-branch $? would always be 0 (the negation result),
+        # making the diagnostic message useless.
+        set +e
+        tsm restart >/dev/null
+        RESTART_EXIT=$?
+        set -e
+        if [[ $RESTART_EXIT -ne 0 ]]; then
+            fail "embedder-crash: tsm restart failed" "exit $RESTART_EXIT"
         elif wait_embedder_ready 60; then
             # 60s rather than initial 180s: the model file is already
             # warm in the OS page cache; restart only respawns the
