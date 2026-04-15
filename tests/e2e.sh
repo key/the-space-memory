@@ -110,6 +110,21 @@ poll_search_miss() {
     return 1
 }
 
+# Wait until `tsm status` reports the embedder as running.
+# wait_embedder_ready TIMEOUT_SECS → exit 0 if ready, 1 on timeout.
+wait_embedder_ready() {
+    local timeout="$1"
+    local elapsed=0
+    while [[ $elapsed -lt $timeout ]]; do
+        if tsm status 2>/dev/null | grep -q "Embedder:.*running"; then
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    return 1
+}
+
 # ── Environment setup ─────────────────────────────────────────────────
 
 export TSM_STATE_DIR
@@ -156,19 +171,10 @@ tsm init
 log "Starting daemon (with embedder + watcher)..."
 tsm start
 
-# Wait for embedder to be ready (model loading can take a while)
+# Wait for embedder to be ready (model loading can take a while on first run)
 log "Waiting for embedder to become ready..."
-EMBEDDER_TIMEOUT=180
-ELAPSED=0
-while [[ $ELAPSED -lt $EMBEDDER_TIMEOUT ]]; do
-    if tsm status 2>/dev/null | grep -q "Embedder:.*running"; then
-        break
-    fi
-    sleep 2
-    ELAPSED=$((ELAPSED + 2))
-done
-if [[ $ELAPSED -ge $EMBEDDER_TIMEOUT ]]; then
-    log "WARNING: Embedder did not become ready within ${EMBEDDER_TIMEOUT}s"
+if ! wait_embedder_ready 180; then
+    log "WARNING: Embedder did not become ready within 180s"
     tsm status 2>/dev/null || true
 fi
 
@@ -533,6 +539,55 @@ else
 fi
 
 fi  # end TSM_E2E_RUN_RACE gate
+
+# ── Embedder crash recovery ──────────────────────────────────────────
+#
+# Verifies embedder lifecycle edge cases:
+#   1. Default `tsm search` errors when embedder is down.
+#   2. `--fallback fts-only` still returns results (FTS5-only degraded mode).
+#   3. `tsm restart` brings the embedder back; default search recovers.
+#
+# Kept last (before Summary) so the forced embedder kill doesn't leak
+# into earlier tests.
+
+echo ""
+log "=== Embedder crash ==="
+
+EMBEDDER_PID_FILE="$TSM_STATE_DIR/embedder.pid"
+if [[ ! -f "$EMBEDDER_PID_FILE" ]]; then
+    fail "embedder-crash: PID file missing" "expected $EMBEDDER_PID_FILE"
+else
+    EMBEDDER_PID=$(cat "$EMBEDDER_PID_FILE")
+    log "Killing embedder (PID $EMBEDDER_PID)..."
+    kill "$EMBEDDER_PID" 2>/dev/null || true
+
+    # Give tsmd's child reaper a moment to notice the dead process.
+    sleep 2
+
+    # (1) Default search must fail when the embedder is down.
+    set +e; tsm search -q "メロス" -f json >/dev/null 2>&1; CAPTURED_EXIT=$?; set -e
+    assert_fail "embedder-crash: default search fails without embedder" "$CAPTURED_EXIT"
+
+    # (2) FTS-only fallback still returns results.
+    run search_json "メロス" --fallback fts-only
+    assert_json "embedder-crash: --fallback fts-only returns FTS results" \
+        '.results | type == "array" and length > 0' \
+        "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+    # (3) Restart recovers the embedder.
+    log "Restarting daemon to recover embedder..."
+    tsm restart >/dev/null 2>&1
+
+    if wait_embedder_ready 60; then
+        pass "embedder-crash: embedder ready after restart"
+        run search_json "メロス"
+        assert_json "embedder-crash: default search recovers after restart" \
+            '.results | type == "array" and length > 0' \
+            "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+    else
+        fail "embedder-crash: embedder not ready after restart" "timeout 60s"
+    fi
+fi
 
 # ══════════════════════════════════════════════════════════════════════
 # Summary
