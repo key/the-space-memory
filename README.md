@@ -2,7 +2,7 @@
 
 ![The Space Memory](docs/assets/cover.png)
 
-[日本語](README.ja.md)
+[日本語](README.ja.md) · [Documentation](https://key.github.io/the-space-memory/)
 
 ## Overview
 
