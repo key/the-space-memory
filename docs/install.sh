@@ -8,12 +8,17 @@
 #   TSM_VERSION    Specific release tag to install (default: latest)
 #   INSTALL_DIR    Where to place binaries     (default: $HOME/.local/bin)
 #   TSM_FORCE      Set to "1" to overwrite an existing installation without prompt
-#
-# See ADR-0019 for the design rationale.
 set -euo pipefail
 
 readonly REPO="key/the-space-memory"
 readonly DEFAULT_INSTALL_DIR="${HOME}/.local/bin"
+
+# Global temp dir, populated by main(). Declared here so the EXIT trap
+# (registered before mktemp) can reference it without `set -u` complaints
+# even if the script aborts before mktemp succeeds.
+TMP_DIR=""
+cleanup() { [ -n "${TMP_DIR:-}" ] && rm -rf "${TMP_DIR}"; }
+trap cleanup EXIT
 
 #
 # Logging helpers
@@ -65,18 +70,31 @@ detect_arch() {
 }
 
 #
-# Resolve the release tag — env override or latest from GitHub API
+# Resolve the release tag — env override or latest from GitHub API.
+#
+# The curl call is split out so that a non-zero grep exit (no tag_name in the
+# response — rate-limited, network outage, schema change) does not abort the
+# script via pipefail before the empty-tag guard in main() runs.
 #
 resolve_tag() {
     if [ -n "${TSM_VERSION:-}" ]; then
         echo "${TSM_VERSION}"
         return
     fi
-    # Use the GitHub API. Don't depend on jq.
-    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    local response
+    response=$(curl -fsSL --proto '=https' --tlsv1.2 \
+        "https://api.github.com/repos/${REPO}/releases/latest") \
+        || fatal "failed to reach GitHub API — check your network connection"
+    if printf '%s' "${response}" | grep -q '"message"'; then
+        local api_msg
+        api_msg=$(printf '%s' "${response}" | grep -oE '"message": *"[^"]+"' | head -n1 || true)
+        fatal "GitHub API returned an error (${api_msg:-unknown}) — set TSM_VERSION to bypass"
+    fi
+    printf '%s' "${response}" \
         | grep -oE '"tag_name": *"[^"]+"' \
         | head -n1 \
-        | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/'
+        | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/' \
+        || true
 }
 
 #
@@ -128,7 +146,7 @@ print_next_steps() {
 ✓ tsm installed at ${install_dir}
 
 Next steps:
-  1. tsm setup         # Download embedding model and WordNet (one-time, system-wide)
+  1. tsm setup         # Download embedding model and WordNet into .tsm/
   2. tsm init          # Initialize this workspace's database
   3. tsm doctor        # Verify everything is in order
 
@@ -166,26 +184,32 @@ main() {
     local archive_url="https://github.com/${REPO}/releases/download/${tag}/${archive_name}"
     local sha_url="${archive_url}.sha256"
 
-    local tmp
-    tmp=$(mktemp -d)
-    trap 'rm -rf "${tmp}"' EXIT
+    TMP_DIR=$(mktemp -d)
 
     info "downloading ${archive_name}"
-    fetch "${archive_url}" "${tmp}/${archive_name}"
+    fetch "${archive_url}" "${TMP_DIR}/${archive_name}"
 
     info "verifying checksum"
-    fetch "${sha_url}" "${tmp}/${archive_name}.sha256"
-    (cd "${tmp}" && "${SHA256_CHECK[@]}" "${archive_name}.sha256" >/dev/null) \
-        || fatal "checksum mismatch — aborting"
+    fetch "${sha_url}" "${TMP_DIR}/${archive_name}.sha256"
+    # Don't redirect output — preserve forensic detail (which file failed,
+    # expected vs actual hash) for security-relevant failures.
+    (cd "${TMP_DIR}" && "${SHA256_CHECK[@]}" "${archive_name}.sha256") \
+        || fatal "checksum mismatch for ${archive_name} — the downloaded file may be corrupt or tampered with"
 
     info "extracting"
-    tar -xzf "${tmp}/${archive_name}" -C "${tmp}"
-    local extracted_dir="${tmp}/tsm-${tag}-${arch}"
+    tar -xzf "${TMP_DIR}/${archive_name}" -C "${TMP_DIR}"
+    local extracted_dir="${TMP_DIR}/tsm-${tag}-${arch}"
+    [ -d "${extracted_dir}" ] \
+        || fatal "expected directory ${extracted_dir} not found in archive — release layout may have changed"
 
     info "installing to ${install_dir}"
     mkdir -p "${install_dir}"
-    install -m 755 "${extracted_dir}/bin/tsm"  "${install_dir}/"
-    install -m 755 "${extracted_dir}/bin/tsmd" "${install_dir}/"
+    # Stage both binaries first, then move atomically. Avoids leaving the
+    # system in a half-installed state if the second copy fails.
+    install -m 755 "${extracted_dir}/bin/tsm"  "${TMP_DIR}/tsm.new"
+    install -m 755 "${extracted_dir}/bin/tsmd" "${TMP_DIR}/tsmd.new"
+    mv "${TMP_DIR}/tsm.new"  "${install_dir}/tsm"
+    mv "${TMP_DIR}/tsmd.new" "${install_dir}/tsmd"
 
     print_next_steps "${install_dir}"
 }
