@@ -160,8 +160,9 @@ The PR labeler workflow (`.github/labeler.yml`) maps prefixes to labels:
 ## Claude Code Plugin
 
 The Claude Code plugin definition (skills/agents/hooks) for `tsm` lives in a
-separate repository: [`claude-code-plugins`](https://github.com/key/claude-plugins)
-(local checkout at `/workspaces/claude-code-plugins/plugins/the-space-memory`).
+separate repository:
+[`key/claude-code-plugins`](https://github.com/key/claude-code-plugins),
+under `plugins/the-space-memory/`.
 
 This repo only ships the `tsm` / `tsmd` binaries. Install the plugin from the
 plugins repo and ensure `tsm` is on `PATH`.
