@@ -140,6 +140,10 @@ src/
 - DB tests use in-memory SQLite (`:memory:`) to prevent state leakage
 - Embedder tests should use mockable trait design
 - Tests must not depend on external daemon state (embedder, etc.)
+- **E2E testdata の日付は placeholder 化必須** — `tests/e2e/testdata/**` 内で
+  日付を直書きしない。`__TODAY__` / `__1Y_AGO__` / `__3M_AGO__` 等を使い、
+  `tests/e2e.sh` の sed で実行時に置換する。直書きは time-decay スコアで
+  flake する（session half-life は 30 日）。CI の `testdata-lint` job が機械的に検出する
 
 ## Branch Naming
 
