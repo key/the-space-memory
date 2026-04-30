@@ -45,14 +45,17 @@ FTS5全文検索とベクトルセマンティック検索（ruri-v3-30m, 256次
 # 1. ビルド
 cargo build --release
 
-# 2. ruri-v3-30m モデルのダウンロード
+# 2. 外部リソースのダウンロード（ruri モデル + 日本語 WordNet DB）。
+#    マシン共有のためセットアップは 1 回だけでよい。
 tsm setup
 
 # 3. ドキュメントのルートディレクトリを設定
 export TSM_INDEX_ROOT=~/my-notes
 
-# 4. データベースの初期化（プロジェクトルートに default .tsmignore を
-#    同時に配置する。既存ファイルがある場合は上書きしない）
+# 4. ワークスペース初期化：DB スキーマ、デフォルト設定ファイル
+#    （tsm.toml、.tsmignore、.tsm/{user_dict.simpledic,custom_terms.toml,
+#    synonyms.csv}）の配置、WordNet/シノニムのインポートまで実施。
+#    冪等で、ユーザがカスタマイズしたファイルは絶対に上書きしない。
 tsm init
 
 # 5. デーモンの起動（embedder + ファイル監視）
