@@ -163,7 +163,8 @@ log "Preparing test data..."
 cp -r "$SCRIPT_DIR/e2e/testdata/"* "$TSM_INDEX_ROOT/"
 sed -i \
     "s/__TODAY__/$TODAY/g; s/__1Y_AGO__/$ONE_YEAR_AGO/g; s/__3M_AGO__/$THREE_MONTHS_AGO/g" \
-    "$TSM_INDEX_ROOT"/notes/*.md
+    "$TSM_INDEX_ROOT"/notes/*.md \
+    "$TSM_INDEX_ROOT"/sessions/*.jsonl
 
 # ── Init & start daemon ──────────────────────────────────────────────
 
@@ -372,7 +373,7 @@ assert_fail "edge: --recent garbage → error" "$CAPTURED_EXIT"
 echo ""
 log "=== Ingest session ==="
 
-SESSION_FILE="$SCRIPT_DIR/e2e/testdata/sessions/test-session.jsonl"
+SESSION_FILE="$TSM_INDEX_ROOT/sessions/test-session.jsonl"
 set +e; CAPTURED_OUTPUT=$(tsm ingest-session "$SESSION_FILE" 2>&1); CAPTURED_EXIT=$?; set -e
 assert_contains "ingest-session: succeeds" "session indexed" "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
