@@ -378,6 +378,10 @@ assert_contains "ingest-session: succeeds" "session indexed" "$CAPTURED_OUTPUT" 
 
 # Search for session-specific content (use fts-only; embedder may not be ready)
 run search_json "量子もつれ" --fallback fts-only
+# DEBUG: dump full top-50 ranking to disambiguate decay vs tokenization vs FTS race
+log "DEBUG ranking for '量子もつれ' (top 50, fts-only):"
+search_json "量子もつれ" --fallback fts-only -k 50 \
+    | jq -c '.results[] | {source_file, score, source_type}' || true
 assert_json "ingest-session: search hits session content" \
     'any(.results[]; .source_file | contains("test-session"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
