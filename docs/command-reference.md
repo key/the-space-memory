@@ -37,22 +37,30 @@ These commands run directly (not routed through the daemon).
 
 ### tsm init
 
-Initialize the database and write a default `.tsmignore`.
+Initialize the workspace: schema, scaffold files, WordNet import, user
+synonym sync. All steps are idempotent and re-runnable.
 
 ```text
 tsm init
 ```
 
-Performs two steps:
+Performs the following per-workspace setup steps. Every file write uses
+`OpenOptions::create_new`, so existing user-customized files are never
+overwritten:
 
-1. Creates the SQLite database at the location specified by `TSM_DB_PATH`
-   (default: `$TSM_INDEX_ROOT/.tsm/tsm.db`). Must be run once before indexing.
-2. Writes a default `.tsmignore` to the project root (the directory
-   containing `tsm.toml`) if one does not already exist. The default
-   excludes hidden directories (`.git/`, `.obsidian/`, `.venv/`, etc.),
-   common build directories (`target/`, `node_modules/`, `dist/`), and
-   large binary artifacts (`*.parquet`, `*.zip`, `*.db`). An existing
-   `.tsmignore` is never overwritten — re-running `tsm init` is safe.
+1. Creates the SQLite database at `$TSM_DB_PATH`
+   (default: `$TSM_INDEX_ROOT/.tsm/tsm.db`).
+2. Writes default scaffold files when missing:
+   - `.tsmignore` (project root) — `.gitignore`-style ignore patterns
+   - `tsm.toml` (project root) — fully commented configuration template
+   - `.tsm/user_dict.simpledic` — empty (lindera user dictionary)
+   - `.tsm/custom_terms.toml` — header comment with format example
+   - `.tsm/synonyms.csv` — header comment for user synonym pairs
+3. Imports Japanese WordNet synonyms from `.tsm/wnjpn.db` if present.
+   If missing, logs a warning and continues — run `tsm setup` to
+   download the file, then re-run `tsm init` to import.
+4. Syncs user-defined synonyms from `.tsm/synonyms.csv` (diff-based,
+   safe to re-run).
 
 **Flags:** none
 
@@ -60,7 +68,8 @@ Performs two steps:
 
 ```bash
 export TSM_INDEX_ROOT=~/my-notes
-tsm init
+tsm setup       # one-time: fetch ruri model + WordNet DB
+tsm init        # per-workspace: schema, scaffold, synonym import
 ```
 
 ---
@@ -138,21 +147,25 @@ tsm restart
 
 ### tsm setup
 
-Download model files and Japanese WordNet synonym database.
+Download external resources (embedding model + WordNet DB). System-wide;
+no workspace DB writes. Run once per machine; re-run only when the
+upstream resources change.
 
 ```text
 tsm setup
 ```
 
-Performs initial setup required before starting the daemon:
+Pure resource-fetch layer:
 
 1. Downloads `cl-nagoya/ruri-v3-30m` model files (`config.json`,
    `tokenizer.json`, `model.safetensors`) from HuggingFace Hub
    and copies them to `.tsm/models/ruri-v3-30m/`.
 2. Downloads Japanese WordNet (`wnjpn.db.gz`) from GitHub and
    decompresses it to `.tsm/wnjpn.db`.
-3. If the database is already initialized (`tsm init`), imports
-   WordNet synonym pairs automatically.
+
+Importing WordNet synonyms into the workspace DB is `tsm init`'s job.
+After running `tsm setup` for the first time, run `tsm init` (or re-run
+it) so the freshly downloaded WordNet DB gets imported.
 
 **Flags:** none
 
@@ -160,6 +173,7 @@ Performs initial setup required before starting the daemon:
 
 ```bash
 tsm setup
+tsm init        # imports WordNet synonyms into the workspace DB
 ```
 
 ---

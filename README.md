@@ -48,14 +48,17 @@ File watching uses inotify (Linux) / FSEvents (macOS).
 # 1. Build
 cargo build --release
 
-# 2. Download the ruri-v3-30m model
+# 2. Download external resources (ruri model + Japanese WordNet DB).
+#    System-wide; run once per machine.
 tsm setup
 
 # 3. Set the document root directory
 export TSM_INDEX_ROOT=~/my-notes
 
-# 4. Initialize the database (also writes a default .tsmignore at the
-#    project root if one does not already exist — edit to taste)
+# 4. Initialize the workspace: DB schema, default scaffold files
+#    (tsm.toml, .tsmignore, .tsm/{user_dict.simpledic,custom_terms.toml,
+#    synonyms.csv}), and WordNet/synonym imports. Idempotent — existing
+#    user-customized files are never overwritten.
 tsm init
 
 # 5. Start the daemon (embedder + file watcher)

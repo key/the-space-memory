@@ -6,6 +6,7 @@ use crate::db;
 use crate::embedder;
 use crate::indexer;
 use crate::searcher;
+use crate::synonyms;
 use crate::user_dict;
 
 /// Default `.tsmignore` shipped by `tsm init`. Patterns are
@@ -33,55 +34,174 @@ dist/
 *.db
 ";
 
-/// Convenience wrapper that pulls `db_path` and `project_root` from the
-/// config singleton and forwards to `cmd_init_with`. Tests bypass this by
-/// calling `cmd_init_with` directly with a tempdir, so the dispatch from
-/// `main.rs` stays trivial here.
-pub fn cmd_init() -> anyhow::Result<()> {
-    cmd_init_with(&config::db_path(), &config::project_root())
+/// Default `tsm.toml` shipped by `tsm init`. Built from the canonical
+/// example template at the repo root so the scaffolded file always matches
+/// the documented options surface.
+const DEFAULT_TSM_TOML: &str = include_str!("../tsm.toml.example");
+
+/// Default header for `synonyms.csv`. The body is empty — users add pairs
+/// and `cmd_init` re-syncs idempotently.
+const DEFAULT_SYNONYMS_CSV: &str = "\
+# User-defined synonym pairs. One pair per line.
+#
+# Format: word_a,word_b
+# Example:
+#   ml,machine learning
+#   nlp,自然言語処理
+#
+# Pairs imported from WordNet are stored separately and are not affected
+# by edits to this file.
+";
+
+/// Default header for `custom_terms.toml`. The body is empty — users add
+/// terms by appending entries.
+const DEFAULT_CUSTOM_TERMS: &str = "\
+# Custom terminology overrides for the lindera tokenizer / scorer.
+#
+# Add an entry per term:
+#
+#   [[terms]]
+#   surface = \"自然言語処理\"
+#   reading = \"シゼンゲンゴショリ\"
+#   pos = \"名詞\"
+#   weight = 1.5
+";
+
+/// Inputs for `cmd_init_with`. All paths are explicit so init can be
+/// driven end-to-end from a tempdir in tests without touching the config
+/// singleton.
+pub struct InitPaths<'a> {
+    pub db_path: &'a Path,
+    pub project_root: &'a Path,
+    pub state_dir: &'a Path,
+    pub user_dict_path: &'a Path,
 }
 
-/// Initialize the DB and install the default `.tsmignore`. Both arguments
-/// are explicit so the function is testable end-to-end without touching the
-/// config singleton — the regression "someone removes the .tsmignore step
-/// from cmd_init" is caught by the integration test below.
-pub fn cmd_init_with(db_path: &Path, project_root: &Path) -> anyhow::Result<()> {
-    db::init_db(db_path)?;
-    log::info!("Database initialized at {}", db_path.display());
-    install_default_tsmignore(project_root)?;
+/// Convenience wrapper that builds `InitPaths` from the config singleton
+/// and forwards to `cmd_init_with`. Tests bypass this by calling
+/// `cmd_init_with` directly with a tempdir.
+pub fn cmd_init() -> anyhow::Result<()> {
+    let db_path = config::db_path();
+    let project_root = config::project_root();
+    let state_dir = config::state_dir();
+    let user_dict_path = config::user_dict_path();
+    cmd_init_with(&InitPaths {
+        db_path: &db_path,
+        project_root: &project_root,
+        state_dir: &state_dir,
+        user_dict_path: &user_dict_path,
+    })
+}
+
+/// Initialize the workspace: schema, scaffold files, WordNet import, user
+/// synonym sync. All steps are idempotent — re-running `tsm init` after
+/// `tsm setup` is the supported recovery path when WordNet is downloaded
+/// after the initial init.
+///
+/// `project_root` and `state_dir` are passed explicitly (rather than
+/// derived from `db_path`) so the function is testable without the config
+/// singleton — the regression "someone removes the .tsmignore step from
+/// cmd_init" is caught by the integration tests below.
+pub fn cmd_init_with(paths: &InitPaths<'_>) -> anyhow::Result<()> {
+    db::init_db(paths.db_path)?;
+    log::info!("Database initialized at {}", paths.db_path.display());
+
+    // Scaffold default files. Each call is idempotent — pre-existing
+    // user-customized files are never overwritten.
+    install_default_tsmignore(paths.project_root)?;
+    install_default_file(
+        &paths.project_root.join("tsm.toml"),
+        DEFAULT_TSM_TOML,
+        "tsm.toml",
+    )?;
+    install_default_file(paths.user_dict_path, "", "user_dict.simpledic")?;
+    install_default_file(
+        &paths.state_dir.join("custom_terms.toml"),
+        DEFAULT_CUSTOM_TERMS,
+        "custom_terms.toml",
+    )?;
+    install_default_file(
+        &paths.state_dir.join("synonyms.csv"),
+        DEFAULT_SYNONYMS_CSV,
+        "synonyms.csv",
+    )?;
+
+    // WordNet import — graceful skip when the resource is missing so
+    // offline `tsm init` and pre-`tsm setup` invocations both succeed.
+    let wordnet_db = paths.state_dir.join("wnjpn.db");
+    let synonyms_csv = paths.state_dir.join("synonyms.csv");
+    let conn = db::get_connection(paths.db_path)?;
+    if wordnet_db.is_file() {
+        log::info!(
+            "Importing WordNet synonyms from {}...",
+            wordnet_db.display()
+        );
+        synonyms::import_wordnet(&conn, &wordnet_db, None)?;
+    } else {
+        log::warn!(
+            "WordNet DB not found at {} — run `tsm setup` to download it, then re-run `tsm init`.",
+            wordnet_db.display()
+        );
+    }
+
+    // User-synonym sync. The CSV always exists at this point because we
+    // just scaffolded it, but we still gate on `is_file` to keep the
+    // behavior obvious if a caller wires in a nonstandard path.
+    if synonyms_csv.is_file() {
+        let result = synonyms::sync_user_synonyms(&conn, &synonyms_csv)?;
+        log::info!(
+            "User synonyms synced: {} pairs ({} deleted, {} skipped)",
+            result.total,
+            result.deleted,
+            result.skipped,
+        );
+    }
+
     Ok(())
 }
 
-/// Write `DEFAULT_TSMIGNORE` to `<project_root>/.tsmignore` if no file
-/// exists there. Idempotent — re-running `tsm init` never overwrites a
-/// user-customized file. Returns Ok in both the wrote-it and skipped-it
-/// cases; only unexpected filesystem errors propagate.
+/// Write `content` to `path` if no file exists there. Idempotent —
+/// re-running `tsm init` never overwrites a user-customized file. The
+/// `display_name` is used in log messages so callers can render
+/// human-friendly names for paths whose `file_name()` is unhelpful (or to
+/// keep log output consistent across path variations).
 ///
-/// Uses `OpenOptions::create_new` rather than `exists()` + `write()` so the
-/// no-overwrite guarantee holds atomically — if `.tsmignore` is created by
-/// another process between the check and the write, `create_new` returns
-/// `AlreadyExists` and we treat that as the skip case rather than silently
-/// clobbering the file.
-fn install_default_tsmignore(project_root: &Path) -> anyhow::Result<()> {
-    let tsmignore_path = project_root.join(".tsmignore");
+/// Uses `OpenOptions::create_new` rather than `exists()` + `write()` so
+/// the no-overwrite guarantee holds atomically — if the file is created
+/// by another process between the check and the write, `create_new`
+/// returns `AlreadyExists` and we treat that as the skip case rather
+/// than silently clobbering the file.
+fn install_default_file(path: &Path, content: &str, display_name: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&tsmignore_path)
+        .open(path)
     {
         Ok(mut f) => {
-            f.write_all(DEFAULT_TSMIGNORE.as_bytes())?;
-            log::info!("Wrote default .tsmignore to {}", tsmignore_path.display());
+            f.write_all(content.as_bytes())?;
+            log::info!("Wrote default {} to {}", display_name, path.display());
         }
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
             log::info!(
-                ".tsmignore already exists at {} — leaving untouched",
-                tsmignore_path.display()
+                "{} already exists at {} — leaving untouched",
+                display_name,
+                path.display()
             );
         }
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+fn install_default_tsmignore(project_root: &Path) -> anyhow::Result<()> {
+    install_default_file(
+        &project_root.join(".tsmignore"),
+        DEFAULT_TSMIGNORE,
+        ".tsmignore",
+    )
 }
 
 /// Run indexing on given file paths under a policy. Returns stats.
@@ -489,11 +609,12 @@ pub fn cmd_setup() -> anyhow::Result<()> {
     }
     log::info!("Model files installed to {}", dest.display());
 
-    // Download and import Japanese WordNet
+    // Download Japanese WordNet DB. Importing the synonyms into the
+    // workspace DB is `tsm init`'s job: `tsm setup` is the pure
+    // resource-fetch layer, with no workspace DB writes.
     setup_wordnet()?;
 
-    // Sync user-defined synonyms (if file exists)
-    cmd_synonym_sync()?;
+    log::info!("Setup complete. Run `tsm init` in your workspace to finish.");
 
     Ok(())
 }
@@ -504,18 +625,6 @@ fn setup_wordnet() -> anyhow::Result<()> {
         log::info!("WordNet DB already exists at {}", wordnet_dest.display());
     } else {
         download_wordnet(&wordnet_dest)?;
-    }
-
-    // Import WordNet synonyms if DB is initialized
-    let db_path = config::db_path();
-    if db_path.is_file() {
-        log::info!("Importing WordNet synonyms...");
-        cmd_import_wordnet(&wordnet_dest)?;
-    } else {
-        log::info!(
-            "Database not initialized yet. Run `tsm init` then `tsm import-wordnet {}` to import synonyms.",
-            wordnet_dest.display()
-        );
     }
     Ok(())
 }
@@ -1603,22 +1712,190 @@ mod tests {
         assert!(written.contains("*.parquet"));
     }
 
+    /// Minimal WordNet-schema fixture for the cli test path. Mirrors the
+    /// schema synonyms.rs depends on (word/sense/synset). Tiny pair set so
+    /// success is observable in `synonyms` table counts.
+    fn create_mock_wordnet_db(path: &Path, pairs: &[(&str, &str)]) {
+        let wn = rusqlite::Connection::open(path).unwrap();
+        wn.execute_batch(
+            "CREATE TABLE word (wordid INTEGER PRIMARY KEY, lemma TEXT, lang TEXT);
+             CREATE TABLE synset (synset TEXT PRIMARY KEY);
+             CREATE TABLE sense (synset TEXT, wordid INTEGER);",
+        )
+        .unwrap();
+        let mut word_id = 1i64;
+        for (i, (a, b)) in pairs.iter().enumerate() {
+            let sid = format!("syn{i:04}");
+            wn.execute(
+                "INSERT INTO synset (synset) VALUES (?)",
+                rusqlite::params![sid],
+            )
+            .unwrap();
+            wn.execute(
+                "INSERT INTO word (wordid, lemma, lang) VALUES (?, ?, 'jpn')",
+                rusqlite::params![word_id, a],
+            )
+            .unwrap();
+            wn.execute(
+                "INSERT INTO sense (synset, wordid) VALUES (?, ?)",
+                rusqlite::params![sid, word_id],
+            )
+            .unwrap();
+            word_id += 1;
+            wn.execute(
+                "INSERT INTO word (wordid, lemma, lang) VALUES (?, ?, 'jpn')",
+                rusqlite::params![word_id, b],
+            )
+            .unwrap();
+            wn.execute(
+                "INSERT INTO sense (synset, wordid) VALUES (?, ?)",
+                rusqlite::params![sid, word_id],
+            )
+            .unwrap();
+            word_id += 1;
+        }
+    }
+
+    /// Drive `cmd_init_with` against a fresh tempdir using the default
+    /// state_dir layout. Returns (project_root, state_dir) for
+    /// post-condition assertions.
+    fn run_init(dir: &Path) -> (PathBuf, PathBuf) {
+        let state_dir = dir.join(".tsm");
+        let db_path = state_dir.join("tsm.db");
+        let user_dict_path = state_dir.join("user_dict.simpledic");
+        super::cmd_init_with(&super::InitPaths {
+            db_path: &db_path,
+            project_root: dir,
+            state_dir: &state_dir,
+            user_dict_path: &user_dict_path,
+        })
+        .unwrap();
+        (dir.to_path_buf(), state_dir)
+    }
+
     #[test]
-    fn cmd_init_with_creates_db_and_tsmignore() {
-        // End-to-end regression test: cmd_init_with must run BOTH steps
-        // (db init AND .tsmignore install). Without this test, removing the
-        // install_default_tsmignore call from cmd_init would still leave
-        // unit tests passing — silently shipping installs without the
-        // default ignore file.
+    fn cmd_init_with_creates_db_and_all_scaffold_files() {
+        // End-to-end regression test: cmd_init_with must produce the DB
+        // file plus every scaffold file. Without this test, dropping
+        // any one of the install_default_* calls would pass unit tests
+        // — silently shipping a partial init.
         let dir = tempfile::TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let project_root = dir.path();
-        super::cmd_init_with(&db_path, project_root).unwrap();
-        assert!(db_path.is_file(), "DB file was not created");
+        let (project_root, state_dir) = run_init(dir.path());
+
+        assert!(state_dir.join("tsm.db").is_file(), "DB was not created");
         assert!(
             project_root.join(".tsmignore").is_file(),
             ".tsmignore was not created"
         );
+        assert!(
+            project_root.join("tsm.toml").is_file(),
+            "tsm.toml was not created"
+        );
+        assert!(
+            state_dir.join("user_dict.simpledic").is_file(),
+            "user_dict.simpledic was not created"
+        );
+        assert!(
+            state_dir.join("custom_terms.toml").is_file(),
+            "custom_terms.toml was not created"
+        );
+        assert!(
+            state_dir.join("synonyms.csv").is_file(),
+            "synonyms.csv was not created"
+        );
+    }
+
+    #[test]
+    fn cmd_init_with_does_not_overwrite_existing_scaffold_files() {
+        // Idempotency: pre-existing user customizations must survive a
+        // second `tsm init`. Asserts every scaffold file individually
+        // because adding a new one without no-overwrite is a footgun.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_dir = dir.path().join(".tsm");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let user_files = [
+            (dir.path().join(".tsmignore"), "user_pattern/\n"),
+            (dir.path().join("tsm.toml"), "# user config\n"),
+            (state_dir.join("user_dict.simpledic"), "user word\n"),
+            (state_dir.join("custom_terms.toml"), "# user terms\n"),
+            (state_dir.join("synonyms.csv"), "# user synonyms\n"),
+        ];
+        for (path, content) in &user_files {
+            std::fs::write(path, content).unwrap();
+        }
+
+        run_init(dir.path());
+
+        for (path, content) in &user_files {
+            let after = std::fs::read_to_string(path).unwrap();
+            assert_eq!(
+                &after,
+                content,
+                "{} was overwritten by cmd_init_with",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_init_with_handles_missing_wordnet_gracefully() {
+        // No wnjpn.db in state_dir — init must succeed (warn-and-continue),
+        // not error. This is the new-user path where `tsm setup` hasn't
+        // run yet.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_, state_dir) = run_init(dir.path());
+
+        let conn = crate::db::get_connection(&state_dir.join("tsm.db")).unwrap();
+        let synonym_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM synonyms", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synonym_rows, 0, "no synonyms should be imported");
+    }
+
+    #[test]
+    fn cmd_init_with_imports_wordnet_when_present() {
+        // WordNet DB pre-staged in state_dir → init imports synonyms.
+        // Covers the post-`tsm setup` flow where the user re-runs `init`.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_dir = dir.path().join(".tsm");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        create_mock_wordnet_db(
+            &state_dir.join("wnjpn.db"),
+            &[("alpha", "beta"), ("gamma", "delta")],
+        );
+
+        run_init(dir.path());
+
+        let conn = crate::db::get_connection(&state_dir.join("tsm.db")).unwrap();
+        let synonym_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM synonyms WHERE source = 'wordnet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(synonym_rows, 2, "wordnet pairs should be imported");
+    }
+
+    #[test]
+    fn cmd_init_with_is_idempotent() {
+        // Running `init` twice — second invocation must succeed and leave
+        // DB / synonyms in the same state. Asserts the INSERT-OR-IGNORE /
+        // diff-sync semantics required for safe re-runs.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_dir = dir.path().join(".tsm");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        create_mock_wordnet_db(&state_dir.join("wnjpn.db"), &[("foo", "bar")]);
+
+        run_init(dir.path());
+        run_init(dir.path()); // second run — must not duplicate or fail
+
+        let conn = crate::db::get_connection(&state_dir.join("tsm.db")).unwrap();
+        let synonym_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM synonyms", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synonym_rows, 1, "second init should not duplicate rows");
     }
 
     #[test]
