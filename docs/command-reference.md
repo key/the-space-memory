@@ -155,7 +155,7 @@ upstream resources change.
 tsm setup
 ```
 
-Pure resource-fetch layer (per ADR-0017):
+Pure resource-fetch layer:
 
 1. Downloads `cl-nagoya/ruri-v3-30m` model files (`config.json`,
    `tokenizer.json`, `model.safetensors`) from HuggingFace Hub

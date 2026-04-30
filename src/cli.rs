@@ -610,8 +610,8 @@ pub fn cmd_setup() -> anyhow::Result<()> {
     log::info!("Model files installed to {}", dest.display());
 
     // Download Japanese WordNet DB. Importing the synonyms into the
-    // workspace DB is `tsm init`'s job (ADR-0017): `tsm setup` is the
-    // pure resource-fetch layer, with no workspace DB writes.
+    // workspace DB is `tsm init`'s job: `tsm setup` is the pure
+    // resource-fetch layer, with no workspace DB writes.
     setup_wordnet()?;
 
     log::info!("Setup complete. Run `tsm init` in your workspace to finish.");
@@ -1776,9 +1776,9 @@ mod tests {
     #[test]
     fn cmd_init_with_creates_db_and_all_scaffold_files() {
         // End-to-end regression test: cmd_init_with must produce the DB
-        // file plus every scaffold file ADR-0017 enumerates. Without this
-        // test, dropping any one of the install_default_* calls would
-        // pass unit tests — silently shipping a partial init.
+        // file plus every scaffold file. Without this test, dropping
+        // any one of the install_default_* calls would pass unit tests
+        // — silently shipping a partial init.
         let dir = tempfile::TempDir::new().unwrap();
         let (project_root, state_dir) = run_init(dir.path());
 
@@ -1882,7 +1882,7 @@ mod tests {
     fn cmd_init_with_is_idempotent() {
         // Running `init` twice — second invocation must succeed and leave
         // DB / synonyms in the same state. Asserts the INSERT-OR-IGNORE /
-        // diff-sync semantics that ADR-0017 relies on for safe re-runs.
+        // diff-sync semantics required for safe re-runs.
         let dir = tempfile::TempDir::new().unwrap();
         let state_dir = dir.path().join(".tsm");
         std::fs::create_dir_all(&state_dir).unwrap();
