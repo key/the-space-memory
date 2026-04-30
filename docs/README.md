@@ -1,9 +1,9 @@
-# tsm Documentation
+# The Space Memory Documentation
 
 Reference documentation for
-[The Space Memory](https://github.com/key/the-space-memory) (`tsm`) —
-a cross-workspace knowledge search engine combining FTS5 and vector
-retrieval.
+[The Space Memory](https://github.com/key/the-space-memory) — a
+cross-workspace knowledge search engine combining FTS5 and vector
+retrieval. The CLI is installed as the `tsm` binary.
 
 ## Install
 
