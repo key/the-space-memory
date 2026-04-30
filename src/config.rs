@@ -333,7 +333,7 @@ impl ResolvedConfig {
             })
             .collect();
         // Sort longest-first so more-specific paths match before shorter prefixes
-        content_dirs.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        content_dirs.sort_by_key(|d| std::cmp::Reverse(d.path.len()));
 
         let session_weight = file_cfg
             .index
