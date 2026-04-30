@@ -12,8 +12,7 @@ retrieval. The CLI is installed as the `tsm` binary.
 The recommended install path is:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/key/the-space-memory/main/docs/install.sh \
-  | bash
+curl -fsSL https://key.github.io/the-space-memory/install.sh | bash
 ```
 
 The script picks the right archive for your platform, verifies the
