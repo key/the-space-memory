@@ -13,11 +13,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Create dummy .env
         run: touch .env
       - name: Build DevContainer
-        uses: devcontainers/ci@v0.3
+        uses: devcontainers/ci@b63b30de439b47a52267f241112c5b453b673db5  # v0.3
         with:
           runCmd: |
             rumdl --version
