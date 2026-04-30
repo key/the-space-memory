@@ -106,18 +106,24 @@ fetch() {
 }
 
 #
-# Confirm overwrite if a binary already exists at INSTALL_DIR.
+# Confirm overwrite if either tsm or tsmd already exists at INSTALL_DIR.
+# Both binaries are part of one logical installation — skipping the prompt
+# when only tsmd is present would silently overwrite a partial install.
 #
 confirm_overwrite() {
     local install_dir="$1"
-    local existing="${install_dir}/tsm"
-    if [ ! -e "${existing}" ]; then
+    local tsm_path="${install_dir}/tsm"
+    local tsmd_path="${install_dir}/tsmd"
+    if [ ! -e "${tsm_path}" ] && [ ! -e "${tsmd_path}" ]; then
         return 0
     fi
 
+    # Pick whichever exists for the version banner; prefer tsm.
+    local probe="${tsm_path}"
+    [ -e "${probe}" ] || probe="${tsmd_path}"
     local current_version
-    current_version=$("${existing}" --version 2>/dev/null || echo "unknown")
-    warn "existing tsm found at ${existing} (${current_version})"
+    current_version=$("${probe}" --version 2>/dev/null || echo "unknown")
+    warn "existing installation found at ${install_dir} (${current_version})"
 
     if [ "${TSM_FORCE:-}" = "1" ]; then
         warn "TSM_FORCE=1 — overwriting"
@@ -128,8 +134,12 @@ confirm_overwrite() {
         fatal "non-interactive shell — re-run with TSM_FORCE=1 to overwrite"
     fi
 
-    printf "Overwrite? [y/N] "
-    read -r reply
+    # `read -r` can return non-zero on EOF (Ctrl-D) or stream error. Without
+    # explicit handling, set -e would exit the script silently.
+    local reply=""
+    if ! read -r reply; then
+        fatal "could not read response — aborting (use TSM_FORCE=1 to bypass)"
+    fi
     case "${reply}" in
         [yY]|[yY][eE][sS]) return 0 ;;
         *) fatal "aborted by user" ;;
