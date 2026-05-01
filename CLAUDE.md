@@ -169,11 +169,23 @@ plugins repo and ensure `tsm` is on `PATH`.
 
 ## Build & Deploy
 
-Build from a host container via Docker, then reference the binary from hooks/skills.
+End users install via mise from GitHub Releases:
+
+```toml
+# In consumer .mise.toml
+"github:key/the-space-memory" = { version = "latest", extract_all = true }
+```
+
+mise verifies SLSA provenance + GitHub artifact attestations during install.
+
+For local development (testing unreleased changes):
 
 ```bash
-docker build -t the-space-memory /path/to/the-space-memory
+cargo build --release   # Binaries land in ./target/release/{tsm,tsmd}
 ```
+
+Releases are published by CI on tagged commits with `tsm-<version>-<os>-<arch>.tar.gz`
+artifacts containing `bin/{tsm,tsmd}`.
 
 ## DevContainer
 
