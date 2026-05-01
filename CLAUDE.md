@@ -184,8 +184,9 @@ For local development (testing unreleased changes):
 cargo build --release   # Binaries land in ./target/release/{tsm,tsmd}
 ```
 
-Releases are published by CI on tagged commits with `tsm-<version>-<os>-<arch>.tar.gz`
-artifacts containing `bin/{tsm,tsmd}`.
+Releases are published by CI on tagged commits as
+`tsm-v<version>-<os>-<arch>.tar.gz` (e.g. `tsm-v0.5.1-linux-x86_64.tar.gz`)
+containing `bin/{tsm,tsmd}` plus `LICENSE`, `README.md`, and `tsm.toml.example`.
 
 ## DevContainer
 
