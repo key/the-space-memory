@@ -15,9 +15,17 @@ jobs:
     strategy:
       matrix:
         include:
+          # Both Linux targets build via `cross` (Docker, Ubuntu 20.04
+          # base, glibc 2.31). Building x86_64 natively on
+          # ubuntu-latest pulls in the runner's glibc (currently 2.39),
+          # which produces binaries that fail to start on Debian 11 /
+          # Ubuntu 20.04 / RHEL 8 with `version 'GLIBC_2.34' not found`.
+          # The cross image stays pinned to glibc 2.31, so the same
+          # archive runs on the older long-term-support distros.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive_name: linux-x86_64
+            use_cross: true
           - os: macos-latest
             target: aarch64-apple-darwin
             archive_name: darwin-arm64
