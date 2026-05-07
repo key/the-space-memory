@@ -1,7 +1,9 @@
 name: Spike Bench CV
 
-# Throwaway workflow to measure wall-clock variance of `tsm rebuild --apply`
+# Throwaway workflow to measure wall-clock variance of `tsm search`
 # on ubuntu-latest before committing to a 5% regression gate threshold.
+# Search is the simplest target that runs while tsmd stays up
+# (rebuild --apply requires a stopped daemon).
 #
 # Triggered by pushes to spike/bench-cv-measurement (this branch only).
 # workflow_dispatch is not available because it requires the workflow on
@@ -85,7 +87,16 @@ jobs:
           tsm status || true
           exit 1
 
-      - name: Run 10 iterations of full rebuild
+      - name: Index testdata once
+        working-directory: ${{ env.TSM_INDEX_ROOT }}
+        run: |
+          set -euo pipefail
+          tsm index >/dev/null
+          # Wait briefly for backfill to settle
+          sleep 5
+          tsm status
+
+      - name: Run 100 search iterations for variance
         working-directory: ${{ env.TSM_INDEX_ROOT }}
         run: |
           set -euo pipefail
@@ -93,15 +104,21 @@ jobs:
           out="${GITHUB_WORKSPACE}/spike-results/measurements.jsonl"
           : > "$out"
 
-          for i in $(seq 1 10); do
-            echo "=== Iteration ${i} ==="
+          # Same query repeated 100 times to isolate system variance
+          # (different queries would conflate with query-dependent latency).
+          query="銀河"
+          for i in $(seq 1 100); do
             start=$(date +%s.%N)
-            tsm rebuild --apply >/dev/null
+            tsm search -q "$query" -k 5 >/dev/null
             end=$(date +%s.%N)
             elapsed=$(python3 -c "print(${end} - ${start})")
-            printf '{"iteration": %d, "elapsed_seconds": %s}\n' "$i" "$elapsed" >> "$out"
-            tail -1 "$out"
+            printf '{"iteration": %d, "query": "%s", "elapsed_seconds": %s}\n' "$i" "$query" "$elapsed" >> "$out"
           done
+
+          echo "First 3 measurements:"
+          head -3 "$out"
+          echo "Last 3 measurements:"
+          tail -3 "$out"
 
           tsm stop || true
 
@@ -117,8 +134,8 @@ jobs:
               d = json.loads(line)
               values.append(d["elapsed_seconds"])
 
-          # Drop the first (warmup) and compute on the rest
-          warm = values[1:]
+          # Drop the first 10 as warmup; compute on the rest
+          warm = values[10:]
           mean = statistics.mean(warm)
           stdev = statistics.stdev(warm)
           cv = (stdev / mean) * 100
@@ -133,6 +150,8 @@ jobs:
               "cv_percent": round(cv, 2),
               "min_seconds": round(min(warm), 4),
               "max_seconds": round(max(warm), 4),
+              "p50_seconds": round(statistics.median(warm), 4),
+              "p95_seconds": round(sorted(warm)[int(len(warm) * 0.95)], 4),
           }
 
           print(json.dumps(summary, indent=2))
