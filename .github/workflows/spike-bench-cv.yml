@@ -1,9 +1,9 @@
 name: Spike Bench CV
 
-# Throwaway workflow to measure wall-clock variance of `tsm search`
-# on ubuntu-latest before committing to a 5% regression gate threshold.
-# Search is the simplest target that runs while tsmd stays up
-# (rebuild --apply requires a stopped daemon).
+# Throwaway workflow to measure in-process search latency variance
+# on ubuntu-latest before committing to a regression gate threshold.
+# Calls `searcher::search()` directly via `examples/spike_search.rs` to
+# isolate algorithm variance from CLI/process-spawn overhead.
 #
 # Triggered by pushes to spike/bench-cv-measurement (this branch only).
 # workflow_dispatch is not available because it requires the workflow on
@@ -96,67 +96,16 @@ jobs:
           sleep 5
           tsm status
 
-      - name: Run 100 search iterations for variance
-        working-directory: ${{ env.TSM_INDEX_ROOT }}
+      - name: Run in-process search spike
         run: |
           set -euo pipefail
           mkdir -p "${GITHUB_WORKSPACE}/spike-results"
-          out="${GITHUB_WORKSPACE}/spike-results/measurements.jsonl"
-          : > "$out"
-
-          # Same query repeated 100 times to isolate system variance
-          # (different queries would conflate with query-dependent latency).
-          query="銀河"
-          for i in $(seq 1 100); do
-            start=$(date +%s.%N)
-            tsm search -q "$query" -k 5 >/dev/null
-            end=$(date +%s.%N)
-            elapsed=$(python3 -c "print(${end} - ${start})")
-            printf '{"iteration": %d, "query": "%s", "elapsed_seconds": %s}\n' "$i" "$query" "$elapsed" >> "$out"
-          done
-
-          echo "First 3 measurements:"
-          head -3 "$out"
-          echo "Last 3 measurements:"
-          tail -3 "$out"
+          cargo run --release --example spike_search \
+            > "${GITHUB_WORKSPACE}/spike-results/summary.json"
+          echo "--- summary ---"
+          cat "${GITHUB_WORKSPACE}/spike-results/summary.json" | head -20
 
           tsm stop || true
-
-      - name: Compute CV statistics
-        run: |
-          python3 - <<'PY'
-          import json
-          import statistics
-          from pathlib import Path
-
-          values = []
-          for line in Path("spike-results/measurements.jsonl").read_text().splitlines():
-              d = json.loads(line)
-              values.append(d["elapsed_seconds"])
-
-          # Drop the first 10 as warmup; compute on the rest
-          warm = values[10:]
-          mean = statistics.mean(warm)
-          stdev = statistics.stdev(warm)
-          cv = (stdev / mean) * 100
-
-          summary = {
-              "iterations_total": len(values),
-              "iterations_used_for_cv": len(warm),
-              "values_seconds_all": values,
-              "values_seconds_used": warm,
-              "mean_seconds": round(mean, 4),
-              "stdev_seconds": round(stdev, 4),
-              "cv_percent": round(cv, 2),
-              "min_seconds": round(min(warm), 4),
-              "max_seconds": round(max(warm), 4),
-              "p50_seconds": round(statistics.median(warm), 4),
-              "p95_seconds": round(sorted(warm)[int(len(warm) * 0.95)], 4),
-          }
-
-          print(json.dumps(summary, indent=2))
-          Path("spike-results/summary.json").write_text(json.dumps(summary, indent=2))
-          PY
 
       - name: Upload results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
