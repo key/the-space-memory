@@ -1,6 +1,6 @@
 name: Spike Bench CV
 
-# Throwaway workflow to measure wall-clock variance of `tsm rebuild --force`
+# Throwaway workflow to measure wall-clock variance of `tsm rebuild --apply`
 # on ubuntu-latest before committing to a 5% regression gate threshold.
 #
 # Triggered by pushes to spike/bench-cv-measurement (this branch only).
@@ -96,7 +96,7 @@ jobs:
           for i in $(seq 1 10); do
             echo "=== Iteration ${i} ==="
             start=$(date +%s.%N)
-            tsm rebuild --force >/dev/null
+            tsm rebuild --apply >/dev/null
             end=$(date +%s.%N)
             elapsed=$(python3 -c "print(${end} - ${start})")
             printf '{"iteration": %d, "elapsed_seconds": %s}\n' "$i" "$elapsed" >> "$out"
