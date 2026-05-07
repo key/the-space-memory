@@ -71,9 +71,10 @@ jobs:
           tsm start
 
           # Wait for embedder to become ready (model load can take a while)
+          # `tsm status` formats with multiple spaces; match loosely.
           for i in $(seq 1 90); do
-            if tsm status 2>/dev/null | grep -q "Embedder: running"; then
-              echo "Embedder ready after ${i}*2s"
+            if tsm status 2>/dev/null | grep -qE "Embedder:[[:space:]]+running"; then
+              echo "Embedder ready after $((i * 2))s"
               tsm status
               exit 0
             fi
