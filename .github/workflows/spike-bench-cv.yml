@@ -3,13 +3,17 @@ name: Spike Bench CV
 # Throwaway workflow to measure wall-clock variance of `tsm rebuild --force`
 # on ubuntu-latest before committing to a 5% regression gate threshold.
 #
-# Run via: gh workflow run "Spike Bench CV" --ref spike/bench-cv-measurement
+# Triggered by pushes to spike/bench-cv-measurement (this branch only).
+# workflow_dispatch is not available because it requires the workflow on
+# the default branch.
 #
 # Output: artifact `spike-bench-cv-results` containing per-iteration timings
 # and computed coefficient of variation.
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - spike/bench-cv-measurement
 
 permissions:
   contents: read
