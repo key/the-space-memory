@@ -1,7 +1,7 @@
 # ADR-0007: tsm の処理を Index / Search の 2 パイプラインに分解し段を明示する
 
-- **Status**: **Proposed**
-- **Date**: 2026-04-15
+- **Status**: **Accepted**
+- **Date**: 2026-04-15 (Proposed) / 2026-05-07 (Accepted)
 - **Deciders**: key
 - **Related**:
   [ADR-0001](./0001-process-roles-and-responsibilities.md),
