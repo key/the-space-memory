@@ -14,6 +14,32 @@ use crate::ipc::{read_message, write_message};
 
 const MODEL_ID: &str = "cl-nagoya/ruri-v3-30m";
 
+/// Bench-only instrumentation. Compiled out unless `bench-counters` feature is enabled.
+///
+/// Counts client-side `embed_via_socket_at` calls. Used by bench harness to verify
+/// the regression invariant "embedder is not called more often than expected"
+/// (ADR-0007 metric #4).
+#[cfg(feature = "bench-counters")]
+pub mod counters {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static EMBEDDER_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn increment_embedder_calls() {
+        EMBEDDER_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total number of `embed_via_socket_at` calls since process start (or last reset).
+    pub fn embedder_call_count() -> u64 {
+        EMBEDDER_CALLS.load(Ordering::Relaxed)
+    }
+
+    /// Reset the counter to zero. For bench setup.
+    pub fn reset_embedder_calls() {
+        EMBEDDER_CALLS.store(0, Ordering::Relaxed);
+    }
+}
+
 /// The embedder engine: loads model and produces embeddings.
 pub struct Embedder {
     model: ModernBert,
@@ -203,6 +229,9 @@ pub fn embed_via_socket(texts: &[String]) -> Option<Vec<Vec<f32>>> {
 
 /// Send texts to the embedder daemon at a specific socket path.
 pub fn embed_via_socket_at(socket_path: &Path, texts: &[String]) -> Option<Vec<Vec<f32>>> {
+    #[cfg(feature = "bench-counters")]
+    counters::increment_embedder_calls();
+
     if !socket_path.exists() {
         return None;
     }
@@ -289,6 +318,23 @@ mod tests {
     fn test_embed_via_socket_nonexistent_path() {
         let result = embed_via_socket_at(Path::new("/tmp/nonexistent.sock"), &[]);
         assert!(result.is_none());
+    }
+
+    #[cfg(feature = "bench-counters")]
+    #[test]
+    #[serial_test::serial(embedder_counter)]
+    fn test_embedder_call_counter_increments() {
+        counters::reset_embedder_calls();
+        let _ = embed_via_socket_at(Path::new("/tmp/nonexistent.sock"), &[]);
+        assert_eq!(counters::embedder_call_count(), 1);
+    }
+
+    #[cfg(feature = "bench-counters")]
+    #[test]
+    #[serial_test::serial(embedder_counter)]
+    fn test_embedder_call_counter_reset_zeroes() {
+        counters::reset_embedder_calls();
+        assert_eq!(counters::embedder_call_count(), 0);
     }
 
     #[test]

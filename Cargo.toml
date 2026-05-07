@@ -46,3 +46,13 @@ flate2 = "1"
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3"
+criterion = { version = "0.7", default-features = false }
+
+[features]
+# Enables atomic counters in production code (e.g. embedder client) for bench instrumentation.
+# Off by default; release builds compile the counters out entirely.
+bench-counters = []
+
+[[bench]]
+name = "search_latency"
+harness = false

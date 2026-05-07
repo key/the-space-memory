@@ -105,6 +105,47 @@ tsm rebuild --apply   # Delete DB and rebuild
 
 Use `tsm doctor` to check system health and daemon status.
 
+## Benchmarks
+
+Performance benches for the search/index pipeline. Currently only the
+search latency bench is implemented; indexing benches and the CI
+regression gate ship in a follow-up PR (see [#181](https://github.com/key/the-space-memory/issues/181)).
+
+### Prerequisites
+
+- `tsmd` running with embedder ready (`tsm start` and verify via `tsm status`)
+- The standard testdata corpus indexed:
+
+  ```bash
+  export TSM_INDEX_ROOT=$(pwd)/tests/e2e/testdata
+  tsm init && tsm index
+  ```
+
+### Running
+
+```bash
+# Search latency (hybrid: FTS5 + vector + entity)
+cargo bench --bench search_latency
+```
+
+### Embedder call counter
+
+For benches that need to verify embedder call counts, build with the
+`bench-counters` feature. Off by default; release builds compile the
+counters out entirely.
+
+```bash
+cargo build --features bench-counters
+```
+
+```rust
+use the_space_memory::embedder::counters;
+
+counters::reset_embedder_calls();
+// ... run code that calls embed_via_socket_at ...
+println!("calls: {}", counters::embedder_call_count());
+```
+
 ## Documentation
 
 - [Command Reference](docs/command-reference.md) — CLI commands, flags, and usage examples
