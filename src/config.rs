@@ -75,6 +75,53 @@ impl std::str::FromStr for SearchFallback {
     }
 }
 
+/// File placement strategy when materializing cached resources.
+///
+/// `Symlink` (default) references the upstream entry by symbolic link;
+/// `Copy` physically duplicates it. See ADR-0008 「リンク戦略」.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkMode {
+    /// Reference upstream entries via symbolic link (default).
+    #[default]
+    Symlink,
+    /// Physically copy upstream entries into the destination.
+    Copy,
+}
+
+impl<'de> serde::Deserialize<'de> for LinkMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse::<LinkMode>().map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for LinkMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LinkMode::Symlink => write!(f, "symlink"),
+            LinkMode::Copy => write!(f, "copy"),
+        }
+    }
+}
+
+impl std::str::FromStr for LinkMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "symlink" => Ok(LinkMode::Symlink),
+            "copy" => Ok(LinkMode::Copy),
+            other => Err(format!(
+                "unknown link_mode value: '{other}' (expected 'symlink' or 'copy')"
+            )),
+        }
+    }
+}
+
 const DEFAULT_SESSION_WEIGHT: f64 = 0.3;
 const DEFAULT_SESSION_HALF_LIFE_DAYS: f64 = 30.0;
 const DEFAULT_IGNORE_FILE: &str = ".tsmignore";
@@ -106,6 +153,20 @@ pub(crate) struct ClaudeSessionConfig {
     pub half_life_days: Option<f64>,
 }
 
+/// The `[setup]` section of tsm.toml. See ADR-0008.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct SetupConfig {
+    pub link_mode: Option<LinkMode>,
+}
+
+/// The `[init]` section of tsm.toml. See ADR-0008.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct InitConfig {
+    pub link_mode: Option<LinkMode>,
+}
+
 /// The `[index]` section of tsm.toml.
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(default)]
@@ -133,6 +194,10 @@ pub(crate) struct ConfigFile {
     user_dict_path: Option<PathBuf>,
     #[serde(default)]
     index: IndexConfig,
+    #[serde(default)]
+    setup: SetupConfig,
+    #[serde(default)]
+    init: InitConfig,
 }
 
 /// Fully resolved configuration.
@@ -194,6 +259,18 @@ pub struct ResolvedConfig {
     /// Default: `{state_dir}/user_dict.simpledic`.
     /// Env: `TSM_USER_DICT`. Config: `user_dict_path`.
     pub user_dict_path: PathBuf,
+
+    /// Strategy `tsm setup` uses when materializing entries inside `cache_dir`
+    /// (HuggingFace cache → cache, sources → cache).
+    /// Default: `Symlink`. Env: `TSM_SETUP_LINK_MODE`. Config: `[setup].link_mode`.
+    /// See ADR-0008.
+    pub setup_link_mode: LinkMode,
+
+    /// Strategy `tsm init` uses when materializing entries inside `state_dir`
+    /// (cache → `.tsm/`).
+    /// Default: `Symlink`. Env: `TSM_INIT_LINK_MODE`. Config: `[init].link_mode`.
+    /// See ADR-0008.
+    pub init_link_mode: LinkMode,
 
     /// Content directories with scoring weights and half-life.
     /// Empty = auto-discover mode (recursively index all .md under index_root).
@@ -298,6 +375,9 @@ impl ResolvedConfig {
         let user_dict_path = env_or("TSM_USER_DICT", file_cfg.user_dict_path.as_ref())
             .unwrap_or_else(|| state_dir.join("user_dict.simpledic"));
 
+        let setup_link_mode = env_parse_link_mode("TSM_SETUP_LINK_MODE", file_cfg.setup.link_mode);
+        let init_link_mode = env_parse_link_mode("TSM_INIT_LINK_MODE", file_cfg.init.link_mode);
+
         let mut content_dirs: Vec<ContentDir> = file_cfg
             .index
             .content_dirs
@@ -386,6 +466,8 @@ impl ResolvedConfig {
             embedder_backfill_interval_secs,
             search_fallback,
             user_dict_path,
+            setup_link_mode,
+            init_link_mode,
             content_dirs,
             session_weight,
             session_half_life_days,
@@ -460,6 +542,19 @@ fn env_parse_fallback(file_val: Option<SearchFallback>) -> SearchFallback {
     file_val.unwrap_or_default()
 }
 
+/// Resolve a `LinkMode` from an env var, falling back to a config file value
+/// and finally `LinkMode::default()`. Used for both
+/// `[setup].link_mode` and `[init].link_mode` (ADR-0008).
+fn env_parse_link_mode(var: &str, file_val: Option<LinkMode>) -> LinkMode {
+    if let Ok(val) = std::env::var(var) {
+        match val.parse::<LinkMode>() {
+            Ok(m) => return m,
+            Err(e) => log::warn!("{var}='{val}' is invalid ({e}); using default"),
+        }
+    }
+    file_val.unwrap_or_default()
+}
+
 /// Read an env var as u64, falling back to a config file value.
 fn env_parse_u64(var: &str, file_val: Option<u64>) -> Option<u64> {
     if let Ok(val) = std::env::var(var) {
@@ -508,6 +603,18 @@ pub fn reload() -> Vec<String> {
             "cache_dir changed ({} → {}); requires `tsm restart`",
             old.cache_dir.display(),
             new_cfg.cache_dir.display()
+        ));
+    }
+    if old.setup_link_mode != new_cfg.setup_link_mode {
+        warnings.push(format!(
+            "setup_link_mode changed ({} → {}); takes effect on next `tsm setup`",
+            old.setup_link_mode, new_cfg.setup_link_mode
+        ));
+    }
+    if old.init_link_mode != new_cfg.init_link_mode {
+        warnings.push(format!(
+            "init_link_mode changed ({} → {}); takes effect on next `tsm init`",
+            old.init_link_mode, new_cfg.init_link_mode
         ));
     }
     if old.index_root != new_cfg.index_root {
@@ -625,6 +732,8 @@ fn load_config_from(candidates: &[PathBuf]) -> (ConfigFile, Option<PathBuf>) {
         if merged.index.extensions.is_none() {
             merged.index.extensions = file.index.extensions;
         }
+        merged.setup.link_mode = merged.setup.link_mode.or(file.setup.link_mode);
+        merged.init.link_mode = merged.init.link_mode.or(file.init.link_mode);
     }
     (merged, loaded_root)
 }
@@ -736,6 +845,14 @@ pub fn db_path() -> PathBuf {
 
 pub fn user_dict_path() -> PathBuf {
     resolved().user_dict_path.clone()
+}
+
+pub fn setup_link_mode() -> LinkMode {
+    resolved().setup_link_mode
+}
+
+pub fn init_link_mode() -> LinkMode {
+    resolved().init_link_mode
 }
 
 pub fn custom_terms_path() -> PathBuf {
@@ -1140,6 +1257,170 @@ mod tests {
         assert_eq!(cfg.cache_dir, PathBuf::from("/env/wins"));
 
         std::env::remove_var("TSM_CACHE_DIR");
+    }
+
+    // ─── LinkMode resolution (ADR-0008 Task 2) ─────────────────────
+
+    #[test]
+    fn test_link_mode_default_is_symlink() {
+        assert_eq!(LinkMode::default(), LinkMode::Symlink);
+    }
+
+    #[test]
+    fn test_link_mode_serde_lowercase() {
+        // Serialize: lowercase form expected.
+        let json = serde_json::to_string(&LinkMode::Symlink).unwrap();
+        assert_eq!(json, "\"symlink\"");
+        let json = serde_json::to_string(&LinkMode::Copy).unwrap();
+        assert_eq!(json, "\"copy\"");
+
+        // Deserialize: lowercase form accepted.
+        let m: LinkMode = serde_json::from_str("\"symlink\"").unwrap();
+        assert_eq!(m, LinkMode::Symlink);
+        let m: LinkMode = serde_json::from_str("\"copy\"").unwrap();
+        assert_eq!(m, LinkMode::Copy);
+
+        // Unknown value rejected with descriptive error.
+        let err = serde_json::from_str::<LinkMode>("\"hardlink\"").unwrap_err();
+        assert!(err.to_string().contains("hardlink"));
+    }
+
+    #[test]
+    fn test_link_mode_from_str_and_display() {
+        use std::str::FromStr;
+        assert_eq!(LinkMode::from_str("symlink").unwrap(), LinkMode::Symlink);
+        assert_eq!(LinkMode::from_str("copy").unwrap(), LinkMode::Copy);
+        // Case sensitivity: uppercase rejected (matches SearchFallback parsing).
+        assert!(LinkMode::from_str("Symlink").is_err());
+        assert!(LinkMode::from_str("hardlink").is_err());
+        assert!(LinkMode::from_str("").is_err());
+
+        // Display roundtrips with FromStr — same lowercase wire form.
+        assert_eq!(LinkMode::Symlink.to_string(), "symlink");
+        assert_eq!(LinkMode::Copy.to_string(), "copy");
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_link_mode_default_is_symlink_when_unconfigured() {
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.setup_link_mode, LinkMode::Symlink);
+        assert_eq!(cfg.init_link_mode, LinkMode::Symlink);
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_link_mode_from_toml() {
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+
+        let cfg = resolved_from_toml(
+            r#"
+            [setup]
+            link_mode = "copy"
+            "#,
+        );
+        assert_eq!(cfg.setup_link_mode, LinkMode::Copy);
+        // [init] is untouched, so stays at default.
+        assert_eq!(cfg.init_link_mode, LinkMode::Symlink);
+    }
+
+    #[test]
+    #[serial]
+    fn test_init_link_mode_from_toml() {
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+
+        let cfg = resolved_from_toml(
+            r#"
+            [init]
+            link_mode = "copy"
+            "#,
+        );
+        assert_eq!(cfg.init_link_mode, LinkMode::Copy);
+        // [setup] is untouched, so stays at default.
+        assert_eq!(cfg.setup_link_mode, LinkMode::Symlink);
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_link_mode_env_override() {
+        std::env::set_var("TSM_SETUP_LINK_MODE", "copy");
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.setup_link_mode, LinkMode::Copy);
+        assert_eq!(cfg.init_link_mode, LinkMode::Symlink);
+
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_init_link_mode_env_override() {
+        std::env::set_var("TSM_INIT_LINK_MODE", "copy");
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.init_link_mode, LinkMode::Copy);
+        assert_eq!(cfg.setup_link_mode, LinkMode::Symlink);
+
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_and_init_link_modes_are_independent() {
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+
+        let cfg = resolved_from_toml(
+            r#"
+            [setup]
+            link_mode = "copy"
+
+            [init]
+            link_mode = "symlink"
+            "#,
+        );
+        assert_eq!(cfg.setup_link_mode, LinkMode::Copy);
+        assert_eq!(cfg.init_link_mode, LinkMode::Symlink);
+    }
+
+    #[test]
+    #[serial]
+    fn test_link_mode_env_beats_toml() {
+        std::env::set_var("TSM_SETUP_LINK_MODE", "copy");
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+
+        let cfg = resolved_from_toml(
+            r#"
+            [setup]
+            link_mode = "symlink"
+            "#,
+        );
+        assert_eq!(cfg.setup_link_mode, LinkMode::Copy);
+
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_link_mode_invalid_env_falls_back_to_toml() {
+        std::env::set_var("TSM_SETUP_LINK_MODE", "hardlink");
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+
+        let cfg = resolved_from_toml(
+            r#"
+            [setup]
+            link_mode = "copy"
+            "#,
+        );
+        // Invalid env value is logged as a warning and the TOML value is honored.
+        assert_eq!(cfg.setup_link_mode, LinkMode::Copy);
+
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
     }
 
     #[test]
@@ -1773,6 +2054,36 @@ half_life_days = 180
                 "warning should mention tsm restart: {w}"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_reload_warns_on_link_mode_change() {
+        // Initialize singleton first.
+        let _ = resolved();
+
+        std::env::set_var("TSM_SETUP_LINK_MODE", "copy");
+        std::env::set_var("TSM_INIT_LINK_MODE", "copy");
+
+        let warnings = reload();
+
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+        // Restore singleton state for subsequent tests.
+        reload();
+
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("setup_link_mode") && w.contains("next `tsm setup`")),
+            "expected setup_link_mode warning mentioning next `tsm setup`, got: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("init_link_mode") && w.contains("next `tsm init`")),
+            "expected init_link_mode warning mentioning next `tsm init`, got: {warnings:?}"
+        );
     }
 
     // ─── models_dir / models_dir_complete ──────────────────────────
