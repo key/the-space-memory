@@ -605,6 +605,18 @@ pub fn reload() -> Vec<String> {
             new_cfg.cache_dir.display()
         ));
     }
+    if old.setup_link_mode != new_cfg.setup_link_mode {
+        warnings.push(format!(
+            "setup_link_mode changed ({} → {}); takes effect on next `tsm setup`",
+            old.setup_link_mode, new_cfg.setup_link_mode
+        ));
+    }
+    if old.init_link_mode != new_cfg.init_link_mode {
+        warnings.push(format!(
+            "init_link_mode changed ({} → {}); takes effect on next `tsm init`",
+            old.init_link_mode, new_cfg.init_link_mode
+        ));
+    }
     if old.index_root != new_cfg.index_root {
         warnings.push(format!(
             "index_root changed ({} → {}); requires `tsm restart`",
@@ -1274,7 +1286,7 @@ mod tests {
     }
 
     #[test]
-    fn test_link_mode_from_str() {
+    fn test_link_mode_from_str_and_display() {
         use std::str::FromStr;
         assert_eq!(LinkMode::from_str("symlink").unwrap(), LinkMode::Symlink);
         assert_eq!(LinkMode::from_str("copy").unwrap(), LinkMode::Copy);
@@ -1282,6 +1294,10 @@ mod tests {
         assert!(LinkMode::from_str("Symlink").is_err());
         assert!(LinkMode::from_str("hardlink").is_err());
         assert!(LinkMode::from_str("").is_err());
+
+        // Display roundtrips with FromStr — same lowercase wire form.
+        assert_eq!(LinkMode::Symlink.to_string(), "symlink");
+        assert_eq!(LinkMode::Copy.to_string(), "copy");
     }
 
     #[test]
@@ -2038,6 +2054,36 @@ half_life_days = 180
                 "warning should mention tsm restart: {w}"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_reload_warns_on_link_mode_change() {
+        // Initialize singleton first.
+        let _ = resolved();
+
+        std::env::set_var("TSM_SETUP_LINK_MODE", "copy");
+        std::env::set_var("TSM_INIT_LINK_MODE", "copy");
+
+        let warnings = reload();
+
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+        // Restore singleton state for subsequent tests.
+        reload();
+
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("setup_link_mode") && w.contains("next `tsm setup`")),
+            "expected setup_link_mode warning mentioning next `tsm setup`, got: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("init_link_mode") && w.contains("next `tsm init`")),
+            "expected init_link_mode warning mentioning next `tsm init`, got: {warnings:?}"
+        );
     }
 
     // ─── models_dir / models_dir_complete ──────────────────────────
