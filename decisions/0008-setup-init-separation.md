@@ -21,10 +21,10 @@
 
 `tsm setup` のコピー先がワークスペース内（CWD 相対）になっている:
 
-| 種別 | 仕様の意図 | 実装の現状 |
-|---|---|---|
-| ruri-v3-30m モデル | system-wide cache | `./.tsm/models/ruri-v3-30m/` |
-| WordNet DB | system-wide cache | `./.tsm/wnjpn.db` |
+| 種別 | 仕様の意図 | 実装の現状 | サイズ |
+|---|---|---|---|
+| ruri-v3-30m モデル | system-wide cache | `./.tsm/models/ruri-v3-30m/` | ~147MB |
+| WordNet DB | system-wide cache | `./.tsm/wnjpn.db` | ~200MB |
 
 `config::state_dir()` は `DEFAULT_STATE_DIR = ".tsm"`（CWD 相対）を返し、
 `models_dir()` / `wordnet_db_path()` がこれに依存している。
@@ -32,7 +32,8 @@
 ### 問題点
 
 1. **"once per machine" が成立しない**
-   ワークスペースを変えるたびに ~250MB の再ダウンロード／重複保存
+   ワークスペースを変えるたびに ~347MB（モデル + WordNet）の
+   再ダウンロード／重複保存
 2. **仕様書と実装が矛盾**
    `docs/command-reference.md` の "System-wide" 記述と実装が乖離
 3. **embedder の前提が曖昧**
@@ -44,18 +45,31 @@
 
 ## Decision
 
-`tsm` のリソースを以下 2 層に明確に分離する。
+`tsm` のリソースを以下 2 層に明確に分離し、各層に独立した link_mode を持たせる。
 
 ### 第 1 層: system-wide cache（machine-global）
 
 machine 全体で共有する **immutable な外部リソース**。
+ディレクトリ位置は `cache_dir`。
 
-| ファイル | 目的 |
-|---|---|
-| `cache_dir/models/ruri-v3-30m/config.json` | embedder モデル設定 |
-| `cache_dir/models/ruri-v3-30m/tokenizer.json` | embedder トークナイザ |
-| `cache_dir/models/ruri-v3-30m/model.safetensors` | embedder 重み（~250MB） |
-| `cache_dir/wnjpn.db` | Japanese WordNet DB（~5MB） |
+```text
+$cache_dir/
+├── manifest.json
+├── models/
+│   └── ruri-v3-30m   →  ~/.cache/huggingface/hub/models--cl-nagoya--ruri-v3-30m/snapshots/<commit-hash>
+│                        （[setup].link_mode = copy なら物理ディレクトリ）
+├── wnjpn.db          →  sources/wnjpn-v1.1.db
+│                        （[setup].link_mode = copy なら物理ファイル）
+└── sources/
+    └── wnjpn-v1.1.db （物理 ~200MB、tsm が所有）
+```
+
+- ruri モデルは HuggingFace Hub の cache snapshot ディレクトリへ
+  **ディレクトリ単位の symlink** （or 物理コピー）
+- WordNet は `sources/wnjpn-<version>.db` を tsm 自身が所有し、
+  `wnjpn.db` をそこへの symlink （or 物理コピー）にする
+- `manifest.json` は取得方式・ソース・サイズ・取得日時を記録
+  （doctor の整合性チェックの根拠）
 
 `cache_dir` の解決順:
 
@@ -65,84 +79,198 @@ machine 全体で共有する **immutable な外部リソース**。
 
 Linux / macOS とも `$HOME/.cache/tsm/` を採用する。
 macOS で `~/Library/Caches` を採らないのは、rustup / uv / cargo 等の
-Rust エコシステムが XDG 系統を採用している慣例に揃えるため
-（ユーザーが手で触りやすい・ドキュメント可搬性が高い）。
-
-`cache_dir` は **書き換え対象外**。
-ワークスペース DB の状態に依らず machine 全体で共有される。
+Rust エコシステムが XDG 系統を採用している慣例に揃えるため。
 
 ### 第 2 層: workspace state（CWD 相対 `.tsm/`）
 
-ワークスペースごとに独立して持つ **mutable な状態**。
+ワークスペースごとに独立して持つ **mutable な状態 + cache へのリソース参照**。
 
-| ファイル | 目的 |
-|---|---|
-| `.tsm/tsm.db` (+ `-shm`, `-wal`) | FTS5 + vector DB |
-| `.tsm/synonyms.csv` | ユーザーシノニム（CSV）|
-| `.tsm/stopwords.txt` | ストップワード |
-| `.tsm/reject_words.txt` | 辞書 reject リスト |
-| `.tsm/custom_terms.toml` | カスタム用語設定 |
-| `.tsm/user_dict.csv` | 形態素辞書（simpledic）|
-| `.tsm/tsm.toml` (任意) | ワークスペース固有設定 |
-| `.tsm/logs/` | ログ |
-| `.tsm/{daemon,embedder}.sock` | IPC ソケット |
-| `.tsm/{tsmd,embedder}.pid` | PID ファイル |
-| `.tsm/tsm-status.json` | デーモン状態 |
+```text
+<workspace>/.tsm/
+├── tsm.db (+ -shm, -wal)        FTS5 + vector DB（物理）
+├── synonyms.csv                  ユーザーシノニム CSV（物理）
+├── stopwords.txt                 ストップワード（物理）
+├── reject_words.txt              辞書 reject リスト（物理）
+├── custom_terms.toml             カスタム用語設定（物理）
+├── user_dict.csv                 形態素辞書 simpledic（物理）
+├── tsm.toml (任意)               ワークスペース固有設定（物理）
+├── logs/                         ログ（物理）
+├── {daemon,embedder}.sock        IPC ソケット（物理）
+├── {tsmd,embedder}.pid           PID ファイル（物理）
+├── tsm-status.json               デーモン状態（物理）
+├── models/
+│   └── ruri-v3-30m   →  $cache_dir/models/ruri-v3-30m
+│                        （[init].link_mode = copy なら物理ディレクトリ）
+└── wnjpn.db          →  $cache_dir/wnjpn.db
+                         （[init].link_mode = copy なら物理ファイル）
+```
+
+embedder は従来どおり `state_dir/models/ruri-v3-30m/` を読む。
+symlink モードでは link を辿って cache、cache から HF cache へ多段に解決される。
+copy モードでは workspace 内に物理ファイルとして存在し、自己完結する。
+
+### リンク戦略（2 層独立）
+
+cache 層と workspace 層、それぞれで `link_mode` を選べる。
+モードは **`symlink`（default）と `copy` の 2 択**。
+
+| mode | 動作 | ディスク使用 | 弱点 |
+|---|---|---|---|
+| `symlink`（**default**） | 上流の実体を symlink で指す | 重複なし | 上流が削除されるとリンク切れ |
+| `copy` | 物理コピー | 重複あり | ストレージ消費が増える |
+
+`hardlink` モードは採用しない（理由は Rationale 参照）。
+
+#### cache 層 (`[setup].link_mode`)
+
+`tsm setup` が cache を構築するときの戦略。
+"上流" は ruri モデルの場合 HF cache、WordNet の場合 `sources/wnjpn-<ver>.db`。
+
+```bash
+tsm setup --link-mode symlink|copy
+```
+
+```toml
+[setup]
+link_mode = "symlink"
+```
+
+#### workspace 層 (`[init].link_mode`)
+
+`tsm init` が `.tsm/` を構築するときの戦略。"上流" は cache。
+
+```bash
+tsm init --link-mode symlink|copy
+```
+
+```toml
+[init]
+link_mode = "symlink"
+```
+
+#### ユースケース別の選び方
+
+| シナリオ | `[setup].link_mode` | `[init].link_mode` | workspace 単位の重複 |
+|---|---|---|---|
+| ホスト単独運用 | `symlink` | `symlink` | 無し |
+| DevContainer 単独運用 | `symlink` | `symlink` | 無し |
+| ホスト ↔ DevContainer 併用 | `symlink` | **`copy`** | workspace ごとに ~347MB |
+| 完全自己完結（移植性最大） | `copy` | `copy` | cache + workspace ごとに ~347MB |
+
+優先順位（各層独立）: CLI フラグ > `tsm.toml` > デフォルト (`symlink`)
+
+#### mode 切り替え時の挙動
+
+- `tsm setup --link-mode <new>`: cache 直下のエントリ
+  （`models/ruri-v3-30m/`, `wnjpn.db`）を作り直す。`sources/` は touch しない
+- `tsm init --link-mode <new>`: `.tsm/models/`, `.tsm/wnjpn.db` のみ作り直す。
+  `tsm.db` を含む他の workspace state は触らない
+
+### manifest.json（cache のメタ情報）
+
+cache_dir 直下に `manifest.json` を置き、各リソースの取得方式・ソース・
+サイズ・取得日時を記録する。
+
+```json
+{
+  "version": 1,
+  "resources": {
+    "models/ruri-v3-30m": {
+      "mode": "symlink",
+      "target": "/Users/key/.cache/huggingface/hub/models--cl-nagoya--ruri-v3-30m/snapshots/abc123",
+      "model_id": "cl-nagoya/ruri-v3-30m",
+      "fetched_at": "2026-05-08T09:18:00+09:00"
+    },
+    "wnjpn.db": {
+      "mode": "symlink",
+      "target": "sources/wnjpn-v1.1.db",
+      "source_url": "https://github.com/bond-lab/wnja/releases/download/v1.1/wnjpn.db.gz",
+      "version": "v1.1",
+      "size": 203110400,
+      "fetched_at": "2026-05-08T09:18:00+09:00"
+    }
+  }
+}
+```
+
+`tsm doctor` がこれを読み、エントリの存在・リンク先生存・サイズ整合を確認する。
 
 ### コマンドの責務
 
-#### `tsm setup`（system-wide のみ。ワークスペースに触れない）
+#### `tsm setup`（machine-wide cache のみ）
 
-1. `cache_dir/models/ruri-v3-30m/` に必要ファイル全てが揃っているか確認
-   - 揃っていれば skip（idempotent）
-   - 欠けていれば HuggingFace Hub から取得して配置
-2. `cache_dir/wnjpn.db` の存在確認
-   - 存在すれば skip
-   - 無ければ GitHub から `wnjpn.db.gz` を取得し展開
-3. **DB に一切触れない**。`.tsm/` ディレクトリも作らない
+1. 必要なら `cache_dir/` と `cache_dir/sources/` を作成
+2. ruri モデル取得:
+   - HuggingFace Hub から `cl-nagoya/ruri-v3-30m` の snapshot を確保
+     （`hf_hub` crate が HF cache に配置）
+   - `[setup].link_mode` に従い `cache_dir/models/ruri-v3-30m` を生成
+3. WordNet 取得:
+   - `cache_dir/sources/wnjpn-v1.1.db` が無ければ GitHub から DL→展開して配置
+   - `[setup].link_mode` に従い `cache_dir/wnjpn.db` を生成
+4. `manifest.json` を更新
+5. **DB に一切触れない**。`.tsm/` ディレクトリも作らない
 
-#### `tsm init`（workspace 固有のみ。cache を読むだけ）
+既に揃っているリソースは skip（idempotent）。
+
+#### `tsm init`（workspace 固有のみ）
 
 1. `.tsm/` を作成
 2. `.tsm/tsm.db` を作成しスキーマ初期化
-3. scaffold（`synonyms.csv`, `stopwords.txt`, `reject_words.txt`）
-4. `cache_dir/wnjpn.db` から WordNet シノニムを `.tsm/tsm.db` に import
-   - cache が無ければ `tsm setup` を促す警告を出して continue
-5. `.tsm/synonyms.csv` からユーザーシノニムを sync
+3. scaffold ファイル群を作成（`synonyms.csv`, `stopwords.txt` 等）
+4. `[init].link_mode` に従い `.tsm/models/ruri-v3-30m`, `.tsm/wnjpn.db`
+   を作成（cache を上流として参照）
+   - cache に対応リソースが無ければ `tsm setup` を促す警告を出して continue
+5. `.tsm/wnjpn.db` から WordNet シノニムを `.tsm/tsm.db` に import
+6. `.tsm/synonyms.csv` からユーザーシノニムを sync
 
-#### `tsmd --embedder`（cache から model をロード）
+#### `tsmd --embedder`（cache 専一）
 
-- `cache_dir/models/ruri-v3-30m/` を参照
-- 不在なら起動失敗 → `tsm setup` を促すエラー
+- `state_dir/models/ruri-v3-30m/` を読む（symlink モードでは多段解決される）
+- 起動時に target の `stat` を確認し、リンク切れなら起動失敗
+  → `tsm setup` または `tsm init` の再実行を促すエラー
 
-#### `tsm doctor`（両層を独立してレポート）
+#### `tsm doctor`（多層チェック）
 
-セクションを分ける:
+```text
+✔ Workspace (.tsm/)
+  ✔ models/ruri-v3-30m  →  cache (link alive)
+  ✔ wnjpn.db            →  cache (link alive)
+  ✔ tsm.db: 1,234 chunks, 1,200 vectors
+✔ System cache (~/.cache/tsm/)
+  ✔ models/ruri-v3-30m  →  HF cache (link alive)
+  ✔ wnjpn.db            →  sources/wnjpn-v1.1.db (link alive)
+  ✔ sources/wnjpn-v1.1.db: 203MB (matches manifest)
+  ✔ manifest.json: 2 entries, all valid
+```
 
-- **System cache**: モデル取得状態、WordNet DB 取得状態
-- **Workspace**: DB 整合性、vector backfill 状態、辞書状態
+リンク切れがどの層で起きているか正確に診断できる。
 
 ### 設定の整理
 
 `config.rs` に新たに追加:
 
 ```rust
-pub fn cache_dir() -> PathBuf;          // 解決後の cache 起点
-pub fn cache_models_dir() -> PathBuf;   // cache_dir + "models/ruri-v3-30m"
-pub fn cache_wordnet_db_path() -> PathBuf; // cache_dir + "wnjpn.db"
+pub fn cache_dir() -> PathBuf;              // 解決後の cache 起点
+pub fn cache_models_dir() -> PathBuf;       // cache_dir + "models/ruri-v3-30m"
+pub fn cache_wordnet_db_path() -> PathBuf;  // cache_dir + "wnjpn.db"
+pub fn cache_sources_dir() -> PathBuf;      // cache_dir + "sources"
+pub fn cache_manifest_path() -> PathBuf;    // cache_dir + "manifest.json"
+
+pub fn setup_link_mode() -> LinkMode;       // cache 層
+pub fn init_link_mode() -> LinkMode;        // workspace 層
 ```
 
 既存の `models_dir()` / `wordnet_db_path()` は **削除**。
 state_dir 起点の同名関数は混乱の温床になるため、cache 系は明示的に
-`cache_*` プレフィックスを付ける。
+`cache_*` プレフィックスを付ける。`state_dir/models/...` への参照は
+embedder のロジック内で `state_dir + "models/ruri-v3-30m"` を直接組み立てる。
 
 ## Rationale
 
 **なぜ system-wide / workspace を 2 層に分けるか**
 
 - リソースの**性質が異なる**: モデルと WordNet DB は immutable / global、
-  DB と CSV は mutable / workspace-local。一緒くたに扱うと、
-  ワークスペース複製時にコピーする・しないの判断が個別に必要になる
+  DB と CSV は mutable / workspace-local
 - **同一マシン上で複数ワークスペースを持つ運用が前提**
   （CLAUDE.md にもある通り、ナレッジは複数の作業ディレクトリにまたがる）。
   モデルが共有されないと UX として致命的
@@ -155,13 +283,59 @@ state_dir 起点の同名関数は混乱の温床になるため、cache 系は�
 - 環境変数で上書き可能なので、Apple 流に拘りたいユーザーは
   `TSM_CACHE_DIR=$HOME/Library/Caches/tsm` を設定すれば良い
 
-**なぜ `models_dir()` を消して `cache_models_dir()` にするか**
+**なぜ link_mode を 2 層独立にするか**
 
-- 名前空間の汚染回避。`state_dir` 系と `cache_dir` 系を関数名から
-  即座に区別できるようにすることで、将来「どっちに書くべきか」の
-  判断ミスを防ぐ
-- breaking change だが、tsm は単一バイナリ製品で外部 API は持たない。
-  影響は内部コードのみ
+- ホスト ↔ DevContainer の往復で `~/.cache/tsm/` の絶対パスが
+  環境間で異なる。workspace 層を `copy` にすれば workspace が自己完結し、
+  環境間移動でも壊れない
+- cache 層は machine 固有なので link_mode の選択は環境依存しない。
+  逆に workspace 層は portability を要求されるシーンがある
+- 「常に symlink」「常に copy」は両極端で、現実のユースケースを
+  カバーしきれない
+
+**なぜ `symlink` をデフォルトとするか**
+
+- 上流（HF cache, sources/）の実体は外部から見て immutable に近い扱い。
+  symlink で参照すれば hardlink のような FS 制約（cross-device の EXDEV）
+  を回避できる
+- リンク切れは embedder 起動時の `stat` チェックと `tsm doctor` の両方で
+  検出するため、症状が見えないまま壊れることを防げる
+- ディスク重複ゼロが標準で得られる方がユーザー体験として優れる
+- `copy` は明示選択（DevContainer 共有・移植性重視）でのみ採用
+
+**なぜ `hardlink` モードを採用しないか**
+
+- ディスク節約（重複ゼロ）は `symlink` で達成できる
+- 上流削除耐性は `copy` で達成できる
+- 「重複ゼロ + 削除耐性」のニッチケースだけが hardlink の固有メリットだが、
+  ユースケースが限定的
+- 一方で実装コストは大きい:
+  - cross-device 環境（コンテナマウント）での EXDEV フォールバック処理
+  - ディレクトリには hardlink 不可なため、ruri モデルだけはファイル単位の
+    特殊処理が必要
+  - mode の数が増えるとテスト・ドキュメントの組み合わせが膨らむ
+- 実装単純化を優先し採用しない
+
+**なぜ ruri モデルは「ディレクトリ単位の symlink」にするか**
+
+- HF cache の snapshot ディレクトリ（`.../snapshots/<commit-hash>/`）は
+  リビジョン固定で中身不変
+- ファイル単位で 3 つの symlink を作るより、ディレクトリ 1 つの symlink で
+  済ませる方がシンプル
+- HF Hub 側で新しい revision が出ても、tsm cache は古い hash を指したまま
+  安定する。新 revision に切り替えたい場合は `tsm setup` 系の再実行で対応
+
+**なぜ WordNet に `sources/` を導入するか**
+
+- WordNet は GitHub release から直接 DL→展開で、HF cache のような
+  中間ストアが存在しない
+- `sources/wnjpn-<version>.db` を tsm 自身が所有し、`wnjpn.db` をそこへの
+  symlink にすることで、cache_dir 直下のリソースを **すべて symlink で
+  統一**できる（構造的整合性）
+- バージョン並存が可能（v1.1 と v1.2 を `sources/` に置いて、`wnjpn.db`
+  のリンク先を切り替えれば即時ロールバック）
+- copy モード時は cache_dir 直下に直接展開してもよいが、`sources/` を
+  常に持つ方が manifest.json のスキーマが対称的になり実装が単純
 
 **なぜ embedder は cache 専一の前提を持つか**
 
@@ -170,17 +344,32 @@ state_dir 起点の同名関数は混乱の温床になるため、cache 系は�
   前提が崩れ、責務分離の効果が薄れる
 - 「cache に無ければ起動失敗」という単純な契約を維持することで、
   setup の実行漏れを早期に検出できる
+- なお workspace `.tsm/models/ruri-v3-30m` を読むこと自体は変わらない。
+  symlink モードでは link 経由で cache に到達する形になる
+
+**なぜ `models_dir()` を消して `cache_models_dir()` にするか**
+
+- 名前空間の汚染回避。`state_dir` 系と `cache_dir` 系を関数名から
+  即座に区別できるようにすることで、将来「どっちに書くべきか」の
+  判断ミスを防ぐ
+- breaking change だが、tsm は単一バイナリ製品で外部 API は持たない。
+  影響は内部コードのみ
 
 ## Consequences
 
 ### Positive
 
-- ワークスペースサイズが最大 ~250MB 縮小（モデル分）
+- ワークスペースサイズが最大 ~347MB 縮小（モデル + WordNet 合計、
+  symlink モード時）
 - "Run once per machine" が文字通り成立する
-- doctor のレポート構造が責務単位で明確になる
+- doctor のレポート構造が層単位で明確になる
 - embedder の前提（cache 専一）が明文化され、将来のプラグイン作者が
   workspace 内モデルを期待しなくなる
 - 仕様書（`docs/command-reference.md`）と実装の乖離が解消される
+- DevContainer ↔ ホスト併用ユースケースを `[init].link_mode = copy` で
+  サポートできる
+- `manifest.json` により cache の状態が機械可読になり、doctor の
+  整合性チェックの根拠が明確化される
 
 ### Negative
 
@@ -188,24 +377,35 @@ state_dir 起点の同名関数は混乱の温床になるため、cache 系は�
   リファクタコストが発生する
 - doctor の出力フォーマットが変わる（JSON 構造を見ている自動化があれば破壊）
 - ワークスペースを別マシンに丸ごとコピーした場合、別マシン側で
-  `tsm setup` が必要になる（モデルがついてこない）
+  `tsm setup` が必要になる（symlink モード時。`copy` モードならついてくる）
+- mode の組み合わせが 2×2 = 4 通り発生し、テスト・ドキュメントが増える
+- multi-stage symlink（workspace → cache → HF cache）はリンク切れ時の
+  原因切り分けに doctor 出力を要する
 
 ### Follow-ups
 
 - **実装 PR の分割案**:
   1. `cache_dir` 解決ロジックの追加（`config.rs`）
-  2. `cache_models_dir()` / `cache_wordnet_db_path()` 追加と embedder の参照差し替え
-  3. `tsm setup` の動作変更（cache 専一化、ワークスペースに触れない）
-  4. `tsm init` の動作変更（cache から WordNet を読む）
-  5. doctor のセクション分割
-  6. 旧 `models_dir()` / `wordnet_db_path()` の削除
-  7. `docs/command-reference.md` の記述を実装と一致させる
+  2. `LinkMode` enum と `[setup].link_mode` / `[init].link_mode` 設定の追加
+  3. `cache_models_dir()` / `cache_wordnet_db_path()` / `cache_sources_dir()`
+     / `cache_manifest_path()` 追加と embedder の参照差し替え
+  4. `tsm setup` の動作変更（cache 専一化 + link_mode 適用 + manifest 更新）
+  5. `tsm init` の動作変更（cache から WordNet を読む + workspace の
+     symlink/copy 作成）
+  6. doctor の多層チェック実装
+  7. 旧 `models_dir()` / `wordnet_db_path()` の削除
+  8. `docs/command-reference.md` の記述を実装と一致させる
 - **テスト**:
   - cache_dir の解決優先順位（env > toml > default）の単体テスト
-  - doctor の system / workspace 分離出力の JSON テスト
+  - link_mode 別の cache 構築テスト（symlink / copy）
+  - link_mode 別の workspace 構築テスト（symlink / copy）
+  - リンク切れ検出の doctor テスト（cache 層 / workspace 層それぞれ）
+  - manifest.json の読み書きと整合性検証の単体テスト
 - **設定ドキュメント**:
-  - `tsm.toml.example` に `cache_dir` 設定例を追加
-  - `docs/configuration.md` に第 1 / 第 2 層の概念を記述
+  - `tsm.toml.example` に `cache_dir`, `[setup].link_mode`,
+    `[init].link_mode` の例を追加
+  - `docs/configuration.md` に第 1 / 第 2 層の概念と link_mode の
+    使い分けを記述
 - **README**:
   - `tsm setup` が machine-global であることを明記
-  - 別マシンへの引っ越し時の手順
+  - DevContainer / 別マシン併用時の `link_mode = copy` の使い方
