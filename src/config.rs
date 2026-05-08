@@ -1046,6 +1046,11 @@ mod tests {
     #[test]
     #[serial]
     fn test_cache_dir_default_uses_xdg_cache_home_when_set() {
+        // HOME is not consulted when XDG_CACHE_HOME is set, but save/restore
+        // it anyway so this test does not depend on a previous test's
+        // cleanup leaving HOME at a sensible value.
+        let prev_home = std::env::var("HOME").ok();
+
         std::env::remove_var("TSM_CACHE_DIR");
         std::env::set_var("XDG_CACHE_HOME", "/tmp/xdg_cache_home_for_test");
 
@@ -1056,6 +1061,33 @@ mod tests {
         );
 
         std::env::remove_var("XDG_CACHE_HOME");
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_dir_default_relative_fallback_when_home_and_xdg_unset() {
+        let prev_home = std::env::var("HOME").ok();
+        let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::remove_var("HOME");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.cache_dir, PathBuf::from(".cache/tsm"));
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
     }
 
     #[test]
