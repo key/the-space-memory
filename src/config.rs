@@ -901,6 +901,40 @@ pub fn models_dir_complete() -> Option<PathBuf> {
     }
 }
 
+// ─── Machine-wide cache helpers (ADR-0008) ─────────────────────
+
+/// Cache directory for the ruri-v3-30m model: `{cache_dir}/models/ruri-v3-30m/`.
+pub fn cache_models_dir() -> PathBuf {
+    cache_dir().join("models/ruri-v3-30m")
+}
+
+/// `Some(path)` if all files in `MODEL_FILES` are present in `cache_models_dir()`,
+/// `None` otherwise.
+pub fn cache_models_dir_complete() -> Option<PathBuf> {
+    let dir = cache_models_dir();
+    if MODEL_FILES.iter().all(|f| dir.join(f).is_file()) {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// WordNet DB path inside the machine-wide cache: `{cache_dir}/wnjpn.db`.
+pub fn cache_wordnet_db_path() -> PathBuf {
+    cache_dir().join("wnjpn.db")
+}
+
+/// Directory holding tsm-owned source artefacts (e.g. `wnjpn-vX.Y.db`):
+/// `{cache_dir}/sources/`.
+pub fn cache_sources_dir() -> PathBuf {
+    cache_dir().join("sources")
+}
+
+/// Cache manifest JSON: `{cache_dir}/manifest.json`.
+pub fn cache_manifest_path() -> PathBuf {
+    cache_dir().join("manifest.json")
+}
+
 // ─── Model cache (XDG) ──────────────────────────────────────────
 // NOTE: model_cache_dir and ensure_model_cache_env are intentionally NOT
 // part of ResolvedConfig. ensure_model_cache_env performs a side-effectful
@@ -2151,6 +2185,89 @@ half_life_days = 180
         assert!(result.is_some());
         assert_eq!(result.unwrap(), dir);
         std::env::remove_var("TSM_STATE_DIR");
+        reload();
+    }
+
+    // ─── cache_*_dir / cache_models_dir_complete (ADR-0008 Task 3) ──
+
+    #[test]
+    #[serial]
+    fn test_cache_models_dir_returns_correct_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        reload();
+        assert_eq!(cache_models_dir(), tmp.path().join("models/ruri-v3-30m"));
+        std::env::remove_var("TSM_CACHE_DIR");
+        reload();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_wordnet_db_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        reload();
+        assert_eq!(cache_wordnet_db_path(), tmp.path().join("wnjpn.db"));
+        std::env::remove_var("TSM_CACHE_DIR");
+        reload();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_sources_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        reload();
+        assert_eq!(cache_sources_dir(), tmp.path().join("sources"));
+        std::env::remove_var("TSM_CACHE_DIR");
+        reload();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_manifest_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        reload();
+        assert_eq!(cache_manifest_path(), tmp.path().join("manifest.json"));
+        std::env::remove_var("TSM_CACHE_DIR");
+        reload();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_models_dir_complete_returns_none_when_files_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        reload();
+        // Empty cache dir — no model files yet.
+        std::fs::create_dir_all(cache_models_dir()).unwrap();
+        assert!(cache_models_dir_complete().is_none());
+
+        // Partial: only one file present.
+        std::fs::write(cache_models_dir().join("config.json"), "{}").unwrap();
+        assert!(cache_models_dir_complete().is_none());
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        reload();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_models_dir_complete_returns_some_when_all_files_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        reload();
+        let dir = cache_models_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in &MODEL_FILES {
+            std::fs::write(dir.join(f), "dummy").unwrap();
+        }
+        let result = cache_models_dir_complete();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), dir);
+
+        std::env::remove_var("TSM_CACHE_DIR");
         reload();
     }
 }

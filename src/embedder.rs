@@ -3,7 +3,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::VarBuilder;
 use candle_transformers::models::modernbert::{Config, ModernBert};
@@ -11,8 +11,6 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 
 use crate::config;
 use crate::ipc::{read_message, write_message};
-
-const MODEL_ID: &str = "cl-nagoya/ruri-v3-30m";
 
 /// The embedder engine: loads model and produces embeddings.
 pub struct Embedder {
@@ -24,41 +22,38 @@ pub struct Embedder {
 impl Embedder {
     /// Load the ruri-v3-30m model.
     ///
-    /// Resolution order:
-    /// 1. `{state_dir}/models/ruri-v3-30m/` — if all 3 files are present
-    /// 2. HuggingFace Hub cache — fallback for backward compatibility
+    /// Resolution order (ADR-0008):
+    /// 1. `{state_dir}/models/ruri-v3-30m/` — workspace override
+    ///    (lets users drop a fine-tuned model into a single workspace)
+    /// 2. `{cache_dir}/models/ruri-v3-30m/` — machine-wide cache
+    ///    populated by `tsm setup`
+    /// 3. Neither populated → fail with an actionable error message
     pub fn load(device: &Device) -> Result<Self> {
-        // Try local models_dir first
         if let Some(dir) = config::models_dir_complete() {
-            log::info!("Loading model from {}", dir.display());
-            return Self::load_from_paths(
-                &dir.join("config.json"),
-                &dir.join("tokenizer.json"),
-                &dir.join("model.safetensors"),
-                device,
-            );
+            log::info!("Loading model from workspace override: {}", dir.display());
+            return Self::load_from_dir(&dir, device);
         }
 
-        // Fallback to HF Hub cache
-        log::warn!(
-            "Local model not found in {}; falling back to HF Hub cache (requires network)",
+        if let Some(dir) = config::cache_models_dir_complete() {
+            log::info!("Loading model from cache: {}", dir.display());
+            return Self::load_from_dir(&dir, device);
+        }
+
+        anyhow::bail!(
+            "ruri-v3-30m model not found. Run `tsm setup` to populate the cache, \
+             or place the model files at {} (workspace override).",
             config::models_dir().display()
         );
-        let api = hf_hub::api::sync::Api::new()?;
-        let repo = api.repo(hf_hub::Repo::new(
-            MODEL_ID.to_string(),
-            hf_hub::RepoType::Model,
-        ));
+    }
 
-        let config_path = repo.get("config.json").context("config.json not found")?;
-        let tokenizer_path = repo
-            .get("tokenizer.json")
-            .context("tokenizer.json not found")?;
-        let weights_path = repo
-            .get("model.safetensors")
-            .context("model.safetensors not found")?;
-
-        Self::load_from_paths(&config_path, &tokenizer_path, &weights_path, device)
+    /// Helper: load all three required files from a single directory.
+    fn load_from_dir(dir: &Path, device: &Device) -> Result<Self> {
+        Self::load_from_paths(
+            &dir.join("config.json"),
+            &dir.join("tokenizer.json"),
+            &dir.join("model.safetensors"),
+            device,
+        )
     }
 
     /// Load model from explicit file paths.
@@ -289,6 +284,40 @@ mod tests {
     fn test_embed_via_socket_nonexistent_path() {
         let result = embed_via_socket_at(Path::new("/tmp/nonexistent.sock"), &[]);
         assert!(result.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_embedder_load_fails_with_helpful_message_when_no_model() {
+        // Both workspace override and cache are empty — load() must bail with
+        // an actionable message that points the user at `tsm setup`.
+        let tmp_state = tempfile::TempDir::new().unwrap();
+        let tmp_cache = tempfile::TempDir::new().unwrap();
+
+        std::env::set_var("TSM_STATE_DIR", tmp_state.path());
+        std::env::set_var("TSM_CACHE_DIR", tmp_cache.path());
+        config::reload();
+
+        let result = Embedder::load(&Device::Cpu);
+
+        std::env::remove_var("TSM_STATE_DIR");
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+
+        // Embedder doesn't implement Debug; use match instead of unwrap_err.
+        let err = match result {
+            Ok(_) => panic!("Embedder::load unexpectedly succeeded with empty dirs"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("tsm setup"),
+            "expected error to mention `tsm setup`, got: {msg}"
+        );
+        assert!(
+            msg.contains("ruri-v3-30m"),
+            "expected error to mention model name, got: {msg}"
+        );
     }
 
     #[test]
