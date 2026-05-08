@@ -122,6 +122,7 @@ pub(crate) struct IndexConfig {
 #[serde(default)]
 pub(crate) struct ConfigFile {
     state_dir: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
     index_root: Option<PathBuf>,
     embedder_socket_path: Option<PathBuf>,
     daemon_socket_path: Option<PathBuf>,
@@ -146,6 +147,13 @@ pub struct ResolvedConfig {
     /// Default: `.tsm/` (relative to working directory).
     /// Env: `TSM_STATE_DIR`. Config: `state_dir`.
     pub state_dir: PathBuf,
+
+    /// Root directory for the machine-wide cache (model files, WordNet DB,
+    /// `manifest.json`). Shared across all workspaces on the host.
+    /// Default: `$XDG_CACHE_HOME/tsm/` (or `$HOME/.cache/tsm/` if XDG unset).
+    /// Env: `TSM_CACHE_DIR`. Config: `cache_dir`.
+    /// See ADR-0008.
+    pub cache_dir: PathBuf,
 
     /// Root directory containing content workspaces to index.
     /// Default: `/workspaces`.
@@ -254,6 +262,9 @@ impl ResolvedConfig {
     pub(crate) fn from_config_file(file_cfg: &ConfigFile, project_root: PathBuf) -> Self {
         let state_dir = env_or("TSM_STATE_DIR", file_cfg.state_dir.as_ref())
             .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
+
+        let cache_dir =
+            env_or("TSM_CACHE_DIR", file_cfg.cache_dir.as_ref()).unwrap_or_else(default_cache_dir);
 
         let index_root = env_or("TSM_INDEX_ROOT", file_cfg.index_root.as_ref())
             .unwrap_or_else(|| PathBuf::from(DEFAULT_INDEX_ROOT));
@@ -366,6 +377,7 @@ impl ResolvedConfig {
 
         Self {
             state_dir,
+            cache_dir,
             index_root,
             embedder_socket_path,
             daemon_socket_path,
@@ -408,6 +420,33 @@ fn env_or(var: &str, file_val: Option<&PathBuf>) -> Option<PathBuf> {
         return Some(PathBuf::from(val));
     }
     file_val.cloned()
+}
+
+/// Default `cache_dir` when neither env nor tsm.toml provides one.
+///
+/// Order:
+///   1. `$XDG_CACHE_HOME` is set (and non-empty) → `$XDG_CACHE_HOME/tsm`
+///   2. `$HOME` is set (and non-empty) → `$HOME/.cache/tsm`
+///   3. Last-resort relative fallback `.cache/tsm` (CWD-relative).
+///
+/// macOS uses the same XDG-style path on purpose; see ADR-0008 Rationale
+/// "なぜ XDG_CACHE_HOME を採るか（macOS でも）". `dirs::cache_dir()` would
+/// return `~/Library/Caches/tsm` on macOS, which is not the desired layout.
+fn default_cache_dir() -> PathBuf {
+    fn non_empty_pathbuf(var: &str) -> Option<PathBuf> {
+        std::env::var(var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
+
+    if let Some(xdg) = non_empty_pathbuf("XDG_CACHE_HOME") {
+        return xdg.join("tsm");
+    }
+    if let Some(home) = non_empty_pathbuf("HOME") {
+        return home.join(".cache").join("tsm");
+    }
+    PathBuf::from(".cache").join("tsm")
 }
 
 /// Resolve search_fallback: env var > config file > default (Error).
@@ -462,6 +501,13 @@ pub fn reload() -> Vec<String> {
             "state_dir changed ({} → {}); requires `tsm restart`",
             old.state_dir.display(),
             new_cfg.state_dir.display()
+        ));
+    }
+    if old.cache_dir != new_cfg.cache_dir {
+        warnings.push(format!(
+            "cache_dir changed ({} → {}); requires `tsm restart`",
+            old.cache_dir.display(),
+            new_cfg.cache_dir.display()
         ));
     }
     if old.index_root != new_cfg.index_root {
@@ -545,6 +591,7 @@ fn load_config_from(candidates: &[PathBuf]) -> (ConfigFile, Option<PathBuf>) {
             loaded_root = project_root_from(path);
         }
         merged.state_dir = merged.state_dir.or(file.state_dir);
+        merged.cache_dir = merged.cache_dir.or(file.cache_dir);
         merged.index_root = merged.index_root.or(file.index_root);
         merged.embedder_socket_path = merged.embedder_socket_path.or(file.embedder_socket_path);
         merged.daemon_socket_path = merged.daemon_socket_path.or(file.daemon_socket_path);
@@ -619,6 +666,10 @@ fn config_file_candidates() -> Vec<PathBuf> {
 
 pub fn state_dir() -> PathBuf {
     resolved().state_dir.clone()
+}
+
+pub fn cache_dir() -> PathBuf {
+    resolved().cache_dir.clone()
 }
 
 pub fn index_root() -> PathBuf {
@@ -983,6 +1034,80 @@ mod tests {
         );
         assert_eq!(cfg.daemon_socket_path, PathBuf::from("/custom/daemon.sock"));
         assert_eq!(cfg.log_dir, PathBuf::from("/custom/logs"));
+    }
+
+    // ─── cache_dir resolution (ADR-0008 Task 1) ─────────────────────
+    // env-mutating tests below MUST be #[serial] because XDG_CACHE_HOME /
+    // HOME are process-global and other tests (and library code) read them.
+    // HOME is save/restored explicitly to avoid corrupting other tests
+    // that rely on it; XDG_CACHE_HOME and TSM_CACHE_DIR are removed at end
+    // because no other tests in this module rely on a specific value.
+
+    #[test]
+    #[serial]
+    fn test_cache_dir_default_uses_xdg_cache_home_when_set() {
+        std::env::remove_var("TSM_CACHE_DIR");
+        std::env::set_var("XDG_CACHE_HOME", "/tmp/xdg_cache_home_for_test");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(
+            cfg.cache_dir,
+            PathBuf::from("/tmp/xdg_cache_home_for_test/tsm")
+        );
+
+        std::env::remove_var("XDG_CACHE_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_dir_default_falls_back_to_home_cache_when_xdg_unset() {
+        let prev_home = std::env::var("HOME").ok();
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::set_var("HOME", "/tmp/home_for_test");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(
+            cfg.cache_dir,
+            PathBuf::from("/tmp/home_for_test/.cache/tsm")
+        );
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_dir_env_override() {
+        std::env::set_var("TSM_CACHE_DIR", "/env/cache");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.cache_dir, PathBuf::from("/env/cache"));
+
+        std::env::remove_var("TSM_CACHE_DIR");
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_dir_toml_override() {
+        std::env::remove_var("TSM_CACHE_DIR");
+
+        let cfg = resolved_from_toml(r#"cache_dir = "/from/toml""#);
+        assert_eq!(cfg.cache_dir, PathBuf::from("/from/toml"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_dir_env_beats_toml() {
+        std::env::set_var("TSM_CACHE_DIR", "/env/wins");
+
+        let cfg = resolved_from_toml(r#"cache_dir = "/from/toml""#);
+        assert_eq!(cfg.cache_dir, PathBuf::from("/env/wins"));
+
+        std::env::remove_var("TSM_CACHE_DIR");
     }
 
     #[test]
