@@ -1,7 +1,7 @@
 # ADR-0008: tsm setup と tsm init の責務分離（system-wide cache と workspace scaffold）
 
-- **Status**: Proposed
-- **Date**: 2026-05-08 (Proposed)
+- **Status**: Accepted
+- **Date**: 2026-05-08 (Proposed) / 2026-05-08 (Accepted)
 - **Deciders**: key
 - **Related**:
   [ADR-0001](./0001-process-roles-and-responsibilities.md),
