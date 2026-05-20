@@ -15,7 +15,8 @@
 | [0005](./0005-embedder-binary-consolidation.md) | tsm-embedder 統合と 2 バイナリ構成 | Accepted | 2026-04-28 |
 | [0006](./0006-cli-option-design.md) | CLI オプション設計の判断基準 | Accepted | 2026-04-28 |
 | [0007](./0007-pipeline-stages.md) | tsm の処理を Index / Search の 2 パイプラインに分解 | Accepted | 2026-05-07 |
-| [0008](./0008-setup-init-separation.md) | tsm setup と tsm init の責務分離 | Accepted | 2026-05-08 |
+| [0008](./0008-setup-init-separation.md) | tsm setup と tsm init の責務分離 | Accepted（一部 → 0009） | 2026-05-08 |
+| [0009](./0009-per-project-daemon.md) | workspace 探索の walk-up 化と tsmd の per-project identity | Proposed | 2026-05-19 |
 
 新規 ADR 追加時は上記表にも 1 行追加すること。
 
