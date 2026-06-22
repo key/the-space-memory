@@ -14,10 +14,10 @@ decomposition, see [ADR-0007](../decisions/0007-pipeline-stages.md).
 ## Why stages
 
 Stage boundaries are cut at the points where **parallelism and resource
-constraint change**. The Index pipeline's Prepare (parallel) / Embed (GPU
-serial) / Persist (DB-mutex serial) boundaries coincide with real resource
-limits; splitting finer only adds inter-stage overhead without sharpening
-responsibility separation.
+constraint change**. The Index pipeline's Prepare (parallel) / Persist
+(DB-mutex serial) / Embed (GPU serial, asynchronous) boundaries coincide
+with real resource limits; splitting finer only adds inter-stage overhead
+without sharpening responsibility separation.
 
 The pipeline is defined **before** the plugin API. A plugin's hook point is
 equal to a stage boundary, so once the stages are fixed, the plugin API only
@@ -26,17 +26,22 @@ let plugin concerns distort the stages and break the parallelism design.
 
 ## Index pipeline
 
+A synchronous core (Prepare → Persist) makes a document searchable via FTS5
+the moment Persist commits. Vector embedding runs asynchronously downstream:
+Persist enqueues the chunk texts, and Embed produces and writes the vectors
+out of band, so indexing never blocks on the embedder.
+
 ```mermaid
 flowchart LR
-    P["Prepare<br/><i>parallel per file</i>"] --> E["Embed<br/><i>serial</i>"]
-    E --> W["Persist<br/><i>serial</i>"]
+    P["Prepare<br/><i>parallel per file</i>"] --> W["Persist<br/><i>serial, synchronous</i>"]
+    W -. "enqueue" .-> E["Embed<br/><i>serial, asynchronous</i>"]
 ```
 
 | Stage | Nature | Responsibility | Input → Output |
 |---|---|---|---|
 | Prepare | IO/CPU bound, parallel per file | Load, frontmatter parse, chunking, metadata extraction | file → chunk set (with metadata) |
-| Embed | GPU bound, serial (embedder contract) | Embedder invocation | chunk set → chunk set with vectors |
-| Persist | DB-mutex bound, serial | FTS5 / vector / metadata writes (1 file = 1 transaction) | chunk set → committed rows |
+| Persist | DB-mutex bound, serial, synchronous | documents + chunks + FTS5 + entity + link writes in one transaction; the document is FTS-searchable on commit | chunk set → committed rows (FTS-ready) |
+| Embed | GPU bound, serial, asynchronous | After commit, chunk texts are enqueued; the embedder produces vectors out of band and writes the vector rows | enqueued chunks → vector rows |
 
 ## Search pipeline
 
@@ -62,8 +67,9 @@ regression it prevents.
 1. **Batch granularity** — the smallest unit flowing between stages is a
    chunk set. Do not flatten to per-chunk. *(Breaking it reintroduces
    per-statement overhead and collapses throughput.)*
-2. **Persist transaction boundary** — 1 file = 1 transaction. *(Breaking it
-   forces a per-statement fsync under WAL.)*
+2. **Persist transaction boundary** — one file's relational and FTS5 writes
+   are a single transaction (vector rows are written separately by Embed).
+   *(Breaking it forces a per-statement fsync under WAL.)*
 3. **Tokenizer consistency** — Prepare and Plan reference the same tokenizer
    implementation; replacing it requires a re-index. *(Breaking it makes
    query tokens diverge from indexed tokens, silently losing recall.)*
@@ -72,6 +78,11 @@ regression it prevents.
    pipeline only the Plan stage calls it, to vectorize the query. No other
    stage or plugin invokes inference directly or in parallel. *(Breaking it
    violates the embedder's single-threaded accept contract.)*
+5. **Vectors are always async** — FTS5 is available the moment Persist
+   commits; vectors are produced and written afterward (best-effort
+   post-commit plus backfill). *(Breaking it couples indexing throughput and
+   availability to the embedder: a slow or stopped embedder would stall or
+   fail indexing instead of degrading to FTS-only.)*
 
 ## Hook insertion points
 
@@ -97,6 +108,10 @@ in the separate hook API specification.
 affected results rather than passing them through; fail-open is prohibited.
 `.tsmignore` is applied at a gate *before* Prepare, so excluded files never
 enter the DB in the first place.
+
+If the embedder is unavailable, Persist still commits and the document is
+searchable via FTS5; the missing vectors are filled later by backfill.
+Indexing never fails because embedding failed.
 
 The per-hook error model — how a failing hook falls back and what context is
 logged — is part of the hook contract and is specified in the separate hook

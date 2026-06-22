@@ -14,7 +14,7 @@
 | [0004](./0004-user-dictionary-design.md) | ユーザー辞書の設計方針 | Accepted（2026-04-14 改訂） | 2026-04-28 |
 | [0005](./0005-embedder-binary-consolidation.md) | tsm-embedder 統合と 2 バイナリ構成 | Accepted | 2026-04-28 |
 | [0006](./0006-cli-option-design.md) | CLI オプション設計の判断基準 | Accepted | 2026-04-28 |
-| [0007](./0007-pipeline-stages.md) | tsm の処理を Index / Search の 2 パイプラインに分解 | Accepted | 2026-05-07 |
+| [0007](./0007-pipeline-stages.md) | tsm の処理を Index / Search の 2 パイプラインに分解 | Accepted | 2026-05-07 / 2026-06-23 |
 | [0008](./0008-setup-init-separation.md) | tsm setup と tsm init の責務分離 | Accepted（一部 → 0009） | 2026-05-08 |
 | [0009](./0009-workspace-and-content-model.md) | プロジェクトとコンテンツ参照モデル | Proposed | 2026-05-19 |
 | [0010](./0010-per-project-daemon.md) | tsmd の per-project identity と socket 競合解決 | Accepted | 2026-05-19 / 2026-06-22 |
