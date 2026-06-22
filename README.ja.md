@@ -54,7 +54,8 @@ export TSM_INDEX_ROOT=~/my-notes
 
 # 4. ワークスペース初期化：DB スキーマ、デフォルト設定ファイル
 #    （tsm.toml、.tsmignore、.tsm/{user_dict.simpledic,custom_terms.toml,
-#    synonyms.csv}）の配置、WordNet/シノニムのインポートまで実施。
+#    synonyms.csv, hooks/extract/10-md_frontmatter.lua,
+#    hooks/score/10-default.lua}）の配置、WordNet/シノニムのインポートまで実施。
 #    冪等で、ユーザがカスタマイズしたファイルは絶対に上書きしない。
 tsm init
 
@@ -101,6 +102,71 @@ tsm rebuild --apply   # DB削除して再構築
 ```
 
 `tsm doctor` でシステムの状態とデーモンのステータスを確認できる。
+
+## Lua フック
+
+tsm は組み込み Lua（mlua, lua54）によるユーザー編集可能なメタデータ抽出と
+結果スコアリングをサポートする。フックは `.tsm/hooks/` に配置し、`tsm init` で
+雛形が生成される。
+
+### フックディレクトリ構成
+
+```text
+.tsm/hooks/
+├── extract/
+│   └── 10-md_frontmatter.lua   ← extract フック（インデックス時）
+└── score/
+    └── 10-default.lua          ← score フック（検索時）
+```
+
+- `.lua` ファイルのみ読み込まれる。それ以外のファイルは無視される。
+- 同一ディレクトリ内のフックはファイル名のソート順に実行される。
+- フックを削除せず無効化するには `.lua` 以外に拡張子を変更する
+  （例: `10-default.lua.disabled`）。
+- ディレクトリが空または存在しない場合は組み込みデフォルトにフォールバックする。
+
+### Extract フック
+
+インデックス時に各ドキュメントチャンクへ呼び出される。受け取るコンテキスト：
+
+```lua
+-- ctx のフィールド: path, body, frontmatter（YAML 全マップ）, metadata（累積済み）
+function extract(ctx)
+  local fm = ctx.frontmatter or {}
+  return { status = fm.status, effective_date = fm.updated }
+end
+```
+
+スカラー値（string、number、boolean）のフラットなテーブルを返す。
+全 extract フックの結果は浅くマージ（同一キーは後勝ち）され、
+`documents.metadata`（JSON カラム）に保存される。
+
+### Score フック
+
+検索時に各結果へ呼び出される。受け取るコンテキスト：
+
+```lua
+-- ctx のフィールド: metadata（extract 結果）, rrf, source_type, path, half_life_days
+-- 組み込み関数: decay(date, half_life_days), today()
+function score(ctx)
+  local m = ctx.metadata or {}
+  local penalty = ({ outdated = 0.4 })[m.status] or 1.0
+  return penalty * decay(m.effective_date, ctx.half_life_days)
+end
+```
+
+各フックは乗数（`>= 0`）を返す。最終スコアは
+`rrf × weight × Π(score フック)` となる。無効な戻り値（負値、NaN、±Inf）は
+警告を出して `1.0` として扱われる。
+
+### サンドボックスとライフサイクル
+
+- Lua VM はサンドボックス化されている。標準ライブラリ（`io`/`os`/`package`）なし、
+  メモリ上限 64 MiB。フックはファイルシステム・ネットワーク・プロセスにアクセスできない。
+- デーモンはすべてのフックを起動時に検証・ロードする（構文エラーやエントリポイント不在は fail-fast）。
+  CLI は遅延プロセス内キャッシュを使用する。
+- **フック編集後は `tsm restart` が必要** — フックは実行中に再読み込みされない。
+- **既存 DB への `metadata` カラム追加は `tsm rebuild --apply` が必要。**
 
 ## ベンチマーク
 

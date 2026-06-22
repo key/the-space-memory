@@ -58,6 +58,9 @@ src/
 ├── indexer.rs           — Indexer (diff detection, FTS5/vector registration)
 ├── searcher.rs          — FTS5 + vector search, RRF fusion, scoring
 ├── embedder.rs          — candle + ruri-v3-30m inference (pure library)
+├── lua_hooks.rs         — Embedded Lua runtime for extract/score hooks (ADR-0013)
+├── hooks/extract/       — Embedded default extract hook (10-md_frontmatter.lua)
+├── hooks/score/         — Embedded default score hook (10-default.lua)
 ├── chunker.rs           — Markdown → H2/H3/paragraph chunking
 ├── session_chunker.rs   — Claude session JSONL → Q&A chunking
 ├── frontmatter.rs       — YAML frontmatter parser
@@ -85,8 +88,12 @@ src/
 
 - **FTS5**: lindera tokenization + unicode61 tokenizer
 - **Vector search**: ruri-v3-30m (256-dim) semantic search. Embedder child process (`tsmd --embedder`) runs on UNIX socket
-- **Scoring**: RRF (Reciprocal Rank Fusion) combining FTS5 and vector results. Time decay + status penalty applied
-- **DB schema changes require `rebuild --apply`** (e.g. FTS tokenizer changes)
+- **Extract hooks** (index time): Lua scripts in `.tsm/hooks/extract/` produce a scalar metadata map
+  stored in `documents.metadata` (JSON). Embedded default reproduces `frontmatter.rs`
+  (status + effective\_date).
+- **Score hooks** (search time): Lua scripts in `.tsm/hooks/score/` each return a multiplier;
+  `final = rrf × weight × Π(score hooks)`. Embedded default reproduces time\_decay × status\_penalty.
+- **DB schema changes require `rebuild --apply`** (e.g. FTS tokenizer changes, new `metadata` column)
 - **Live re-indexing**: `tsm reindex {all|fts|vectors}` — daemon runs batched
   re-index in background, yielding to search between batches
 
@@ -220,6 +227,15 @@ A change is merge-ready when **all** of the following hold:
 
 ## Gotchas
 
+- **Lua hooks dir layout** — `.tsm/hooks/{extract,score}/NN-name.lua` (sorted by file name, `.lua` only).
+  Empty or absent dir → embedded defaults. Disable a hook by renaming away the `.lua` extension.
+- **Editing a hook requires `tsm restart`** — daemon validates and loads all hooks at startup
+  (fail-fast on broken script). CLI uses a lazy per-process cache. Neither reloads hooks at runtime.
+- **`metadata` column requires `rebuild --apply` on pre-existing DBs** — `documents.metadata`
+  (JSON) added by the Lua hooks feature is not a live migration; run `tsm rebuild --apply` once
+  after upgrading.
+- **Lua VMs are sandboxed** — `StdLib::NONE` + 64 MiB memory ceiling per VM.
+  No `io`/`os`/`package` available; hooks cannot touch the filesystem, network, or spawn processes.
 - **Hook stdin JSON key is `prompt`** (not `user_prompt`).
   Hook output must wrap `additionalContext` in
   `hookSpecificOutput: { hookEventName, additionalContext }`
