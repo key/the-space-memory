@@ -43,12 +43,16 @@ core は「ベクトル検索・RRF・フックを呼ぶ器」に徹し、メタ
 **デフォルト同梱スクリプトへ移譲**する。
 
 - `extract/10-md_frontmatter.lua`（同梱）: `frontmatter.rs` 相当。core が渡す
-  解析済み frontmatter を `{status, effective_date, ...}` の正規化 map に落とす。
+  解析済み frontmatter から canonical キーを読み、`{status, effective_date}` の
+  正規化 map に落とす。
 - `score/10-default.lua`（同梱）: 現状の `time_decay` × `status_penalty` を再現。
 
-両者を同梱することで、**ユーザーがフックを 1 つも書かなくても現状の挙動を
-完全に再現する**（抽出・スコアともリグレッションなし）。core は frontmatter の
-構造を解析して Lua に渡すだけで、どのキーを採用するかは extract フック側が決める。
+両デフォルトは**バイナリに埋め込み**（`include_str!`）、`.tsm/hooks/` に有効な
+フックが無いときの**フォールバック**として使う。これにより
+**ユーザーがフックを 1 つも書かなくても現状の挙動を完全に再現する**
+（抽出・スコアともリグレッションなし）。`tsm init` は加えて編集可能なコピーを
+ディスクへ scaffold する（後述）。core は frontmatter の構造を解析して
+Lua に渡すだけで、どのキーを採用するかは extract フック側が決める。
 
 ### スクリプトランタイム: 埋め込み Lua（mlua, vendored Lua 5.4）
 
@@ -75,9 +79,9 @@ core は「ベクトル検索・RRF・フックを呼ぶ器」に徹し、メタ
 #### `extract` フック（Prepare）
 
 ```lua
--- ctx.frontmatter は core が YAML をパース済みで table として渡す
+-- ctx.frontmatter は core がパース済みの YAML マッピング全体（任意キー）を table で渡す
 -- (サンドボックス Lua に YAML パーサを持たせないため)
--- ctx = { path, body, frontmatter = {...}, source_type, metadata = {累積} }
+-- ctx = { path, body, frontmatter = {<全 top-level キー>}, source_type, metadata = {累積} }
 
 -- 同梱の extract/10-md_frontmatter.lua（frontmatter.rs 相当・no-regression デフォルト）
 function extract(ctx)
@@ -100,7 +104,11 @@ ADR 本文（`- **Status**:` 等）からの抽出のように、ソース固有
   あくまで既定であり、`ctx.metadata.<key>` の有無を見て「既にあれば触らない
   （前勝ち）」「条件付きで補完」といったポリシーも作者が記述できる。
 - YAML frontmatter のパースは core が担い、結果を table で渡す。Lua 側で YAML を
-  パースさせない。
+  パースさせない。**core は固定スキーマに落とさず、パースした top-level キーを
+  そのまま渡す**（新キー追加に core 改修が不要＝語彙非依存を維持）。
+- 同梱 `10-md_frontmatter.lua` が読む canonical キーは現 `frontmatter.rs` と同じ
+  **`status` / `created` / `updated` / `tags` / `superseded_by`**。
+  正規化先は `status`（そのまま）と `effective_date`（`updated` を採用）。
 
 #### `score` フック（Rank）
 
@@ -177,6 +185,21 @@ end
   ロードする。ディスク I/O は起動時の 1 回のみ。
 - 帰結として **Lua を編集したら `tsm restart` が必要**（既存の segmenter / tokenizer
   キャッシュと同じ手触り）。
+
+### デフォルトの配布とフォールバック
+
+`.tsmignore` / `tsm.toml.example` と同じ流儀で、デフォルトフックは 2 経路で提供する。
+
+- **埋め込みフォールバック**: 同梱の `10-md_frontmatter.lua` / `10-default.lua` を
+  バイナリに `include_str!` で埋め込む。起動時、`extract` / `score` の各ディレクトリに
+  有効な `.lua` が **1 つも無ければ**、その段は埋め込みデフォルトで動く。これにより
+  `tsm init` 未実行・アップグレード直後でも no-regression を保証する
+  （ADR-0011 の「init は暗黙に走らない」と両立。正しい挙動に init を要求しない）。
+- **`tsm init` による scaffold**: `tsm init` は編集可能なコピーを
+  `.tsm/hooks/{extract,score}/` に書き出す（`install_default_tsmignore` と同じく
+  **既存ファイルは上書きしない**）。ユーザーはこれを起点に編集・追加する。
+- ディレクトリに 1 つでもフックがあれば、その段はディスク上のチェーンのみを使う
+  （埋め込みデフォルトは注入しない）。埋め込みは「空のときの素の挙動」を担うだけ。
 
 ### 失敗時セマンティクス（2 層）
 
