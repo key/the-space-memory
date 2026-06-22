@@ -131,11 +131,10 @@ wait_embedder_ready() {
 
 export TSM_STATE_DIR
 TSM_STATE_DIR="$(mktemp -d)"
-export TSM_INDEX_ROOT
-TSM_INDEX_ROOT="$(mktemp -d)"
-# ADR-0009 §2: tsm resolves the project root from the CWD's tsm.toml. Run from
-# a dedicated temp project dir so `tsm init` scaffolds tsm.toml there (not in
-# the repo) and every later command resolves to the same root.
+# ADR-0009 §2 / §3: tsm resolves the project root from the CWD's tsm.toml.
+# Run from a dedicated temp project dir so `tsm init` scaffolds tsm.toml there
+# (not in the repo) and every later command resolves to the same root.
+# Content is placed directly under TSM_PROJECT_DIR (no separate TSM_INDEX_ROOT).
 TSM_PROJECT_DIR="$(mktemp -d)"
 cd "$TSM_PROJECT_DIR" || exit 1
 export TSM_EMBEDDER_IDLE_TIMEOUT=0
@@ -150,7 +149,7 @@ THREE_MONTHS_AGO_START=$(date -d '3 months ago' +%Y-%m-01)
 THREE_MONTHS_AGO_END=$(date -d '2 months ago' +%Y-%m-01)
 
 log "TSM_STATE_DIR=$TSM_STATE_DIR"
-log "TSM_INDEX_ROOT=$TSM_INDEX_ROOT"
+log "TSM_PROJECT_DIR=$TSM_PROJECT_DIR"
 log "TODAY=$TODAY  1Y_AGO=$ONE_YEAR_AGO  3M_AGO=$THREE_MONTHS_AGO"
 
 # Cleanup on exit (invoked via trap below)
@@ -158,18 +157,18 @@ log "TODAY=$TODAY  1Y_AGO=$ONE_YEAR_AGO  3M_AGO=$THREE_MONTHS_AGO"
 cleanup() {
     log "Cleaning up..."
     tsm stop 2>/dev/null || true
-    rm -rf "$TSM_STATE_DIR" "$TSM_INDEX_ROOT" "$TSM_PROJECT_DIR"
+    rm -rf "$TSM_STATE_DIR" "$TSM_PROJECT_DIR"
 }
 trap cleanup EXIT
 
 # ── Prepare test data ─────────────────────────────────────────────────
 
 log "Preparing test data..."
-cp -r "$SCRIPT_DIR/e2e/testdata/"* "$TSM_INDEX_ROOT/"
+cp -r "$SCRIPT_DIR/e2e/testdata/"* "$TSM_PROJECT_DIR/"
 sed -i \
     "s/__TODAY__/$TODAY/g; s/__1Y_AGO__/$ONE_YEAR_AGO/g; s/__3M_AGO__/$THREE_MONTHS_AGO/g" \
-    "$TSM_INDEX_ROOT"/notes/*.md \
-    "$TSM_INDEX_ROOT"/sessions/*.jsonl
+    "$TSM_PROJECT_DIR"/notes/*.md \
+    "$TSM_PROJECT_DIR"/sessions/*.jsonl
 
 # ── Init & start daemon ──────────────────────────────────────────────
 
@@ -378,7 +377,7 @@ assert_fail "edge: --recent garbage → error" "$CAPTURED_EXIT"
 echo ""
 log "=== Ingest session ==="
 
-SESSION_FILE="$TSM_INDEX_ROOT/sessions/test-session.jsonl"
+SESSION_FILE="$TSM_PROJECT_DIR/sessions/test-session.jsonl"
 set +e; CAPTURED_OUTPUT=$(tsm ingest-session "$SESSION_FILE" 2>&1); CAPTURED_EXIT=$?; set -e
 assert_contains "ingest-session: succeeds" "session indexed" "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
@@ -397,7 +396,7 @@ echo ""
 log "=== Watcher ==="
 
 # Create a new file and wait for watcher to pick it up
-WATCHER_FILE="$TSM_INDEX_ROOT/notes/watcher-test.md"
+WATCHER_FILE="$TSM_PROJECT_DIR/notes/watcher-test.md"
 cat > "$WATCHER_FILE" <<HEREDOC
 ---
 status: current
@@ -461,7 +460,7 @@ if [[ "${TSM_E2E_RUN_RACE:-0}" != "1" ]]; then
 else
 
 RACE_COUNT=20
-RACE_DIR="$TSM_INDEX_ROOT/notes"
+RACE_DIR="$TSM_PROJECT_DIR/notes"
 
 # Parallel create
 for i in $(seq 1 "$RACE_COUNT"); do

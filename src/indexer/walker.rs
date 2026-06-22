@@ -3,8 +3,8 @@
 //! `ContentWalker` is the single source of truth for "which files should tsm
 //! index?" It centralizes the ad-hoc walker logic that used to be split
 //! across `cli::discover_watch_dirs` (now deleted), the watcher event
-//! filter, and the stdin path. Callers needing an `index_root` override
-//! (the daemon, `cmd_rebuild`) use `from_env_with_index_root` directly.
+//! filter, and the stdin path. Callers needing a `project_root` override
+//! (the daemon, `cmd_rebuild`) use `from_env_with_project_root` directly.
 //!
 //! ## Ignore resolution
 //!
@@ -15,7 +15,7 @@
 //!    `!.git/` in `.tsmignore` cannot bring them back.
 //! 2. **`.tsmignore` patterns** — read from the tsm project root (the
 //!    directory containing `tsm.toml`). Patterns are resolved relative
-//!    to `index_root`, not relative to the physical `.tsmignore` file.
+//!    to `project_root`.
 //!    When `.tsmignore` is absent, no exclusion patterns are applied —
 //!    run `tsm init` to create the default file (which excludes hidden
 //!    dirs and common build artifacts).
@@ -39,7 +39,7 @@ use crate::indexer::IngestPolicy;
 const FORCED_EXCLUDED_DIRS: &[&str] = &[".git", ".tsm"];
 
 pub struct ContentWalker {
-    index_root: PathBuf,
+    project_root: PathBuf,
     content_dirs: Vec<ContentDir>,
     extensions: Vec<String>,
     matcher: Gitignore,
@@ -55,16 +55,15 @@ impl ContentWalker {
     /// not opted in. See the module-level doc for the rationale on routing
     /// every constructor through `new` instead of mutating `ResolvedConfig`.
     pub fn new(
-        index_root: PathBuf,
-        project_root: &Path,
+        project_root: PathBuf,
         extensions: Vec<String>,
         content_dirs: Vec<ContentDir>,
         respect_gitignore: bool,
         ignore_file: &str,
     ) -> Self {
-        let matcher = build_matcher(&index_root, project_root, ignore_file, respect_gitignore);
+        let matcher = build_matcher(&project_root, ignore_file, respect_gitignore);
         Self {
-            index_root,
+            project_root,
             content_dirs,
             extensions,
             matcher,
@@ -76,8 +75,7 @@ impl ContentWalker {
     /// lookup semantics.
     pub fn from_config(cfg: &ResolvedConfig) -> Self {
         Self::new(
-            cfg.index_root.clone(),
-            &cfg.project_root,
+            cfg.project_root.clone(),
             cfg.extensions.clone(),
             cfg.content_dirs.clone(),
             cfg.respect_gitignore,
@@ -95,18 +93,14 @@ impl ContentWalker {
         Self::from_config(&crate::config::ResolvedConfig::from_env())
     }
 
-    /// Construct a walker rooted at a specific `index_root`, overriding the
+    /// Construct a walker rooted at a specific `project_root`, overriding the
     /// value in `ResolvedConfig`. Used by the daemon handler whose
-    /// `index_root` argument is the authoritative one per request (and by
+    /// `project_root` argument is the authoritative one per request (and by
     /// tests that exercise the handler with a tempdir).
-    ///
-    /// `project_root` (and therefore `.tsmignore` location) still comes from
-    /// the loaded config — only `index_root` is overridden.
-    pub fn from_env_with_index_root(index_root: &Path) -> Self {
+    pub fn from_env_with_project_root(project_root: &Path) -> Self {
         let cfg = crate::config::ResolvedConfig::from_env();
         Self::new(
-            index_root.to_path_buf(),
-            &cfg.project_root,
+            project_root.to_path_buf(),
             cfg.extensions,
             cfg.content_dirs,
             cfg.respect_gitignore,
@@ -123,7 +117,7 @@ impl ContentWalker {
     /// drift fixed in #134 / #135. Production callers must go through
     /// `accepts()`.
     pub(crate) fn is_ignored(&self, path: &Path) -> bool {
-        let Ok(rel) = path.strip_prefix(&self.index_root) else {
+        let Ok(rel) = path.strip_prefix(&self.project_root) else {
             return true;
         };
         if has_forced_excluded_component(rel) {
@@ -164,14 +158,14 @@ impl ContentWalker {
     }
 
     /// The starting points for traversal — either explicit `content_dirs`
-    /// entries or auto-discovered immediate subdirectories of `index_root`.
+    /// entries or auto-discovered immediate subdirectories of `project_root`.
     fn collection_roots(&self) -> Vec<PathBuf> {
         if self.content_dirs.is_empty() {
             self.auto_discover_roots()
         } else {
             let mut roots = Vec::with_capacity(self.content_dirs.len());
             for dir in &self.content_dirs {
-                let full = self.index_root.join(&dir.path);
+                let full = self.project_root.join(&dir.path);
                 if !full.is_dir() {
                     log::warn!(
                         "content_dir '{}' not found at {}; skipping",
@@ -194,12 +188,12 @@ impl ContentWalker {
     }
 
     fn auto_discover_roots(&self) -> Vec<PathBuf> {
-        let entries = match std::fs::read_dir(&self.index_root) {
+        let entries = match std::fs::read_dir(&self.project_root) {
             Ok(e) => e,
             Err(e) => {
                 log::warn!(
                     "cannot read {}: {e}; no subdirectories discovered",
-                    self.index_root.display()
+                    self.project_root.display()
                 );
                 return Vec::new();
             }
@@ -262,21 +256,14 @@ impl IngestPolicy for ContentWalker {
 }
 
 /// Build the combined `.tsmignore` + (optional) `.gitignore` matcher. The
-/// builder is anchored at `index_root` so pattern resolution matches the
-/// spec, even when `.tsmignore` physically lives in a different directory
-/// (the tsm project root). When `.tsmignore` is absent, no patterns from
-/// it are loaded — `tsm init` is the migration path for users coming from
-/// the old fallback.
-fn build_matcher(
-    index_root: &Path,
-    project_root: &Path,
-    ignore_file: &str,
-    respect_gitignore: bool,
-) -> Gitignore {
-    let mut builder = GitignoreBuilder::new(index_root);
+/// builder is anchored at `project_root` so pattern resolution matches the
+/// spec. When `.tsmignore` is absent, no patterns from it are loaded —
+/// `tsm init` is the migration path for users coming from the old fallback.
+fn build_matcher(project_root: &Path, ignore_file: &str, respect_gitignore: bool) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(project_root);
 
     if respect_gitignore {
-        let gi = index_root.join(".gitignore");
+        let gi = project_root.join(".gitignore");
         if gi.is_file() {
             if let Some(err) = builder.add(&gi) {
                 log::warn!("ignoring .gitignore at {}: {err}", gi.display());
@@ -307,7 +294,7 @@ fn build_matcher(
     })
 }
 
-/// True if any component of the (index_root-relative) path is a forced
+/// True if any component of the (project_root-relative) path is a forced
 /// excluded directory name. Checked outside the `Gitignore` matcher so that
 /// users cannot re-include these via negation patterns.
 fn has_forced_excluded_component(rel_path: &Path) -> bool {
@@ -333,25 +320,16 @@ mod tests {
         std::fs::write(full, body).unwrap();
     }
 
-    /// Build a `ResolvedConfig` where `index_root` and `project_root` both
-    /// point at `root`. This is the common single-repo case and suffices
-    /// for tests that don't care about the split between the two.
+    /// Build a `ResolvedConfig` where `project_root` points at `root`.
     fn cfg_for(root: &Path) -> ResolvedConfig {
-        let toml = format!(
-            r#"
-index_root = "{}"
-state_dir = "/tmp/unused-state"
-"#,
-            root.display()
-        );
-        let file_cfg: crate::config::ConfigFile = toml::from_str(&toml).unwrap();
+        let toml = r#"state_dir = "/tmp/unused-state""#;
+        let file_cfg: crate::config::ConfigFile = toml::from_str(toml).unwrap();
         ResolvedConfig::from_config_file(&file_cfg, root.to_path_buf())
     }
 
-    /// Build a walker anchored entirely at `tempdir` (both `index_root`
-    /// and `project_root`). Project-root-aware tests that need the two to
-    /// differ should call `cfg_for` variants and `ContentWalker::from_config`
-    /// directly.
+    /// Build a walker anchored entirely at `tempdir` as the project root.
+    /// Tests that need custom configuration should call `cfg_for` and
+    /// `ContentWalker::from_config` directly.
     fn walker_in(tempdir: &TempDir) -> ContentWalker {
         ContentWalker::from_config(&cfg_for(tempdir.path()))
     }
@@ -387,7 +365,7 @@ state_dir = "/tmp/unused-state"
 
     // ─── Multi-repo / middle-path matching ────────────────────────────
     //
-    // Orchestration use case: `index_root` points at a parent dir containing
+    // Orchestration use case: `project_root` points at a parent dir containing
     // several independent repos (e.g. `/workspaces/{company, daily, ...}`),
     // each with its own `.git/`, `target/`, etc. Patterns and forced
     // excludes must match at any depth, not just top-level.
@@ -396,7 +374,7 @@ state_dir = "/tmp/unused-state"
     #[serial_test::serial]
     fn forced_excludes_match_at_any_depth() {
         // `.git/` and `.tsm/` under *any* sub-repo must be excluded, not
-        // only at index_root level. Ensures `has_forced_excluded_component`
+        // only at project_root level. Ensures `has_forced_excluded_component`
         // scans every path component.
         let tmp = TempDir::new().unwrap();
         write_file(tmp.path(), "company/.git/HEAD.md", "no");
@@ -435,7 +413,7 @@ state_dir = "/tmp/unused-state"
 
     #[test]
     #[serial_test::serial]
-    fn tsmignore_leading_slash_anchors_to_index_root() {
+    fn tsmignore_leading_slash_anchors_to_project_root() {
         // With leading slash, patterns are anchored: `/worktrees/` excludes
         // only the top-level `worktrees/`, NOT sub-repo worktrees dirs.
         // This is the escape hatch when the any-depth default is too broad.
@@ -533,7 +511,7 @@ state_dir = "/tmp/unused-state"
         let walker = walker_in(&tmp);
         assert!(!walker.is_ignored(&tmp.path().join("public/ok.md")));
         assert!(walker.is_ignored(&tmp.path().join("private/secret.md")));
-        // Outside index_root → ignored.
+        // Outside project_root → ignored.
         assert!(walker.is_ignored(Path::new("/etc/passwd")));
     }
 
@@ -580,12 +558,10 @@ state_dir = "/tmp/unused-state"
     fn cfg_with_gitignore(root: &Path, respect: bool) -> ResolvedConfig {
         let toml = format!(
             r#"
-index_root = "{}"
 state_dir = "/tmp/unused-state"
 [index]
 respect_gitignore = {}
 "#,
-            root.display(),
             respect
         );
         let file_cfg: crate::config::ConfigFile = toml::from_str(&toml).unwrap();
@@ -639,16 +615,12 @@ respect_gitignore = {}
         let tmp = TempDir::new().unwrap();
         write_file(tmp.path(), "notes/a.md", "md");
         write_file(tmp.path(), "notes/b.txt", "txt");
-        let toml = format!(
-            r#"
-index_root = "{}"
+        let toml = r#"
 state_dir = "/tmp/unused-state"
 [index]
 extensions = ["md", "txt"]
-"#,
-            tmp.path().display()
-        );
-        let file_cfg: crate::config::ConfigFile = toml::from_str(&toml).unwrap();
+"#;
+        let file_cfg: crate::config::ConfigFile = toml::from_str(toml).unwrap();
         let cfg = ResolvedConfig::from_config_file(&file_cfg, tmp.path().to_path_buf());
         let walker = ContentWalker::from_config(&cfg);
         let files = walker.collect_files();
@@ -669,10 +641,8 @@ extensions = ["md", "txt"]
             .map(|d| format!("[[index.content_dirs]]\npath = \"{d}\"\n"))
             .collect();
         let toml = format!(
-            r#"index_root = "{}"
-state_dir = "/tmp/unused-state"
+            r#"state_dir = "/tmp/unused-state"
 {}"#,
-            root.display(),
             entries
         );
         let file_cfg: crate::config::ConfigFile = toml::from_str(&toml).unwrap();
@@ -699,89 +669,20 @@ state_dir = "/tmp/unused-state"
             .any(|p| p.components().any(|c| c.as_os_str() == "drop")));
     }
 
-    // ─── project_root != index_root ───────────────────────────────────
-    //
-    // `.tsmignore` lives in project_root (CWD, next to tsm.toml) but its
-    // patterns resolve relative to index_root. These tests exercise the
-    // split — they're the #134 spec checklist items.
-
-    /// Build a config where project_root and index_root differ. Used for
-    /// tests that exercise the split — `.tsmignore` lookup uses
-    /// `project_root`, pattern resolution uses `index_root`.
-    fn cfg_split(project_root: &Path, index_root: &Path) -> ResolvedConfig {
-        let toml = format!(
-            r#"
-index_root = "{}"
-state_dir = "/tmp/unused-state"
-"#,
-            index_root.display()
-        );
-        let file_cfg: crate::config::ConfigFile = toml::from_str(&toml).unwrap();
-        ResolvedConfig::from_config_file(&file_cfg, project_root.to_path_buf())
-    }
-
-    #[test]
-    fn tsmignore_patterns_resolve_relative_to_index_root_not_cwd() {
-        // Two independent tempdirs: project_root holds .tsmignore, index_root
-        // is the separate tree being scanned. Pattern-confusion trap: same
-        // name exists under both roots; if the matcher were (wrongly)
-        // anchored at project_root, `project/private/` would be excluded
-        // while `index/private/` would slip through.
-        let project = TempDir::new().unwrap();
-        let index = TempDir::new().unwrap();
-        write_file(project.path(), ".tsmignore", "private/\n");
-        write_file(
-            project.path(),
-            "private/unrelated.md",
-            "should-never-be-scanned",
-        );
-        write_file(index.path(), "public/ok.md", "a");
-        write_file(index.path(), "private/secret.md", "b");
-
-        let walker = ContentWalker::from_config(&cfg_split(project.path(), index.path()));
-        let files = walker.collect_files();
-        assert!(files.iter().any(|p| p.ends_with("public/ok.md")));
-        assert!(!files
-            .iter()
-            .any(|p| p.components().any(|c| c.as_os_str() == "private")));
-    }
-
-    #[test]
-    fn tsmignore_placed_in_index_root_is_ignored() {
-        // Spec checklist: ".tsmignore in index_root (when different from
-        // project root) is ignored". project_root has no .tsmignore, so
-        // the synthetic hidden-dir fallback is the only active rule — the
-        // index_root/.tsmignore must NOT be picked up.
-        let project = TempDir::new().unwrap();
-        let index = TempDir::new().unwrap();
-        // This .tsmignore would drop public/ok.md IF it were honored.
-        write_file(index.path(), ".tsmignore", "public/\n");
-        write_file(index.path(), "public/ok.md", "a");
-
-        let walker = ContentWalker::from_config(&cfg_split(project.path(), index.path()));
-        let files = walker.collect_files();
-        // File is still collected → index_root/.tsmignore was not loaded.
-        assert!(files.iter().any(|p| p.ends_with("public/ok.md")));
-    }
-
     // ─── new() constructor ─────────────────────────────────────────────
 
     #[test]
     fn new_takes_raw_params_without_resolved_config() {
-        // The point of `new()` is to let callers (notably the daemon's
-        // per-request handler) construct a walker with an `index_root` that
-        // differs from the loaded config WITHOUT mutating the singleton's
-        // pub fields. Verify the constructor accepts raw params and produces
-        // a working walker.
-        let project = TempDir::new().unwrap();
-        let index = TempDir::new().unwrap();
-        write_file(project.path(), ".tsmignore", "skip/\n");
-        write_file(index.path(), "keep/a.md", "a");
-        write_file(index.path(), "skip/b.md", "b");
+        // Verify the `new()` constructor accepts raw params and produces
+        // a working walker with .tsmignore patterns applied relative to
+        // project_root.
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), ".tsmignore", "skip/\n");
+        write_file(tmp.path(), "keep/a.md", "a");
+        write_file(tmp.path(), "skip/b.md", "b");
 
         let walker = ContentWalker::new(
-            index.path().to_path_buf(),
-            project.path(),
+            tmp.path().to_path_buf(),
             vec!["md".into()],
             vec![],
             false,
@@ -792,6 +693,25 @@ state_dir = "/tmp/unused-state"
         assert!(!files
             .iter()
             .any(|p| p.components().any(|c| c.as_os_str() == "skip")));
+    }
+
+    // ─── tsmignore pattern resolution relative to project_root ────────
+
+    #[test]
+    fn tsmignore_patterns_resolve_relative_to_project_root() {
+        // .tsmignore with `private/\n` excludes `project_root/private/`
+        // — patterns are resolved relative to project_root.
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), ".tsmignore", "private/\n");
+        write_file(tmp.path(), "public/ok.md", "a");
+        write_file(tmp.path(), "private/secret.md", "b");
+
+        let walker = ContentWalker::from_config(&cfg_for(tmp.path()));
+        let files = walker.collect_files();
+        assert!(files.iter().any(|p| p.ends_with("public/ok.md")));
+        assert!(!files
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == "private")));
     }
 
     #[test]

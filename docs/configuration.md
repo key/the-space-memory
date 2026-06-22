@@ -23,7 +23,6 @@ tsm searches for a config file in the following order; the first file found wins
 | `TSM_CONFIG` | path | _(none)_ | _(no toml equiv)_ | Override path to the config file itself; the directory containing it becomes the project root |
 | `TSM_STATE_DIR` | path | `.tsm` | `state_dir` | Root directory for all tsm data (DB, sockets, PID, logs, user dict) |
 | `TSM_CACHE_DIR` | path | `{XDG_CACHE_HOME}/tsm` (else `$HOME/.cache/tsm`) | `cache_dir` | Cache directory for the model and WordNet DB |
-| `TSM_INDEX_ROOT` | path | `/workspaces` | `index_root` | Root directory containing content workspaces to index |
 | `TSM_EMBEDDER_SOCKET` | path | `{state_dir}/embedder.sock` | `embedder_socket_path` | UNIX socket path for the embedder child process |
 | `TSM_DAEMON_SOCKET` | path | `{state_dir}/daemon.sock` | `daemon_socket_path` | UNIX socket path for tsmd |
 | `TSM_LOG_DIR` | path | `{state_dir}/logs` | `log_dir` | Directory for daemon log files |
@@ -53,10 +52,6 @@ variables. They have no `tsm.toml` equivalent.
 # Root directory for all tsm state files: DB, sockets, PID, logs, user dict.
 # Default: .tsm (relative to working directory)
 state_dir = ".tsm"
-
-# Root directory containing content workspaces to index.
-# Default: /workspaces
-index_root = "/workspaces"
 
 # UNIX socket for the embedder child process.
 # Default: {state_dir}/embedder.sock
@@ -91,10 +86,10 @@ user_dict_path = ".tsm/user_dict.simpledic"
 
 [index]
 # Content directories to index, with per-directory scoring parameters.
-# Paths are relative to index_root. Absolute paths are rejected with a warning.
-# When content_dirs is empty, tsm auto-discovers all .md files under index_root.
+# Paths are relative to the project root. Absolute paths are rejected with a warning.
+# When content_dirs is empty, tsm auto-discovers all .md files under the project root.
 [[index.content_dirs]]
-# Directory path relative to index_root (required).
+# Directory path relative to the project root (required).
 path = "notes"
 # Score multiplier for results from this directory.
 # Non-finite or <= 0 values trigger a warning and fall back to 1.0.
@@ -131,14 +126,14 @@ half_life_days = 30.0
 
 ### Path Matching
 
-- Paths in `content_dirs` are relative to `index_root`; absolute paths are rejected with a warning
+- Paths in `content_dirs` are relative to the project root; absolute paths are rejected with a warning
 - Matching uses prefix + `/` boundary check: `notes/foo.md` matches `path = "notes"`, but `notes-extra/bar.md` does not
 - Entries are sorted longest-first so more-specific paths take precedence over shorter prefixes
 - Unmatched files fall back to source-type defaults (see below)
 
 ### Auto-Discover Mode
 
-When `content_dirs` is empty, tsm recursively indexes all `.md` files under `index_root`.
+When `content_dirs` is empty, tsm recursively indexes all `.md` files under the project root.
 Scoring parameters are derived from the source type:
 
 | source_type | half_life_days |
@@ -172,7 +167,6 @@ Changes take effect differently depending on the field:
 **Requires `tsm restart`** (daemon must be stopped and restarted):
 
 - `state_dir`
-- `index_root`
 - `daemon_socket_path`
 - `embedder_socket_path`
 - `log_dir`

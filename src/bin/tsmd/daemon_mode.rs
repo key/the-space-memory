@@ -24,7 +24,7 @@ pub fn run(args: Args) -> Result<()> {
 
     let socket_path = args.socket.unwrap_or_else(config::daemon_socket_path);
     let db_path = args.db.unwrap_or_else(config::db_path);
-    let index_root = config::index_root();
+    let project_root = config::project_root();
 
     // Acquire the per-project startup lock FIRST — before opening the DB or
     // touching the socket — and hold it for the daemon's whole lifetime. The
@@ -63,6 +63,19 @@ pub fn run(args: Args) -> Result<()> {
         anyhow::bail!(
             "Database not initialized at {}. Run `tsm init` first.",
             db_path.display()
+        );
+    }
+
+    // ADR-0009 §3: reject a config that still carries the removed `index_root`
+    // key.  `anyhow::bail!` here keeps the accept loop clean — no socket is
+    // bound, no children are spawned, and `tsm start` surfaces the stderr via
+    // `wait_for_daemon_ready` (same path as the uninitialized-DB guard above).
+    if let Some(path) = config::legacy_index_root() {
+        anyhow::bail!(
+            "`index_root = \"{}\"` in tsm.toml is no longer supported (ADR-0009 §3). \
+             Replace it with `[[index.content_dirs]]` entries with paths relative to \
+             the project root.",
+            path.display()
         );
     }
 
@@ -243,7 +256,7 @@ pub fn run(args: Args) -> Result<()> {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let conn = Arc::clone(&conn);
-                let index_root = index_root.clone();
+                let project_root = project_root.clone();
                 let search_active = Arc::clone(&search_active);
                 let watcher_pid = Arc::clone(&watcher_pid);
                 let reindex_active = Arc::clone(&reindex_active);
@@ -253,7 +266,7 @@ pub fn run(args: Args) -> Result<()> {
                     if let Err(e) = handle_client(
                         &mut stream,
                         &conn,
-                        &index_root,
+                        &project_root,
                         &search_active,
                         &watcher_pid,
                         &reindex_active,
@@ -301,7 +314,7 @@ pub fn run(args: Args) -> Result<()> {
 fn handle_client(
     stream: &mut std::os::unix::net::UnixStream,
     conn: &Arc<Mutex<rusqlite::Connection>>,
-    index_root: &std::path::Path,
+    project_root: &std::path::Path,
     search_active: &Arc<AtomicUsize>,
     watcher_pid: &Arc<AtomicU32>,
     reindex_active: &Arc<AtomicBool>,
@@ -393,7 +406,7 @@ fn handle_client(
     let conn = conn
         .lock()
         .map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
-    let resp = daemon::handle_request(&conn, req, index_root, &SHUTDOWN);
+    let resp = daemon::handle_request(&conn, req, project_root, &SHUTDOWN);
     write_response(stream, &resp)?;
     Ok(())
 }

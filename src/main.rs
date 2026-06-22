@@ -238,6 +238,20 @@ fn main() -> anyhow::Result<()> {
     }
     config::set_project_root(project_root);
 
+    // ADR-0009 §3: reject a config that still has the removed `index_root` key.
+    // This is the only place a hard exit is permitted for this condition; the
+    // daemon uses `anyhow::bail!` and reload uses a warning (mirrors the
+    // uninitialized-DB startup behaviour in ADR-0011).
+    if let Some(path) = config::legacy_index_root() {
+        eprintln!(
+            "error: `index_root = \"{}\"` in tsm.toml is no longer supported (ADR-0009 §3).\n\
+             Replace it with `[[index.content_dirs]]` entries with paths relative to the \
+             project root.\nAborting.",
+            path.display()
+        );
+        std::process::exit(1);
+    }
+
     the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Stderr)?;
     match args.command {
         // ── Always direct ──
@@ -324,11 +338,11 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Index { files_from_stdin } => {
             let req = if files_from_stdin {
-                let index_root = config::index_root();
-                let paths = cli::read_paths_from_stdin(&index_root);
+                let project_root = config::project_root();
+                let paths = cli::read_paths_from_stdin(&project_root);
                 let rel_paths: Vec<String> = paths
                     .iter()
-                    .filter_map(|p| p.strip_prefix(&index_root).ok())
+                    .filter_map(|p| p.strip_prefix(&project_root).ok())
                     .map(|p| p.to_string_lossy().to_string())
                     .collect();
                 DaemonRequest::Index { files: rel_paths }

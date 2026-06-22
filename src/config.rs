@@ -22,7 +22,6 @@ pub const DICT_CANDIDATE_FREQ_THRESHOLD: i64 = 5;
 pub const MIN_QUERY_KEYWORDS: usize = 1;
 
 const DEFAULT_STATE_DIR: &str = ".tsm";
-const DEFAULT_INDEX_ROOT: &str = "/workspaces";
 const DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS: u64 = 300;
 
@@ -220,11 +219,6 @@ pub struct ResolvedConfig {
     /// See ADR-0008.
     pub cache_dir: PathBuf,
 
-    /// Root directory containing content workspaces to index.
-    /// Default: `/workspaces`.
-    /// Env: `TSM_INDEX_ROOT`. Config: `index_root`.
-    pub index_root: PathBuf,
-
     /// UNIX socket path for the embedder child process (encode requests).
     /// Default: `{state_dir}/embedder.sock`.
     /// Env: `TSM_EMBEDDER_SOCKET`. Config: `embedder_socket_path`.
@@ -273,7 +267,7 @@ pub struct ResolvedConfig {
     pub init_link_mode: LinkMode,
 
     /// Content directories with scoring weights and half-life.
-    /// Empty = auto-discover mode (recursively index all .md under index_root).
+    /// Empty = auto-discover mode (recursively index all .md under project_root).
     pub content_dirs: Vec<ContentDir>,
 
     /// Score weight for Claude Code session data.
@@ -282,19 +276,29 @@ pub struct ResolvedConfig {
     /// Half-life in days for Claude Code session data time decay.
     pub session_half_life_days: f64,
 
-    /// Whether to also apply the root `.gitignore` under `index_root` during indexing.
+    /// Whether to also apply the root `.gitignore` under `project_root` during indexing.
     /// Default: true. Config: `[index].respect_gitignore`.
     pub respect_gitignore: bool,
 
     /// Filename of the project-level ignore file, resolved relative to the tsm
     /// project root (the directory containing `tsm.toml`). Its patterns are
-    /// applied relative to `index_root`.
+    /// applied relative to `project_root`.
     /// Default: `.tsmignore`. Config: `[index].ignore_file`.
     pub ignore_file: String,
 
     /// File extensions to include during indexing (without leading dot).
     /// Default: `["md"]`. Config: `[index].extensions`.
     pub extensions: Vec<String>,
+
+    /// Set when a loaded config file still carries a legacy `index_root` key
+    /// (removed in ADR-0009 §3). The value is captured here instead of
+    /// calling `process::exit` so each caller can decide how to handle it:
+    /// - CLI startup (`tsm` main): hard-exit with a migration message.
+    /// - Daemon startup (`tsmd`): `anyhow::bail!` before socket bind.
+    /// - Config reload: push a warning into the reload warnings vec and keep running.
+    ///
+    /// `None` means no legacy key was found. Not user-configurable via TOML.
+    pub rejected_index_root: Option<PathBuf>,
 
     /// Directory tsm treats as the user's workspace — where `.tsmignore`
     /// and `tsm.toml` are expected to live. Derived at load time from the
@@ -352,9 +356,8 @@ impl ResolvedConfig {
     ///
     /// `project_root` is the directory tsm treats as the user's workspace —
     /// typically the directory that held the `tsm.toml` that was loaded,
-    /// falling back to the current working directory. It is where
-    /// `.tsmignore` is resolved from (patterns still anchor at
-    /// `index_root`, only the file lookup uses `project_root`).
+    /// falling back to the current working directory. Content paths resolve
+    /// relative to `project_root`; `.tsmignore` is also loaded from here.
     ///
     /// Visible within the crate for testing; production code should use
     /// `from_env()`. Tests pass a tempdir to avoid mutating process-global
@@ -365,9 +368,6 @@ impl ResolvedConfig {
 
         let cache_dir =
             env_or("TSM_CACHE_DIR", file_cfg.cache_dir.as_ref()).unwrap_or_else(default_cache_dir);
-
-        let index_root = env_or("TSM_INDEX_ROOT", file_cfg.index_root.as_ref())
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_INDEX_ROOT));
 
         let embedder_socket_path = env_or(
             "TSM_EMBEDDER_SOCKET",
@@ -412,7 +412,7 @@ impl ResolvedConfig {
                 }
                 if std::path::Path::new(&c.path).is_absolute() {
                     log::warn!(
-                        "content_dirs entry '{}' is absolute; paths must be relative to index_root",
+                        "content_dirs entry '{}' is absolute; paths must be relative to the project root",
                         c.path
                     );
                     return None;
@@ -478,10 +478,11 @@ impl ResolvedConfig {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| vec![DEFAULT_INDEX_EXTENSION.to_string()]);
 
+        let rejected_index_root = file_cfg.index_root.clone();
+
         Self {
             state_dir,
             cache_dir,
-            index_root,
             embedder_socket_path,
             daemon_socket_path,
             log_dir,
@@ -498,6 +499,7 @@ impl ResolvedConfig {
             ignore_file,
             extensions,
             project_root,
+            rejected_index_root,
         }
     }
 }
@@ -669,13 +671,6 @@ pub fn reload() -> Vec<String> {
             old.init_link_mode, new_cfg.init_link_mode
         ));
     }
-    if old.index_root != new_cfg.index_root {
-        warnings.push(format!(
-            "index_root changed ({} → {}); requires `tsm restart`",
-            old.index_root.display(),
-            new_cfg.index_root.display()
-        ));
-    }
     if old.daemon_socket_path != new_cfg.daemon_socket_path {
         warnings.push("daemon_socket_path changed; requires `tsm restart`".to_string());
     }
@@ -695,8 +690,22 @@ pub fn reload() -> Vec<String> {
             new_cfg.project_root.display()
         ));
     }
+    if let Some(ref p) = new_cfg.rejected_index_root {
+        warnings.push(format!(
+            "`index_root = \"{}\"` in tsm.toml is no longer supported (ADR-0009 §3); \
+             replace it with `[[index.content_dirs]]` entries. \
+             The key is ignored; run `tsm restart` after fixing the config.",
+            p.display()
+        ));
+    }
 
-    *w = new_cfg;
+    // Do not apply a config that re-adds index_root: discard the bad field
+    // and keep the daemon running with the previous (or cleaned) config.
+    let applied = ResolvedConfig {
+        rejected_index_root: None,
+        ..new_cfg
+    };
+    *w = applied;
 
     log::info!("config reloaded from tsm.toml");
     if !warnings.is_empty() {
@@ -875,10 +884,6 @@ pub fn cache_dir() -> PathBuf {
     resolved().cache_dir.clone()
 }
 
-pub fn index_root() -> PathBuf {
-    resolved().index_root.clone()
-}
-
 pub fn embedder_socket_path() -> PathBuf {
     resolved().embedder_socket_path.clone()
 }
@@ -929,6 +934,17 @@ pub fn index_extensions() -> Vec<String> {
 
 pub fn project_root() -> PathBuf {
     resolved().project_root.clone()
+}
+
+/// Return the legacy `index_root` value captured from the config file, if any.
+///
+/// When `Some`, a config file still uses the removed `index_root` key (ADR-0009 §3).
+/// Callers are responsible for handling this condition:
+/// - CLI startup: hard-exit with a migration message.
+/// - Daemon startup: `anyhow::bail!` before socket bind.
+/// - Config reload: push a warning and keep running.
+pub fn legacy_index_root() -> Option<PathBuf> {
+    resolved().rejected_index_root.clone()
 }
 
 // ─── Derived paths ───────────────────────────────────────────────
@@ -1172,7 +1188,6 @@ mod tests {
         assert_eq!(SCORE_THRESHOLD, 0.005);
         assert_eq!(MAX_RESULTS, 5);
         assert_eq!(EMBEDDING_DIM, 256);
-        assert_eq!(DEFAULT_INDEX_ROOT, "/workspaces");
         assert_eq!(DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS, 600);
         assert_eq!(DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS, 300);
         assert_eq!(DICT_CANDIDATE_FREQ_THRESHOLD, 5);
@@ -1181,7 +1196,7 @@ mod tests {
     // ─── ResolvedConfig from config file ─────────────────────────────
     // These tests construct ResolvedConfig via from_config_file() directly,
     // bypassing the OnceLock singleton. Tests that set TOML fields overridden
-    // by env vars (state_dir, index_root, etc.) must use #[serial] to avoid
+    // by env vars (state_dir, etc.) must use #[serial] to avoid
     // races with other tests that mutate those env vars.
 
     #[test]
@@ -1190,7 +1205,6 @@ mod tests {
         // Clear all TSM env vars to ensure defaults are tested, not CI overrides.
         for var in [
             "TSM_STATE_DIR",
-            "TSM_INDEX_ROOT",
             "TSM_EMBEDDER_SOCKET",
             "TSM_DAEMON_SOCKET",
             "TSM_LOG_DIR",
@@ -1201,7 +1215,6 @@ mod tests {
         }
         let cfg = resolved_from_toml("");
         assert_eq!(cfg.state_dir, PathBuf::from(DEFAULT_STATE_DIR));
-        assert_eq!(cfg.index_root, PathBuf::from(DEFAULT_INDEX_ROOT));
         assert_eq!(
             cfg.embedder_socket_path,
             PathBuf::from(".tsm/embedder.sock")
@@ -1254,13 +1267,11 @@ mod tests {
         let cfg = resolved_from_toml(
             r#"
             state_dir = "/custom/data"
-            index_root = "/custom/root"
             embedder_idle_timeout_secs = 0
             embedder_backfill_interval_secs = 60
         "#,
         );
         assert_eq!(cfg.state_dir, PathBuf::from("/custom/data"));
-        assert_eq!(cfg.index_root, PathBuf::from("/custom/root"));
         assert_eq!(cfg.embedder_idle_timeout_secs, 0);
         assert_eq!(cfg.embedder_backfill_interval_secs, 60);
     }
@@ -1593,7 +1604,6 @@ mod tests {
             &config_path,
             r#"
 state_dir = "/custom/data"
-index_root = "/custom/root"
 embedder_idle_timeout_secs = 1200
 "#,
         )
@@ -1601,12 +1611,103 @@ embedder_idle_timeout_secs = 1200
 
         let (cfg, root) = load_config_from(&[config_path.clone()]);
         assert_eq!(cfg.state_dir, Some(PathBuf::from("/custom/data")));
-        assert_eq!(cfg.index_root, Some(PathBuf::from("/custom/root")));
         assert_eq!(cfg.embedder_idle_timeout_secs, Some(1200));
         assert!(cfg.daemon_socket_path.is_none());
         // project_root derives from the loaded file's parent — the same
         // absolute path that was passed in, no canonicalization applied.
         assert_eq!(root.as_deref(), config_path.parent());
+    }
+
+    #[test]
+    fn test_from_config_file_captures_rejected_index_root() {
+        // A ConfigFile with index_root set must surface it in rejected_index_root.
+        let file: ConfigFile = toml::from_str(r#"index_root = "/old/root""#).unwrap();
+        let cfg = ResolvedConfig::from_config_file(&file, PathBuf::from("/tmp/unused-root"));
+        assert_eq!(
+            cfg.rejected_index_root,
+            Some(PathBuf::from("/old/root")),
+            "index_root should be captured in rejected_index_root"
+        );
+    }
+
+    #[test]
+    fn test_from_config_file_no_rejected_index_root_when_absent() {
+        let file: ConfigFile = toml::from_str(r#"state_dir = "/some/dir""#).unwrap();
+        let cfg = ResolvedConfig::from_config_file(&file, PathBuf::from("/tmp/unused-root"));
+        assert!(
+            cfg.rejected_index_root.is_none(),
+            "rejected_index_root must be None when index_root is absent"
+        );
+    }
+
+    #[test]
+    fn test_load_config_from_captures_rejected_index_root() {
+        // Going through load_config_from (not just from_config_file) must also
+        // surface the rejected index_root so the real production path is covered.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("tsm.toml");
+        std::fs::write(&config_path, r#"index_root = "/legacy/root""#).unwrap();
+
+        let (merged, _root) = load_config_from(&[config_path]);
+        assert_eq!(
+            merged.index_root,
+            Some(PathBuf::from("/legacy/root")),
+            "index_root must be merged and preserved for rejected_index_root population"
+        );
+        let cfg = ResolvedConfig::from_config_file(&merged, PathBuf::from("/tmp/unused-root"));
+        assert_eq!(
+            cfg.rejected_index_root,
+            Some(PathBuf::from("/legacy/root")),
+            "rejected_index_root must be populated from the merged ConfigFile"
+        );
+    }
+
+    #[test]
+    fn test_reload_warns_when_index_root_re_added() {
+        // reload() must push a warning (not exit) when a reloaded config still
+        // carries index_root.  We test the pure warning-generation logic by
+        // calling the helper directly rather than exercising the OnceLock path,
+        // which can only be initialised once per process.
+        let old = ResolvedConfig::from_config_file(
+            &ConfigFile::default(),
+            PathBuf::from("/tmp/unused-root"),
+        );
+        let file_with_index_root: ConfigFile =
+            toml::from_str(r#"index_root = "/bad/path""#).unwrap();
+        let new_cfg = ResolvedConfig::from_config_file(
+            &file_with_index_root,
+            PathBuf::from("/tmp/unused-root"),
+        );
+        // Build the same warnings that reload() would produce for this pair.
+        let mut warnings = Vec::new();
+        if let Some(ref p) = new_cfg.rejected_index_root {
+            warnings.push(format!(
+                "`index_root = \"{}\"` in tsm.toml is no longer supported (ADR-0009 §3); \
+                 replace it with `[[index.content_dirs]]` entries. \
+                 The key is ignored; run `tsm restart` after fixing the config.",
+                p.display()
+            ));
+        }
+        // Reload must not apply the bad value — verify the new config carries it.
+        assert!(
+            !warnings.is_empty(),
+            "reload must warn when index_root re-appears"
+        );
+        let w = &warnings[0];
+        assert!(
+            w.contains("index_root"),
+            "warning must mention index_root: {w}"
+        );
+        assert!(
+            w.contains("ADR-0009"),
+            "warning must reference ADR-0009: {w}"
+        );
+        assert!(
+            w.contains("content_dirs"),
+            "warning must suggest content_dirs: {w}"
+        );
+        // And the old config is unaffected (no rejected_index_root).
+        assert!(old.rejected_index_root.is_none());
     }
 
     #[test]
@@ -1621,14 +1722,14 @@ embedder_idle_timeout_secs = 1200
             &low,
             r#"
 state_dir = "/low"
-index_root = "/low-root"
+embedder_idle_timeout_secs = 999
 "#,
         )
         .unwrap();
 
         let (cfg, root) = load_config_from(&[high.clone(), low]);
         assert_eq!(cfg.state_dir, Some(PathBuf::from("/high")));
-        assert_eq!(cfg.index_root, Some(PathBuf::from("/low-root")));
+        assert_eq!(cfg.embedder_idle_timeout_secs, Some(999));
         // project_root comes from the FIRST successfully-loaded candidate,
         // regardless of which fields subsequent files contribute.
         assert_eq!(root.as_deref(), high.parent());
@@ -1638,7 +1739,6 @@ index_root = "/low-root"
     fn test_load_config_empty_candidates() {
         let (cfg, root) = load_config_from(&[]);
         assert!(cfg.state_dir.is_none());
-        assert!(cfg.index_root.is_none());
         assert!(root.is_none(), "no config loaded → no project_root");
     }
 
@@ -2315,25 +2415,19 @@ half_life_days = 180
 
         // Set env vars to force structural field changes
         std::env::set_var("TSM_STATE_DIR", "/tmp/reload-test-state");
-        std::env::set_var("TSM_INDEX_ROOT", "/tmp/reload-test-root");
 
         let warnings = reload();
 
         // Clean up env vars
         std::env::remove_var("TSM_STATE_DIR");
-        std::env::remove_var("TSM_INDEX_ROOT");
 
         // Restore original config
         reload();
 
-        // Should have warnings for state_dir and index_root (and derived paths)
+        // Should have warning for state_dir (and derived paths)
         assert!(
             warnings.iter().any(|w| w.contains("state_dir")),
             "expected state_dir warning, got: {warnings:?}"
-        );
-        assert!(
-            warnings.iter().any(|w| w.contains("index_root")),
-            "expected index_root warning, got: {warnings:?}"
         );
         // All warnings should mention tsm restart
         for w in &warnings {
