@@ -12,6 +12,7 @@ use the_space_memory::daemon_protocol::{
     read_request, write_response, DaemonRequest, DaemonResponse,
 };
 use the_space_memory::db;
+use the_space_memory::ipc::accept_blocking;
 use the_space_memory::status;
 
 use crate::{backfill, child, Args, SHUTDOWN};
@@ -253,7 +254,7 @@ pub fn run(args: Args) -> Result<()> {
 
     // ─── Accept loop — children are NOT restarted on crash ───────────
     while !SHUTDOWN.load(Ordering::SeqCst) {
-        match listener.accept() {
+        match accept_blocking(&listener) {
             Ok((mut stream, _)) => {
                 let conn = Arc::clone(&conn);
                 let project_root = project_root.clone();
