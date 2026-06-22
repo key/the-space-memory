@@ -562,14 +562,23 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to start tsmd: {e}"))?;
 
-    // Wait for socket to appear (max 30 seconds), but fail fast if the daemon
-    // exits before binding (e.g. uninitialized DB) instead of polling the full
-    // timeout. Its captured stderr is surfaced so the reason is visible.
+    wait_for_daemon_ready(&mut child, &socket_path, &stderr_path, verbose)
+}
+
+/// Wait for the spawned daemon to bind its socket (max 30s), failing fast if it
+/// exits before binding (e.g. uninitialized DB) instead of polling the full
+/// timeout. The captured stderr is surfaced so the reason is visible.
+fn wait_for_daemon_ready(
+    child: &mut std::process::Child,
+    socket_path: &std::path::Path,
+    stderr_path: &std::path::Path,
+    verbose: bool,
+) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(30);
     loop {
         if socket_path.exists() {
-            if let Ok(resp) = daemon_protocol::send_request(&socket_path, &DaemonRequest::Ping) {
+            if let Ok(resp) = daemon_protocol::send_request(socket_path, &DaemonRequest::Ping) {
                 if resp.ok {
                     report_daemon_state(verbose, "tsmd started");
                     return Ok(());
@@ -577,7 +586,7 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
             }
         }
         if let Ok(Some(status)) = child.try_wait() {
-            let detail = read_daemon_failure(&stderr_path);
+            let detail = read_daemon_failure(stderr_path);
             anyhow::bail!("tsmd exited before starting ({status}).{detail}");
         }
         if start.elapsed() > timeout {
