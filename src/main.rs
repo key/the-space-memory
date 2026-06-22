@@ -556,7 +556,11 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
 
     let socket_path = config::daemon_socket_path();
 
-    // Check if already running
+    // If a daemon is already serving this socket, we're done. Do NOT remove a
+    // non-responding socket here: a hung-but-live daemon still holds the startup
+    // lock, and deleting its socket before tsmd's lock check would reintroduce
+    // the silent clobber. tsmd reclaims a genuinely stale socket itself,
+    // gated by the per-project lock.
     if socket_path.exists() {
         if let Ok(resp) = daemon_protocol::send_request(&socket_path, &DaemonRequest::Ping) {
             if resp.ok {
@@ -564,8 +568,6 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
-        // Stale socket — remove it
-        let _ = std::fs::remove_file(&socket_path);
     }
 
     // Find the tsmd binary (same directory as tsm)
@@ -595,11 +597,28 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
     let stderr_file = std::fs::File::create(&stderr_path)
         .map_err(|e| anyhow::anyhow!("Failed to open daemon log {}: {e}", stderr_path.display()))?;
 
+    // Pass the project root explicitly so tsmd chdir()s there and `ps`/`pgrep`
+    // reveal the owning project.
+    //
+    // We pass `canonical(CWD)`, not `config::project_root()`. Today `state_dir`
+    // (and thus the socket path) is resolved CWD-relative — `.tsm/…` — and is
+    // NOT derived from `project_root` (config.rs DEFAULT_STATE_DIR). So the
+    // socket tsm waits on lives under the *CWD*; tsmd must chdir to that same
+    // directory or the two would bind/connect different files. `config::
+    // project_root()` can diverge from CWD via escape hatches (e.g. $TSM_CONFIG
+    // pointing elsewhere), which would break that agreement. In the normal case
+    // (a `tsm.toml` in CWD) `canonical(CWD)` equals the ADR-0009 §2 project root.
+    // Once ADR-0009 makes `state_dir` derive from `project_root`, this converges
+    // on `config::project_root()`.
+    let project_root = std::fs::canonicalize(std::env::current_dir()?)?;
+
     // Spawn tsmd in a new session (detached)
     let mut cmd = std::process::Command::new(&tsmd_path);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(stderr_file));
+        .stderr(std::process::Stdio::from(stderr_file))
+        .arg("--project-root")
+        .arg(&project_root);
     if no_watcher {
         cmd.arg("--no-watcher");
     }
@@ -692,6 +711,36 @@ fn format_daemon_failure(stderr: &str) -> String {
     format!("\n{body}")
 }
 
+/// Read the running daemon's PID from its (diagnostic) PID file, if present.
+fn read_daemon_pid() -> Option<u32> {
+    std::fs::read_to_string(config::daemon_pid_path())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Poll until process `pid` has exited, or `timeout` elapses.
+///
+/// Returns `true` if the process is gone, `false` on timeout. Used so `tsm stop`
+/// does not return until the daemon has actually terminated and released its
+/// startup lock — otherwise `tsm restart` would race the dying daemon and the
+/// new tsmd would bail with "another tsmd already owns this project".
+fn wait_for_pid_exit(pid: u32, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        // kill(pid, 0) sends no signal, only probes existence. Treat the process
+        // as gone ONLY on ESRCH; rc == 0 (alive) or EPERM (alive but not ours)
+        // both mean keep waiting, so a permission quirk can't be misread as exit.
+        let rc = unsafe { libc::kill(pid as i32, 0) };
+        if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Stop the tsmd daemon by sending a Shutdown request.
 fn cmd_stop() -> anyhow::Result<()> {
     let socket_path = config::daemon_socket_path();
@@ -701,9 +750,23 @@ fn cmd_stop() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Capture the PID before shutdown so we can wait for the process to fully
+    // exit below; the daemon removes its PID file during cleanup.
+    let pid = read_daemon_pid();
+
     match daemon_protocol::send_request(&socket_path, &DaemonRequest::Shutdown) {
         Ok(resp) => {
             if resp.ok {
+                // Wait for the daemon to actually exit (releasing its startup
+                // lock) before returning, so `tsm restart` can start a fresh
+                // tsmd without colliding with the still-dying one. The daemon
+                // ACKs Shutdown before tearing down its accept loop and reaping
+                // children, so the process outlives this reply briefly.
+                if let Some(pid) = pid {
+                    if !wait_for_pid_exit(pid, std::time::Duration::from_secs(10)) {
+                        log::warn!("tsmd (pid {pid}) did not exit within 10s of shutdown");
+                    }
+                }
                 println!("tsmd stopped");
             } else {
                 log::warn!("tsmd reported error: {}", resp.error.unwrap_or_default());
@@ -749,5 +812,28 @@ mod tests {
         assert!(out.starts_with("\n  line4"));
         assert!(out.ends_with("  line8"));
         assert!(!out.contains("line3"));
+    }
+
+    #[test]
+    fn test_wait_for_pid_exit_returns_true_for_dead_process() {
+        // Spawn a process that exits immediately, reap it, then confirm the
+        // wait observes it as gone.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true`");
+        let pid = child.id();
+        child.wait().expect("reap child");
+
+        assert!(wait_for_pid_exit(pid, std::time::Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn test_wait_for_pid_exit_times_out_for_live_process() {
+        // Our own process is alive, so the wait must hit the (short) timeout.
+        let me = std::process::id();
+        assert!(!wait_for_pid_exit(
+            me,
+            std::time::Duration::from_millis(100)
+        ));
     }
 }

@@ -3,6 +3,7 @@ pub mod classifier;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod daemon_lock;
 pub mod daemon_protocol;
 pub mod db;
 pub mod doc_links;
