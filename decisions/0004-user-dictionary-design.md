@@ -1,7 +1,11 @@
+---
+status: accepted
+created: 2026-04-01
+updated: 2026-04-14
+---
+
 # ADR-0004: ユーザー辞書の設計方針
 
-- **Status**: **Accepted（2026-04-14 改訂）**
-- **Date**: 2026-04-01（初版） / 2026-04-14（改訂）
 - **Deciders**: key
 - **Related**:
   [Issue #59](https://github.com/key/the-space-memory/issues/59),

@@ -1,7 +1,11 @@
+---
+status: proposed
+created: 2026-05-19
+updated: 2026-05-19
+---
+
 # ADR-0009: プロジェクトとコンテンツ参照モデル
 
-- **Status**: **Proposed**
-- **Date**: 2026-05-19
 - **Deciders**: key
 - **Related**:
   [ADR-0001](./0001-process-roles-and-responsibilities.md),
