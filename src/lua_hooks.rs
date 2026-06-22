@@ -464,6 +464,23 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn test_init_hooks_caches_embedded_when_absent() {
+        // Arrange: temp state_dir with no hooks subdirs (absent, not empty).
+        let tmp = TempDir::new().unwrap();
+        unsafe { std::env::set_var("TSM_STATE_DIR", tmp.path()) };
+        reset_hooks_cache();
+        // Act: init_hooks loads and caches without error.
+        init_hooks().unwrap();
+        let h = hooks();
+        // Assert: at least the embedded defaults in each slot.
+        unsafe { std::env::remove_var("TSM_STATE_DIR") };
+        reset_hooks_cache();
+        assert!(!h.extract.is_empty());
+        assert!(!h.score.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_hooks_lazy_accessor_returns_populated_sources() {
         // Arrange: temp state_dir, no user hooks -> embedded defaults used.
         let tmp = TempDir::new().unwrap();

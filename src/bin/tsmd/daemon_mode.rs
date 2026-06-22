@@ -85,6 +85,11 @@ pub fn run(args: Args) -> Result<()> {
         );
     }
 
+    // Load + validate Lua hooks before serving. Fail-fast on a broken hook
+    // (ADR-0011 philosophy: refuse to start in a broken state).
+    the_space_memory::lua_hooks::init_hooks()
+        .map_err(|e| anyhow::anyhow!("hook load failed: {e}"))?;
+
     // ─── Start embedder child process ────────────────────────────────
     let embedder_pid_path = state_dir.join("embedder.pid");
 
