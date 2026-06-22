@@ -20,6 +20,7 @@
 | [0010](./0010-per-project-daemon.md) | tsmd の per-project identity と socket 競合解決 | Proposed | 2026-05-19 |
 | [0011](./0011-uninitialized-db-failfast-and-readonly-doctor.md) | 未初期化 DB での fail-fast と doctor の read-only 化 | Accepted | 2026-06-22 |
 | [0012](./0012-output-channel-model.md) | 出力チャネルモデル（ユーザー出力 / ログ / エラーの分離） | Accepted | 2026-06-22 |
+| [0013](./0013-lua-metadata-scoring-hooks.md) | メタデータ抽出とスコアリングを Lua フックで拡張可能にする | Proposed | 2026-06-22 |
 
 新規 ADR 追加時は上記表にも 1 行追加すること。
 
@@ -105,11 +106,12 @@ PR でのマージは原則 `Proposed` のまま行い、合意形成完了後�
 ### Negative
 
 - 受け入れるトレードオフ
-
-### Follow-ups
-
-- 別途扱う関連事項（実装 PR の分割案、後続 ADR の予告など）
 ```
+
+ADR は target state を定義するものであり、タスクリストではない。
+実装 PR の分割案・後続 ADR の予告・運用 TODO のような**時間とともに変化し
+陳腐化する内容は ADR に書かない**（`### Follow-ups` のような節は設けない）。
+これらは PR 説明文・issue・`CHANGELOG.md` 側に置く。
 
 ### 言語
 
