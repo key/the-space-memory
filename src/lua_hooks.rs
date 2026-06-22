@@ -230,6 +230,90 @@ fn run_one_extract(
     Ok(())
 }
 
+/// Register builtins available to score hooks:
+/// - `decay(date, half_life_days)` → f64 multiplier
+/// - `today()` → `%Y-%m-%d` date string (UTC)
+fn register_score_builtins(lua: &Lua) -> anyhow::Result<()> {
+    let decay_fn = lua.create_function(|_, (date, half_life): (Option<String>, f64)| {
+        Ok(crate::searcher::decay_with_half_life(
+            date.as_deref(),
+            half_life,
+        ))
+    })?;
+    lua.globals().set("decay", decay_fn)?;
+    let today_fn = lua.create_function(|_, ()| Ok(crate::searcher::today_string()))?;
+    lua.globals().set("today", today_fn)?;
+    Ok(())
+}
+
+fn run_one_score(
+    script: &HookScript,
+    metadata_json: Option<&str>,
+    rrf: f64,
+    source_type: &str,
+    path: &str,
+    half_life_days: f64,
+) -> anyhow::Result<f64> {
+    let lua = new_sandboxed_lua()?;
+    register_score_builtins(&lua)?;
+    lua.load(&script.source).exec()?;
+    let ctx = lua.create_table()?;
+    let meta = lua.create_table()?;
+    if let Some(json) = metadata_json {
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(json) {
+            for (k, v) in map {
+                match v {
+                    Value::String(s) => meta.set(k, s)?,
+                    Value::Number(n) => {
+                        if let Some(f) = n.as_f64() {
+                            meta.set(k, f)?;
+                        }
+                    }
+                    Value::Bool(b) => meta.set(k, b)?,
+                    _ => {}
+                }
+            }
+        }
+    }
+    ctx.set("metadata", meta)?;
+    ctx.set("rrf", rrf)?;
+    ctx.set("source_type", source_type)?;
+    ctx.set("path", path)?;
+    ctx.set("half_life_days", half_life_days)?;
+    let f: mlua::Function = lua.globals().get("score")?;
+    Ok(f.call(ctx)?)
+}
+
+/// Run the score chain; returns the product of each hook's multiplier.
+///
+/// Per hook: if it errors, returns a non-number, NaN, ±Inf, or negative value,
+/// that hook contributes `1.0` and a warning is logged. Never returns `Err`.
+pub fn run_score(
+    sources: &HookSources,
+    metadata_json: Option<&str>,
+    rrf: f64,
+    source_type: &str,
+    path: &str,
+    half_life_days: f64,
+) -> f64 {
+    let mut product = 1.0_f64;
+    for script in &sources.score {
+        match run_one_score(
+            script,
+            metadata_json,
+            rrf,
+            source_type,
+            path,
+            half_life_days,
+        ) {
+            Ok(v) if v.is_finite() && v >= 0.0 => product *= v,
+            Ok(v) => log::warn!("score hook {} returned invalid {v}; using 1.0", script.name),
+            Err(e) => log::warn!("score hook {} failed: {e}; using 1.0", script.name),
+        }
+    }
+    product
+}
+
 /// Test/reset helper for the process-wide cache.
 #[cfg(test)]
 pub fn reset_hooks_cache() {
@@ -507,6 +591,70 @@ mod tests {
         };
         let v = run_extract(&s, "a.md", "body", &Frontmatter::default());
         assert_eq!(v["a"], serde_json::json!(1)); // first script's contribution kept
+    }
+
+    // ── run_score tests (Task 5) ────────────────────────────────────────────
+
+    #[test]
+    fn test_run_score_default_reproduces_penalty_and_decay() {
+        let s = sources_from(DEFAULT_EXTRACT_HOOK, DEFAULT_SCORE_HOOK);
+        // outdated penalty=0.4; effective_date today -> decay≈1.0; half_life 90.
+        let today = crate::searcher::today_string();
+        let meta = format!("{{\"status\":\"outdated\",\"effective_date\":\"{today}\"}}");
+        let got = run_score(&s, Some(&meta), 1.0, "note", "a.md", 90.0);
+        assert!((got - 0.4).abs() < 0.05, "got {got}");
+    }
+
+    #[test]
+    fn test_run_score_invalid_return_is_neutral() {
+        let s = sources_from(
+            "function extract(c) return {} end",
+            "function score(c) return -5 end",
+        );
+        let got = run_score(&s, Some("{}"), 1.0, "note", "a.md", 90.0);
+        assert_eq!(got, 1.0); // negative -> neutral
+    }
+
+    #[test]
+    fn test_run_score_chain_is_product() {
+        let s = HookSources {
+            extract: vec![HookScript {
+                name: "e".into(),
+                source: "function extract(c) return {} end".into(),
+            }],
+            score: vec![
+                HookScript {
+                    name: "10".into(),
+                    source: "function score(c) return 0.5 end".into(),
+                },
+                HookScript {
+                    name: "20".into(),
+                    source: "function score(c) return 0.5 end".into(),
+                },
+            ],
+        };
+        let got = run_score(&s, Some("{}"), 1.0, "note", "a.md", 90.0);
+        assert_eq!(got, 0.25);
+    }
+
+    #[test]
+    fn test_run_score_today_builtin_returns_date_string() {
+        let s = sources_from(
+            "function extract(c) return {} end",
+            r#"function score(c) local t = today(); if type(t) == "string" and #t == 10 then return 1.0 else return 0.0 end end"#,
+        );
+        let got = run_score(&s, Some("{}"), 1.0, "note", "a.md", 90.0);
+        assert_eq!(got, 1.0, "today() should return a 10-char date string");
+    }
+
+    #[test]
+    fn test_run_score_error_is_neutral() {
+        let s = sources_from(
+            "function extract(c) return {} end",
+            "function score(c) error('boom') end",
+        );
+        let got = run_score(&s, Some("{}"), 1.0, "note", "a.md", 90.0);
+        assert_eq!(got, 1.0); // error -> neutral 1.0
     }
 
     #[test]
