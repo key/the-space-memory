@@ -279,6 +279,16 @@ pub(crate) fn time_decay(updated: Option<&str>, file_path: &str, source_type: &s
     let now = Utc::now();
     let days = (now - updated_dt).num_days().max(0) as f64;
     let half_life = config::half_life_days(file_path, source_type);
+    decay_factor(days, half_life)
+}
+
+/// Exponential time decay `0.5^(days / half_life)`. A `half_life` of 0 is the
+/// "timeless" sentinel: decay is disabled and full score (1.0) is returned
+/// regardless of age, avoiding the `days / 0` blow-up to 0 or NaN.
+fn decay_factor(days: f64, half_life: f64) -> f64 {
+    if half_life == 0.0 {
+        return 1.0;
+    }
     0.5_f64.powf(days / half_life)
 }
 
@@ -454,6 +464,18 @@ mod tests {
         let session_decay = time_decay(Some(date), "session:abc", "session");
         let note_decay = time_decay(Some(date), "daily/notes/test.md", "note");
         assert!(session_decay < note_decay);
+    }
+
+    #[test]
+    fn test_decay_factor_zero_half_life_disables_decay() {
+        // half_life == 0 is the "timeless" sentinel: full score regardless of age.
+        assert_eq!(decay_factor(0.0, 0.0), 1.0);
+        assert_eq!(decay_factor(10_000.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn test_decay_factor_halves_at_one_half_life() {
+        assert_eq!(decay_factor(90.0, 90.0), 0.5);
     }
 
     #[test]

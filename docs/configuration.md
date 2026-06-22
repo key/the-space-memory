@@ -101,7 +101,8 @@ path = "notes"
 # Default: 1.0
 weight = 1.2
 # Time-decay half-life in days for documents in this directory.
-# Non-finite or <= 0 values trigger a warning and fall back to 90.0.
+# 0 disables time decay (documents are treated as timeless).
+# Negative or non-finite values trigger a warning and fall back to 90.0.
 # Default: 90.0
 half_life_days = 120.0
 
@@ -121,6 +122,7 @@ half_life_days = 90.0
 # Default: 0.3
 weight = 0.3
 # Time-decay half-life in days for Claude Code session data.
+# 0 disables time decay; negative or non-finite values fall back to the default.
 # Default: 30.0
 half_life_days = 30.0
 ```
