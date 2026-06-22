@@ -1,7 +1,11 @@
+---
+status: accepted
+created: 2026-04-08
+updated: 2026-04-08
+---
+
 # ADR-0006: CLI オプション設計の判断基準
 
-- **Status**: **Accepted（確定）**
-- **Date**: 2026-04-08
 - **Deciders**: key
 - **Related**:
   [Issue #114](https://github.com/key/the-space-memory/issues/114)

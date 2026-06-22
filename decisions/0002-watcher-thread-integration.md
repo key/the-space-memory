@@ -1,7 +1,11 @@
+---
+status: accepted
+created: 2026-04-01
+updated: 2026-04-01
+---
+
 # ADR-0002: プロセスの役割と責務分担（watcher スレッド化）
 
-- **Status**: **Accepted（確定）**
-- **Date**: 2026-04-01
 - **Deciders**: key
 - **Supersedes**: [ADR-0001](./0001-process-roles-and-responsibilities.md)
 - **Related**:

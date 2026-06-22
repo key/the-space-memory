@@ -1,7 +1,11 @@
+---
+status: accepted
+created: 2026-04-01
+updated: 2026-04-01
+---
+
 # ADR-0003: 設定値は ResolvedConfig シングルトンで管理する
 
-- **Status**: **Accepted（確定）**
-- **Date**: 2026-04-01
 - **Deciders**: key
 - **Related**:
   [Issue #60](https://github.com/key/the-space-memory/issues/60)

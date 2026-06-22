@@ -1,7 +1,11 @@
+---
+status: accepted
+created: 2026-04-07
+updated: 2026-04-07
+---
+
 # ADR-0005: tsm-embedder 統合と 2 バイナリ構成
 
-- **Status**: **Accepted（確定）**
-- **Date**: 2026-04-07
 - **Deciders**: key
 - **Supersedes**: [ADR-0002](./0002-watcher-thread-integration.md)（watcher 部分のみ）
 - **Related**:

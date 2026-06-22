@@ -64,8 +64,8 @@ ADR は **target state（到達したい状態）** の定義に専念する。
 | `Superseded by ADR-NNNN` | 部分的に上書きされた場合 |
 
 ドラフト中の PR は `Proposed`。**マージするときは Status を `Accepted` に変更する**
-（マージ＝決定確定）。マージ前の最終コミットで本文 Status と上記索引行を
-`Accepted` に更新し、Date に `/ YYYY-MM-DD (Accepted)` を追記する。
+（マージ＝決定確定）。マージ前の最終コミットで frontmatter の `status` と `updated` を
+更新し、上記索引行の Status 列も `Accepted` に合わせる。
 
 ### 番号付け
 
@@ -78,10 +78,15 @@ ADR は **target state（到達したい状態）** の定義に専念する。
 各 ADR は以下のセクションを持つ:
 
 ```markdown
+---
+status: proposed | accepted | deprecated
+created: YYYY-MM-DD
+updated: YYYY-MM-DD
+superseded_by: NNNN-filename.md   # deprecated の場合のみ
+---
+
 # ADR-NNNN: タイトル
 
-- **Status**: **Proposed | Accepted | Deprecated**
-- **Date**: YYYY-MM-DD (Proposed) [/ YYYY-MM-DD (Accepted)]
 - **Deciders**: 名前
 - **Related**: 関連 ADR や Issue へのリンク
 

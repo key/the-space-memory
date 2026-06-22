@@ -1,7 +1,11 @@
+---
+status: accepted
+created: 2026-06-22
+updated: 2026-06-22
+---
+
 # ADR-0011: 未初期化 DB での fail-fast と doctor の read-only 化（auto-start 境界の整理）
 
-- **Status**: Accepted
-- **Date**: 2026-06-22 (Proposed) / 2026-06-22 (Accepted)
 - **Deciders**: key
 - **Related**:
   [ADR-0001](./0001-process-roles-and-responsibilities.md),

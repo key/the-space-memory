@@ -1,7 +1,11 @@
+---
+status: accepted
+created: 2026-05-19
+updated: 2026-06-22
+---
+
 # ADR-0010: tsmd の per-project identity と socket 競合解決
 
-- **Status**: **Accepted**
-- **Date**: 2026-05-19 (Proposed) / 2026-06-22 (Accepted)
 - **Deciders**: key
 - **Related**:
   [ADR-0001](./0001-process-roles-and-responsibilities.md),
