@@ -513,7 +513,11 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
 
     let socket_path = config::daemon_socket_path();
 
-    // Check if already running
+    // If a daemon is already serving this socket, we're done. Do NOT remove a
+    // non-responding socket here: a hung-but-live daemon still holds the startup
+    // lock, and deleting its socket before tsmd's lock check would reintroduce
+    // the silent clobber (#200). tsmd reclaims a genuinely stale socket itself,
+    // gated by the per-project lock. (ADR-0010)
     if socket_path.exists() {
         if let Ok(resp) = daemon_protocol::send_request(&socket_path, &DaemonRequest::Ping) {
             if resp.ok {
@@ -521,8 +525,6 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
-        // Stale socket — remove it
-        let _ = std::fs::remove_file(&socket_path);
     }
 
     // Find the tsmd binary (same directory as tsm)
@@ -552,11 +554,28 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
     let stderr_file = std::fs::File::create(&stderr_path)
         .map_err(|e| anyhow::anyhow!("Failed to open daemon log {}: {e}", stderr_path.display()))?;
 
+    // Pass the project root explicitly so tsmd chdir()s there and `ps`/`pgrep`
+    // reveal the owning project (ADR-0010).
+    //
+    // We pass `canonical(CWD)`, not `config::project_root()`. Today `state_dir`
+    // (and thus the socket path) is resolved CWD-relative — `.tsm/…` — and is
+    // NOT derived from `project_root` (config.rs DEFAULT_STATE_DIR). So the
+    // socket tsm waits on lives under the *CWD*; tsmd must chdir to that same
+    // directory or the two would bind/connect different files. `config::
+    // project_root()` can diverge from CWD via escape hatches (e.g. $TSM_CONFIG
+    // pointing elsewhere), which would break that agreement. In the normal case
+    // (a `tsm.toml` in CWD) `canonical(CWD)` equals the ADR-0009 §2 project root.
+    // Once ADR-0009 makes `state_dir` derive from `project_root`, this converges
+    // on `config::project_root()`.
+    let project_root = std::fs::canonicalize(std::env::current_dir()?)?;
+
     // Spawn tsmd in a new session (detached)
     let mut cmd = std::process::Command::new(&tsmd_path);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(stderr_file));
+        .stderr(std::process::Stdio::from(stderr_file))
+        .arg("--project-root")
+        .arg(&project_root);
     if no_watcher {
         cmd.arg("--no-watcher");
     }

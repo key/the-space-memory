@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 
 use the_space_memory::config;
 use the_space_memory::daemon;
+use the_space_memory::daemon_lock;
 use the_space_memory::daemon_protocol::{
     read_request, write_response, DaemonRequest, DaemonResponse,
 };
@@ -40,7 +41,27 @@ pub fn run(args: Args) -> Result<()> {
 
     let conn = Arc::new(Mutex::new(conn));
 
-    // Clean up stale socket
+    // Acquire the per-project startup lock BEFORE touching the socket, and hold
+    // it for the daemon's whole lifetime. The lock — not the PID file — is the
+    // sole ownership oracle: acquiring it proves no other live daemon owns this
+    // project, so any leftover socket is stale and safe to reclaim; failing to
+    // acquire it means a live daemon (possibly hung) owns the socket and we must
+    // not steal it. This serializes concurrent `tsm start` on one atomic gate
+    // and closes the silent socket clobber (#200). (ADR-0010)
+    let lock_path = config::state_dir().join("tsmd.lock");
+    let _startup_lock = match daemon_lock::try_acquire(&lock_path)
+        .context(format!("Failed to open lock file {}", lock_path.display()))?
+    {
+        daemon_lock::LockOutcome::Acquired(guard) => guard,
+        daemon_lock::LockOutcome::Held => {
+            anyhow::bail!(
+                "another tsmd already owns this project ({}). Run `tsm stop` first.",
+                config::project_root().display()
+            );
+        }
+    };
+
+    // We hold the lock, so no live daemon exists: a leftover socket is stale.
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
     }
