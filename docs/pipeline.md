@@ -67,9 +67,11 @@ regression it prevents.
 3. **Tokenizer consistency** — Prepare and Plan reference the same tokenizer
    implementation; replacing it requires a re-index. *(Breaking it makes
    query tokens diverge from indexed tokens, silently losing recall.)*
-4. **Embed serial contract** — the embedder is invoked only from the Embed
-   stage; no other stage or plugin calls it directly. *(Breaking it violates
-   the embedder's single-threaded accept contract.)*
+4. **Embed serial contract** — the embedder runs as a single serial process.
+   In the Index pipeline only the Embed stage calls it; in the Search
+   pipeline only the Plan stage calls it, to vectorize the query. No other
+   stage or plugin invokes inference directly or in parallel. *(Breaking it
+   violates the embedder's single-threaded accept contract.)*
 
 ## Hook insertion points
 
@@ -91,20 +93,14 @@ in the separate hook API specification.
 
 ## Failure behavior
 
-Hook failures fall back through a per-kind hierarchy and never halt the
-pipeline:
-
-```text
-user plugin → default plugin (per kind) → Rust built-in fallback
-```
-
-On error, the plugin name, file path, and error are logged and processing
-continues; indexing and search as a whole do not stop.
-
 **Visibility is fail-closed.** A visibility plugin that fails withholds the
 affected results rather than passing them through; fail-open is prohibited.
 `.tsmignore` is applied at a gate *before* Prepare, so excluded files never
 enter the DB in the first place.
+
+The per-hook error model — how a failing hook falls back and what context is
+logged — is part of the hook contract and is specified in the separate hook
+API specification, not here.
 
 ## Related
 
