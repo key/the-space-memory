@@ -5,8 +5,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use mlua::{Lua, LuaOptions, StdLib};
+use serde_json::{Map, Value};
 
 use crate::config;
+use crate::frontmatter::Frontmatter;
 
 /// Per-VM memory ceiling for hook execution (bytes). Sandboxing: no stdlib
 /// (`io`/`os`/`package` absent) so hooks cannot touch FS/process/network.
@@ -135,6 +137,90 @@ pub fn hooks() -> Arc<HookSources> {
     let arc = Arc::new(sources);
     *guard = Some(Arc::clone(&arc));
     arc
+}
+
+/// Build the `ctx.frontmatter` table from the parsed Frontmatter (full mapping).
+fn frontmatter_table(lua: &Lua, fm: &Frontmatter) -> anyhow::Result<mlua::Table> {
+    let t = lua.create_table()?;
+    if let Some(s) = &fm.status {
+        t.set("status", s.clone())?;
+    }
+    if let Some(s) = &fm.created {
+        t.set("created", s.clone())?;
+    }
+    if let Some(s) = &fm.updated {
+        t.set("updated", s.clone())?;
+    }
+    if let Some(s) = &fm.superseded_by {
+        t.set("superseded_by", s.clone())?;
+    }
+    let tags = lua.create_table()?;
+    for (i, tag) in fm.tags.iter().enumerate() {
+        tags.set(i + 1, tag.clone())?;
+    }
+    t.set("tags", tags)?;
+    Ok(t)
+}
+
+/// Convert a Lua table of scalars into JSON object entries (present keys only).
+fn lua_table_to_json(t: &mlua::Table, out: &mut Map<String, Value>) {
+    for pair in t.pairs::<String, mlua::Value>() {
+        let Ok((k, v)) = pair else {
+            continue;
+        };
+        let jv = match v {
+            mlua::Value::String(s) => Value::String(s.to_string_lossy().to_string()),
+            mlua::Value::Integer(i) => Value::from(i),
+            mlua::Value::Number(n) => Value::from(n),
+            mlua::Value::Boolean(b) => Value::from(b),
+            mlua::Value::Nil => continue,
+            _ => continue, // non-scalar: skip (ADR: scalar map only)
+        };
+        out.insert(k, jv);
+    }
+}
+
+/// Run the extract chain; shallow-merge present keys (last-wins). Per-script
+/// runtime errors are logged and skipped (fail-safe).
+pub fn run_extract(sources: &HookSources, path: &str, body: &str, fm: &Frontmatter) -> Value {
+    let mut acc: Map<String, Value> = Map::new();
+    for script in &sources.extract {
+        if let Err(e) = run_one_extract(script, path, body, fm, &mut acc) {
+            log::warn!("extract hook {} failed: {e}", script.name);
+        }
+    }
+    Value::Object(acc)
+}
+
+fn run_one_extract(
+    script: &HookScript,
+    path: &str,
+    body: &str,
+    fm: &Frontmatter,
+    acc: &mut Map<String, Value>,
+) -> anyhow::Result<()> {
+    let lua = new_sandboxed_lua()?;
+    lua.load(&script.source).exec()?;
+    let ctx = lua.create_table()?;
+    ctx.set("path", path)?;
+    ctx.set("body", body)?;
+    ctx.set("frontmatter", frontmatter_table(&lua, fm)?)?;
+    // Accumulated metadata so far, for earlier-wins/conditional policies.
+    let meta = lua.create_table()?;
+    for (k, v) in acc.iter() {
+        if let Value::String(s) = v {
+            meta.set(k.clone(), s.clone())?;
+        } else if let Value::Number(n) = v {
+            if let Some(f) = n.as_f64() {
+                meta.set(k.clone(), f)?;
+            }
+        }
+    }
+    ctx.set("metadata", meta)?;
+    let f: mlua::Function = lua.globals().get("extract")?;
+    let ret: mlua::Table = f.call(ctx)?;
+    lua_table_to_json(&ret, acc);
+    Ok(())
 }
 
 /// Test/reset helper for the process-wide cache.
@@ -339,5 +425,80 @@ mod tests {
         unsafe { std::env::remove_var("TSM_STATE_DIR") };
         reset_hooks_cache();
         assert!(!h.extract.is_empty());
+    }
+
+    // ── run_extract tests (Task 4) ──────────────────────────────────────────
+
+    use crate::frontmatter::Frontmatter;
+
+    fn sources_from(extract_src: &str, score_src: &str) -> HookSources {
+        HookSources {
+            extract: vec![HookScript {
+                name: "t".into(),
+                source: extract_src.into(),
+            }],
+            score: vec![HookScript {
+                name: "t".into(),
+                source: score_src.into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_run_extract_default_maps_frontmatter() {
+        let s = sources_from(DEFAULT_EXTRACT_HOOK, "function score(c) return 1 end");
+        let fm = Frontmatter {
+            status: Some("current".into()),
+            updated: Some("2026-03-01".into()),
+            ..Default::default()
+        };
+        let v = run_extract(&s, "a.md", "body", &fm);
+        assert_eq!(v["status"], serde_json::json!("current"));
+        assert_eq!(v["effective_date"], serde_json::json!("2026-03-01"));
+    }
+
+    #[test]
+    fn test_run_extract_chain_last_wins_present_keys() {
+        let s = HookSources {
+            extract: vec![
+                HookScript {
+                    name: "10".into(),
+                    source: "function extract(c) return { status='a', kept='x' } end".into(),
+                },
+                HookScript {
+                    name: "20".into(),
+                    source: "function extract(c) return { status='b' } end".into(),
+                },
+            ],
+            score: vec![HookScript {
+                name: "s".into(),
+                source: "function score(c) return 1 end".into(),
+            }],
+        };
+        let v = run_extract(&s, "a.md", "body", &Frontmatter::default());
+        assert_eq!(v["status"], serde_json::json!("b")); // last-wins
+        assert_eq!(v["kept"], serde_json::json!("x")); // present-key from earlier survives
+    }
+
+    #[test]
+    fn test_run_extract_runtime_error_is_swallowed() {
+        let s = HookSources {
+            extract: vec![
+                HookScript {
+                    name: "ok".into(),
+                    source: "function extract(c) return { a=1 } end".into(),
+                },
+                HookScript {
+                    name: "boom".into(),
+                    source: "function extract(c) error('boom') end".into(),
+                },
+            ],
+            score: vec![HookScript {
+                name: "s".into(),
+                source: "function score(c) return 1 end".into(),
+            }],
+        };
+        let v = run_extract(&s, "a.md", "body", &Frontmatter::default());
+        assert_eq!(v["a"], serde_json::json!(1)); // first script's contribution kept
     }
 }
