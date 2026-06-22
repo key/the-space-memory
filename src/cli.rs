@@ -10,7 +10,7 @@ use crate::synonyms;
 use crate::user_dict;
 
 /// Default `.tsmignore` shipped by `tsm init`. Patterns are
-/// `.gitignore`-syntax and resolve relative to `index_root`.
+/// `.gitignore`-syntax and resolve relative to `project_root`.
 ///
 /// Hidden directories (`.*/`) and common build/dependency directories are
 /// excluded by default — the historical "fallback hidden-dir pattern"
@@ -210,25 +210,25 @@ fn install_default_tsmignore(project_root: &Path) -> anyhow::Result<()> {
 pub fn run_index(
     conn: &rusqlite::Connection,
     file_paths: &[PathBuf],
-    index_root: &Path,
+    project_root: &Path,
     policy: &dyn indexer::IngestPolicy,
 ) -> anyhow::Result<indexer::IndexStats> {
-    indexer::index_all(conn, file_paths, index_root, policy)
+    indexer::index_all(conn, file_paths, project_root, policy)
 }
 
 pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
-    let index_root = config::index_root();
+    let project_root = config::project_root();
 
     let walker = indexer::ContentWalker::from_env();
     let file_paths: Vec<PathBuf> = if files_from_stdin {
-        read_paths_from_stdin(&index_root)
+        read_paths_from_stdin(&project_root)
     } else {
         walker.collect_files()
     };
 
-    let stats = run_index(&conn, &file_paths, &index_root, &walker)?;
+    let stats = run_index(&conn, &file_paths, &project_root, &walker)?;
     println!(
         "Indexed: {}, Skipped: {}, Removed: {}",
         stats.indexed, stats.skipped, stats.removed
@@ -236,11 +236,11 @@ pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read one-path-per-line from stdin and resolve each against `index_root`.
+/// Read one-path-per-line from stdin and resolve each against `project_root`.
 /// No ignore/extension filtering is performed here — the indexer applies
 /// the policy gate itself, so duplicating the check here would add code
 /// surface with no behavioral benefit.
-pub fn read_paths_from_stdin(index_root: &Path) -> Vec<PathBuf> {
+pub fn read_paths_from_stdin(project_root: &Path) -> Vec<PathBuf> {
     // `filter_map` (not `map_while`) so a transient stdin I/O error on one
     // line is logged and skipped rather than silently truncating the rest of
     // the input — matters when a post-save hook pipes many paths.
@@ -255,7 +255,7 @@ pub fn read_paths_from_stdin(index_root: &Path) -> Vec<PathBuf> {
             }
         })
         .filter(|line| !line.trim().is_empty())
-        .map(|line| index_root.join(line.trim()))
+        .map(|line| project_root.join(line.trim()))
         .collect()
 }
 
@@ -367,7 +367,7 @@ pub fn format_json(
     results: &[searcher::SearchResult],
     total_hits: usize,
     include_content: Option<usize>,
-    index_root: &Path,
+    project_root: &Path,
 ) -> anyhow::Result<String> {
     let mut json_results: Vec<serde_json::Value> = Vec::new();
 
@@ -396,7 +396,7 @@ pub fn format_json(
 
         if let Some(n) = include_content {
             if i < n {
-                let full_path = index_root.join(&r.source_file);
+                let full_path = project_root.join(&r.source_file);
                 if let Ok(content) = std::fs::read_to_string(&full_path) {
                     obj["content"] = serde_json::Value::String(content);
                 }
@@ -419,10 +419,10 @@ fn print_json(
     total_hits: usize,
     include_content: Option<usize>,
 ) -> anyhow::Result<()> {
-    let index_root = config::index_root();
+    let project_root = config::project_root();
     println!(
         "{}",
-        format_json(results, total_hits, include_content, &index_root)?
+        format_json(results, total_hits, include_content, &project_root)?
     );
     Ok(())
 }
@@ -1470,7 +1470,7 @@ fn spawn_background_backfill() {
 
 pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
-    let index_root = config::index_root();
+    let project_root = config::project_root();
     let socket = config::embedder_socket_path();
 
     if !apply {
@@ -1521,19 +1521,19 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
 
     // Full index (synchronous, with progress)
     let conn = db::get_connection(&db_path)?;
-    let walker = indexer::ContentWalker::from_env_with_index_root(&index_root);
+    let walker = indexer::ContentWalker::from_env_with_project_root(&project_root);
     let file_paths = walker.collect_files();
     let total = file_paths.len();
     println!("Indexing {total} files...");
 
     let progress = |current: usize, total: usize, path: &Path| {
-        let rel = path.strip_prefix(&index_root).unwrap_or(path).display();
+        let rel = path.strip_prefix(&project_root).unwrap_or(path).display();
         log::debug!("  [{current}/{total}] {rel}");
     };
     let stats = indexer::index_all_with_progress(
         &conn,
         &file_paths,
-        &index_root,
+        &project_root,
         &walker,
         Some(&progress),
     )?;
@@ -1689,8 +1689,8 @@ mod tests {
     }
 
     // Walker behavior is covered by indexer::walker::tests. In this module
-    // `cmd_rebuild` constructs ContentWalker via from_env_with_index_root
-    // (explicit index_root override); other commands use from_env().
+    // `cmd_rebuild` constructs ContentWalker via from_env_with_project_root
+    // (explicit project_root override); other commands use from_env().
 
     #[test]
     fn install_default_tsmignore_writes_when_absent() {

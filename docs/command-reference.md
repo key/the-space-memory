@@ -49,7 +49,7 @@ Performs the following per-workspace setup steps. Every file write uses
 overwritten:
 
 1. Creates the SQLite database at `$TSM_DB_PATH`
-   (default: `$TSM_INDEX_ROOT/.tsm/tsm.db`).
+   (default: `{state_dir}/tsm.db`).
 2. Writes default scaffold files when missing:
    - `.tsmignore` (project root) — `.gitignore`-style ignore patterns
    - `tsm.toml` (project root) — fully commented configuration template
@@ -67,7 +67,6 @@ overwritten:
 **Example:**
 
 ```bash
-export TSM_INDEX_ROOT=~/my-notes
 tsm setup       # one-time: fetch ruri model + WordNet DB
 tsm init        # per-workspace: schema, scaffold, synonym import
 ```
@@ -287,10 +286,10 @@ tsm index [--files-from-stdin]
 
 Without `--files-from-stdin`, scans directories configured in `tsm.toml`
 (`content_dirs`). If `content_dirs` is not configured, auto-discovers
-non-hidden subdirectories under `TSM_INDEX_ROOT`.
+non-hidden subdirectories under the project root.
 
 With `--files-from-stdin`, reads file paths (one per line) from stdin.
-Each path is resolved relative to `TSM_INDEX_ROOT`.
+Each path is resolved relative to the project root.
 
 Index updates are incremental: only changed chunks are re-indexed.
 
@@ -785,7 +784,7 @@ Fields:
 |---|---|
 | Result number | Sequential index starting at 1 |
 | `[source_type]` | `markdown` for `.md` files, `session` for JSONL sessions |
-| File path | Relative path from `TSM_INDEX_ROOT` |
+| File path | Relative path from the project root |
 | Section path | Heading path or Q&A label |
 | Score | RRF-fused relevance score |
 | Snippet | Relevant excerpt |

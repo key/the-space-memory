@@ -49,13 +49,11 @@ cargo build --release
 #    マシン共有のためセットアップは 1 回だけでよい。
 tsm setup
 
-# 3. ドキュメントのルートディレクトリを設定
-export TSM_INDEX_ROOT=~/my-notes
-
-# 4. ワークスペース初期化：DB スキーマ、デフォルト設定ファイル
+# 3. ノートのディレクトリでワークスペース初期化：DB スキーマ、デフォルト設定ファイル
 #    （tsm.toml、.tsmignore、.tsm/{user_dict.simpledic,custom_terms.toml,
 #    synonyms.csv}）の配置、WordNet/シノニムのインポートまで実施。
 #    冪等で、ユーザがカスタマイズしたファイルは絶対に上書きしない。
+cd ~/my-notes
 tsm init
 
 # 5. デーモンの起動（embedder + ファイル監視）
@@ -73,11 +71,11 @@ tsm search -q "クエリ" -k 5
 
 ### インデックス対象
 
-tsmは `TSM_INDEX_ROOT` 配下の `.md` ファイルを再帰的にスキャンする。
+tsmはプロジェクトルート（`tsm.toml` があるディレクトリ）配下の `.md` ファイルを再帰的にスキャンする。
 典型的なディレクトリ構成：
 
 ```text
-~/my-notes/              ← TSM_INDEX_ROOT
+~/my-notes/              ← プロジェクトルート（tsm.toml を含む）
 ├── projects/
 │   ├── project-a.md
 │   └── project-b.md
@@ -87,7 +85,7 @@ tsmは `TSM_INDEX_ROOT` 配下の `.md` ファイルを再帰的にスキャン�
     └── 2026-04.md
 ```
 
-`TSM_INDEX_ROOT` 配下のすべてのMarkdownファイルが自動的にインデックスされる。
+プロジェクトルート配下のすべてのMarkdownファイルが自動的にインデックスされる。
 ファイル監視により、追加・変更・削除をリアルタイムに検知する。
 
 ### メンテナンス
@@ -115,7 +113,6 @@ tsm rebuild --apply   # DB削除して再構築
 | `TSM_CONFIG` | _(自動探索)_ | _(なし)_ | 設定ファイルのパス。それが置かれているディレクトリがプロジェクトルートになる |
 | `TSM_STATE_DIR` | `.tsm` | `state_dir` | tsm の状態一式（DB・ソケット・PID・ログ・ユーザー辞書）のルートディレクトリ |
 | `TSM_CACHE_DIR` | `$XDG_CACHE_HOME/tsm`（無ければ `$HOME/.cache/tsm`） | `cache_dir` | モデルと WordNet DB のキャッシュディレクトリ |
-| `TSM_INDEX_ROOT` | `/workspaces` | `index_root` | インデックス対象を含むルートディレクトリ |
 | `TSM_EMBEDDER_SOCKET` | `{state_dir}/embedder.sock` | `embedder_socket_path` | embedder 子プロセスの UNIX ソケット |
 | `TSM_DAEMON_SOCKET` | `{state_dir}/daemon.sock` | `daemon_socket_path` | `tsmd` デーモンの UNIX ソケット |
 | `TSM_LOG_DIR` | `{state_dir}/logs` | `log_dir` | デーモンログの出力ディレクトリ |
@@ -141,7 +138,7 @@ tsm rebuild --apply   # DB削除して再構築
 - 標準の testdata コーパスがインデックス済み:
 
   ```bash
-  export TSM_INDEX_ROOT=$(pwd)/tests/e2e/testdata
+  cd tests/e2e/testdata
   tsm init && tsm index
   ```
 

@@ -14,7 +14,7 @@ use crate::indexer::IngestPolicy;
 pub fn handle_request(
     conn: &Connection,
     req: DaemonRequest,
-    index_root: &Path,
+    project_root: &Path,
     shutdown_flag: &AtomicBool,
 ) -> DaemonResponse {
     match req {
@@ -55,7 +55,7 @@ pub fn handle_request(
                         &output.results,
                         output.total_hits,
                         include_content,
-                        index_root,
+                        project_root,
                     );
                     match json_str {
                         Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
@@ -75,7 +75,7 @@ pub fn handle_request(
             // No explicit filter loop here — the indexer's entry point
             // enforces the policy for both the full-walk and
             // caller-supplied-paths cases.
-            let walker = crate::indexer::ContentWalker::from_env_with_index_root(index_root);
+            let walker = crate::indexer::ContentWalker::from_env_with_project_root(project_root);
             let file_paths: Vec<PathBuf> = if files.is_empty() {
                 walker.collect_files()
             } else {
@@ -87,7 +87,7 @@ pub fn handle_request(
                 // over stdin or through the fs-watcher. Surfacing at warn
                 // here preserves the observability that the pre-refactor
                 // call sites provided.
-                let joined: Vec<PathBuf> = files.iter().map(|f| index_root.join(f)).collect();
+                let joined: Vec<PathBuf> = files.iter().map(|f| project_root.join(f)).collect();
                 for p in &joined {
                     if !walker.accepts(p) {
                         log::warn!(
@@ -98,7 +98,7 @@ pub fn handle_request(
                 }
                 joined
             };
-            match cli::run_index(conn, &file_paths, index_root, &walker) {
+            match cli::run_index(conn, &file_paths, project_root, &walker) {
                 Ok(stats) => DaemonResponse::success(serde_json::json!({
                     "indexed": stats.indexed,
                     "skipped": stats.skipped,

@@ -1,2 +1,3 @@
 [global]
 line_length = 120
+exclude = ["tsm.toml.example"]

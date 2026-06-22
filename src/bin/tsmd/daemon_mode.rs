@@ -23,7 +23,7 @@ pub fn run(args: Args) -> Result<()> {
 
     let socket_path = args.socket.unwrap_or_else(config::daemon_socket_path);
     let db_path = args.db.unwrap_or_else(config::db_path);
-    let index_root = config::index_root();
+    let project_root = config::project_root();
 
     // Open DB connection
     let conn = db::get_connection(&db_path)
@@ -209,7 +209,7 @@ pub fn run(args: Args) -> Result<()> {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let conn = Arc::clone(&conn);
-                let index_root = index_root.clone();
+                let project_root = project_root.clone();
                 let search_active = Arc::clone(&search_active);
                 let watcher_pid = Arc::clone(&watcher_pid);
                 let reindex_active = Arc::clone(&reindex_active);
@@ -219,7 +219,7 @@ pub fn run(args: Args) -> Result<()> {
                     if let Err(e) = handle_client(
                         &mut stream,
                         &conn,
-                        &index_root,
+                        &project_root,
                         &search_active,
                         &watcher_pid,
                         &reindex_active,
@@ -267,7 +267,7 @@ pub fn run(args: Args) -> Result<()> {
 fn handle_client(
     stream: &mut std::os::unix::net::UnixStream,
     conn: &Arc<Mutex<rusqlite::Connection>>,
-    index_root: &std::path::Path,
+    project_root: &std::path::Path,
     search_active: &Arc<AtomicUsize>,
     watcher_pid: &Arc<AtomicU32>,
     reindex_active: &Arc<AtomicBool>,
@@ -359,7 +359,7 @@ fn handle_client(
     let conn = conn
         .lock()
         .map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
-    let resp = daemon::handle_request(&conn, req, index_root, &SHUTDOWN);
+    let resp = daemon::handle_request(&conn, req, project_root, &SHUTDOWN);
     write_response(stream, &resp)?;
     Ok(())
 }

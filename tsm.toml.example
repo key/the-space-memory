@@ -8,11 +8,6 @@
 # Env: TSM_STATE_DIR
 # state_dir = ".tsm"
 
-# Root directory containing content workspaces to index.
-# Default: "/workspaces"
-# Env: TSM_INDEX_ROOT
-# index_root = "/workspaces"
-
 # UNIX socket path for the embedder child process (encode requests).
 # Default: "{state_dir}/embedder.sock"
 # Env: TSM_EMBEDDER_SOCKET
@@ -59,11 +54,11 @@
 #   half_life_days — time decay half-life in days (default: 90.0).
 #                    Set to 0 to disable time decay (treat as timeless).
 #
-# Empty = auto-discover mode (recursively index all .md under index_root).
+# Empty = auto-discover mode (recursively index all .md under the project root).
 #
 # content_dirs = [
-#     { path = "/workspaces/notes", weight = 1.0, half_life_days = 90.0 },
-#     { path = "/workspaces/docs",  weight = 0.8, half_life_days = 180.0 },
+#     { path = "notes", weight = 1.0, half_life_days = 90.0 },
+#     { path = "docs",  weight = 0.8, half_life_days = 180.0 },
 # ]
 
 [index.claude_session]

@@ -24,7 +24,7 @@ pub fn run() -> Result<()> {
     // Log to stderr (inherited from the daemon, captured into tsmd-stderr.log);
     // children do not manage their own log files.
     the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::DaemonStderr)?;
-    let index_root = config::index_root();
+    let project_root = config::project_root();
 
     // Install signal handlers
     unsafe {
@@ -46,25 +46,25 @@ pub fn run() -> Result<()> {
     let mut debouncer =
         new_debouncer(Duration::from_secs(2), tx).context("Failed to create file watcher")?;
 
-    // The watcher's scope comes purely from `index_root` + `content_dirs`
+    // The watcher's scope comes purely from `project_root` + `content_dirs`
     // — it does NOT consult `.tsmignore`, `extensions`, or `respect_gitignore`.
     // Those are policy concerns owned by the daemon's indexer via
     // `IngestPolicy`. Keeping the watcher oblivious means the event stream
     // is independent of user policy edits (no SIGHUP needed to pick up
     // `.tsmignore` changes — the indexer's next gate call does that).
-    let mut watched = setup_watches(&mut debouncer, &index_root);
+    let mut watched = setup_watches(&mut debouncer, &project_root);
 
     if watched.is_empty() {
         anyhow::bail!(
             "No content directories found to watch under {}",
-            index_root.display()
+            project_root.display()
         );
     }
 
     log::info!(
         "watching {} directories under {}",
         watched.len(),
-        index_root.display()
+        project_root.display()
     );
 
     let daemon_socket = config::daemon_socket_path();
@@ -77,7 +77,7 @@ pub fn run() -> Result<()> {
             // Only `content_dirs` can change the watch scope; a new
             // `.tsmignore` would not affect registration (the watcher
             // doesn't know about it by design).
-            update_watches(&mut debouncer, &mut watched, &index_root);
+            update_watches(&mut debouncer, &mut watched, &project_root);
             if watched.is_empty() {
                 // Config edit left us with nothing to watch (e.g. every
                 // `content_dirs` entry points at a nonexistent path).
@@ -106,7 +106,7 @@ pub fn run() -> Result<()> {
                     // duplicate predicate in the watcher was a bug-magnet
                     // (see #134 review), so every event is forwarded and
                     // the indexer makes the final call.
-                    match event.path.strip_prefix(&index_root) {
+                    match event.path.strip_prefix(&project_root) {
                         Ok(rel) => {
                             files_to_index.insert(rel.to_string_lossy().into_owned());
                         }
@@ -160,7 +160,7 @@ pub fn run() -> Result<()> {
 
 /// Directories to watch recursively with inotify. Pure tsm.toml plumbing:
 /// — if `content_dirs` is configured, watch those specific subdirs;
-/// — otherwise watch `index_root` itself.
+/// — otherwise watch `project_root` itself.
 ///
 /// No policy consultation: this is scope-for-registration only. Events
 /// from force-excluded or user-ignored paths will still arrive and be
@@ -169,13 +169,13 @@ pub fn run() -> Result<()> {
 /// Takes `content_dirs` as a parameter rather than reading
 /// `config::content_dirs()` internally so tests can exercise both
 /// branches without touching the global `RESOLVED` singleton.
-fn watch_targets(index_root: &Path, content_dirs: &[config::ContentDir]) -> Vec<PathBuf> {
+fn watch_targets(project_root: &Path, content_dirs: &[config::ContentDir]) -> Vec<PathBuf> {
     if content_dirs.is_empty() {
-        vec![index_root.to_path_buf()]
+        vec![project_root.to_path_buf()]
     } else {
         content_dirs
             .iter()
-            .map(|d| index_root.join(&d.path))
+            .map(|d| project_root.join(&d.path))
             .filter(|p| {
                 let ok = p.is_dir();
                 if !ok {
@@ -192,11 +192,11 @@ fn setup_watches(
     debouncer: &mut notify_debouncer_mini::Debouncer<
         notify_debouncer_mini::notify::RecommendedWatcher,
     >,
-    index_root: &Path,
+    project_root: &Path,
 ) -> HashSet<PathBuf> {
     let mut watched = HashSet::new();
     let dirs = config::content_dirs();
-    for full_dir in watch_targets(index_root, &dirs) {
+    for full_dir in watch_targets(project_root, &dirs) {
         if let Err(e) = debouncer
             .watcher()
             .watch(&full_dir, RecursiveMode::Recursive)
@@ -215,10 +215,10 @@ fn update_watches(
         notify_debouncer_mini::notify::RecommendedWatcher,
     >,
     current: &mut HashSet<PathBuf>,
-    index_root: &Path,
+    project_root: &Path,
 ) {
     let dirs = config::content_dirs();
-    let desired: HashSet<PathBuf> = watch_targets(index_root, &dirs).into_iter().collect();
+    let desired: HashSet<PathBuf> = watch_targets(project_root, &dirs).into_iter().collect();
 
     // Unwatch removed dirs
     for dir in current.difference(&desired) {
@@ -288,8 +288,8 @@ mod tests {
     }
 
     #[test]
-    fn test_watch_targets_empty_content_dirs_returns_index_root() {
-        // No content_dirs configured → watcher registers index_root itself.
+    fn test_watch_targets_empty_content_dirs_returns_project_root() {
+        // No content_dirs configured → watcher registers project_root itself.
         let dir = tempfile::TempDir::new().unwrap();
         let targets = watch_targets(dir.path(), &[]);
         assert_eq!(targets, vec![dir.path().to_path_buf()]);
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_watch_targets_with_content_dirs() {
-        // Configured content_dirs → each resolved relative to index_root.
+        // Configured content_dirs → each resolved relative to project_root.
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(dir.path().join("daily")).unwrap();
         std::fs::create_dir(dir.path().join("company")).unwrap();
@@ -326,14 +326,13 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_run_watcher_registers_index_root() {
+    fn test_run_watcher_registers_project_root() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(dir.path().join("notes")).unwrap();
 
         SHUTDOWN.store(true, Ordering::SeqCst);
 
         let _cwd = CwdGuard::change_to(dir.path());
-        unsafe { std::env::set_var("TSM_INDEX_ROOT", dir.path().as_os_str()) };
         the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::DaemonStderr)
             .ok();
 
@@ -352,6 +351,5 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_millis(10)).is_err());
 
         SHUTDOWN.store(false, Ordering::SeqCst);
-        unsafe { std::env::remove_var("TSM_INDEX_ROOT") };
     }
 }

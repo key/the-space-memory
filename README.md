@@ -52,13 +52,12 @@ cargo build --release
 #    System-wide; run once per machine.
 tsm setup
 
-# 3. Set the document root directory
-export TSM_INDEX_ROOT=~/my-notes
-
-# 4. Initialize the workspace: DB schema, default scaffold files
-#    (tsm.toml, .tsmignore, .tsm/{user_dict.simpledic,custom_terms.toml,
-#    synonyms.csv}), and WordNet/synonym imports. Idempotent — existing
+# 3. Initialize the workspace from your notes directory:
+#    DB schema, default scaffold files (tsm.toml, .tsmignore,
+#    .tsm/{user_dict.simpledic,custom_terms.toml, synonyms.csv}),
+#    and WordNet/synonym imports. Idempotent — existing
 #    user-customized files are never overwritten.
+cd ~/my-notes
 tsm init
 
 # 5. Start the daemon (embedder + file watcher)
@@ -76,11 +75,11 @@ Hugging Face model cache.
 
 ### What gets indexed
 
-tsm recursively scans `TSM_INDEX_ROOT` for `.md` files.
+tsm recursively scans the project root (directory containing `tsm.toml`) for `.md` files.
 A typical directory layout:
 
 ```text
-~/my-notes/              ← TSM_INDEX_ROOT
+~/my-notes/              ← project root (contains tsm.toml)
 ├── projects/
 │   ├── project-a.md
 │   └── project-b.md
@@ -90,7 +89,7 @@ A typical directory layout:
     └── 2026-04.md
 ```
 
-All Markdown files under `TSM_INDEX_ROOT` are indexed automatically.
+All Markdown files under the project root are indexed automatically.
 The file watcher detects additions, modifications, and deletions in real time.
 
 ### Maintenance
@@ -119,7 +118,6 @@ the environment variable takes precedence. See
 | `TSM_CONFIG` | *(discovered)* | *(n/a)* | Path to the config file; the directory containing it becomes the project root |
 | `TSM_STATE_DIR` | `.tsm` | `state_dir` | Root directory for all tsm state (DB, sockets, PID, logs, user dict) |
 | `TSM_CACHE_DIR` | `$XDG_CACHE_HOME/tsm` (else `$HOME/.cache/tsm`) | `cache_dir` | Cache directory for the model and WordNet DB |
-| `TSM_INDEX_ROOT` | `/workspaces` | `index_root` | Root directory containing the content to index |
 | `TSM_EMBEDDER_SOCKET` | `{state_dir}/embedder.sock` | `embedder_socket_path` | UNIX socket for the embedder child process |
 | `TSM_DAEMON_SOCKET` | `{state_dir}/daemon.sock` | `daemon_socket_path` | UNIX socket for the `tsmd` daemon |
 | `TSM_LOG_DIR` | `{state_dir}/logs` | `log_dir` | Directory for daemon log files |
@@ -145,7 +143,7 @@ regression gate ship in a follow-up PR (see [#181](https://github.com/key/the-sp
 - The standard testdata corpus indexed:
 
   ```bash
-  export TSM_INDEX_ROOT=$(pwd)/tests/e2e/testdata
+  cd tests/e2e/testdata
   tsm init && tsm index
   ```
 

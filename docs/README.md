@@ -24,7 +24,6 @@ initialization:
 ```bash
 tsm setup        # download embedding model + WordNet DB (system-wide)
 cd ~/my-notes
-export TSM_INDEX_ROOT=$PWD
 tsm init         # workspace bootstrap: schema, scaffold, synonym import
 tsm start        # start the daemon (embedder + file watcher)
 tsm index        # index your documents
