@@ -20,8 +20,9 @@ tsm searches for a config file in the following order; the first file found wins
 
 | Env Var | Type | Default | toml field | Description |
 |---|---|---|---|---|
-| `TSM_CONFIG` | path | _(none)_ | _(no toml equiv)_ | Override path to the config file itself |
+| `TSM_CONFIG` | path | _(none)_ | _(no toml equiv)_ | Override path to the config file itself; the directory containing it becomes the project root |
 | `TSM_STATE_DIR` | path | `.tsm` | `state_dir` | Root directory for all tsm data (DB, sockets, PID, logs, user dict) |
+| `TSM_CACHE_DIR` | path | `{XDG_CACHE_HOME}/tsm` (else `$HOME/.cache/tsm`) | `cache_dir` | Cache directory for the model and WordNet DB |
 | `TSM_INDEX_ROOT` | path | `/workspaces` | `index_root` | Root directory containing content workspaces to index |
 | `TSM_EMBEDDER_SOCKET` | path | `{state_dir}/embedder.sock` | `embedder_socket_path` | UNIX socket path for the embedder child process |
 | `TSM_DAEMON_SOCKET` | path | `{state_dir}/daemon.sock` | `daemon_socket_path` | UNIX socket path for tsmd |
@@ -30,7 +31,21 @@ tsm searches for a config file in the following order; the first file found wins
 | `TSM_EMBEDDER_BACKFILL_INTERVAL` | u64 (seconds) | `300` | `embedder_backfill_interval_secs` | Seconds between periodic vector backfill checks (0 = disable) |
 | `TSM_SEARCH_FALLBACK` | enum | `"error"` | `search_fallback` | Behavior when embedder is down: `error` or `fts_only` |
 | `TSM_USER_DICT` | path | `{state_dir}/user_dict.simpledic` | `user_dict_path` | Path to the lindera user dictionary |
-| `HF_HUB_CACHE` | path | `{XDG_CACHE_HOME}/tsm/models/` | _(no toml equiv)_ | Model cache directory for HuggingFace Hub |
+| `TSM_SETUP_LINK_MODE` | enum | `symlink` | `[setup].link_mode` | How `tsm setup` materializes cached resources: `symlink` or `copy` |
+| `TSM_INIT_LINK_MODE` | enum | `symlink` | `[init].link_mode` | How `tsm init` links workspace resources to the cache: `symlink` or `copy` |
+
+## Standard and External Variables
+
+These are not tsm-specific; tsm reads (and in one case sets) well-known
+variables. They have no `tsm.toml` equivalent.
+
+| Env Var | Default | Description |
+|---|---|---|
+| `RUST_LOG` | `info` | Log level / filter spec (parsed by the logger) |
+| `NO_COLOR` | _(unset)_ | When set, disables colored terminal output |
+| `HF_HUB_CACHE` | `{XDG_CACHE_HOME}/tsm/models` | Hugging Face Hub model cache. `tsm setup` sets this automatically if unset; override to redirect the cache |
+| `XDG_CACHE_HOME` | `$HOME/.cache` | Fallback input for the `TSM_CACHE_DIR` default (XDG Base Directory convention) |
+| `HOME` | _(OS-provided)_ | Fallback input for the `TSM_CACHE_DIR` default when `XDG_CACHE_HOME` is unset |
 
 ## tsm.toml Full Example
 
@@ -86,7 +101,8 @@ path = "notes"
 # Default: 1.0
 weight = 1.2
 # Time-decay half-life in days for documents in this directory.
-# Non-finite or <= 0 values trigger a warning and fall back to 90.0.
+# 0 disables time decay (documents are treated as timeless).
+# Negative or non-finite values trigger a warning and fall back to 90.0.
 # Default: 90.0
 half_life_days = 120.0
 
@@ -106,6 +122,7 @@ half_life_days = 90.0
 # Default: 0.3
 weight = 0.3
 # Time-decay half-life in days for Claude Code session data.
+# 0 disables time decay; negative or non-finite values fall back to the default.
 # Default: 30.0
 half_life_days = 30.0
 ```

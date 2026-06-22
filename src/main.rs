@@ -46,6 +46,12 @@ impl From<ReindexKindArg> for ReindexKind {
     about = "The Space Memory — knowledge search engine"
 )]
 struct Cli {
+    /// Project root: the directory holding `tsm.toml` (ADR-0009 §2).
+    /// Used when the current directory has no `tsm.toml`. Without either,
+    /// commands fail (except `tsm init`, which scaffolds in the CWD).
+    #[arg(long, global = true, value_name = "DIR")]
+    project_root: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -194,8 +200,45 @@ fn main() -> anyhow::Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     config::ensure_model_cache_env();
-    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Stderr)?;
     let args = Cli::parse();
+
+    // ADR-0009 §2: resolve the project root (the dir holding `tsm.toml`) from
+    // the CWD, `--project-root`, or `$TSM_CONFIG`, and inject it before any
+    // config access. `init` and `setup` are project-independent (they run
+    // before a project exists — scaffolding and model-cache download), so they
+    // tolerate an unresolved root and fall back to the CWD. Every other command
+    // fails fast with a guiding error.
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!(
+                "warning: cannot determine the current directory ({e}); \
+                 project-root resolution may be incorrect"
+            );
+            PathBuf::from(".")
+        }
+    };
+    let tsm_config = std::env::var_os("TSM_CONFIG").map(PathBuf::from);
+    let resolved_root =
+        config::resolve_project_root(&cwd, args.project_root.as_deref(), tsm_config.as_deref());
+    let project_root = match &args.command {
+        Commands::Init | Commands::Setup => resolved_root.unwrap_or_else(|_| cwd.clone()),
+        _ => resolved_root?,
+    };
+    // Surface a `--project-root` that lost to the CWD's `tsm.toml` or
+    // `$TSM_CONFIG` — otherwise the explicit flag is silently ineffective.
+    if let Some(arg) = args.project_root.as_deref() {
+        if project_root.as_path() != arg {
+            eprintln!(
+                "warning: --project-root '{}' overridden; using project root '{}'",
+                arg.display(),
+                project_root.display()
+            );
+        }
+    }
+    config::set_project_root(project_root);
+
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Stderr)?;
     match args.command {
         // ── Always direct ──
         Commands::Init => cli::cmd_init()?,

@@ -69,6 +69,9 @@ tsm index
 tsm search -q "クエリ" -k 5
 ```
 
+`tsm setup` は `HF_HUB_CACHE` を自動設定する。Hugging Face のモデルキャッシュを
+別の場所に向けたい場合は明示的に上書きする。
+
 ### インデックス対象
 
 tsmは `TSM_INDEX_ROOT` 配下の `.md` ファイルを再帰的にスキャンする。
@@ -173,6 +176,30 @@ end
   となり、スコアラーは `status`/`updated` カラムから合成するため、スコアリングへの影響はない。
   カスタム extract フック作成後に既存ドキュメントへ metadata を反映したい場合は `tsm reindex` を
   実行する — 破壊的な全再構築は不要。
+
+## 環境変数
+
+以下の設定はいずれも `tsm.toml`（`tsm.toml キー` 列）でも指定でき、環境変数が
+優先される。全変数の詳細は [docs/configuration.md](docs/configuration.md) を参照。
+
+| 変数 | デフォルト | `tsm.toml` キー | 説明 |
+|---|---|---|---|
+| `TSM_CONFIG` | _(自動探索)_ | _(なし)_ | 設定ファイルのパス。それが置かれているディレクトリがプロジェクトルートになる |
+| `TSM_STATE_DIR` | `.tsm` | `state_dir` | tsm の状態一式（DB・ソケット・PID・ログ・ユーザー辞書）のルートディレクトリ |
+| `TSM_CACHE_DIR` | `$XDG_CACHE_HOME/tsm`（無ければ `$HOME/.cache/tsm`） | `cache_dir` | モデルと WordNet DB のキャッシュディレクトリ |
+| `TSM_INDEX_ROOT` | `/workspaces` | `index_root` | インデックス対象を含むルートディレクトリ |
+| `TSM_EMBEDDER_SOCKET` | `{state_dir}/embedder.sock` | `embedder_socket_path` | embedder 子プロセスの UNIX ソケット |
+| `TSM_DAEMON_SOCKET` | `{state_dir}/daemon.sock` | `daemon_socket_path` | `tsmd` デーモンの UNIX ソケット |
+| `TSM_LOG_DIR` | `{state_dir}/logs` | `log_dir` | デーモンログの出力ディレクトリ |
+| `TSM_EMBEDDER_IDLE_TIMEOUT` | `600` | `embedder_idle_timeout_secs` | embedder が自動停止するまでのアイドル秒数（`0` = 無効）。`tsmd` は `--no-idle-timeout` で起動するため、これは単体起動時のみ有効 |
+| `TSM_EMBEDDER_BACKFILL_INTERVAL` | `300` | `embedder_backfill_interval_secs` | ベクター backfill の定期チェック間隔（秒、`0` = 無効） |
+| `TSM_SEARCH_FALLBACK` | `error` | `search_fallback` | embedder 停止時の挙動: `error` または `fts_only` |
+| `TSM_USER_DICT` | `{state_dir}/user_dict.simpledic` | `user_dict_path` | lindera ユーザー辞書のパス |
+| `TSM_SETUP_LINK_MODE` | `symlink` | `[setup].link_mode` | `tsm setup` がキャッシュ資源を配置する方式: `symlink` または `copy` |
+| `TSM_INIT_LINK_MODE` | `symlink` | `[init].link_mode` | `tsm init` がワークスペース資源をキャッシュへ紐付ける方式: `symlink` または `copy` |
+
+このほか `RUST_LOG`（ログレベル、デフォルト `info`）と `NO_COLOR`（カラー出力の
+無効化）を尊重する。
 
 ## ベンチマーク
 
