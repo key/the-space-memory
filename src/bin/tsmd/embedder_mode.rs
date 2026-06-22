@@ -42,8 +42,8 @@ fn load_model(model_dir: Option<&Path>) -> Result<Embedder> {
             );
         }
         log::warn!(
-            "Model files incomplete in {}; falling back to HF Hub cache. \
-             Run `tsm setup` to install model files locally.",
+            "Model files incomplete in {}; falling back to default resolution \
+             (state_dir override → cache_dir). Run `tsm setup` to populate the cache.",
             dir.display()
         );
     }
