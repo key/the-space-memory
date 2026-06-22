@@ -66,6 +66,19 @@ pub fn run(args: Args) -> Result<()> {
         );
     }
 
+    // ADR-0009 §3: reject a config that still carries the removed `index_root`
+    // key.  `anyhow::bail!` here keeps the accept loop clean — no socket is
+    // bound, no children are spawned, and `tsm start` surfaces the stderr via
+    // `wait_for_daemon_ready` (same path as the uninitialized-DB guard above).
+    if let Some(path) = config::legacy_index_root() {
+        anyhow::bail!(
+            "`index_root = \"{}\"` in tsm.toml is no longer supported (ADR-0009 §3). \
+             Replace it with `[[index.content_dirs]]` entries with paths relative to \
+             the project root.",
+            path.display()
+        );
+    }
+
     let conn = Arc::new(Mutex::new(conn));
 
     // We hold the lock, so no live daemon exists: a leftover socket is stale.

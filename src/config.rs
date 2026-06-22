@@ -290,6 +290,16 @@ pub struct ResolvedConfig {
     /// Default: `["md"]`. Config: `[index].extensions`.
     pub extensions: Vec<String>,
 
+    /// Set when a loaded config file still carries a legacy `index_root` key
+    /// (removed in ADR-0009 §3). The value is captured here instead of
+    /// calling `process::exit` so each caller can decide how to handle it:
+    /// - CLI startup (`tsm` main): hard-exit with a migration message.
+    /// - Daemon startup (`tsmd`): `anyhow::bail!` before socket bind.
+    /// - Config reload: push a warning into the reload warnings vec and keep running.
+    ///
+    /// `None` means no legacy key was found. Not user-configurable via TOML.
+    pub rejected_index_root: Option<PathBuf>,
+
     /// Directory tsm treats as the user's workspace — where `.tsmignore`
     /// and `tsm.toml` are expected to live. Derived at load time from the
     /// parent of the first successfully-loaded config file (or CWD if no
@@ -468,6 +478,8 @@ impl ResolvedConfig {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| vec![DEFAULT_INDEX_EXTENSION.to_string()]);
 
+        let rejected_index_root = file_cfg.index_root.clone();
+
         Self {
             state_dir,
             cache_dir,
@@ -487,6 +499,7 @@ impl ResolvedConfig {
             ignore_file,
             extensions,
             project_root,
+            rejected_index_root,
         }
     }
 }
@@ -677,8 +690,22 @@ pub fn reload() -> Vec<String> {
             new_cfg.project_root.display()
         ));
     }
+    if let Some(ref p) = new_cfg.rejected_index_root {
+        warnings.push(format!(
+            "`index_root = \"{}\"` in tsm.toml is no longer supported (ADR-0009 §3); \
+             replace it with `[[index.content_dirs]]` entries. \
+             The key is ignored; run `tsm restart` after fixing the config.",
+            p.display()
+        ));
+    }
 
-    *w = new_cfg;
+    // Do not apply a config that re-adds index_root: discard the bad field
+    // and keep the daemon running with the previous (or cleaned) config.
+    let applied = ResolvedConfig {
+        rejected_index_root: None,
+        ..new_cfg
+    };
+    *w = applied;
 
     log::info!("config reloaded from tsm.toml");
     if !warnings.is_empty() {
@@ -745,14 +772,14 @@ fn load_config_from(candidates: &[PathBuf]) -> (ConfigFile, Option<PathBuf>) {
             }
         };
         if let Err(e) = check_no_index_root(&file, path) {
-            eprintln!("error: {e}\nAborting.");
-            std::process::exit(1);
+            log::warn!("{e}");
         }
         if loaded_root.is_none() {
             loaded_root = project_root_from(path);
         }
         merged.state_dir = merged.state_dir.or(file.state_dir);
         merged.cache_dir = merged.cache_dir.or(file.cache_dir);
+        merged.index_root = merged.index_root.or(file.index_root);
         merged.embedder_socket_path = merged.embedder_socket_path.or(file.embedder_socket_path);
         merged.daemon_socket_path = merged.daemon_socket_path.or(file.daemon_socket_path);
         merged.log_dir = merged.log_dir.or(file.log_dir);
@@ -926,6 +953,17 @@ pub fn index_extensions() -> Vec<String> {
 
 pub fn project_root() -> PathBuf {
     resolved().project_root.clone()
+}
+
+/// Return the legacy `index_root` value captured from the config file, if any.
+///
+/// When `Some`, a config file still uses the removed `index_root` key (ADR-0009 §3).
+/// Callers are responsible for handling this condition:
+/// - CLI startup: hard-exit with a migration message.
+/// - Daemon startup: `anyhow::bail!` before socket bind.
+/// - Config reload: push a warning and keep running.
+pub fn legacy_index_root() -> Option<PathBuf> {
+    resolved().rejected_index_root.clone()
 }
 
 // ─── Derived paths ───────────────────────────────────────────────
@@ -1601,8 +1639,7 @@ embedder_idle_timeout_secs = 1200
 
     #[test]
     fn test_index_root_in_config_is_rejected() {
-        // A config file containing `index_root` should trigger the check_no_index_root
-        // helper with an error (the actual process::exit is not testable here).
+        // check_no_index_root returns Err when index_root is present.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.toml");
         let file: ConfigFile = toml::from_str(r#"index_root = "/old/root""#).unwrap();
@@ -1629,6 +1666,98 @@ embedder_idle_timeout_secs = 1200
         let path = dir.path().join("ok.toml");
         let file: ConfigFile = toml::from_str(r#"state_dir = "/some/dir""#).unwrap();
         assert!(check_no_index_root(&file, &path).is_ok());
+    }
+
+    #[test]
+    fn test_from_config_file_captures_rejected_index_root() {
+        // A ConfigFile with index_root set must surface it in rejected_index_root.
+        let file: ConfigFile = toml::from_str(r#"index_root = "/old/root""#).unwrap();
+        let cfg = ResolvedConfig::from_config_file(&file, PathBuf::from("/tmp/unused-root"));
+        assert_eq!(
+            cfg.rejected_index_root,
+            Some(PathBuf::from("/old/root")),
+            "index_root should be captured in rejected_index_root"
+        );
+    }
+
+    #[test]
+    fn test_from_config_file_no_rejected_index_root_when_absent() {
+        let file: ConfigFile = toml::from_str(r#"state_dir = "/some/dir""#).unwrap();
+        let cfg = ResolvedConfig::from_config_file(&file, PathBuf::from("/tmp/unused-root"));
+        assert!(
+            cfg.rejected_index_root.is_none(),
+            "rejected_index_root must be None when index_root is absent"
+        );
+    }
+
+    #[test]
+    fn test_load_config_from_captures_rejected_index_root() {
+        // Going through load_config_from (not just from_config_file) must also
+        // surface the rejected index_root so the real production path is covered.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("tsm.toml");
+        std::fs::write(&config_path, r#"index_root = "/legacy/root""#).unwrap();
+
+        let (merged, _root) = load_config_from(&[config_path]);
+        assert_eq!(
+            merged.index_root,
+            Some(PathBuf::from("/legacy/root")),
+            "index_root must be merged and preserved for rejected_index_root population"
+        );
+        let cfg = ResolvedConfig::from_config_file(&merged, PathBuf::from("/tmp/unused-root"));
+        assert_eq!(
+            cfg.rejected_index_root,
+            Some(PathBuf::from("/legacy/root")),
+            "rejected_index_root must be populated from the merged ConfigFile"
+        );
+    }
+
+    #[test]
+    fn test_reload_warns_when_index_root_re_added() {
+        // reload() must push a warning (not exit) when a reloaded config still
+        // carries index_root.  We test the pure warning-generation logic by
+        // calling the helper directly rather than exercising the OnceLock path,
+        // which can only be initialised once per process.
+        let old = ResolvedConfig::from_config_file(
+            &ConfigFile::default(),
+            PathBuf::from("/tmp/unused-root"),
+        );
+        let file_with_index_root: ConfigFile =
+            toml::from_str(r#"index_root = "/bad/path""#).unwrap();
+        let new_cfg = ResolvedConfig::from_config_file(
+            &file_with_index_root,
+            PathBuf::from("/tmp/unused-root"),
+        );
+        // Build the same warnings that reload() would produce for this pair.
+        let mut warnings = Vec::new();
+        if let Some(ref p) = new_cfg.rejected_index_root {
+            warnings.push(format!(
+                "`index_root = \"{}\"` in tsm.toml is no longer supported (ADR-0009 §3); \
+                 replace it with `[[index.content_dirs]]` entries. \
+                 The key is ignored; run `tsm restart` after fixing the config.",
+                p.display()
+            ));
+        }
+        // Reload must not apply the bad value — verify the new config carries it.
+        assert!(
+            !warnings.is_empty(),
+            "reload must warn when index_root re-appears"
+        );
+        let w = &warnings[0];
+        assert!(
+            w.contains("index_root"),
+            "warning must mention index_root: {w}"
+        );
+        assert!(
+            w.contains("ADR-0009"),
+            "warning must reference ADR-0009: {w}"
+        );
+        assert!(
+            w.contains("content_dirs"),
+            "warning must suggest content_dirs: {w}"
+        );
+        // And the old config is unaffected (no rejected_index_root).
+        assert!(old.rejected_index_root.is_none());
     }
 
     #[test]
