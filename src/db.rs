@@ -168,9 +168,16 @@ fn table_exists(conn: &Connection, name: &str) -> bool {
 /// Check whether the database has been initialized with the core schema.
 ///
 /// A freshly created (empty) DB file has no tables; `init` must be run before
-/// the daemon can serve requests against it.
+/// the daemon can serve requests against it. Requires the core operational
+/// tables `init_db` always creates: `documents`, `chunks`, and the FTS5
+/// `chunks_fts` (so a DB that merely happens to have the first two is rejected).
+/// `chunks_vec` is intentionally NOT required — it is created best-effort and may
+/// be legitimately absent when the sqlite-vec extension is unavailable. Column-
+/// and index-level identity is not checked here; schema drift is `rebuild`'s job.
 pub fn is_initialized(conn: &Connection) -> bool {
-    table_exists(conn, "documents") && table_exists(conn, "chunks")
+    table_exists(conn, "documents")
+        && table_exists(conn, "chunks")
+        && table_exists(conn, "chunks_fts")
 }
 
 /// Ensure the `content_hash` column exists on the `chunks` table (migration for older DBs).
@@ -428,6 +435,19 @@ mod tests {
     #[test]
     fn test_is_initialized_false_for_bare_db() {
         let conn = Connection::open_in_memory().unwrap();
+        assert!(!is_initialized(&conn));
+    }
+
+    #[test]
+    fn test_is_initialized_false_without_fts_table() {
+        // documents + chunks alone is not our schema: a real init also creates
+        // chunks_fts. Reject a DB that merely happens to have those two tables.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (id INTEGER PRIMARY KEY);
+             CREATE TABLE chunks (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
         assert!(!is_initialized(&conn));
     }
 

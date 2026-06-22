@@ -307,7 +307,15 @@ fn main() -> anyhow::Result<()> {
             };
             match daemon_protocol::try_send_request(&socket, &req) {
                 Some(Ok(resp)) => render_doctor(resp, &format)?,
-                _ => cli::cmd_doctor(&format)?,
+                // Socket present but unresponsive (broken or shutting-down
+                // daemon): surface the error so it is not silently hidden, but
+                // still produce a local report — a diagnostic must never hard-fail.
+                Some(Err(e)) => {
+                    eprintln!("warning: daemon socket present but did not respond: {e}");
+                    cli::cmd_doctor(&format)?;
+                }
+                // No daemon running: local read-only check.
+                None => cli::cmd_doctor(&format)?,
             }
         }
 
