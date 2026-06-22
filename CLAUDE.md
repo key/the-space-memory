@@ -89,7 +89,8 @@ src/
 - **FTS5**: lindera tokenization + unicode61 tokenizer
 - **Vector search**: ruri-v3-30m (256-dim) semantic search. Embedder child process (`tsmd --embedder`) runs on UNIX socket
 - **Extract hooks** (index time): Lua scripts in `.tsm/hooks/extract/` produce a scalar metadata map
-  stored in `documents.metadata` (JSON). Embedded default reproduces `frontmatter.rs`
+  stored in `documents.metadata` (JSON). `ctx.frontmatter` exposes top-level YAML keys
+  (scalars + sequences; nested mappings not passed). Embedded default reproduces `frontmatter.rs`
   (status + effective\_date).
 - **Score hooks** (search time): Lua scripts in `.tsm/hooks/score/` each return a multiplier;
   `final = rrf × weight × Π(score hooks)`. Embedded default reproduces time\_decay × status\_penalty.

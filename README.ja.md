@@ -130,12 +130,15 @@ tsm は組み込み Lua（mlua, lua54）によるユーザー編集可能なメ�
 インデックス時に各ドキュメントチャンクへ呼び出される。受け取るコンテキスト：
 
 ```lua
--- ctx のフィールド: path, body, frontmatter（YAML 全マップ）, metadata（累積済み）
+-- ctx のフィールド: path, body, frontmatter（トップレベル YAML キー）, metadata（累積済み）
 function extract(ctx)
   local fm = ctx.frontmatter or {}
   return { status = fm.status, effective_date = fm.updated }
 end
 ```
+
+`ctx.frontmatter` はトップレベルの YAML キーを公開する：スカラー（string/number/bool）と
+シーケンス（`tags` など。Lua 配列として渡る）。ネストしたマップは渡されない。
 
 スカラー値（string、number、boolean）のフラットなテーブルを返す。
 全 extract フックの結果は浅くマージ（同一キーは後勝ち）され、

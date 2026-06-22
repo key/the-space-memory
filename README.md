@@ -132,12 +132,15 @@ result scoring. Hooks live in `.tsm/hooks/` and are scaffolded by `tsm init`.
 Called at index time for each document chunk. Receive a context table:
 
 ```lua
--- ctx fields: path, body, frontmatter (full YAML map), metadata (accumulated so far)
+-- ctx fields: path, body, frontmatter (top-level YAML keys), metadata (accumulated so far)
 function extract(ctx)
   local fm = ctx.frontmatter or {}
   return { status = fm.status, effective_date = fm.updated }
 end
 ```
+
+`ctx.frontmatter` exposes the top-level YAML keys: scalars (string/number/bool)
+and sequences (e.g. `tags`, as a Lua array). Nested mappings are not passed.
 
 Return a flat table of scalar values (string, number, boolean). The results of
 all extract hooks are shallow-merged (last-wins for duplicate keys) and stored
