@@ -13,6 +13,32 @@ pub struct Frontmatter {
     pub superseded_by: Option<String>,
 }
 
+/// Parse all top-level YAML frontmatter keys into a map, preserving all values.
+/// Scalars are kept as-is; sequences and mappings are also preserved.
+/// Returns an empty map when there is no frontmatter or it fails to parse.
+pub fn parse_map(text: &str) -> std::collections::BTreeMap<String, serde_yaml::Value> {
+    let Some(caps) = FM_PATTERN.captures(text) else {
+        return std::collections::BTreeMap::new();
+    };
+    let yaml_str = &caps[1];
+    let yaml: serde_yaml::Value = match serde_yaml::from_str(yaml_str) {
+        Ok(v) => v,
+        Err(_) => return std::collections::BTreeMap::new(),
+    };
+    let serde_yaml::Value::Mapping(map) = yaml else {
+        return std::collections::BTreeMap::new();
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for (k, v) in map {
+        if let serde_yaml::Value::String(key) = k {
+            if !matches!(v, serde_yaml::Value::Null) {
+                out.insert(key, v);
+            }
+        }
+    }
+    out
+}
+
 /// Parse YAML frontmatter from text. Returns (Frontmatter, remaining body).
 pub fn parse(text: &str) -> (Frontmatter, &str) {
     let Some(caps) = FM_PATTERN.captures(text) else {
@@ -134,5 +160,37 @@ mod tests {
         let text = "---\nstatus: current\ntags:\n---\n\nBody.\n";
         let (fm, _body) = parse(text);
         assert!(fm.tags.is_empty());
+    }
+
+    #[test]
+    fn test_parse_map_arbitrary_key() {
+        // Non-standard key `priority` must appear alongside standard keys.
+        let text = "---\nstatus: current\nupdated: 2026-03-24\npriority: high\ntags: [Rust, 検索]\n---\n\nBody.\n";
+        let map = parse_map(text);
+        assert_eq!(map.get("status").and_then(|v| v.as_str()), Some("current"));
+        assert_eq!(map.get("priority").and_then(|v| v.as_str()), Some("high"));
+        assert_eq!(
+            map.get("updated").and_then(|v| v.as_str()),
+            Some("2026-03-24")
+        );
+        // sequences are preserved
+        assert!(map.get("tags").is_some());
+    }
+
+    #[test]
+    fn test_parse_map_no_frontmatter_returns_empty() {
+        let map = parse_map("# Just a title\n\nNo frontmatter.\n");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_parse_map_null_value_skipped() {
+        let text = "---\nstatus: current\nnull_key:\n---\n\nBody.\n";
+        let map = parse_map(text);
+        assert!(map.contains_key("status"));
+        assert!(
+            !map.contains_key("null_key"),
+            "null values should be skipped"
+        );
     }
 }

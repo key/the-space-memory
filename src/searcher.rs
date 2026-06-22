@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
+use serde_json::json;
 
 use crate::classifier;
 use crate::config;
@@ -156,7 +157,7 @@ pub fn search(
 
     let sql = format!(
         "SELECT c.id AS chunk_id, c.section_path, c.content,
-                d.file_path, d.source_type, d.status, d.updated
+                d.file_path, d.source_type, d.status, d.updated, d.metadata
          FROM chunks c
          JOIN documents d ON c.document_id = d.id
          WHERE c.id IN ({placeholders}){time_sql}{path_sql}"
@@ -180,12 +181,15 @@ pub fn search(
             row.get::<_, String>(4)?,
             row.get::<_, Option<String>>(5)?,
             row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
         ))
     })?;
 
+    let hooks = crate::lua_hooks::hooks();
     let mut results = Vec::new();
     for row in rows {
-        let (chunk_id, section_path, content, file_path, source_type, status, updated) = row?;
+        let (chunk_id, section_path, content, file_path, source_type, status, updated, metadata) =
+            row?;
 
         let mut rrf = 0.0;
         if let Some(&rank) = fts_ranks.get(&chunk_id) {
@@ -198,10 +202,27 @@ pub fn search(
             rrf += 1.0 / (config::RRF_K + rank as f64);
         }
 
-        let decay = time_decay(updated.as_deref(), &file_path, &source_type);
-        let penalty = config::status_penalty(status.as_deref());
+        // Build effective metadata JSON: use stored metadata if present;
+        // otherwise synthesize from status/updated columns so NULL-metadata
+        // rows score identically to pre-feature rows.
+        let effective_metadata = metadata.clone().or_else(|| {
+            let obj = json!({
+                "status": status.as_deref(),
+                "effective_date": updated.as_deref(),
+            });
+            Some(obj.to_string())
+        });
         let weight = config::directory_weight(&file_path);
-        let score = rrf * decay * penalty * weight;
+        let half_life = config::half_life_days(&file_path, &source_type);
+        let multiplier = crate::lua_hooks::run_score(
+            &hooks,
+            effective_metadata.as_deref(),
+            rrf,
+            &source_type,
+            &file_path,
+            half_life,
+        );
+        let score = rrf * weight * multiplier;
 
         if score < config::SCORE_THRESHOLD {
             continue;
@@ -259,26 +280,21 @@ pub fn search(
     })
 }
 
-pub(crate) fn time_decay(updated: Option<&str>, file_path: &str, source_type: &str) -> f64 {
-    let updated = match updated {
+/// Decay multiplier 0.5^(age_days / half_life). Returns 0.5 if the date is
+/// absent, empty, or unparseable (missing-date sentinel).
+pub(crate) fn decay_with_half_life(updated: Option<&str>, half_life: f64) -> f64 {
+    let s = match updated {
         Some(s) if !s.is_empty() => s,
         _ => return 0.5,
     };
-
-    let updated_dt: DateTime<Utc> = match updated.parse::<DateTime<Utc>>() {
+    let updated_dt: DateTime<Utc> = match s.parse::<DateTime<Utc>>() {
         Ok(dt) => dt,
-        Err(_) => {
-            // Try parsing as naive date
-            match chrono::NaiveDate::parse_from_str(updated, "%Y-%m-%d") {
-                Ok(nd) => nd.and_hms_opt(0, 0, 0).unwrap().and_utc(),
-                Err(_) => return 0.5,
-            }
-        }
+        Err(_) => match chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            Ok(nd) => nd.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+            Err(_) => return 0.5,
+        },
     };
-
-    let now = Utc::now();
-    let days = (now - updated_dt).num_days().max(0) as f64;
-    let half_life = config::half_life_days(file_path, source_type);
+    let days = (Utc::now() - updated_dt).num_days().max(0) as f64;
     decay_factor(days, half_life)
 }
 
@@ -290,6 +306,11 @@ fn decay_factor(days: f64, half_life: f64) -> f64 {
         return 1.0;
     }
     0.5_f64.powf(days / half_life)
+}
+
+/// Today's date as a `%Y-%m-%d` string (UTC).
+pub(crate) fn today_string() -> String {
+    Utc::now().date_naive().format("%Y-%m-%d").to_string()
 }
 
 /// Build an expanded FTS5 query: original terms (AND) OR expansion terms.
@@ -434,35 +455,51 @@ mod tests {
     #[test]
     fn test_recent_date_high_decay() {
         let now = Utc::now().format("%Y-%m-%d").to_string();
-        let decay = time_decay(Some(&now), "daily/notes/test.md", "note");
+        let decay = decay_with_half_life(
+            Some(&now),
+            config::half_life_days("daily/notes/test.md", "note"),
+        );
         assert!(decay > 0.9);
         assert!(decay <= 1.0);
     }
 
     #[test]
     fn test_none_returns_half() {
-        assert_eq!(time_decay(None, "daily/notes/test.md", "note"), 0.5);
+        assert_eq!(
+            decay_with_half_life(None, config::half_life_days("daily/notes/test.md", "note")),
+            0.5
+        );
     }
 
     #[test]
     fn test_invalid_date_returns_half() {
         assert_eq!(
-            time_decay(Some("not-a-date"), "daily/notes/test.md", "note"),
+            decay_with_half_life(
+                Some("not-a-date"),
+                config::half_life_days("daily/notes/test.md", "note")
+            ),
             0.5
         );
     }
 
     #[test]
     fn test_old_date_low_decay() {
-        let decay = time_decay(Some("2020-01-01"), "daily/notes/test.md", "note");
+        let decay = decay_with_half_life(
+            Some("2020-01-01"),
+            config::half_life_days("daily/notes/test.md", "note"),
+        );
         assert!(decay < 0.1);
     }
 
     #[test]
     fn test_source_type_half_life() {
         let date = "2025-01-01";
-        let session_decay = time_decay(Some(date), "session:abc", "session");
-        let note_decay = time_decay(Some(date), "daily/notes/test.md", "note");
+        let session_decay =
+            decay_with_half_life(Some(date), config::half_life_days("session:abc", "session"));
+        let note_decay = decay_with_half_life(
+            Some(date),
+            config::half_life_days("daily/notes/test.md", "note"),
+        );
         assert!(session_decay < note_decay);
     }
 
@@ -476,21 +513,6 @@ mod tests {
     #[test]
     fn test_decay_factor_halves_at_one_half_life() {
         assert_eq!(decay_factor(90.0, 90.0), 0.5);
-    }
-
-    #[test]
-    fn test_status_penalty_none() {
-        assert_eq!(config::status_penalty(None), 1.0);
-    }
-
-    #[test]
-    fn test_status_penalty_current() {
-        assert_eq!(config::status_penalty(Some("current")), 1.0);
-    }
-
-    #[test]
-    fn test_status_penalty_outdated() {
-        assert!(config::status_penalty(Some("outdated")) < 1.0);
     }
 
     #[test]
@@ -653,7 +675,7 @@ mod tests {
         let conn = db::get_memory_connection().unwrap();
         let dir = tempfile::TempDir::new().unwrap();
 
-        // Use today's date so time_decay doesn't push score below threshold
+        // Use today's date so decay doesn't push score below threshold
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let md = format!(
             "---\nstatus: current\nupdated: {today}\n---\n\n# 射撃ルール\n\n射撃場での安全管理。\n"
@@ -1079,5 +1101,155 @@ mod tests {
             "company/knowledge/related.md"
         );
         assert_eq!(decoded.related_docs[0].link_type, "tag");
+    }
+
+    // ── Score hook integration tests ──────────────────────────────────────────
+
+    /// Helper: insert a document + chunk + chunks_fts into an in-memory DB.
+    /// Returns the chunk_id. `metadata` may be None (NULL) or Some(json_str).
+    fn insert_doc_with_chunk(
+        conn: &Connection,
+        path: &str,
+        status: &str,
+        updated: &str,
+        metadata: Option<&str>,
+    ) -> i64 {
+        let content = "射撃場のルールについて説明します。";
+        conn.execute(
+            "INSERT INTO documents
+             (file_path, source_type, title, file_hash, indexed_at, status, updated, metadata)
+             VALUES (?, 'note', 'T', ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                path,
+                format!("hash-{path}"),
+                updated,
+                status,
+                updated,
+                metadata
+            ],
+        )
+        .unwrap();
+        let doc_id: i64 = conn
+            .query_row(
+                "SELECT id FROM documents WHERE file_path = ?",
+                rusqlite::params![path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO chunks (document_id, chunk_index, section_path, content)
+             VALUES (?, 0, 'T', ?)",
+            rusqlite::params![doc_id, content],
+        )
+        .unwrap();
+        let chunk_id: i64 = conn
+            .query_row(
+                "SELECT id FROM chunks WHERE document_id = ?",
+                rusqlite::params![doc_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let wakachi_text = crate::tokenizer::wakachi(content);
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
+            rusqlite::params![chunk_id, wakachi_text],
+        )
+        .unwrap();
+        chunk_id
+    }
+
+    /// No-regression: insert a `superseded` doc (rank 0) and a `current` doc
+    /// (rank 1) into chunks_fts. Verify scores reflect the penalty: the
+    /// superseded doc should score substantially lower than the current one.
+    ///
+    /// Insertion order: superseded first → FTS rank 0 (score×0.2 ≥ threshold);
+    /// current second → FTS rank 1 (score×1.0 well above threshold).
+    #[test]
+    fn test_search_applies_score_hook_penalty() {
+        let conn = db::get_memory_connection().unwrap();
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+
+        // superseded inserted first → FTS rank 0 → score = rrf_0 × 0.2
+        // current inserted second → FTS rank 1 → score = rrf_1 × 1.0
+        // Since rrf_0 ≈ rrf_1 and penalty = 0.2, superseded << current.
+        let meta_sup =
+            serde_json::json!({"status":"superseded","effective_date":&today}).to_string();
+        let meta_cur = serde_json::json!({"status":"current","effective_date":&today}).to_string();
+        insert_doc_with_chunk(&conn, "sup.md", "superseded", &today, Some(&meta_sup));
+        insert_doc_with_chunk(&conn, "cur.md", "current", &today, Some(&meta_cur));
+
+        let out = search(&conn, "射撃場", 10, None, false, None).unwrap();
+        // Both docs must appear; superseded at rank 0 still passes threshold
+        // (rrf_0 × 0.2 = 1.5/60 × 0.2 = 0.005 which is exactly at threshold
+        //  and passes the `< SCORE_THRESHOLD` strict-less-than check).
+        let sup = out.results.iter().find(|r| r.source_file.contains("sup"));
+        let cur = out
+            .results
+            .iter()
+            .find(|r| r.source_file.contains("cur"))
+            .unwrap();
+        if let Some(sup) = sup {
+            assert!(
+                sup.score < cur.score * 0.5,
+                "superseded should be penalized: cur={} sup={}",
+                cur.score,
+                sup.score
+            );
+        } else {
+            // superseded score fell below threshold — that also proves penalty was applied,
+            // since current doc IS present with a non-trivial score.
+            assert!(
+                cur.score > 0.005,
+                "current doc must score above threshold; got {}",
+                cur.score
+            );
+        }
+    }
+
+    /// Synthesis fallback: insert a documents row with metadata=NULL but
+    /// status='superseded' and a recent updated date; verify the score is
+    /// penalized (~0.2 × current), proving the NULL→synthesized fallback works.
+    ///
+    /// Same insertion order as above: superseded first (rank 0), current second.
+    #[test]
+    fn test_search_synthesis_fallback_penalizes_null_metadata() {
+        let conn = db::get_memory_connection().unwrap();
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+
+        // metadata=NULL for both: status/updated columns must be synthesized.
+        insert_doc_with_chunk(&conn, "sup-null.md", "superseded", &today, None);
+        insert_doc_with_chunk(&conn, "cur-null.md", "current", &today, None);
+
+        let out = search(&conn, "射撃場", 10, None, false, None).unwrap();
+        let cur = out
+            .results
+            .iter()
+            .find(|r| r.source_file.contains("cur-null"))
+            .unwrap();
+        let sup = out
+            .results
+            .iter()
+            .find(|r| r.source_file.contains("sup-null"));
+        if let Some(sup) = sup {
+            assert!(
+                sup.score < cur.score * 0.5,
+                "NULL-metadata superseded should be penalized via synthesis: cur={} sup={}",
+                cur.score,
+                sup.score
+            );
+        } else {
+            // superseded dropped below threshold — penalty is definitely applied.
+            assert!(
+                cur.score > 0.005,
+                "current doc must score above threshold; got {}",
+                cur.score
+            );
+        }
     }
 }

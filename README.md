@@ -57,8 +57,9 @@ export TSM_INDEX_ROOT=~/my-notes
 
 # 4. Initialize the workspace: DB schema, default scaffold files
 #    (tsm.toml, .tsmignore, .tsm/{user_dict.simpledic,custom_terms.toml,
-#    synonyms.csv}), and WordNet/synonym imports. Idempotent — existing
-#    user-customized files are never overwritten.
+#    synonyms.csv, hooks/extract/10-md_frontmatter.lua,
+#    hooks/score/10-default.lua}), and WordNet/synonym imports.
+#    Idempotent — existing user-customized files are never overwritten.
 tsm init
 
 # 5. Start the daemon (embedder + file watcher)
@@ -107,6 +108,76 @@ tsm rebuild --apply   # Delete DB and rebuild
 ```
 
 Use `tsm doctor` to check system health and daemon status.
+
+## Lua Hooks
+
+tsm uses embedded Lua (mlua, lua54) for user-editable metadata extraction and
+result scoring. Hooks live in `.tsm/hooks/` and are scaffolded by `tsm init`.
+
+### Hook directory layout
+
+```text
+.tsm/hooks/
+├── extract/
+│   └── 10-md_frontmatter.lua   ← extract hook (index time)
+└── score/
+    └── 10-default.lua          ← score hook (search time)
+```
+
+- Only `.lua` files are loaded; non-`.lua` files are ignored.
+- Multiple hooks in the same directory are executed in sorted file-name order.
+- To disable a hook without deleting it, rename it away from `.lua`
+  (e.g. `10-default.lua.disabled`).
+- An empty or absent directory falls back to the embedded default hook.
+
+### Extract hooks
+
+Called at index time for each document chunk. Receive a context table:
+
+```lua
+-- ctx fields: path, body, frontmatter (top-level YAML keys), metadata (accumulated so far)
+function extract(ctx)
+  local fm = ctx.frontmatter or {}
+  return { status = fm.status, effective_date = fm.updated }
+end
+```
+
+`ctx.frontmatter` exposes the top-level YAML keys: scalars (string/number/bool)
+and sequences (e.g. `tags`, as a Lua array). Nested mappings are not passed.
+
+Return a flat table of scalar values (string, number, boolean). The results of
+all extract hooks are shallow-merged (last-wins for duplicate keys) and stored
+in `documents.metadata` (JSON column).
+
+### Score hooks
+
+Called at search time for each result. Receive a context table:
+
+```lua
+-- ctx fields: metadata (from extract), rrf, source_type, path, half_life_days
+-- builtins: decay(date, half_life_days), today()
+function score(ctx)
+  local m = ctx.metadata or {}
+  local penalty = ({ outdated = 0.4 })[m.status] or 1.0
+  return penalty * decay(m.effective_date, ctx.half_life_days)
+end
+```
+
+Each hook returns a multiplier (`>= 0`). The final score is
+`rrf × weight × Π(score hooks)`. Invalid returns (negative, NaN, ±Inf) are
+treated as `1.0` with a warning.
+
+### Sandboxing and lifecycle
+
+- Lua VMs are sandboxed: no standard library (`io`/`os`/`package` absent),
+  64 MiB memory ceiling. Hooks cannot touch the filesystem, network, or processes.
+- The daemon validates and loads all hooks at startup (fail-fast on syntax error
+  or missing entrypoint). The CLI uses a lazy per-process cache.
+- **Editing a hook requires `tsm restart`** — hooks are not reloaded at runtime.
+- **The `metadata` column is added automatically** (idempotent migration on connect); existing rows
+  have NULL metadata and the searcher synthesizes scoring from `status`/`updated`, so scoring is
+  unaffected. To populate `metadata` for existing documents after writing custom extract hooks, run
+  `tsm reindex` — a full destructive rebuild is not required.
 
 ## Environment Variables
 

@@ -324,6 +324,11 @@ pub fn index_file(conn: &Connection, file_path: &Path, index_root: &Path) -> any
     // Parse file
     let text = std::fs::read_to_string(file_path)?;
     let (fm, body) = frontmatter::parse(&text);
+    let fm_map = frontmatter::parse_map(&text);
+
+    let metadata_json =
+        crate::lua_hooks::run_extract(&crate::lua_hooks::hooks(), &rel_path, body, &fm_map)
+            .to_string();
 
     let now = chrono::Utc::now().to_rfc3339();
     let source_type = config::source_type_from_dir(&directory);
@@ -350,21 +355,21 @@ pub fn index_file(conn: &Connection, file_path: &Path, index_root: &Path) -> any
     let doc_id = if let Some((doc_id, _)) = existing {
         // Update existing document row (preserves doc_id for entity_edges/doc_links)
         tx.execute(
-            "UPDATE documents SET source_type=?, title=?, status=?, created=?, updated=?, tags=?, file_hash=?, indexed_at=?
+            "UPDATE documents SET source_type=?, title=?, status=?, created=?, updated=?, tags=?, file_hash=?, indexed_at=?, metadata=?
              WHERE id=?",
             rusqlite::params![
                 source_type, filename, fm.status, fm.created, fm.updated,
-                tags_str, current_hash, now, doc_id,
+                tags_str, current_hash, now, metadata_json, doc_id,
             ],
         )?;
         doc_id
     } else {
         tx.execute(
-            "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at, metadata)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params![
                 rel_path, source_type, filename, fm.status, fm.created, fm.updated,
-                tags_str, current_hash, now,
+                tags_str, current_hash, now, metadata_json,
             ],
         )?;
         tx.last_insert_rowid()
@@ -540,6 +545,8 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
     let tx = conn.unchecked_transaction()?;
 
     let doc_id = if let Some((doc_id, _)) = existing {
+        // metadata intentionally omitted: sessions have no frontmatter;
+        // searcher synthesizes scoring from status/updated when metadata is NULL.
         tx.execute(
             "UPDATE documents SET source_type=?, title=?, status=?, created=?, updated=?, tags=?, file_hash=?, indexed_at=?
              WHERE id=?",
@@ -2548,5 +2555,32 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(after, before);
+    }
+
+    // ─── metadata JSON integration test ──────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn test_index_file_stores_metadata_json() {
+        crate::lua_hooks::reset_hooks_cache();
+        let conn = db::get_memory_connection().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("doc.md");
+        std::fs::write(
+            &f,
+            "---\nstatus: outdated\nupdated: 2026-02-02\n---\n# T\n\nbody\n",
+        )
+        .unwrap();
+        index_file(&conn, &f, tmp.path()).unwrap();
+        let meta: Option<String> = conn
+            .query_row(
+                "SELECT metadata FROM documents WHERE source_type IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&meta.unwrap()).unwrap();
+        assert_eq!(v["status"], serde_json::json!("outdated"));
+        assert_eq!(v["effective_date"], serde_json::json!("2026-02-02"));
     }
 }
