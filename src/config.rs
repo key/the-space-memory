@@ -319,10 +319,33 @@ pub struct ResolvedConfig {
 
 impl ResolvedConfig {
     /// Resolve all config values from environment variables, config files, and defaults.
+    ///
+    /// Two resolution paths (ADR-0009 §2):
+    /// - **Injected** (the `tsm` CLI calls `set_project_root()` in `main`):
+    ///   the project root is explicit, so the config file is loaded only from
+    ///   `<root>/tsm.toml` (or `$TSM_CONFIG`). No XDG fallback.
+    /// - **Un-injected** (`tsmd`, tests): legacy discovery via
+    ///   `config_file_candidates()` incl. the XDG config dir, with
+    ///   `cwd_fallback()` for the project root. Preserved so `tsmd` keeps
+    ///   working unchanged until ADR-0010 wires its own `--project-root`.
     pub fn from_env() -> Self {
+        if let Some(root) = injected_root() {
+            let tsm_config = std::env::var_os("TSM_CONFIG").map(PathBuf::from);
+            return Self::from_env_injected(root, tsm_config.as_deref());
+        }
         let (file_cfg, loaded_root) = load_config_from(&config_file_candidates());
         let project_root = loaded_root.unwrap_or_else(cwd_fallback);
         Self::from_config_file(&file_cfg, project_root)
+    }
+
+    /// Resolve config for an explicitly injected project root (ADR-0009 §2):
+    /// load `tsm.toml` from `<root>` (or `$TSM_CONFIG`) only — no XDG fallback.
+    /// Pure over its inputs (no process-global read), so the injected path is
+    /// unit-testable without touching the `PROJECT_ROOT` singleton.
+    fn from_env_injected(root: PathBuf, tsm_config: Option<&Path>) -> Self {
+        let candidates = injected_candidates(&root, tsm_config);
+        let (file_cfg, _) = load_config_from(&candidates);
+        Self::from_config_file(&file_cfg, root)
     }
 
     /// Resolve from a pre-loaded `ConfigFile` with an explicit project root.
@@ -566,6 +589,35 @@ fn env_parse_u64(var: &str, file_val: Option<u64>) -> Option<u64> {
     file_val
 }
 
+/// Explicitly resolved project root (ADR-0009 §2), injected once by the
+/// binary's `main` after CLI parsing, before any config access. When set,
+/// `from_env()` uses it and skips legacy XDG/CWD discovery.
+static PROJECT_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Inject the resolved project root. Set-once: later calls are ignored, so
+/// the value stays consistent for the lifetime of the process. Call from
+/// `main` after `resolve_project_root()` and before any config accessor.
+pub fn set_project_root(root: PathBuf) {
+    let _ = PROJECT_ROOT.set(root);
+}
+
+/// The injected project root, if `set_project_root()` has been called.
+fn injected_root() -> Option<PathBuf> {
+    PROJECT_ROOT.get().cloned()
+}
+
+/// Config-file candidates for an explicitly injected project root
+/// (ADR-0009 §2): `$TSM_CONFIG` (if set) then `<root>/tsm.toml`. No XDG —
+/// an injected root is authoritative, so silent fallbacks are dropped.
+fn injected_candidates(root: &Path, tsm_config: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(cfg) = tsm_config {
+        candidates.push(cfg.to_path_buf());
+    }
+    candidates.push(root.join("tsm.toml"));
+    candidates
+}
+
 static RESOLVED: OnceLock<RwLock<ResolvedConfig>> = OnceLock::new();
 
 /// Get the lazily-loaded resolved config singleton (cloned).
@@ -769,6 +821,48 @@ fn config_file_candidates() -> Vec<PathBuf> {
         candidates.push(dirs.config_dir().join("config.toml"));
     }
     candidates
+}
+
+/// Resolve the project root per ADR-0009 §2. The project root is the directory
+/// that holds `tsm.toml`. Precedence (no walk-up, no silent fallback):
+///   1. `TSM_CONFIG` escape hatch (§6) → parent directory of that file
+///   2. `<cwd>/tsm.toml` exists → `cwd`
+///   3. `--project-root <dir>` whose direct child `tsm.toml` exists → `dir`
+///   4. otherwise → error
+///
+/// Pure over its inputs (only stats `cwd`/`arg`) so it can run before the
+/// config singleton initializes. `tsm_config` is the caller-read `TSM_CONFIG`.
+pub fn resolve_project_root(
+    cwd: &Path,
+    project_root_arg: Option<&Path>,
+    tsm_config: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(cfg) = tsm_config {
+        let abs = if cfg.is_absolute() {
+            cfg.to_path_buf()
+        } else {
+            cwd.join(cfg)
+        };
+        return abs.parent().map(Path::to_path_buf).ok_or_else(|| {
+            anyhow::anyhow!("TSM_CONFIG '{}' has no parent directory", cfg.display())
+        });
+    }
+    if cwd.join("tsm.toml").is_file() {
+        return Ok(cwd.to_path_buf());
+    }
+    if let Some(arg) = project_root_arg {
+        if arg.join("tsm.toml").is_file() {
+            return Ok(arg.to_path_buf());
+        }
+        anyhow::bail!(
+            "--project-root '{}' has no tsm.toml; run `tsm init` there first",
+            arg.display()
+        );
+    }
+    anyhow::bail!(
+        "no tsm.toml in the current directory and no --project-root given; \
+         run `tsm init` here or pass --project-root <dir>"
+    )
 }
 
 // ─── Accessor functions (delegate to ResolvedConfig singleton) ───
@@ -1543,6 +1637,122 @@ index_root = "/low-root"
         assert!(cfg.state_dir.is_none());
         assert!(cfg.index_root.is_none());
         assert!(root.is_none(), "no config loaded → no project_root");
+    }
+
+    // ── resolve_project_root (ADR-0009 §2) ──────────────────────────────
+    // Pure resolution: precedence is TSM_CONFIG → CWD-direct tsm.toml →
+    // --project-root → error. No walk-up, no silent fallback.
+
+    #[test]
+    fn test_resolve_project_root_cwd_has_tsm_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tsm.toml"), "").unwrap();
+        let root = resolve_project_root(dir.path(), None, None).unwrap();
+        assert_eq!(root, dir.path());
+    }
+
+    #[test]
+    fn test_resolve_project_root_falls_back_to_arg() {
+        let cwd = tempfile::tempdir().unwrap(); // no tsm.toml here
+        let arg = tempfile::tempdir().unwrap();
+        std::fs::write(arg.path().join("tsm.toml"), "").unwrap();
+        let root = resolve_project_root(cwd.path(), Some(arg.path()), None).unwrap();
+        assert_eq!(root, arg.path());
+    }
+
+    #[test]
+    fn test_resolve_project_root_cwd_wins_over_arg() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("tsm.toml"), "").unwrap();
+        let arg = tempfile::tempdir().unwrap();
+        std::fs::write(arg.path().join("tsm.toml"), "").unwrap();
+        let root = resolve_project_root(cwd.path(), Some(arg.path()), None).unwrap();
+        assert_eq!(
+            root,
+            cwd.path(),
+            "CWD tsm.toml takes precedence over --project-root"
+        );
+    }
+
+    #[test]
+    fn test_resolve_project_root_arg_without_tsm_toml_errors() {
+        let cwd = tempfile::tempdir().unwrap();
+        let arg = tempfile::tempdir().unwrap(); // no tsm.toml under arg
+        assert!(resolve_project_root(cwd.path(), Some(arg.path()), None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_project_root_unresolvable_errors() {
+        let cwd = tempfile::tempdir().unwrap(); // no tsm.toml, no arg
+        assert!(resolve_project_root(cwd.path(), None, None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_project_root_tsm_config_wins() {
+        // TSM_CONFIG escape hatch (§6): project_root = parent(TSM_CONFIG),
+        // short-circuiting even when CWD has its own tsm.toml.
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("tsm.toml"), "").unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg_file = cfg_dir.path().join("tsm.toml");
+        std::fs::write(&cfg_file, "").unwrap();
+        let root = resolve_project_root(cwd.path(), None, Some(&cfg_file)).unwrap();
+        assert_eq!(root, cfg_dir.path());
+    }
+
+    #[test]
+    fn test_resolve_project_root_tsm_config_relative() {
+        // A bare relative TSM_CONFIG (e.g. "custom.toml") resolves against cwd;
+        // the project root is its parent directory.
+        let cwd = tempfile::tempdir().unwrap();
+        let root = resolve_project_root(cwd.path(), None, Some(Path::new("custom.toml"))).unwrap();
+        assert_eq!(root, cwd.path());
+    }
+
+    #[test]
+    fn test_resolve_project_root_tsm_config_no_parent_errors() {
+        // A filesystem-root TSM_CONFIG ("/") has no parent → error.
+        let cwd = tempfile::tempdir().unwrap();
+        assert!(resolve_project_root(cwd.path(), None, Some(Path::new("/"))).is_err());
+    }
+
+    #[test]
+    fn test_from_env_injected_uses_root_and_reads_its_tsm_toml() {
+        // The injected path uses `root` as project_root and loads its tsm.toml.
+        // Uses content_dirs (no env override) so the assertion is env-stable.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tsm.toml"),
+            "[[index.content_dirs]]\npath = \"injected-notes\"\nweight = 2.0\n",
+        )
+        .unwrap();
+        let cfg = ResolvedConfig::from_env_injected(dir.path().to_path_buf(), None);
+        assert_eq!(cfg.project_root, dir.path());
+        assert!(
+            cfg.content_dirs
+                .iter()
+                .any(|d| d.path == "injected-notes" && d.weight == 2.0),
+            "injected root's tsm.toml should be loaded"
+        );
+    }
+
+    #[test]
+    fn test_injected_candidates_only_root_tsm_toml() {
+        // No XDG on the injected path — just <root>/tsm.toml.
+        let c = injected_candidates(Path::new("/proj"), None);
+        assert_eq!(c, vec![PathBuf::from("/proj/tsm.toml")]);
+    }
+
+    #[test]
+    fn test_injected_candidates_tsm_config_takes_precedence() {
+        let c = injected_candidates(Path::new("/proj"), Some(Path::new("/custom/my.toml")));
+        assert_eq!(
+            c,
+            vec![
+                PathBuf::from("/custom/my.toml"),
+                PathBuf::from("/proj/tsm.toml"),
+            ]
+        );
     }
 
     #[test]
