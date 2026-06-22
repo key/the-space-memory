@@ -71,6 +71,9 @@ tsm index
 tsm search -q "query" -k 5
 ```
 
+`tsm setup` sets `HF_HUB_CACHE` automatically; override it to redirect the
+Hugging Face model cache.
+
 ### What gets indexed
 
 tsm recursively scans `TSM_INDEX_ROOT` for `.md` files.
@@ -104,6 +107,31 @@ tsm rebuild --apply   # Delete DB and rebuild
 ```
 
 Use `tsm doctor` to check system health and daemon status.
+
+## Environment Variables
+
+Every setting below can also be set in `tsm.toml` (the `tsm.toml key` column);
+the environment variable takes precedence. See
+[docs/configuration.md](docs/configuration.md) for the full reference.
+
+| Variable | Default | `tsm.toml` key | Description |
+|---|---|---|---|
+| `TSM_CONFIG` | *(discovered)* | *(n/a)* | Path to the config file; the directory containing it becomes the project root |
+| `TSM_STATE_DIR` | `.tsm` | `state_dir` | Root directory for all tsm state (DB, sockets, PID, logs, user dict) |
+| `TSM_CACHE_DIR` | `$XDG_CACHE_HOME/tsm` (else `$HOME/.cache/tsm`) | `cache_dir` | Cache directory for the model and WordNet DB |
+| `TSM_INDEX_ROOT` | `/workspaces` | `index_root` | Root directory containing the content to index |
+| `TSM_EMBEDDER_SOCKET` | `{state_dir}/embedder.sock` | `embedder_socket_path` | UNIX socket for the embedder child process |
+| `TSM_DAEMON_SOCKET` | `{state_dir}/daemon.sock` | `daemon_socket_path` | UNIX socket for the `tsmd` daemon |
+| `TSM_LOG_DIR` | `{state_dir}/logs` | `log_dir` | Directory for daemon log files |
+| `TSM_EMBEDDER_IDLE_TIMEOUT` | `600` | `embedder_idle_timeout_secs` | Idle seconds before the embedder auto-stops (`0` = never). `tsmd` spawns it with `--no-idle-timeout`, so this applies only to standalone runs |
+| `TSM_EMBEDDER_BACKFILL_INTERVAL` | `300` | `embedder_backfill_interval_secs` | Seconds between periodic vector backfill checks (`0` = disable) |
+| `TSM_SEARCH_FALLBACK` | `error` | `search_fallback` | Behavior when the embedder is down: `error` or `fts_only` |
+| `TSM_USER_DICT` | `{state_dir}/user_dict.simpledic` | `user_dict_path` | Path to the lindera user dictionary |
+| `TSM_SETUP_LINK_MODE` | `symlink` | `[setup].link_mode` | How `tsm setup` materializes cached resources: `symlink` or `copy` |
+| `TSM_INIT_LINK_MODE` | `symlink` | `[init].link_mode` | How `tsm init` links workspace resources to the cache: `symlink` or `copy` |
+
+tsm also honors `RUST_LOG` (log level, default `info`) and `NO_COLOR`
+(disable colored output).
 
 ## Benchmarks
 
