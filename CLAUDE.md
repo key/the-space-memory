@@ -270,11 +270,14 @@ A change is merge-ready when **all** of the following hold:
 - **Segmenter is cached** — `tokenizer::get_segmenter()` caches the Segmenter
   (including user dict). Call `reset_segmenter()` after writing new simpledic
   if rebuilding FTS in the same process
-- **Daemon fail-fasts on an uninitialized DB** — `tsmd` refuses to start when
-  the DB lacks the core schema (`db::is_initialized`), exiting with
-  "Run `tsm init` first" before binding the socket (ADR-0008: init is explicit,
-  never auto-created). `cmd_start` detects the early exit via `try_wait` and
-  surfaces the captured stderr, so auto-start fails immediately instead of
+- **Daemon fail-fasts on an uninitialized DB — without creating `.tsm`** —
+  both `cmd_start` and `tsmd` probe the DB read-only (`db::probe_initialized`,
+  which opens with no `CREATE` flag and never materializes the file) BEFORE the
+  stderr log, logger, startup lock, or socket touch the state directory.
+  Starting in an unconfigured directory exits with "Run `tsm init` first" and
+  leaves no stray `.tsm` behind (ADR-0008: init is explicit, never
+  auto-created). `cmd_start` also surfaces the spawned daemon's captured stderr
+  via `try_wait`, so a daemon that dies after spawn fails immediately instead of
   blocking on the 30s socket-wait timeout
 - **`tsm doctor` never auto-starts the daemon** — it is a read-only diagnostic.
   Uses the daemon's report if already running, else falls back to a local

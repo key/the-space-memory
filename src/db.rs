@@ -181,6 +181,21 @@ pub fn is_initialized(conn: &Connection) -> bool {
         && table_exists(conn, "chunks_fts")
 }
 
+/// Whether the DB at `path` exists and carries the core schema, WITHOUT
+/// creating it.
+///
+/// Opens the file read-only (no `CREATE` flag) so a missing DB never
+/// materializes: starting an uninitialized project must not leave a stray
+/// state directory behind (ADR-0008 — `init` is an explicit, separate step).
+/// A missing, unopenable, or schemaless DB reports `false`. Used as a
+/// side-effect-free pre-flight gate before the daemon creates its logger,
+/// lock, and socket.
+pub fn probe_initialized(path: &Path) -> bool {
+    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map(|conn| is_initialized(&conn))
+        .unwrap_or(false)
+}
+
 /// Ensure the `content_hash` column exists on the `chunks` table (migration for older DBs).
 ///
 /// No-op when the `chunks` table is absent: a freshly initialized DB already has
@@ -484,6 +499,33 @@ mod tests {
         let db_path = dir.path().join("uninit.db");
         let conn = get_connection(&db_path).unwrap();
         assert!(!is_initialized(&conn));
+    }
+
+    #[test]
+    fn test_probe_initialized_false_for_missing_file_without_creating_it() {
+        // The whole point of the probe: report "not initialized" for an absent DB
+        // WITHOUT materializing the file (which would leave a stray `.tsm`).
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing.db");
+        assert!(!probe_initialized(&db_path));
+        assert!(!db_path.exists(), "probe must not create the DB file");
+    }
+
+    #[test]
+    fn test_probe_initialized_false_for_bare_db() {
+        // An existing-but-schemaless DB file is not initialized.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bare.db");
+        Connection::open(&db_path).unwrap(); // creates an empty file, no schema
+        assert!(!probe_initialized(&db_path));
+    }
+
+    #[test]
+    fn test_probe_initialized_true_for_initialized_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ready.db");
+        init_db(&db_path).unwrap();
+        assert!(probe_initialized(&db_path));
     }
 
     #[test]

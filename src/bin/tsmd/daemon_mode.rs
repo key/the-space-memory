@@ -18,12 +18,26 @@ use crate::{backfill, child, Args, SHUTDOWN};
 
 pub fn run(args: Args) -> Result<()> {
     config::ensure_model_cache_env();
+
+    let db_path = args.db.clone().unwrap_or_else(config::db_path);
+
+    // Fail fast on an uninitialized DB BEFORE the logger, lock, or socket
+    // materialize the state directory. `init` is an explicit, separate step
+    // (ADR-0008); the daemon must never auto-create its schema, nor leave a
+    // stray `.tsm` when started in an unconfigured directory. The probe opens
+    // read-only and never creates the DB file.
+    if !db::probe_initialized(&db_path) {
+        anyhow::bail!(
+            "Database not initialized at {}. Run `tsm init` first.",
+            db_path.display()
+        );
+    }
+
     the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
         name: "tsmd",
     })?;
 
     let socket_path = args.socket.unwrap_or_else(config::daemon_socket_path);
-    let db_path = args.db.unwrap_or_else(config::db_path);
     let project_root = config::project_root();
 
     // Acquire the per-project startup lock FIRST — before opening the DB or
@@ -53,18 +67,10 @@ pub fn run(args: Args) -> Result<()> {
         }
     };
 
-    // Open DB connection
+    // Open DB connection. The read-only probe at the top of `run` already proved
+    // the schema is present, so this never serves (or creates) a schemaless DB.
     let conn = db::get_connection(&db_path)
         .context(format!("Failed to open DB at {}", db_path.display()))?;
-
-    // Fail fast on an uninitialized DB rather than serving a schemaless database.
-    // `init` is a deliberate, separate step (see ADR-0008); do not auto-create the schema.
-    if !db::is_initialized(&conn) {
-        anyhow::bail!(
-            "Database not initialized at {}. Run `tsm init` first.",
-            db_path.display()
-        );
-    }
 
     // ADR-0009 §3: reject a config that still carries the removed `index_root`
     // key.  `anyhow::bail!` here keeps the accept loop clean — no socket is
