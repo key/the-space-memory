@@ -8,7 +8,6 @@ use mlua::{Lua, LuaOptions, StdLib};
 use serde_json::{Map, Value};
 
 use crate::config;
-use crate::frontmatter::Frontmatter;
 
 /// Per-VM memory ceiling for hook execution (bytes). Sandboxing: no stdlib
 /// (`io`/`os`/`package` absent) so hooks cannot touch FS/process/network.
@@ -138,26 +137,54 @@ pub fn hooks() -> Arc<HookSources> {
     arc
 }
 
-/// Build the `ctx.frontmatter` table from the parsed Frontmatter (full mapping).
-fn frontmatter_table(lua: &Lua, fm: &Frontmatter) -> anyhow::Result<mlua::Table> {
+/// Build the `ctx.frontmatter` table from the full parsed YAML map.
+///
+/// Converts each top-level key to the matching Lua value type:
+/// - String/Bool/Number scalars → Lua string/bool/number
+/// - Sequences → 1-indexed Lua array table of their scalar string elements
+/// - Null / nested mappings → skipped
+fn frontmatter_table(
+    lua: &Lua,
+    fm_map: &std::collections::BTreeMap<String, serde_yaml::Value>,
+) -> anyhow::Result<mlua::Table> {
     let t = lua.create_table()?;
-    if let Some(s) = &fm.status {
-        t.set("status", s.clone())?;
+    for (key, val) in fm_map {
+        match val {
+            serde_yaml::Value::String(s) => {
+                t.set(key.clone(), s.clone())?;
+            }
+            serde_yaml::Value::Bool(b) => {
+                t.set(key.clone(), *b)?;
+            }
+            serde_yaml::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    t.set(key.clone(), i)?;
+                } else if let Some(f) = n.as_f64() {
+                    t.set(key.clone(), f)?;
+                }
+            }
+            serde_yaml::Value::Sequence(seq) => {
+                let arr = lua.create_table()?;
+                let mut idx = 1usize;
+                for item in seq {
+                    let s = match item {
+                        serde_yaml::Value::String(s) => Some(s.clone()),
+                        serde_yaml::Value::Number(n) => Some(n.to_string()),
+                        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+                        _ => None,
+                    };
+                    if let Some(s) = s {
+                        arr.set(idx, s)?;
+                        idx += 1;
+                    }
+                }
+                t.set(key.clone(), arr)?;
+            }
+            // Null and nested mappings are skipped (already excluded by parse_map,
+            // but guard here for direct callers with raw maps)
+            _ => {}
+        }
     }
-    if let Some(s) = &fm.created {
-        t.set("created", s.clone())?;
-    }
-    if let Some(s) = &fm.updated {
-        t.set("updated", s.clone())?;
-    }
-    if let Some(s) = &fm.superseded_by {
-        t.set("superseded_by", s.clone())?;
-    }
-    let tags = lua.create_table()?;
-    for (i, tag) in fm.tags.iter().enumerate() {
-        tags.set(i + 1, tag.clone())?;
-    }
-    t.set("tags", tags)?;
     Ok(t)
 }
 
@@ -182,10 +209,15 @@ fn lua_table_to_json(t: &mlua::Table, out: &mut Map<String, Value>) {
 
 /// Run the extract chain; shallow-merge present keys (last-wins). Per-script
 /// runtime errors are logged and skipped (fail-safe).
-pub fn run_extract(sources: &HookSources, path: &str, body: &str, fm: &Frontmatter) -> Value {
+pub fn run_extract(
+    sources: &HookSources,
+    path: &str,
+    body: &str,
+    fm_map: &std::collections::BTreeMap<String, serde_yaml::Value>,
+) -> Value {
     let mut acc: Map<String, Value> = Map::new();
     for script in &sources.extract {
-        if let Err(e) = run_one_extract(script, path, body, fm, &mut acc) {
+        if let Err(e) = run_one_extract(script, path, body, fm_map, &mut acc) {
             log::warn!("extract hook {} failed: {e}", script.name);
         }
     }
@@ -196,7 +228,7 @@ fn run_one_extract(
     script: &HookScript,
     path: &str,
     body: &str,
-    fm: &Frontmatter,
+    fm_map: &std::collections::BTreeMap<String, serde_yaml::Value>,
     acc: &mut Map<String, Value>,
 ) -> anyhow::Result<()> {
     let lua = new_sandboxed_lua()?;
@@ -204,7 +236,7 @@ fn run_one_extract(
     let ctx = lua.create_table()?;
     ctx.set("path", path)?;
     ctx.set("body", body)?;
-    ctx.set("frontmatter", frontmatter_table(&lua, fm)?)?;
+    ctx.set("frontmatter", frontmatter_table(&lua, fm_map)?)?;
     // Accumulated metadata so far, for earlier-wins/conditional policies.
     let meta = lua.create_table()?;
     for (k, v) in acc.iter() {
@@ -361,11 +393,17 @@ mod tests {
 
     #[test]
     fn test_sandbox_has_no_io() {
-        // Arrange/Act: io should be nil under StdLib::NONE.
+        // Arrange/Act: io, os, and package must all be nil under StdLib::NONE.
         let lua = new_sandboxed_lua().unwrap();
-        let is_nil: bool = lua.load("return io == nil").eval().unwrap();
+        let all_nil: bool = lua
+            .load("return io == nil and os == nil and package == nil")
+            .eval()
+            .unwrap();
         // Assert
-        assert!(is_nil, "io must be unavailable in sandboxed VM");
+        assert!(
+            all_nil,
+            "io, os, and package must all be unavailable in sandboxed VM"
+        );
     }
 
     // ── Discovery + fallback + fail-fast tests ──────────────────────────────
@@ -537,7 +575,18 @@ mod tests {
 
     // ── run_extract tests ────────────────────────────────────────────────────
 
-    use crate::frontmatter::Frontmatter;
+    use std::collections::BTreeMap;
+
+    fn empty_fm() -> BTreeMap<String, serde_yaml::Value> {
+        BTreeMap::new()
+    }
+
+    fn fm_with(pairs: &[(&str, &str)]) -> BTreeMap<String, serde_yaml::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_yaml::Value::String(v.to_string())))
+            .collect()
+    }
 
     fn sources_from(extract_src: &str, score_src: &str) -> HookSources {
         HookSources {
@@ -555,11 +604,7 @@ mod tests {
     #[test]
     fn test_run_extract_default_maps_frontmatter() {
         let s = sources_from(DEFAULT_EXTRACT_HOOK, "function score(c) return 1 end");
-        let fm = Frontmatter {
-            status: Some("current".into()),
-            updated: Some("2026-03-01".into()),
-            ..Default::default()
-        };
+        let fm = fm_with(&[("status", "current"), ("updated", "2026-03-01")]);
         let v = run_extract(&s, "a.md", "body", &fm);
         assert_eq!(v["status"], serde_json::json!("current"));
         assert_eq!(v["effective_date"], serde_json::json!("2026-03-01"));
@@ -583,7 +628,7 @@ mod tests {
                 source: "function score(c) return 1 end".into(),
             }],
         };
-        let v = run_extract(&s, "a.md", "body", &Frontmatter::default());
+        let v = run_extract(&s, "a.md", "body", &empty_fm());
         assert_eq!(v["status"], serde_json::json!("b")); // last-wins
         assert_eq!(v["kept"], serde_json::json!("x")); // present-key from earlier survives
     }
@@ -606,8 +651,47 @@ mod tests {
                 source: "function score(c) return 1 end".into(),
             }],
         };
-        let v = run_extract(&s, "a.md", "body", &Frontmatter::default());
+        let v = run_extract(&s, "a.md", "body", &empty_fm());
         assert_eq!(v["a"], serde_json::json!(1)); // first script's contribution kept
+    }
+
+    #[test]
+    fn test_run_extract_non_standard_frontmatter_key_readable() {
+        // ADR-0013: a non-standard key (priority) must reach the extract hook.
+        // Also verify that sequences (tags) arrive as an array table.
+        let s = sources_from(
+            r#"function extract(c)
+                local fm = c.frontmatter or {}
+                return {
+                    p = fm.priority,
+                    first_tag = fm.tags and fm.tags[1] or "none",
+                }
+            end"#,
+            "function score(c) return 1 end",
+        );
+        let mut fm: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
+        fm.insert(
+            "priority".to_string(),
+            serde_yaml::Value::String("high".to_string()),
+        );
+        fm.insert(
+            "tags".to_string(),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("Rust".to_string()),
+                serde_yaml::Value::String("検索".to_string()),
+            ]),
+        );
+        let v = run_extract(&s, "a.md", "body", &fm);
+        assert_eq!(
+            v["p"],
+            serde_json::json!("high"),
+            "non-standard key must be visible to extract hook"
+        );
+        assert_eq!(
+            v["first_tag"],
+            serde_json::json!("Rust"),
+            "tags sequence must arrive as 1-indexed Lua array"
+        );
     }
 
     // ── run_score tests ──────────────────────────────────────────────────────
@@ -703,7 +787,7 @@ mod tests {
         };
 
         // Act
-        let v = run_extract(&s, "a.md", "body", &Frontmatter::default());
+        let v = run_extract(&s, "a.md", "body", &empty_fm());
 
         // Assert: bool propagated, string kept, second script saw the flag.
         assert_eq!(v["flag"], serde_json::json!(true));

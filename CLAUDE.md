@@ -93,7 +93,8 @@ src/
   (status + effective\_date).
 - **Score hooks** (search time): Lua scripts in `.tsm/hooks/score/` each return a multiplier;
   `final = rrf × weight × Π(score hooks)`. Embedded default reproduces time\_decay × status\_penalty.
-- **DB schema changes require `rebuild --apply`** (e.g. FTS tokenizer changes, new `metadata` column)
+- **DB schema changes require `rebuild --apply`** (e.g. FTS tokenizer changes) — the `metadata`
+  column is added automatically on connect (idempotent migration) and does not require a rebuild
 - **Live re-indexing**: `tsm reindex {all|fts|vectors}` — daemon runs batched
   re-index in background, yielding to search between batches
 
@@ -231,9 +232,11 @@ A change is merge-ready when **all** of the following hold:
   Empty or absent dir → embedded defaults. Disable a hook by renaming away the `.lua` extension.
 - **Editing a hook requires `tsm restart`** — daemon validates and loads all hooks at startup
   (fail-fast on broken script). CLI uses a lazy per-process cache. Neither reloads hooks at runtime.
-- **`metadata` column requires `rebuild --apply` on pre-existing DBs** — `documents.metadata`
-  (JSON) added by the Lua hooks feature is not a live migration; run `tsm rebuild --apply` once
-  after upgrading.
+- **`metadata` column is added automatically** — `documents.metadata` (JSON) is added by an
+  idempotent `ALTER TABLE` migration on connect. Existing rows have NULL metadata; the searcher
+  synthesizes scoring from `status`/`updated` columns, so scoring is unaffected. To populate
+  metadata for existing documents after writing custom extract hooks, run `tsm reindex` — a full
+  destructive rebuild is not required.
 - **Lua VMs are sandboxed** — `StdLib::NONE` + 64 MiB memory ceiling per VM.
   No `io`/`os`/`package` available; hooks cannot touch the filesystem, network, or spawn processes.
   Infinite loops are NOT bounded (op-count/timeout limit is deferred); hooks are user-owned scripts,

@@ -168,7 +168,10 @@ treated as `1.0` with a warning.
 - The daemon validates and loads all hooks at startup (fail-fast on syntax error
   or missing entrypoint). The CLI uses a lazy per-process cache.
 - **Editing a hook requires `tsm restart`** — hooks are not reloaded at runtime.
-- **Adding the `metadata` column to a pre-existing DB requires `tsm rebuild --apply`.**
+- **The `metadata` column is added automatically** (idempotent migration on connect); existing rows
+  have NULL metadata and the searcher synthesizes scoring from `status`/`updated`, so scoring is
+  unaffected. To populate `metadata` for existing documents after writing custom extract hooks, run
+  `tsm reindex` — a full destructive rebuild is not required.
 
 ## Benchmarks
 

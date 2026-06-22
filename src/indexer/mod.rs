@@ -324,9 +324,11 @@ pub fn index_file(conn: &Connection, file_path: &Path, index_root: &Path) -> any
     // Parse file
     let text = std::fs::read_to_string(file_path)?;
     let (fm, body) = frontmatter::parse(&text);
+    let fm_map = frontmatter::parse_map(&text);
 
     let metadata_json =
-        crate::lua_hooks::run_extract(&crate::lua_hooks::hooks(), &rel_path, body, &fm).to_string();
+        crate::lua_hooks::run_extract(&crate::lua_hooks::hooks(), &rel_path, body, &fm_map)
+            .to_string();
 
     let now = chrono::Utc::now().to_rfc3339();
     let source_type = config::source_type_from_dir(&directory);

@@ -185,6 +185,7 @@ pub fn search(
         ))
     })?;
 
+    let hooks = crate::lua_hooks::hooks();
     let mut results = Vec::new();
     for row in rows {
         let (chunk_id, section_path, content, file_path, source_type, status, updated, metadata) =
@@ -214,7 +215,7 @@ pub fn search(
         let weight = config::directory_weight(&file_path);
         let half_life = config::half_life_days(&file_path, &source_type);
         let multiplier = crate::lua_hooks::run_score(
-            &crate::lua_hooks::hooks(),
+            &hooks,
             effective_metadata.as_deref(),
             rrf,
             &source_type,
