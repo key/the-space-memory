@@ -184,6 +184,15 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Restore the default SIGPIPE disposition. Rust's runtime sets SIGPIPE to
+    // SIG_IGN at startup, which turns a write to a closed pipe into a panic
+    // (`failed printing to stdout`) when results are piped into `head`, `pbcopy`,
+    // etc. Resetting to SIG_DFL makes the CLI terminate quietly on a broken pipe,
+    // matching standard Unix tools. tsmd is a separate binary and re-establishes
+    // SIG_IGN at its own startup, so this does not affect the daemon.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     config::ensure_model_cache_env();
     the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Stderr)?;
     let args = Cli::parse();
@@ -585,9 +594,13 @@ fn wait_for_daemon_ready(
                 }
             }
         }
-        if let Ok(Some(status)) = child.try_wait() {
-            let detail = read_daemon_failure(stderr_path);
-            anyhow::bail!("tsmd exited before starting ({status}).{detail}");
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let detail = read_daemon_failure(stderr_path);
+                anyhow::bail!("tsmd exited before starting ({status}).{detail}");
+            }
+            Err(e) => anyhow::bail!("failed to poll tsmd startup status: {e}"),
+            Ok(None) => {}
         }
         if start.elapsed() > timeout {
             anyhow::bail!("Timeout waiting for tsmd to start.");

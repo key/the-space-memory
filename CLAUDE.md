@@ -254,17 +254,18 @@ A change is merge-ready when **all** of the following hold:
   not create a `tsm.db` file)
 - **Log files: two, not per-process** — the daemon (`tsmd`) writes a structured,
   daily-rotated `tsmd.log` (kept 3 generations; holds all daemon info/warn).
-  Children (embedder, watcher) keep NO own files; they log to stderr at `warn`,
-  which `cmd_start` captures into a single, unrotated `logs/tsmd-stderr.log`.
-  That capture replaces terminal inheritance (no shell spam) and `cmd_start`
-  reads it to surface startup failures. `tsmd-stderr.log` is NOT rotated, so it
-  is kept small by design: children log at `warn` not `info`, and the daemon's
-  file logger drops `duplicate_to_stderr` (its warns already go to `tsmd.log`).
-  It is truncated on each start. A foreground `tsmd` still logs to the terminal
-- **CLI (`tsm`) logs at `warn` by default; the daemon at `info`**
-  (`logging::default_log_spec`). User-facing command output is `println!`, not
-  the logger, so it shows regardless of level. Set `RUST_LOG=info`/`debug` for
-  verbose CLI logs
+  Children (embedder, watcher) keep NO own files; they log to stderr, which
+  `cmd_start` captures into a single, unrotated `logs/tsmd-stderr.log`. That
+  capture replaces terminal inheritance (no shell spam) and `cmd_start` reads it
+  to surface startup failures. Shell spam is prevented structurally (stderr
+  capture + the daemon dropping `duplicate_to_stderr`), NOT by lowering log
+  levels — so child lifecycle/diagnostic logs stay visible in the file.
+  `tsmd-stderr.log` is truncated on each start (bounded across runs) but is NOT
+  rotated, so a single long-lived session can grow it (size cap is a follow-up).
+  A foreground `tsmd` still logs to the terminal
+- **All log modes default to `info`** (`logging::default_log_spec`). User-facing
+  command output is `println!`, not the logger, so it shows regardless of level.
+  Set `RUST_LOG=warn` to quiet the CLI terminal, or `debug` for more detail
 - **macOS tempdir tests fail locally, pass on Linux CI** — `tempfile::tempdir()`
   returns `/var/...` but `current_dir()` resolves the symlink to `/private/var/...`,
   so tests asserting `path == cwd` (e.g.

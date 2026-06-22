@@ -7,13 +7,13 @@ use log::Record;
 use crate::config;
 
 pub enum LogMode {
-    /// CLI (tsm) — log to stderr at `warn`
+    /// CLI (tsm) — log to stderr.
     Stderr,
-    /// Daemon children (embedder, watcher) — log to stderr at `warn`.
-    /// They inherit the daemon's stderr, which `cmd_start` captures into a single
-    /// `tsmd-stderr.log`, so they keep no own files. `warn` (not `info`) keeps that
-    /// shared, unrotated capture from growing without bound under a long-lived
-    /// daemon; verbose child logs are available via `RUST_LOG` or foreground runs.
+    /// Daemon children (embedder, watcher) — log to stderr, which `cmd_start`
+    /// captures into a single `tsmd-stderr.log` instead of inheriting the
+    /// terminal. They keep no own files. Terminal log spam is prevented by that
+    /// capture (and by routing user-facing output through `println!`), not by
+    /// lowering the log level — so child lifecycle logs stay visible in the file.
     DaemonStderr,
     /// Daemon main (tsmd) — structured log to file with daily rotation
     Daemon { name: &'static str },
@@ -21,16 +21,15 @@ pub enum LogMode {
 
 static LOGGER_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
-/// Default log level spec for a mode, overridable via `RUST_LOG`.
+/// Default log level spec, overridable via `RUST_LOG`.
 ///
-/// The CLI (`tsm`) defaults to `warn` so normal runs stay quiet — user-facing
-/// output goes through `println!`, not the logger. The daemon logs to a file,
-/// so `info` is appropriate there.
-fn default_log_spec(mode: &LogMode) -> &'static str {
-    match mode {
-        LogMode::Stderr | LogMode::DaemonStderr => "warn",
-        LogMode::Daemon { .. } => "info",
-    }
+/// All modes default to `info`. Terminal log spam — the original problem — is
+/// prevented structurally (the daemon/children no longer inherit the terminal:
+/// their stderr is captured to a file, and user-facing output goes through
+/// `println!`), not by lowering the level. Keeping `info` ensures lifecycle and
+/// diagnostic logs stay visible in the log files.
+fn default_log_spec(_mode: &LogMode) -> &'static str {
+    "info"
 }
 
 /// Initialize the logger. Safe to call multiple times (idempotent via OnceLock).
@@ -118,8 +117,8 @@ mod tests {
     }
 
     #[test]
-    fn test_default_log_spec_stderr_is_warn() {
-        assert_eq!(default_log_spec(&LogMode::Stderr), "warn");
+    fn test_default_log_spec_stderr_is_info() {
+        assert_eq!(default_log_spec(&LogMode::Stderr), "info");
     }
 
     #[test]
@@ -128,10 +127,11 @@ mod tests {
     }
 
     #[test]
-    fn test_default_log_spec_daemon_stderr_is_warn() {
-        // Daemon children log to the shared, unrotated tree stderr at warn so it
-        // does not grow without bound under a long-lived daemon.
-        assert_eq!(default_log_spec(&LogMode::DaemonStderr), "warn");
+    fn test_default_log_spec_daemon_stderr_is_info() {
+        // Levels stay at info; terminal spam is prevented by capturing child
+        // stderr to a file and routing results through println!, not by lowering
+        // the level — so child lifecycle logs remain visible.
+        assert_eq!(default_log_spec(&LogMode::DaemonStderr), "info");
     }
 
     #[test]

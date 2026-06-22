@@ -43,7 +43,7 @@
 | # | チャネル | 内容 | 行き先 | レベル / 制御 | パイプ |
 |---|---|---|---|---|---|
 | ① | ユーザー出力（結果） | コマンドの成果物：検索結果、init/setup/dict/index の進捗と結果、status/doctor 表示、明示時の `tsmd started` / `stopped` | **stdout**（`println!`） | レベルに依らず常時。`--format json` で機械可読 | ✅ |
-| ② | 通常ログ（診断） | 内部動作の記録。CLI の補助情報、daemon の運用ログ | logger。CLI=**stderr**（既定 `warn`）/ daemon=**`tsmd.log`**（既定 `info`） | `RUST_LOG` で上書き | ❌ |
+| ② | 通常ログ（診断） | 内部動作の記録。CLI の補助情報、daemon の運用ログ | logger。CLI=**stderr** / daemon=**`tsmd.log`**（いずれも既定 `info`） | `RUST_LOG` で上書き | ❌ |
 | ③ | エラー出力 | 失敗・警告。致命的 anyhow エラー、`log::warn!` | **stderr**（CLI）/ daemon ツリーの raw stderr は detached 時 `tsmd-stderr.log` | 致命時は非ゼロ終了 | ❌ |
 
 ### 不変条件
@@ -51,22 +51,23 @@
 - **stdout は「結果」専用**。診断・進捗ノイズ・ログを混ぜない。これにより
   `| head` / `| jq` / `| pbcopy` が常に成立する。
 - **② ③ は stdout に出さない**（stderr / ファイル）。パイプライン出力を汚さない。
-- **抑制とユーザー出力は独立**。既定ログレベルを `warn` にしても、`println!`
-  の ① は必ず出る。`tsm dict update` のような成果物は消えない。
+- **ログとユーザー出力は独立**。① は `println!` なのでログレベルに依らず必ず
+  出る。`tsm dict update` のような成果物は、ログ設定に関わらず消えない。
 - **暗黙の処理は静音**。daemon の auto-start（daemon-routed コマンド経由）は
   ① にも ② にも余計な行を出さない。明示操作（`tsm start` / `stop` / `restart`）
   のみ ① に確認を出す。
 
 ### プロセス別の写像
 
-- **`tsm`（CLI）**: ① stdout / ②③ stderr。logger 既定 `warn`
-  （`logging::LogMode::Stderr` → `default_log_spec` = `warn`）。
-  ユーザー向けの全コマンド出力は `log::info!` ではなく `println!`。
+- **`tsm`（CLI）**: ① stdout / ②③ stderr。logger 既定 `info`
+  （`logging::LogMode::Stderr`）。ユーザー向けの全コマンド出力は `log::info!`
+  ではなく `println!` なので、② のログとは混ざらない。
 - **`tsmd`（daemon・detached）**: stdout/stderr を端末から切り離す。
   ② は `tsmd.log`（`info`、日次ローテーション・3 世代）。
   ③ はツリーの raw stderr で `cmd_start` が `tsmd-stderr.log` に捕捉。
 - **子（embedder / watcher）**: 独自ファイルを持たず、親の stderr を継承して
-  `tsmd-stderr.log` へ。レベルは **`warn`**（`LogMode::DaemonStderr`）。
+  `tsmd-stderr.log` へ。レベルは `info`（`LogMode::DaemonStderr`）。端末へは
+  継承させず捕捉するため、`info` でも端末スパムにはならない。
 - **foreground `tsmd`**: ②③ はそのまま端末 stderr。
 
 ### ログファイルは 2 つに集約
@@ -79,33 +80,37 @@
   リダイレクトし、子はこれを継承。pre-logger の起動失敗・fail-fast の理由
   （ADR-0011、`cmd_start` がここを読んで表示）・致命的エラーが集まる。
 
-`tsmd-stderr.log` は **rotate されない**ため、流入を絞って実質有界にする:
+端末スパムの防止はレベルではなく構造で担保する:
 
-- 子は `warn`（`info` ではない）で書く。watcher の file-event 等の定常 `info`
-  を抑制し、長寿命 daemon 1 セッション中の無制限増加を防ぐ。
-- daemon は `tsmd.log` に構造化出力を持つため `duplicate_to_stderr` を廃止
-  （冗長かつ stderr ファイルを膨らませる原因）。
+- 子の stderr は端末へ継承させず `tsmd-stderr.log` に捕捉する（端末に溢れない）。
+- daemon は `tsmd.log` に構造化出力を持つため `duplicate_to_stderr` を廃止する
+  （冗長かつ daemon の warn を端末へ複製していた原因）。
 
-結果、定常時の `tsmd-stderr.log` は「起動ログ＋稀な warn/error」のみ。
-起動ごとに truncate するので複数起動を跨いでも蓄積しない（truncate が有界化
-するのは run 間であり、1 run 内の有界性は上記の流入抑制で担保する）。
+`tsmd-stderr.log` は起動ごとに truncate するため、複数起動を跨いでは蓄積しない。
+ただし **rotate はされず**、子を `info` で書くため、1 つの長寿命 daemon
+セッション中はサイズ上限が無い。サイズ上限 / rotation の付与は follow-up とする
+（レベルを下げて抑制する案は、子のライフサイクルログが消えるため採らない）。
 
 ## Consequences
 
 ### Positive
 
 - `tsm dict update | head | pbcopy` のようなパイプ加工が常に成立する。
-- 既定で端末が静か（CLI=`warn`）。背景 daemon の警告がシェルに溢れない。
-- 「結果を出す」と「ログを抑制する」が独立。レベルを変えても成果物は不変。
+- 背景 daemon の警告がシェルに溢れない（stderr を端末継承させず捕捉し、
+  `duplicate_to_stderr` も廃止したため）。これがレベルに依らず成り立つ。
+- 「結果を出す」と「ログ」が独立。① は `println!` なのでレベルに関わらず不変。
 - ログファイルがプロセス別最大 ~24 → **2 ファイル**。調査時の参照先が明確
   （`tsmd.log` = 構造化、`tsmd-stderr.log` = ツリーの raw stderr）。
-- `tsmd-stderr.log` は流入抑制で実質有界。
+- ログレベルを下げないため、子のライフサイクルや診断 `info` が消えない。
 
 ### Negative
 
-- CLI の詳細ログが必要な場合は `RUST_LOG=info`（または `debug`）が必要。
+- CLI はデフォルト `info` のため、`tsm` 実行時に診断 `info` が stderr（端末）へ
+  出る。結果（①）は `println!` で別系統だが、端末を完全に無音にしたい場合は
+  `RUST_LOG=warn` で絞る。
 - 子（embedder / watcher）のログは構造化ファイル・ローテーションを失い、
   現行 daemon セッションの `tsmd-stderr.log`（起動ごとに truncate）にのみ残る。
+  rotate されないため長寿命セッションでは増加しうる（上限付与は follow-up）。
   長期保持が必要なら `tsmd.log` 側で拾うか、将来 supervisor（systemd/launchd）へ
   委譲する。複数プロセスが 1 つの継承 stderr に書くため行の interleave は
   起こりうる（共有 fd 追記のため破損はしない）。
