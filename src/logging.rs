@@ -1,28 +1,46 @@
 use std::io::Write;
 use std::sync::OnceLock;
 
-use flexi_logger::{Age, Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, Logger, Naming};
+use flexi_logger::{Age, Cleanup, Criterion, DeferredNow, FileSpec, Logger, Naming};
 use log::Record;
 
 use crate::config;
 
 pub enum LogMode {
-    /// CLI (tsm) — log to stderr only
+    /// CLI (tsm) — log to stderr at `warn`
     Stderr,
-    /// Daemon (tsmd, tsmd --embedder, tsmd --fs-watcher) — log to file with daily rotation
+    /// Daemon children (embedder, watcher) — log to stderr at `warn`.
+    /// They inherit the daemon's stderr, which `cmd_start` captures into a single
+    /// `tsmd-stderr.log`, so they keep no own files. `warn` (not `info`) keeps that
+    /// shared, unrotated capture from growing without bound under a long-lived
+    /// daemon; verbose child logs are available via `RUST_LOG` or foreground runs.
+    DaemonStderr,
+    /// Daemon main (tsmd) — structured log to file with daily rotation
     Daemon { name: &'static str },
 }
 
 static LOGGER_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
+/// Default log level spec for a mode, overridable via `RUST_LOG`.
+///
+/// The CLI (`tsm`) defaults to `warn` so normal runs stay quiet — user-facing
+/// output goes through `println!`, not the logger. The daemon logs to a file,
+/// so `info` is appropriate there.
+fn default_log_spec(mode: &LogMode) -> &'static str {
+    match mode {
+        LogMode::Stderr | LogMode::DaemonStderr => "warn",
+        LogMode::Daemon { .. } => "info",
+    }
+}
+
 /// Initialize the logger. Safe to call multiple times (idempotent via OnceLock).
 pub fn init_logger(mode: LogMode) -> anyhow::Result<()> {
     let result = LOGGER_INIT.get_or_init(|| {
-        let logger = Logger::try_with_env_or_str("info")
+        let logger = Logger::try_with_env_or_str(default_log_spec(&mode))
             .map_err(|e| format!("failed to parse log spec: {e}"))?
             .use_utc();
         match mode {
-            LogMode::Stderr => logger
+            LogMode::Stderr | LogMode::DaemonStderr => logger
                 .log_to_stderr()
                 .format(tsm_log_format)
                 .start()
@@ -39,11 +57,10 @@ pub fn init_logger(mode: LogMode) -> anyhow::Result<()> {
                             .basename(name)
                             .suffix("log"),
                     )
-                    .duplicate_to_stderr(Duplicate::Warn)
                     .rotate(
                         Criterion::Age(Age::Day),
                         Naming::Timestamps,
-                        Cleanup::KeepLogFiles(7),
+                        Cleanup::KeepLogFiles(3),
                     )
                     .format(tsm_log_format)
                     .start()
@@ -98,6 +115,23 @@ mod tests {
     #[test]
     fn test_short_module_empty() {
         assert_eq!(short_module("?"), "?");
+    }
+
+    #[test]
+    fn test_default_log_spec_stderr_is_warn() {
+        assert_eq!(default_log_spec(&LogMode::Stderr), "warn");
+    }
+
+    #[test]
+    fn test_default_log_spec_daemon_is_info() {
+        assert_eq!(default_log_spec(&LogMode::Daemon { name: "tsmd" }), "info");
+    }
+
+    #[test]
+    fn test_default_log_spec_daemon_stderr_is_warn() {
+        // Daemon children log to the shared, unrotated tree stderr at warn so it
+        // does not grow without bound under a long-lived daemon.
+        assert_eq!(default_log_spec(&LogMode::DaemonStderr), "warn");
     }
 
     #[test]

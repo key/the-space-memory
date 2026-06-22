@@ -190,11 +190,11 @@ fn main() -> anyhow::Result<()> {
     match args.command {
         // ── Always direct ──
         Commands::Init => cli::cmd_init()?,
-        Commands::Start { no_watcher } => cmd_start(no_watcher)?,
+        Commands::Start { no_watcher } => cmd_start(no_watcher, true)?,
         Commands::Stop => cmd_stop()?,
         Commands::Restart => {
             cmd_stop()?;
-            cmd_start(false)?;
+            cmd_start(false, true)?;
         }
         Commands::Setup => cli::cmd_setup()?,
         Commands::VectorFill { batch_size } => cli::cmd_vector_fill(batch_size)?,
@@ -298,10 +298,17 @@ fn main() -> anyhow::Result<()> {
         }
 
         Commands::Doctor { format } => {
+            // Doctor is a read-only diagnostic: never auto-start the daemon.
+            // Use the daemon's in-process report if it is already running,
+            // otherwise fall back to a local check (handles uninitialized DBs).
+            let socket = config::daemon_socket_path();
             let req = DaemonRequest::Doctor {
                 format: format.clone(),
             };
-            render_doctor(send_to_daemon(&req)?, &format)?;
+            match daemon_protocol::try_send_request(&socket, &req) {
+                Some(Ok(resp)) => render_doctor(resp, &format)?,
+                _ => cli::cmd_doctor(&format)?,
+            }
         }
 
         Commands::ImportWordnet { wordnet_db } => {
@@ -333,8 +340,8 @@ fn send_to_daemon(req: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
         None => {} // daemon not running, auto-start below
     }
 
-    // Auto-start tsmd
-    cmd_start(false)?;
+    // Auto-start tsmd (quiet: this is implicit, not an explicit `tsm start`)
+    cmd_start(false, false)?;
 
     // Retry after start
     daemon_protocol::send_request(&socket, req)
@@ -399,7 +406,7 @@ fn render_index(resp: DaemonResponse) -> anyhow::Result<()> {
         let indexed = payload["indexed"].as_i64().unwrap_or(0);
         let skipped = payload["skipped"].as_i64().unwrap_or(0);
         let removed = payload["removed"].as_i64().unwrap_or(0);
-        log::info!("indexed: {indexed}, skipped: {skipped}, removed: {removed}");
+        println!("indexed: {indexed}, skipped: {skipped}, removed: {removed}");
     }
     Ok(())
 }
@@ -412,9 +419,9 @@ fn render_ingest(resp: DaemonResponse, session_file: &std::path::Path) -> anyhow
         .to_string_lossy();
     if let Some(payload) = resp.payload {
         if payload["indexed"].as_bool().unwrap_or(false) {
-            log::info!("session indexed: {name}");
+            println!("session indexed: {name}");
         } else {
-            log::info!("session unchanged: {name}");
+            println!("session unchanged: {name}");
         }
     }
     Ok(())
@@ -474,13 +481,17 @@ fn render_import_wordnet(resp: DaemonResponse) -> anyhow::Result<()> {
     check_resp(&resp)?;
     if let Some(payload) = resp.payload {
         let count = payload["imported"].as_i64().unwrap_or(0);
-        log::info!("imported {count} synonym pairs from WordNet");
+        println!("imported {count} synonym pairs from WordNet");
     }
     Ok(())
 }
 
 /// Start the tsmd daemon as a background process.
-fn cmd_start(no_watcher: bool) -> anyhow::Result<()> {
+///
+/// `verbose` controls success feedback: an explicit `tsm start`/`restart` prints
+/// a confirmation, while an implicit auto-start (from a daemon-routed command)
+/// stays quiet so it does not prepend noise to that command's output.
+fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
 
     let socket_path = config::daemon_socket_path();
@@ -489,7 +500,7 @@ fn cmd_start(no_watcher: bool) -> anyhow::Result<()> {
     if socket_path.exists() {
         if let Ok(resp) = daemon_protocol::send_request(&socket_path, &DaemonRequest::Ping) {
             if resp.ok {
-                log::info!("tsmd is already running");
+                report_daemon_state(verbose, "tsmd is already running");
                 return Ok(());
             }
         }
@@ -511,12 +522,24 @@ fn cmd_start(no_watcher: bool) -> anyhow::Result<()> {
         );
     }
 
+    // Capture the detached daemon tree's stderr to a single file instead of
+    // inheriting the terminal: a long-lived background process must not spew
+    // warnings into the user's shell. Children (embedder, watcher) inherit this
+    // fd and log to it too (they keep no separate files), so this is the daemon
+    // tree's combined stderr. It is also read back below to surface startup
+    // failures. Truncated each start, so it does not accumulate across runs.
+    let stderr_path = config::log_dir().join("tsmd-stderr.log");
+    if let Some(parent) = stderr_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stderr_file = std::fs::File::create(&stderr_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open daemon log {}: {e}", stderr_path.display()))?;
+
     // Spawn tsmd in a new session (detached)
-    // Keep stderr inherited so pre-logger startup errors are visible
     let mut cmd = std::process::Command::new(&tsmd_path);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit());
+        .stderr(std::process::Stdio::from(stderr_file));
     if no_watcher {
         cmd.arg("--no-watcher");
     }
@@ -527,20 +550,27 @@ fn cmd_start(no_watcher: bool) -> anyhow::Result<()> {
         });
     }
 
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to start tsmd: {e}"))?;
 
-    // Wait for socket to appear (max 30 seconds)
+    // Wait for socket to appear (max 30 seconds), but fail fast if the daemon
+    // exits before binding (e.g. uninitialized DB) instead of polling the full
+    // timeout. Its captured stderr is surfaced so the reason is visible.
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(30);
     loop {
         if socket_path.exists() {
             if let Ok(resp) = daemon_protocol::send_request(&socket_path, &DaemonRequest::Ping) {
                 if resp.ok {
-                    log::info!("tsmd started");
+                    report_daemon_state(verbose, "tsmd started");
                     return Ok(());
                 }
             }
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let detail = read_daemon_failure(&stderr_path);
+            anyhow::bail!("tsmd exited before starting ({status}).{detail}");
         }
         if start.elapsed() > timeout {
             anyhow::bail!("Timeout waiting for tsmd to start.");
@@ -549,19 +579,59 @@ fn cmd_start(no_watcher: bool) -> anyhow::Result<()> {
     }
 }
 
+/// Report a daemon lifecycle state: print it for explicit commands (`verbose`),
+/// otherwise log at info so an implicit auto-start stays quiet by default.
+fn report_daemon_state(verbose: bool, message: &str) {
+    if verbose {
+        println!("{message}");
+    } else {
+        log::info!("{message}");
+    }
+}
+
+/// Read a captured daemon stderr log and format its tail for an error message.
+fn read_daemon_failure(stderr_path: &std::path::Path) -> String {
+    match std::fs::read_to_string(stderr_path) {
+        Ok(s) => format_daemon_failure(&s),
+        Err(_) => String::new(),
+    }
+}
+
+/// Format the tail of captured daemon stderr as an indented detail block.
+/// Returns an empty string when there is nothing useful to show.
+fn format_daemon_failure(stderr: &str) -> String {
+    let tail: Vec<&str> = stderr
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .rev()
+        .take(5)
+        .collect();
+    if tail.is_empty() {
+        return String::new();
+    }
+    let body = tail
+        .into_iter()
+        .rev()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("\n{body}")
+}
+
 /// Stop the tsmd daemon by sending a Shutdown request.
 fn cmd_stop() -> anyhow::Result<()> {
     let socket_path = config::daemon_socket_path();
 
     if !socket_path.exists() {
-        log::info!("tsmd is not running");
+        println!("tsmd is not running");
         return Ok(());
     }
 
     match daemon_protocol::send_request(&socket_path, &DaemonRequest::Shutdown) {
         Ok(resp) => {
             if resp.ok {
-                log::info!("tsmd stopped");
+                println!("tsmd stopped");
             } else {
                 log::warn!("tsmd reported error: {}", resp.error.unwrap_or_default());
             }
@@ -569,9 +639,42 @@ fn cmd_stop() -> anyhow::Result<()> {
         Err(e) => {
             log::warn!("could not connect to tsmd: {e}");
             let _ = std::fs::remove_file(&socket_path);
-            log::info!("removed stale socket");
+            println!("removed stale socket");
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_daemon_failure_empty() {
+        assert_eq!(format_daemon_failure(""), "");
+        assert_eq!(format_daemon_failure("\n  \n"), "");
+    }
+
+    #[test]
+    fn test_format_daemon_failure_indents_tail() {
+        let out =
+            format_daemon_failure("warming up\nError: Database not initialized. Run `tsm init`.\n");
+        assert_eq!(
+            out,
+            "\n  warming up\n  Error: Database not initialized. Run `tsm init`."
+        );
+    }
+
+    #[test]
+    fn test_format_daemon_failure_keeps_last_five_lines() {
+        let input = (1..=8)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = format_daemon_failure(&input);
+        assert!(out.starts_with("\n  line4"));
+        assert!(out.ends_with("  line8"));
+        assert!(!out.contains("line3"));
+    }
 }

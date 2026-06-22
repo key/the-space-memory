@@ -154,8 +154,33 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Check whether a table with the given name exists.
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+        > 0
+}
+
+/// Check whether the database has been initialized with the core schema.
+///
+/// A freshly created (empty) DB file has no tables; `init` must be run before
+/// the daemon can serve requests against it.
+pub fn is_initialized(conn: &Connection) -> bool {
+    table_exists(conn, "documents") && table_exists(conn, "chunks")
+}
+
 /// Ensure the `content_hash` column exists on the `chunks` table (migration for older DBs).
+///
+/// No-op when the `chunks` table is absent: a freshly initialized DB already has
+/// the column via `SCHEMA_SQL`, and an uninitialized DB has no table to migrate.
 pub fn ensure_chunk_hash_column(conn: &Connection) -> anyhow::Result<()> {
+    if !table_exists(conn, "chunks") {
+        return Ok(());
+    }
     let has: bool = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('chunks') WHERE name='content_hash'",
         [],
@@ -392,5 +417,33 @@ mod tests {
         init_db(&db_path).unwrap();
         let conn = get_connection(&db_path).unwrap();
         assert!(has_vec_table(&conn));
+    }
+
+    #[test]
+    fn test_is_initialized_true_for_schema() {
+        let conn = get_memory_connection().unwrap();
+        assert!(is_initialized(&conn));
+    }
+
+    #[test]
+    fn test_is_initialized_false_for_bare_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(!is_initialized(&conn));
+    }
+
+    #[test]
+    fn test_ensure_chunk_hash_column_noop_without_chunks_table() {
+        // A bare DB has no `chunks` table; the migration must be a no-op, not an error.
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_chunk_hash_column(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_get_connection_succeeds_on_uninitialized_db() {
+        // An empty (uninitialized) DB file must open cleanly; init is a separate step.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("uninit.db");
+        let conn = get_connection(&db_path).unwrap();
+        assert!(!is_initialized(&conn));
     }
 }

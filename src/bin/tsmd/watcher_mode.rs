@@ -21,9 +21,9 @@ extern "C" fn sighup_handler(_sig: libc::c_int) {
 
 /// Entry point for `tsmd --fs-watcher`.
 pub fn run() -> Result<()> {
-    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
-        name: "tsmd-watcher",
-    })?;
+    // Log to stderr (inherited from the daemon, captured into tsmd-stderr.log);
+    // children do not manage their own log files.
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::DaemonStderr)?;
     let index_root = config::index_root();
 
     // Install signal handlers
@@ -334,10 +334,8 @@ mod tests {
 
         let _cwd = CwdGuard::change_to(dir.path());
         unsafe { std::env::set_var("TSM_INDEX_ROOT", dir.path().as_os_str()) };
-        the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
-            name: "test",
-        })
-        .ok();
+        the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::DaemonStderr)
+            .ok();
 
         // Watcher should exit immediately due to SHUTDOWN
         // We test the individual pieces rather than run() which also inits logger

@@ -238,6 +238,29 @@ A change is merge-ready when **all** of the following hold:
 - **Segmenter is cached** — `tokenizer::get_segmenter()` caches the Segmenter
   (including user dict). Call `reset_segmenter()` after writing new simpledic
   if rebuilding FTS in the same process
+- **Daemon fail-fasts on an uninitialized DB** — `tsmd` refuses to start when
+  the DB lacks the core schema (`db::is_initialized`), exiting with
+  "Run `tsm init` first" before binding the socket (ADR-0008: init is explicit,
+  never auto-created). `cmd_start` detects the early exit via `try_wait` and
+  surfaces the captured stderr, so auto-start fails immediately instead of
+  blocking on the 30s socket-wait timeout
+- **`tsm doctor` never auto-starts the daemon** — it is a read-only diagnostic.
+  Uses the daemon's report if already running, else falls back to a local
+  `doctor_check` (which reports an uninitialized/missing DB gracefully and does
+  not create a `tsm.db` file)
+- **Log files: two, not per-process** — the daemon (`tsmd`) writes a structured,
+  daily-rotated `tsmd.log` (kept 3 generations; holds all daemon info/warn).
+  Children (embedder, watcher) keep NO own files; they log to stderr at `warn`,
+  which `cmd_start` captures into a single, unrotated `logs/tsmd-stderr.log`.
+  That capture replaces terminal inheritance (no shell spam) and `cmd_start`
+  reads it to surface startup failures. `tsmd-stderr.log` is NOT rotated, so it
+  is kept small by design: children log at `warn` not `info`, and the daemon's
+  file logger drops `duplicate_to_stderr` (its warns already go to `tsmd.log`).
+  It is truncated on each start. A foreground `tsmd` still logs to the terminal
+- **CLI (`tsm`) logs at `warn` by default; the daemon at `info`**
+  (`logging::default_log_spec`). User-facing command output is `println!`, not
+  the logger, so it shows regardless of level. Set `RUST_LOG=info`/`debug` for
+  verbose CLI logs
 
 ## Design Decisions (ADR)
 
@@ -249,7 +272,10 @@ Review existing records before making architectural changes.
 | `decisions/` | ADR (decision records and rationale) |
 
 For changes involving process architecture, IPC, or failure behavior,
-see ADR-0001.
+see ADR-0001. For uninitialized-DB fail-fast, daemon auto-start boundaries,
+and read-only `doctor`, see ADR-0009. For the output-channel model
+(user output → stdout, logs/errors → stderr/file, log-file consolidation),
+see ADR-0010.
 
 ## Language Policy
 

@@ -16,6 +16,8 @@
 | [0006](./0006-cli-option-design.md) | CLI オプション設計の判断基準 | Accepted | 2026-04-28 |
 | [0007](./0007-pipeline-stages.md) | tsm の処理を Index / Search の 2 パイプラインに分解 | Accepted | 2026-05-07 |
 | [0008](./0008-setup-init-separation.md) | tsm setup と tsm init の責務分離 | Accepted | 2026-05-08 |
+| [0009](./0009-uninitialized-db-failfast-and-readonly-doctor.md) | 未初期化 DB での fail-fast と doctor の read-only 化 | Accepted | 2026-06-22 |
+| [0010](./0010-output-channel-model.md) | 出力チャネルモデル（ユーザー出力 / ログ / エラーの分離） | Accepted | 2026-06-22 |
 
 新規 ADR 追加時は上記表にも 1 行追加すること。
 
@@ -95,12 +97,15 @@ PR でのマージは原則 `Proposed` のまま行い、合意形成完了後�
 ## Consequences
 
 ### Positive
+
 - 期待される利点
 
 ### Negative
+
 - 受け入れるトレードオフ
 
 ### Follow-ups
+
 - 別途扱う関連事項（実装 PR の分割案、後続 ADR の予告など）
 ```
 
