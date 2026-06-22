@@ -1762,13 +1762,14 @@ index_root = "/low-root"
     #[serial]
     fn test_load_config_relative_path_resolves_against_cwd() {
         // A bare relative candidate like "tsm.toml" must yield a
-        // project_root derived from CWD (not a bare empty path), with no
-        // canonicalize syscall in the picture. Avoids the race where the
-        // file could change between read and canonicalize.
+        // project_root derived from CWD (not a bare empty path). On macOS,
+        // tempdir returns /var/... but current_dir() resolves symlinks to
+        // /private/var/... — canonicalize upfront so both sides match.
         let dir = tempfile::tempdir().unwrap();
+        let dir_path = std::fs::canonicalize(dir.path()).unwrap();
         let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        std::fs::write(dir.path().join("tsm.toml"), r#"state_dir = "/rel""#).unwrap();
+        std::env::set_current_dir(&dir_path).unwrap();
+        std::fs::write(dir_path.join("tsm.toml"), r#"state_dir = "/rel""#).unwrap();
 
         let (cfg, root) = load_config_from(&[PathBuf::from("tsm.toml")]);
 
@@ -1776,7 +1777,7 @@ index_root = "/low-root"
 
         assert_eq!(cfg.state_dir, Some(PathBuf::from("/rel")));
         // project_root should be CWD (tempdir), not empty / None.
-        assert_eq!(root.unwrap(), dir.path());
+        assert_eq!(root.unwrap(), dir_path);
     }
 
     #[test]

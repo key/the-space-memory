@@ -31,12 +31,18 @@ cargo fmt --check
 # Lint (Markdown / Shell / YAML / TOML)
 rumdl check <file>.md
 shellcheck <file>.sh
-yamllint <file>.yml
+ryl <file>.yml
 taplo check <file>.toml
 
 # Code metrics
 lizard src/ --language rust -Tcyclomatic_complexity=15 -w  # CCN warnings
 npx jscpd                                                  # Duplicate detection
+
+# Git hooks (prek). Run once after cloning. Hooks live in the shared .git, so
+# they apply across all worktrees; a branch without .pre-commit-config.yaml is
+# blocked until it picks up the config. See .pre-commit-config.yaml for the
+# stage split (fast file-scoped checks pre-commit; CI-mirroring gates pre-push).
+prek install --hook-type pre-commit --hook-type pre-push
 
 # E2E tests (requires release build + model download)
 bash tests/e2e.sh
@@ -288,11 +294,12 @@ A change is merge-ready when **all** of the following hold:
 - **All log modes default to `info`** (`logging::default_log_spec`). User-facing
   command output is `println!`, not the logger, so it shows regardless of level.
   Set `RUST_LOG=warn` to quiet the CLI terminal, or `debug` for more detail
-- **macOS tempdir tests fail locally, pass on Linux CI** — `tempfile::tempdir()`
-  returns `/var/...` but `current_dir()` resolves the symlink to `/private/var/...`,
-  so tests asserting `path == cwd` (e.g.
-  `config::tests::test_load_config_relative_path_resolves_against_cwd`) fail on
-  macOS only. Not a regression — verify on Linux CI before chasing it
+- **macOS tempdir vs `current_dir()` symlinks** — `tempfile::tempdir()` returns
+  `/var/...` but after `set_current_dir`, `current_dir()` resolves the symlink to
+  `/private/var/...`. A test asserting `path == cwd` must canonicalize the tempdir
+  path up front and use it for both `set_current_dir` and the assertion (see
+  `config::tests::test_load_config_relative_path_resolves_against_cwd`); otherwise
+  it fails on macOS only while passing on Linux CI
 
 ## Design Decisions (ADR)
 
