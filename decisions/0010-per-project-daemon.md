@@ -40,15 +40,22 @@
 
 `tsmd` は `project_root` を **ADR-0009 §2 の共通アルゴリズム**で決定する：
 **CWD 直下に `tsm.toml` があればそれ、無ければ `--project-root` 引数、
-どちらも無ければ起動失敗**。`--project-root` は必須ではなくフォールバックだが、
-**`tsm start` は常に `--project-root` を渡す**（`ps` 可視性のため）。
-値は **常に canonical 化されたフルパス（絶対パス）** とし、`ps` でもフルパスで
-表示される（相対パスや `~` 短縮形は argv に渡さない）。
+どちらも無ければ起動失敗**。
 
-`tsm start` 経由では daemon の CWD が `tsm` の実行ディレクトリと一致する保証が
-ないため、`--project-root` 明示が `ps` 識別の確実な経路になる。
-直接起動（デバッグ等）では CWD 直下に `tsm.toml` があれば `--project-root`
-省略も可能。
+**`tsm start` が spawn する `tsmd`（および `--embedder` / `--fs-watcher`
+子プロセス）には、起動後の argv に必ず `--project-root <canonical abs_path>` が
+付与される。** `tsm start` は確定済みの `project_root` を持っているため、CWD に
+`tsm.toml` があるか否かに関わらず常に明示注入する。これにより、稼働中の
+`tsmd` は `ps` / `pgrep -af tsmd` で必ずフルパスの所属 workspace を表示する。
+値は **常に canonical 化されたフルパス（絶対パス）** とし、相対パスや `~`
+短縮形は argv に渡さない。
+
+加えて `tsm start` は子プロセスの初期 CWD を `project_root` に設定して spawn
+する。これにより §2 の「CWD 直下 `tsm.toml` 優先」ルールと注入した
+`--project-root` が必ず一致し、別の `tsm.toml` を誤って拾う余地が無い。
+
+`--project-root` 自体は必須引数ではない（直接起動で CWD 直下に `tsm.toml` が
+あれば省略可）。ただし `tsm start` 経由では上記のとおり常に付与される。
 
 ```text
 tsmd --project-root /workspaces/proj-a
@@ -89,6 +96,7 @@ tsmd --project-root /workspaces/proj-a --fs-watcher
 1. project_root 確定（ADR-0009 §2: CWD 直下 tsm.toml → --project-root → 失敗）
 2. <workspace>/.tsm/ を必要なら作る
 3. spawn:  tsmd --project-root <abs_path> [--no-watcher]
+           （子プロセスの初期 CWD = project_root。--project-root は常に付与）
 4. <workspace>/.tsm/daemon.sock の出現を待つ（既存ロジック流用）
 ```
 
