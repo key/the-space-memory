@@ -14,43 +14,39 @@
 [ADR-0009](./0009-workspace-and-content-model.md) はプロジェクトの境界（CWD 直下
 `tsm.toml` → `--project-root` で確定する `project_root`）を定義した。
 
+socket と DB はプロジェクトごとに `<project_root>/.tsm/` 配下で分離されているため、
+複数のプロジェクトで daemon を並列稼働させること自体は既に可能である。しかし、
+稼働中の daemon の所属が外から判別できず、起動時の socket 競合にも穴がある。
+
 本 ADR は、その `project_root` を前提にプロセスの境界を定義する。具体的には、どの
-`tsmd` がどのプロジェクト用かを識別する方法と、起動時の socket 競合を防ぐ方法を
-扱う。現状、以下の不都合が残っている。
+`tsmd` がどのプロジェクト用かを `ps` で識別できるようにする方法と、起動時の socket
+競合を防ぐ方法を扱う。現状、以下の不都合が残っている。
 
 ### 課題
 
-1. **複数プロジェクトの並列稼働ができない**
-   1 マシン 1 daemon を前提としており、複数の Claude Code セッションを別々の
-   プロジェクトで同時に開くと検索対象が混線する。プロジェクト単位で独立した daemon を
-   持てる構造が無い。
+1. **`ps -ef` で daemon の所属が判別できない**
+   `tsmd` / `tsmd --embedder` / `tsmd --fs-watcher` がどのプロジェクト用か、argv からも
+   env からも分からない。複数プロジェクトを並列稼働させたとき、どの daemon がどの
+   プロジェクトを担当しているかを追えず、トラブルシュートが困難である。
 
 2. **`tsmd` 直接起動時の silent socket clobber**（[#200](https://github.com/key/the-space-memory/issues/200)）
    `src/bin/tsmd/daemon_mode.rs:33-36` が既存 socket を無条件に削除している。
    `tsm start` 経由（`src/main.rs:489-498`）の Ping だけがガードであり、バイナリ
    直接起動の経路では同じ state_dir に対し silent な上書きが発生する。
 
-3. **`ps -ef` で daemon の所属が判別できない**
-   `tsmd` / `tsmd --embedder` / `tsmd --fs-watcher` がどのプロジェクト用か、argv からも
-   env からも分からない。複数プロジェクトの並列稼働時にトラブルシュートが困難である。
-
 ## Decision
 
 ### 1. tsmd の per-project identity（`--project-root` 引数）
 
-`tsmd` は `project_root` を ADR-0009 §2 の共通アルゴリズムで決定する。すなわち、
-CWD 直下に `tsm.toml` があればそれ、無ければ `--project-root` 引数、どちらも無ければ
-起動失敗とする。`--project-root` は必須引数ではなく、CWD 直下に `tsm.toml` が無い
-ときのフォールバックである。
+`tsmd` は常に `tsm` から起動される（`src/main.rs` の `cmd_start` が `tsmd` を spawn
+する）。そこで `tsm start` は、起動する `tsmd`（および `--embedder` / `--fs-watcher`
+子プロセス）の argv に必ず `--project-root <canonical_abs_path>` を付与する。
+`tsm start` は ADR-0009 §2 で確定済みの `project_root` を持つため、これを明示的に渡す。
 
-ただし `tsm start` が起動する `tsmd`（および `--embedder` / `--fs-watcher` 子
-プロセス）には、argv に必ず `--project-root <canonical_abs_path>` を付与する。
-`tsm start` は確定済みの `project_root` を持つため、CWD に `tsm.toml` があるか否かに
-関わらず常に明示する。
-
-これにより、稼働中の `tsmd` は `ps` や `pgrep -af tsmd` で必ずフルパスの所属
-プロジェクトを表示する。引数は canonical 化済みの絶対パスのみとし、相対パスや `~`
-短縮形は argv に渡さない。
+`tsmd` 自身はプロジェクトルートの探索を行わない。受け取った `--project-root` を
+`project_root` として用いる。引数は canonical 化済みの絶対パスのみとし、相対パスや
+`~` 短縮形は渡さない。これにより、稼働中の `tsmd` は `ps` や `pgrep -af tsmd` で必ず
+フルパスの所属プロジェクトを表示する。
 
 ```text
 tsmd --project-root /Users/key/work/proj-a
@@ -58,10 +54,9 @@ tsmd --project-root /Users/key/work/proj-a --embedder --no-idle-timeout
 tsmd --project-root /Users/key/work/proj-a --fs-watcher
 ```
 
-加えて `tsm start` は、子プロセスの初期 CWD を `project_root` に設定して起動する。
-これにより ADR-0009 §2 の「CWD 直下 `tsm.toml` 優先」ルールと、付与した
-`--project-root` が必ず一致し、別の `tsm.toml` を誤って拾う余地が無くなる。env での
-暗黙伝達は使わない（`ps` 可視性のため）。
+env での暗黙伝達は使わない（`ps` 可視性のため）。デバッグ目的で `tsmd` を直接起動する
+場合は、ADR-0009 §2 の解決規則（CWD 直下 `tsm.toml` → `--project-root` → 失敗）に
+従う。
 
 ### 2. 起動直後の処理と socket 競合検知
 
@@ -90,14 +85,13 @@ tsmd --project-root /Users/key/work/proj-a --fs-watcher
 
 ### 3. CLI 側の起動・接続フロー
 
-`tsm start`:
+`tsm start`（`<project-root>/.tsm/` は `tsm init` が作成済みである前提。未初期化なら
+`tsmd` が fail-fast する）:
 
 ```text
 1. project_root 確定（ADR-0009 §2: CWD 直下 tsm.toml → --project-root → 失敗）
-2. <project-root>/.tsm/ を必要なら作る
-3. 起動: tsmd --project-root <abs_path> [--no-watcher]
-        （子プロセスの初期 CWD = project_root。--project-root は常に付与）
-4. <project-root>/.tsm/daemon.sock の出現を待つ（既存ロジック流用）
+2. 起動: tsmd --project-root <abs_path> [--no-watcher]（--project-root を常に付与）
+3. <project-root>/.tsm/daemon.sock の出現を待つ（既存ロジック流用）
 ```
 
 `tsm search` / `status` / `doctor` 等:
@@ -168,10 +162,11 @@ ADR-0009 はプロジェクトの境界とコンテンツ参照を扱い、本 A
 
 ### Positive
 
-- 複数プロジェクトの並列稼働が自然に動く。Claude Code プラグイン（別 repo
+- `ps -ef` や `pgrep -af tsmd` で、どの daemon がどのプロジェクト用かを即座に判別できる。
+  複数プロジェクトの並列稼働は元々可能だが、本 ADR により稼働中の daemon の所属が
+  外から追えるようになる。Claude Code プラグイン（別 repo
   [`key/claude-code-plugins`](https://github.com/key/claude-code-plugins) で管理）の
   hook はプロジェクトルートに cd 済みのため、追加変更は不要である。
-- `ps -ef` や `pgrep -af tsmd` で、どの daemon がどのプロジェクト用かを即座に判別できる。
 - [#200](https://github.com/key/the-space-memory/issues/200) の silent socket clobber が
   構造的に解決し、生存 daemon を誤って壊さない。
 - DB・socket・log の境界がプロジェクト単位で完全に分離され、片方の障害が他方に波及
@@ -191,8 +186,9 @@ ADR-0009 はプロジェクトの境界とコンテンツ参照を扱い、本 A
 ### Follow-ups
 
 - **Umbrella issue を作成**し、以下のタスク粒度でサブ issue 化する。
-  1. `tsmd` に `--project-root <PATH>` 引数（canonical 絶対パス）を追加し、ADR-0009 §2 の
-     `resolve_project_root` を適用する。`chdir` の実装と state_dir の固定も行う。
+  1. `tsmd` に `--project-root <PATH>` 引数（canonical 絶対パス）を追加し、それを
+     `project_root` として用いる（`tsmd` 自身は探索しない。直接起動時のみ ADR-0009 §2 の
+     `resolve_project_root` を適用）。`chdir` の実装と state_dir の固定も行う。
   2. `tsm start` が解決した `project_root` を、起動時に argv へ `--project-root` として
      注入する（CWD に `tsm.toml` があっても `ps` 可視性のため常に渡す）。
   3. 子プロセスの起動（`child::spawn_child`）にも `--project-root` を継承する。

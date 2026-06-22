@@ -93,8 +93,9 @@
 
 ### 2. プロジェクトルート（`project_root`）の決定
 
-`project_root` は次の優先順で決定する。`tsm` CLI と `tsmd`（daemon・子プロセス）で
-共通のアルゴリズムを使う。
+`project_root` は次の優先順で決定する。この解決を行うのは主に `tsm` CLI である
+（`tsmd` は常に `tsm` から `--project-root` を受け取るため、通常は探索しない。
+ADR-0010 を参照）。
 
 ```text
 resolve_project_root(cwd, project_root_arg):
@@ -111,9 +112,8 @@ resolve_project_root(cwd, project_root_arg):
 - **CWD 直下のみ**を見る。上方向への walk-up は行わない。明示的な CWD か
   `--project-root` のいずれかでプロジェクトルートを一意に確定させ、実行場所に
   よって暗黙に親へ遡る曖昧さを排除する。
-- `--project-root` は `tsm` と `tsmd` の双方が受け付ける。`tsm start` は解決した
-  プロジェクトルートの絶対パスを `tsmd --project-root <abs>` として明示的に渡し、
-  daemon 側でも同じアルゴリズムで `project_root` が確定する
+- `tsm start` は解決したプロジェクトルートの絶対パスを `tsmd --project-root <abs>`
+  として常に渡す。`tsmd` はこれを受け取って `project_root` とし、自身では探索しない
   （[ADR-0010](./0010-per-project-daemon.md)）。
 - CWD 直下にも `--project-root` にも `tsm.toml` が無ければ起動失敗とする
   （黙ってフォールバックしない）。
@@ -336,8 +336,9 @@ ADR-0008 は `.tsm/` の内部構造と cache・プロジェクトの責務分�
   移行する必要がある。自動マイグレーションは提供しない（ADR-0008 と同じ思想）。
 - ADR-0008 の `.tsm/tsm.toml (任意)` 仕様を破壊変更で supersede するため、
   `decisions/0008-setup-init-separation.md` 側にも追記が必要になる。
-- `tsm init` が必須ステップとして増える。`cd /path && tsm start` の一発では動かなく
-  なり、先に `tsm init` を挟む必要がある。
+- `tsm.toml` がプロジェクトルートを示す marker になるため、`tsm init` で `tsm.toml`
+  を生成していないディレクトリでは `tsm start` 等が起動しない（`tsm init` は DB 作成の
+  ために元々必須のステップであり、新たな必須ステップが増えるわけではない）。
 - walk-up を採用しないため、プロジェクトのサブディレクトリから `tsm` を実行すると
   CWD 直下に `tsm.toml` が無く起動失敗する。サブディレクトリで使う場合は
   `--project-root` を明示する必要がある。
