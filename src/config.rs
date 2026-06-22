@@ -331,13 +331,21 @@ impl ResolvedConfig {
     pub fn from_env() -> Self {
         if let Some(root) = injected_root() {
             let tsm_config = std::env::var_os("TSM_CONFIG").map(PathBuf::from);
-            let candidates = injected_candidates(&root, tsm_config.as_deref());
-            let (file_cfg, _) = load_config_from(&candidates);
-            return Self::from_config_file(&file_cfg, root);
+            return Self::from_env_injected(root, tsm_config.as_deref());
         }
         let (file_cfg, loaded_root) = load_config_from(&config_file_candidates());
         let project_root = loaded_root.unwrap_or_else(cwd_fallback);
         Self::from_config_file(&file_cfg, project_root)
+    }
+
+    /// Resolve config for an explicitly injected project root (ADR-0009 §2):
+    /// load `tsm.toml` from `<root>` (or `$TSM_CONFIG`) only — no XDG fallback.
+    /// Pure over its inputs (no process-global read), so the injected path is
+    /// unit-testable without touching the `PROJECT_ROOT` singleton.
+    fn from_env_injected(root: PathBuf, tsm_config: Option<&Path>) -> Self {
+        let candidates = injected_candidates(&root, tsm_config);
+        let (file_cfg, _) = load_config_from(&candidates);
+        Self::from_config_file(&file_cfg, root)
     }
 
     /// Resolve from a pre-loaded `ConfigFile` with an explicit project root.
@@ -1676,6 +1684,42 @@ index_root = "/low-root"
         std::fs::write(&cfg_file, "").unwrap();
         let root = resolve_project_root(cwd.path(), None, Some(&cfg_file)).unwrap();
         assert_eq!(root, cfg_dir.path());
+    }
+
+    #[test]
+    fn test_resolve_project_root_tsm_config_relative() {
+        // A bare relative TSM_CONFIG (e.g. "custom.toml") resolves against cwd;
+        // the project root is its parent directory.
+        let cwd = tempfile::tempdir().unwrap();
+        let root = resolve_project_root(cwd.path(), None, Some(Path::new("custom.toml"))).unwrap();
+        assert_eq!(root, cwd.path());
+    }
+
+    #[test]
+    fn test_resolve_project_root_tsm_config_no_parent_errors() {
+        // A filesystem-root TSM_CONFIG ("/") has no parent → error.
+        let cwd = tempfile::tempdir().unwrap();
+        assert!(resolve_project_root(cwd.path(), None, Some(Path::new("/"))).is_err());
+    }
+
+    #[test]
+    fn test_from_env_injected_uses_root_and_reads_its_tsm_toml() {
+        // The injected path uses `root` as project_root and loads its tsm.toml.
+        // Uses content_dirs (no env override) so the assertion is env-stable.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tsm.toml"),
+            "[[index.content_dirs]]\npath = \"injected-notes\"\nweight = 2.0\n",
+        )
+        .unwrap();
+        let cfg = ResolvedConfig::from_env_injected(dir.path().to_path_buf(), None);
+        assert_eq!(cfg.project_root, dir.path());
+        assert!(
+            cfg.content_dirs
+                .iter()
+                .any(|d| d.path == "injected-notes" && d.weight == 2.0),
+            "injected root's tsm.toml should be loaded"
+        );
     }
 
     #[test]

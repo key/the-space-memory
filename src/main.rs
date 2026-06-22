@@ -204,16 +204,38 @@ fn main() -> anyhow::Result<()> {
 
     // ADR-0009 §2: resolve the project root (the dir holding `tsm.toml`) from
     // the CWD, `--project-root`, or `$TSM_CONFIG`, and inject it before any
-    // config access. `tsm init` tolerates an unresolved root — it scaffolds in
-    // the CWD; every other command fails fast with a guiding error.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // config access. `init` and `setup` are project-independent (they run
+    // before a project exists — scaffolding and model-cache download), so they
+    // tolerate an unresolved root and fall back to the CWD. Every other command
+    // fails fast with a guiding error.
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!(
+                "warning: cannot determine the current directory ({e}); \
+                 project-root resolution may be incorrect"
+            );
+            PathBuf::from(".")
+        }
+    };
     let tsm_config = std::env::var_os("TSM_CONFIG").map(PathBuf::from);
     let resolved_root =
         config::resolve_project_root(&cwd, args.project_root.as_deref(), tsm_config.as_deref());
     let project_root = match &args.command {
-        Commands::Init => resolved_root.unwrap_or(cwd),
+        Commands::Init | Commands::Setup => resolved_root.unwrap_or_else(|_| cwd.clone()),
         _ => resolved_root?,
     };
+    // Surface a `--project-root` that lost to the CWD's `tsm.toml` or
+    // `$TSM_CONFIG` — otherwise the explicit flag is silently ineffective.
+    if let Some(arg) = args.project_root.as_deref() {
+        if project_root.as_path() != arg {
+            eprintln!(
+                "warning: --project-root '{}' overridden; using project root '{}'",
+                arg.display(),
+                project_root.display()
+            );
+        }
+    }
     config::set_project_root(project_root);
 
     the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Stderr)?;
