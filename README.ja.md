@@ -161,6 +161,10 @@ function score(ctx)
 end
 ```
 
+上記は最小例。同梱デフォルト（`score/10-default.lua`）は完全な status→ペナルティ表を使う：
+`superseded=0.2`、`rejected=0.3`、`dropped=0.3`、`deprecated=0.3`、
+`outdated=0.4`、`proposed=0.7`、その他は `1.0`。
+
 各フックは乗数（`>= 0`）を返す。最終スコアは
 `rrf × weight × Π(score フック)` となる。無効な戻り値（負値、NaN、±Inf）は
 警告を出して `1.0` として扱われる。
