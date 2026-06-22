@@ -543,6 +543,8 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
     let tx = conn.unchecked_transaction()?;
 
     let doc_id = if let Some((doc_id, _)) = existing {
+        // metadata intentionally omitted: sessions have no frontmatter;
+        // searcher synthesizes scoring from status/updated when metadata is NULL.
         tx.execute(
             "UPDATE documents SET source_type=?, title=?, status=?, created=?, updated=?, tags=?, file_hash=?, indexed_at=?
              WHERE id=?",
@@ -2553,7 +2555,7 @@ mod tests {
         assert_eq!(after, before);
     }
 
-    // ─── metadata JSON integration test (Task 4) ─────────────
+    // ─── metadata JSON integration test ──────────────────────
 
     #[test]
     #[serial_test::serial]

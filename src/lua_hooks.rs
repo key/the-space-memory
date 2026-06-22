@@ -17,7 +17,7 @@ const LUA_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 /// Embedded default extract hook (reproduces frontmatter.rs behavior).
 pub const DEFAULT_EXTRACT_HOOK: &str = include_str!("hooks/extract/10-md_frontmatter.lua");
 
-/// Embedded default score hook (reproduces time_decay x status_penalty).
+/// Embedded default score hook (time-decay × status-based penalty scoring).
 pub const DEFAULT_SCORE_HOOK: &str = include_str!("hooks/score/10-default.lua");
 
 /// A single Lua hook script with its logical name and source text.
@@ -35,7 +35,6 @@ pub struct HookSources {
 }
 
 /// Create a sandboxed Lua VM: no standard library, bounded memory.
-/// Used by all later lua_hooks tasks.
 fn new_sandboxed_lua() -> anyhow::Result<Lua> {
     let lua = Lua::new_with(StdLib::NONE, LuaOptions::default())?;
     lua.set_memory_limit(LUA_MEMORY_LIMIT)?;
@@ -163,6 +162,7 @@ fn frontmatter_table(lua: &Lua, fm: &Frontmatter) -> anyhow::Result<mlua::Table>
 }
 
 /// Convert a Lua table of scalars into JSON object entries (present keys only).
+/// Only string-keyed entries are included; integer-keyed (array) entries are dropped.
 fn lua_table_to_json(t: &mlua::Table, out: &mut Map<String, Value>) {
     for pair in t.pairs::<String, mlua::Value>() {
         let Ok((k, v)) = pair else {
@@ -174,7 +174,7 @@ fn lua_table_to_json(t: &mlua::Table, out: &mut Map<String, Value>) {
             mlua::Value::Number(n) => Value::from(n),
             mlua::Value::Boolean(b) => Value::from(b),
             mlua::Value::Nil => continue,
-            _ => continue, // non-scalar: skip (ADR: scalar map only)
+            _ => continue, // non-scalar (tables, functions): skip (ADR: scalar map only)
         };
         out.insert(k, jv);
     }
@@ -327,7 +327,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    // ── Sandbox tests (from Task 1) ─────────────────────────────────────────
+    // ── Sandbox tests ───────────────────────────────────────────────────────
 
     #[test]
     fn test_lua_define_call_number_and_table() {
@@ -368,7 +368,7 @@ mod tests {
         assert!(is_nil, "io must be unavailable in sandboxed VM");
     }
 
-    // ── Discovery + fallback + fail-fast tests (Task 3) ────────────────────
+    // ── Discovery + fallback + fail-fast tests ──────────────────────────────
 
     #[test]
     fn test_load_falls_back_to_embedded_when_dirs_empty() {
@@ -443,7 +443,7 @@ mod tests {
         assert!(err.to_string().contains("extract"));
     }
 
-    // ── Process-wide cache tests (Task 3) ──────────────────────────────────
+    // ── Process-wide cache tests ────────────────────────────────────────────
 
     #[test]
     #[serial_test::serial]
@@ -535,7 +535,7 @@ mod tests {
         assert!(!h.extract.is_empty());
     }
 
-    // ── run_extract tests (Task 4) ──────────────────────────────────────────
+    // ── run_extract tests ────────────────────────────────────────────────────
 
     use crate::frontmatter::Frontmatter;
 
@@ -610,7 +610,7 @@ mod tests {
         assert_eq!(v["a"], serde_json::json!(1)); // first script's contribution kept
     }
 
-    // ── run_score tests (Task 5) ────────────────────────────────────────────
+    // ── run_score tests ──────────────────────────────────────────────────────
 
     #[test]
     fn test_run_score_default_reproduces_penalty_and_decay() {

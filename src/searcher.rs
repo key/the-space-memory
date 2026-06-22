@@ -482,21 +482,6 @@ mod tests {
     }
 
     #[test]
-    fn test_status_penalty_none() {
-        assert_eq!(config::status_penalty(None), 1.0);
-    }
-
-    #[test]
-    fn test_status_penalty_current() {
-        assert_eq!(config::status_penalty(Some("current")), 1.0);
-    }
-
-    #[test]
-    fn test_status_penalty_outdated() {
-        assert!(config::status_penalty(Some("outdated")) < 1.0);
-    }
-
-    #[test]
     fn test_snippet_strips_prefix() {
         let content = "【daily/notes/test】セクション\nこれは本文です。";
         let result = snippet(content);
@@ -1084,7 +1069,7 @@ mod tests {
         assert_eq!(decoded.related_docs[0].link_type, "tag");
     }
 
-    // ── Task 5: score hook integration tests ─────────────────────────────────
+    // ── Score hook integration tests ──────────────────────────────────────────
 
     /// Helper: insert a document + chunk + chunks_fts into an in-memory DB.
     /// Returns the chunk_id. `metadata` may be None (NULL) or Some(json_str).

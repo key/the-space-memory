@@ -236,6 +236,8 @@ A change is merge-ready when **all** of the following hold:
   after upgrading.
 - **Lua VMs are sandboxed** — `StdLib::NONE` + 64 MiB memory ceiling per VM.
   No `io`/`os`/`package` available; hooks cannot touch the filesystem, network, or spawn processes.
+  Infinite loops are NOT bounded (op-count/timeout limit is deferred); hooks are user-owned scripts,
+  not untrusted third-party code.
 - **Hook stdin JSON key is `prompt`** (not `user_prompt`).
   Hook output must wrap `additionalContext` in
   `hookSpecificOutput: { hookEventName, additionalContext }`

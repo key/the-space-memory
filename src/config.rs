@@ -979,15 +979,6 @@ pub fn ensure_model_cache_env() {
 
 // ─── Pure functions (no config dependency) ───────────────────────
 
-pub fn status_penalty(status: Option<&str>) -> f64 {
-    match status {
-        Some("superseded") => 0.2,
-        Some("rejected") | Some("dropped") => 0.3,
-        Some("outdated") => 0.4,
-        _ => 1.0,
-    }
-}
-
 /// Half-life in days, resolved from content_dirs config by file path prefix.
 /// Falls back to source_type-based defaults when content_dirs is empty or unmatched.
 pub fn half_life_days(file_path: &str, source_type: &str) -> f64 {
@@ -1199,7 +1190,7 @@ mod tests {
         assert_eq!(cfg.log_dir, PathBuf::from("/custom/logs"));
     }
 
-    // ─── cache_dir resolution (ADR-0008 Task 1) ─────────────────────
+    // ─── cache_dir resolution ────────────────────────────────────────
     // env-mutating tests below MUST be #[serial] because XDG_CACHE_HOME /
     // HOME are process-global and other tests (and library code) read them.
     // HOME is save/restored explicitly to avoid corrupting other tests
@@ -1305,7 +1296,7 @@ mod tests {
         std::env::remove_var("TSM_CACHE_DIR");
     }
 
-    // ─── LinkMode resolution (ADR-0008 Task 2) ─────────────────────
+    // ─── LinkMode resolution ─────────────────────────────────────────
 
     #[test]
     fn test_link_mode_default_is_symlink() {
@@ -1598,16 +1589,6 @@ index_root = "/low-root"
     #[test]
     fn test_directory_weight_session() {
         assert_eq!(directory_weight("session:abc123"), DEFAULT_SESSION_WEIGHT);
-    }
-
-    #[test]
-    fn test_status_penalty_values() {
-        assert_eq!(status_penalty(None), 1.0);
-        assert_eq!(status_penalty(Some("current")), 1.0);
-        assert_eq!(status_penalty(Some("outdated")), 0.4);
-        assert_eq!(status_penalty(Some("rejected")), 0.3);
-        assert_eq!(status_penalty(Some("dropped")), 0.3);
-        assert_eq!(status_penalty(Some("superseded")), 0.2);
     }
 
     #[test]
@@ -2200,7 +2181,7 @@ half_life_days = 180
         reload();
     }
 
-    // ─── cache_*_dir / cache_models_dir_complete (ADR-0008 Task 3) ──
+    // ─── cache_*_dir / cache_models_dir_complete ─────────────────────
 
     #[test]
     #[serial]

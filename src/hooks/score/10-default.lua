@@ -1,4 +1,4 @@
--- Default score hook: reproduces time_decay x status_penalty.
+-- Default score hook: time-decay × status-based penalty scoring.
 -- Builtins provided by core: decay(date, half_life_days).
 function score(ctx)
   local m = ctx.metadata or {}
