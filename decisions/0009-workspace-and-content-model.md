@@ -23,8 +23,9 @@ scaffold ファイル / cache へのリンクが配置される構造になっ�
 **workspace の境界（どこを workspace とみなすか）**、
 **コンテンツの参照（workspace 内外のどこを索引するか）**——
 を 1 つの一貫したモデルとして定義する。2 軸はいずれも
-「walk-up で確定する `project_root`」を共通の基準点として共有しており、
-分離するとかえって基準点の二重定義を招くため、1 ADR にまとめる。
+「CWD 直下の `tsm.toml` または `--project-root` で確定する `project_root`」を
+共通の基準点として共有しており、分離するとかえって基準点の二重定義を招くため、
+1 ADR にまとめる。
 
 3 軸目の **プロセスの境界（どの daemon がどの workspace 用か）** は
 [ADR-0010](./0010-per-project-daemon.md) で扱う。ADR-0010 は本 ADR が定義する
@@ -40,12 +41,12 @@ DB の `source_file` 表現を破壊変更するため（§3〜§4）、同じ `
 
 ### 課題
 
-1. **workspace 探索が CWD のみ**
-   `config::state_dir()` は `DEFAULT_STATE_DIR = ".tsm"` を CWD 相対で返す。
-   workspace のサブディレクトリから `tsm` を叩くと workspace を見失い、
-   そこに `.tsm/` を作ろうとする（または XDG global にフォールバックする）。
-   git / mise / cargo はいずれも上方向への探索を行うのが業界慣習であり、
-   tsm だけがこの慣習に反している
+1. **workspace の決定ルールが不明確**
+   `config::state_dir()` は `DEFAULT_STATE_DIR = ".tsm"` を CWD 相対で返すだけで、
+   「どこを workspace とみなすか」「複数 workspace をどう区別するか」の明示的な
+   ルールが無い。CWD 次第で `.tsm/` を作る場所が変わり（または XDG global に
+   フォールバックし）、どの DB を見ているのかが利用者から追いにくい。
+   workspace を一意に確定する明示的な決定ルールが要る
 
 2. **`tsm.toml` の置き場所が見えにくい**
    ADR-0008 line 96 では `tsm.toml (任意)` を `.tsm/` の中に置く設計だが、
@@ -90,23 +91,32 @@ DB の `source_file` 表現を破壊変更するため（§3〜§4）、同じ `
 
 `.tsm/` の内部構造は ADR-0008 に従う。本 ADR は marker の位置のみを変更する。
 
-### 2. workspace 探索は walk-up 方式
+### 2. workspace 探索（`project_root` の決定）
 
-**`tsm` CLI** は **CWD から上方向に辿って最初に見つかった `tsm.toml`** を
-workspace marker として採用する。それを含むディレクトリが workspace。
+`project_root` は次の優先順で決定する。`tsm` CLI と `tsmd`（daemon / 子
+プロセス）で共通のアルゴリズムを使う。
 
 ```text
-discover_workspace(cwd):
-    for d in cwd.ancestors():
-        if (d / "tsm.toml").exists():
-            return d
-    return None
+resolve_project_root(cwd, project_root_arg):
+    # 1. CWD 直下に tsm.toml があればそれを採用
+    if (cwd / "tsm.toml").exists():
+        return cwd
+    # 2. なければ --project-root 引数を採用
+    if project_root_arg is set:
+        return project_root_arg     # その直下に tsm.toml がある前提
+    # 3. どちらも無ければ起動失敗
+    fail("no tsm.toml in CWD and no --project-root; run `tsm init`")
 ```
 
-walk-up を行うのは **`tsm` CLI のみ**である。`tsmd`（daemon / 子プロセス）は
-walk-up しない。`tsm` が確定した workspace の絶対パスを `tsmd --project-root`
-として明示的に渡す（[ADR-0010](./0010-per-project-daemon.md)）。探索ロジックを
-CLI 側に一元化し、daemon は受け取ったパスに従うだけにする。
+- **CWD 直下のみ**を見る（上方向への walk-up はしない）。明示的な CWD か
+  `--project-root` のどちらかで workspace を一意に確定させ、「実行場所に
+  よって暗黙に親へ遡る」曖昧さを排除する
+- `--project-root` は `tsm` / `tsmd` 双方が受け付ける。`tsm start` は解決した
+  workspace の絶対パスを `tsmd --project-root <abs>` として明示的に渡し、
+  daemon 側でも同じアルゴリズムで `project_root` が確定する
+  （[ADR-0010](./0010-per-project-daemon.md)）
+- CWD 直下にも `--project-root` にも `tsm.toml` が無ければ **起動失敗**させる
+  （黙ってフォールバックしない）
 
 `.tsm/` ディレクトリの存在は marker として用いない（`.tsm/` は
 state の置き場であり workspace の意味論的な境界ではないため）。
@@ -115,13 +125,17 @@ state の置き場であり workspace の意味論的な境界ではないため
 `content_dirs` の相対パス解決（§3）と ADR-0010 の `--project-root` の基準点
 —— になる。
 
-#### コマンド別の未発見時挙動
+#### コマンド別の未確定時挙動
 
-| コマンド | `tsm.toml` 未発見時 |
+`project_root` が確定できなかった（CWD 直下に `tsm.toml` 無し、かつ
+`--project-root` 未指定）場合：
+
+| コマンド | 挙動 |
 |---|---|
 | `tsm init` | CWD 直下に `tsm.toml` + `.tsm/` を作る（ADR-0008 の init 仕様に従う） |
-| `tsm start` | エラー「`tsm init` を実行してね」 |
-| `tsm search` / `status` / `doctor` 等 | エラー「`tsm init` を実行してね」 |
+| `tsm start` | エラー「`tsm init` を実行するか `--project-root` を指定してね」 |
+| `tsm search` / `status` / `doctor` 等 | エラー「`tsm init` を実行するか `--project-root` を指定してね」 |
+| `tsmd`（直接起動） | エラー終了（[ADR-0010](./0010-per-project-daemon.md)）|
 
 ### 3. コンテンツ参照は `content_dirs` に一本化（`index_root` 廃止）
 
@@ -142,8 +156,8 @@ half_life_days = 180
 ```
 
 - `path` の解決規則：
-  - **相対パス**（`.` / `../shared-notes` 等）は **`project_root`（§2 の
-    walk-up で確定する `tsm.toml` のディレクトリ）に join** してから
+  - **相対パス**（`.` / `../shared-notes` 等）は **`project_root`（§2 で
+    確定する `tsm.toml` のディレクトリ）に join** してから
     canonical 化する。`..` を許可する
   - **絶対パス**は `project_root` に join せず、そのまま canonical 化する
   - これにより「workspace 外を索引したい」用途（オーケストレーションで
@@ -228,7 +242,7 @@ half_life_days = 180
 
 | 変数 | 扱い |
 |---|---|
-| `TSM_CONFIG` | 指定されていれば walk-up をスキップしてそのファイルを採用。このとき `project_root`（= `content_dirs` 相対解決と ADR-0010 の `--project-root` の基準）は **`TSM_CONFIG` の親ディレクトリ**とする |
+| `TSM_CONFIG` | 指定されていれば §2 の CWD / `--project-root` 解決をスキップしてそのファイルを採用。このとき `project_root`（= `content_dirs` 相対解決と ADR-0010 の `--project-root` の基準）は **`TSM_CONFIG` の親ディレクトリ**とする |
 | `TSM_STATE_DIR` | 指定されていれば `<workspace>/.tsm/` を上書き |
 | `TSM_DAEMON_SOCKET` / `TSM_EMBEDDER_SOCKET` 等 | 既存どおり個別パスを上書き |
 
@@ -245,11 +259,14 @@ ADR-0008 の `.tsm/tsm.toml (任意)` は機械的に整合は取れるが、
 mise / cargo / pyproject はいずれも workspace 直下に置く慣習で、
 ADR-0008 task #190（`tsm init` 書き換え）が未実装の今なら破壊コストは小さい。
 
-**なぜ walk-up を入れるか**:
-CLI を打つ場所＝必ずしも workspace root とは限らない。サブディレクトリで
-`tsm search` を叩いても自 workspace の daemon に繋がるのが直感的。
-実装も `current_dir()` から `ancestors()` を回すだけで複雑性は低い。
-git / mise / cargo / npm すべて同方式を採用している。
+**なぜ walk-up ではなく「CWD 直下 + `--project-root`」にするか**:
+walk-up（git/mise 流の祖先探索）は便利だが、「実行場所によって暗黙に
+どこまで親へ遡るか」が見えにくく、意図しない上位 `tsm.toml` を拾う事故や、
+どの workspace を見ているのか追いにくい曖昧さを生む。明示的に「CWD 直下に
+`tsm.toml` があるか、無ければ `--project-root` を渡す」の二択に倒すことで、
+workspace が常に一意に確定し、`tsmd` に渡す `project_root`（ADR-0010）とも
+同じアルゴリズムで一貫する。サブディレクトリからの利用は `--project-root`
+明示で対応でき、暗黙探索による曖昧さを避けられる。
 
 **なぜ `.tsm/` の存在を marker にしないか**:
 `.tsm/` は state の置き場であり、空でも `mkdir` 一発で作れる。
@@ -260,7 +277,7 @@ tsm の `.tsm/` は cache link や DB を持つため作りやすく、同じ感
 
 **なぜ `index_root` を廃止し `content_dirs` に一本化するか**:
 `index_root` の全役割（相対基準 / auto-discover 起点 / 相対保存基準 /
-gitignore アンカー / 別 location 指定）は、`project_root`（walk-up で確定）と
+gitignore アンカー / 別 location 指定）は、`project_root`（§2 で確定）と
 `content_dirs`（絶対 / `..` 許可）に過不足なく吸収される。中間概念として
 残すと「どちらで索引対象を指定するのか」という 2 経路の混乱が残り、
 これは本 ADR が解こうとしている課題そのもの。単一経路に倒すのが直感的。
@@ -303,8 +320,9 @@ ADR-0010 は本 ADR の `project_root` を消費する依存関係にあるが�
 
 ### Positive
 
-- 設定ファイル探索が CWD-only から walk-up になり、サブディレクトリでの
-  CLI 利用が自 workspace の設定に追従する
+- workspace の決定が「CWD 直下の `tsm.toml` か `--project-root`」の明示的な
+  二択に固定され、どの workspace / DB を見ているかが一意で追いやすくなる
+  （暗黙の親探索による事故が起きない）
 - `tsm.toml` が workspace 直下に出ることで、ユーザーが設定の存在を
   視認しやすくなる
 - 索引対象が「`project_root`（境界）＋ `content_dirs`（実体）」の 2 層に
@@ -325,8 +343,10 @@ ADR-0010 は本 ADR の `project_root` を消費する依存関係にあるが�
   `decisions/0008-setup-init-separation.md` 側にも追記が必要
 - `tsm init` が必須ステップとして増える。`cd /path && tsm start` 一発では
   動かなくなる（`tsm init` を先に挟む必要）
-- walk-up のコストが各 CLI 呼び出しに加わる（ただし定数回の stat、
-  実測で問題になるレベルではない）
+- walk-up を採用しないため、workspace のサブディレクトリから `tsm` を
+  叩くと CWD 直下に `tsm.toml` が無く起動失敗する。サブディレクトリで
+  使いたい場合は `--project-root` を明示する必要がある（git/mise 流の
+  暗黙の親探索は行わない）
 - **breaking change**: `source_file` を絶対パス保存に変えるためスキーマ意味が
   変わり、`rebuild --apply` が必須。絶対パス保存は DB がマシン依存になり、
   workspace を別パスへ移動すると既存行が stale になる（`rebuild` で再生成）
@@ -343,7 +363,9 @@ ADR-0010 は本 ADR の `project_root` を消費する依存関係にあるが�
   PR を本 ADR と同時にマージ。ADR-0008 task #190 がまだ未実装のため
   実装コンフリクトは無い
 - **Umbrella issue を作成**、以下のタスク粒度でサブ issue 化：
-  1. `config.rs` に `find_workspace()`（walk-up 探索）を実装
+  1. `config.rs` に `resolve_project_root(cwd, project_root_arg)`
+     （CWD 直下 `tsm.toml` → `--project-root` → 失敗）を実装。
+     `tsm` / `tsmd` 双方が `--project-root` 引数を受ける
   2. `tsm init` 拡張：`<workspace>/tsm.toml` 雛形生成、`.tsm/.gitignore`
      （`*` のみ）作成（ADR-0008 task #190 の中で対応するか別タスクにするか調整）
   3. `index_root` 撤廃：`config.rs` から `index_root` / `DEFAULT_INDEX_ROOT` /

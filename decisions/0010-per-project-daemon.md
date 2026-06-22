@@ -12,7 +12,8 @@
 ## Context
 
 [ADR-0009](./0009-workspace-and-content-model.md) が **workspace の境界**
-（walk-up で確定する `project_root`）を定義した。本 ADR はその `project_root` を
+（CWD 直下 `tsm.toml` → `--project-root` で確定する `project_root`）を定義した。
+本 ADR はその `project_root` を
 受けて、**プロセスの境界 ——どの `tsmd` がどの workspace 用か—— をどう識別し、
 競合をどう防ぐか** を扱う。現状以下の不都合が残っている。
 
@@ -37,10 +38,17 @@
 
 ### 1. tsmd の per-project identity（`--project-root` 引数）
 
-`tsmd` は **workspace の絶対パスを必須引数 `--project-root` として受ける**。
-値は **常に canonical 化されたフルパス（絶対パス）** とする。`tsm` CLI が
-walk-up（ADR-0009 §2）で確定した workspace を canonical 化して渡し、`ps` でも
-フルパスで表示される（相対パスや `~` 短縮形は argv に渡さない）。
+`tsmd` は `project_root` を **ADR-0009 §2 の共通アルゴリズム**で決定する：
+**CWD 直下に `tsm.toml` があればそれ、無ければ `--project-root` 引数、
+どちらも無ければ起動失敗**。`--project-root` は必須ではなくフォールバックだが、
+**`tsm start` は常に `--project-root` を渡す**（`ps` 可視性のため）。
+値は **常に canonical 化されたフルパス（絶対パス）** とし、`ps` でもフルパスで
+表示される（相対パスや `~` 短縮形は argv に渡さない）。
+
+`tsm start` 経由では daemon の CWD が `tsm` の実行ディレクトリと一致する保証が
+ないため、`--project-root` 明示が `ps` 識別の確実な経路になる。
+直接起動（デバッグ等）では CWD 直下に `tsm.toml` があれば `--project-root`
+省略も可能。
 
 ```text
 tsmd --project-root /workspaces/proj-a
@@ -78,7 +86,7 @@ tsmd --project-root /workspaces/proj-a --fs-watcher
 `tsm start`:
 
 ```text
-1. CWD から walk-up → workspace 確定（ADR-0009 §2）
+1. project_root 確定（ADR-0009 §2: CWD 直下 tsm.toml → --project-root → 失敗）
 2. <workspace>/.tsm/ を必要なら作る
 3. spawn:  tsmd --project-root <abs_path> [--no-watcher]
 4. <workspace>/.tsm/daemon.sock の出現を待つ（既存ロジック流用）
@@ -87,7 +95,7 @@ tsmd --project-root /workspaces/proj-a --fs-watcher
 `tsm search` / `status` / `doctor` 等:
 
 ```text
-1. CWD から walk-up → workspace 確定（ADR-0009 §2）
+1. project_root 確定（ADR-0009 §2: CWD 直下 tsm.toml → --project-root → 失敗）
 2. <workspace>/.tsm/daemon.sock に接続
 3. 不在 → エラー「tsm start してね」
 ```
@@ -164,9 +172,10 @@ socket clobber 解決）は独立してレビュー / 実装できる小さな�
 
 ### Negative
 
-- `tsmd` を直接起動する際に `--project-root` が必須になる
-  （素の `tsmd` 起動はできなくなる）。通常運用は `tsm start` 経由のため
-  影響は限定的だが、デバッグ用の直接起動手順は更新が必要
+- `tsmd` を直接起動する際、CWD 直下に `tsm.toml` が無ければ `--project-root`
+  が必要になる（CWD に `tsm.toml` も `--project-root` も無いと起動失敗）。
+  通常運用は `tsm start` 経由のため影響は限定的だが、デバッグ用の直接起動
+  手順は更新が必要
 - env vars を escape hatch に格下げしたことで、グローバル `TSM_STATE_DIR`
   を前提にしていた既存スクリプトは挙動が変わる可能性
 - 「応答なし + PID 生存」を非零終了にするため、PID ファイルが腐っている
@@ -176,14 +185,15 @@ socket clobber 解決）は独立してレビュー / 実装できる小さな�
 ### Follow-ups
 
 - **Umbrella issue を作成**、以下のタスク粒度でサブ issue 化：
-  1. `tsmd` に `--project-root <PATH>` 引数追加（canonical 絶対パス必須）、
-     `chdir` 実装、state_dir 固定
-  2. `tsm start` で walk-up → spawn 時に argv へ `--project-root` 注入
+  1. `tsmd` に `--project-root <PATH>` 引数追加（canonical 絶対パス）、
+     ADR-0009 §2 の `resolve_project_root` を適用、`chdir` 実装、state_dir 固定
+  2. `tsm start` が解決した project_root を spawn 時に argv へ
+     `--project-root` 注入（CWD に tsm.toml があっても ps 可視性のため常に渡す）
   3. 子プロセス spawn (`child::spawn_child`) にも `--project-root` 継承
   4. `daemon_mode.rs` の socket clobber を「Ping + PID alive チェック」の
      三分岐に置き換え（[#200](https://github.com/key/the-space-memory/issues/200) 解決）
   5. ドキュメント更新（README / README.ja / CLAUDE.md。
-     `tsmd` 直接起動手順に `--project-root` 必須を明記）
-- **ADR-0009 との順序**: 本 ADR は ADR-0009 の `project_root`（walk-up）を
-  前提とするため、ADR-0009 の workspace 探索（task `find_workspace()`）を
+     `tsmd` 直接起動手順に project_root 解決順を明記）
+- **ADR-0009 との順序**: 本 ADR は ADR-0009 の `project_root` 決定
+  （`resolve_project_root`）を前提とするため、ADR-0009 の workspace 探索を
   先行実装する
