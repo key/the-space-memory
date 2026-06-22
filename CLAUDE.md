@@ -40,6 +40,10 @@ npx jscpd                                                  # Duplicate detection
 
 # E2E tests (requires release build + model download)
 bash tests/e2e.sh
+
+# Benchmarks (requires live tsmd + indexed corpus; see README "Benchmarks")
+cargo bench --bench search_latency
+cargo test --features bench-counters   # counter-instrumented tests (off by default)
 ```
 
 ## Architecture
@@ -261,6 +265,11 @@ A change is merge-ready when **all** of the following hold:
   (`logging::default_log_spec`). User-facing command output is `println!`, not
   the logger, so it shows regardless of level. Set `RUST_LOG=info`/`debug` for
   verbose CLI logs
+- **macOS tempdir tests fail locally, pass on Linux CI** — `tempfile::tempdir()`
+  returns `/var/...` but `current_dir()` resolves the symlink to `/private/var/...`,
+  so tests asserting `path == cwd` (e.g.
+  `config::tests::test_load_config_relative_path_resolves_against_cwd`) fail on
+  macOS only. Not a regression — verify on Linux CI before chasing it
 
 ## Design Decisions (ADR)
 
@@ -273,9 +282,9 @@ Review existing records before making architectural changes.
 
 For changes involving process architecture, IPC, or failure behavior,
 see ADR-0001. For uninitialized-DB fail-fast, daemon auto-start boundaries,
-and read-only `doctor`, see ADR-0009. For the output-channel model
+and read-only `doctor`, see ADR-0011. For the output-channel model
 (user output → stdout, logs/errors → stderr/file, log-file consolidation),
-see ADR-0010.
+see ADR-0012.
 
 ## Language Policy
 

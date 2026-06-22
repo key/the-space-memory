@@ -6,6 +6,9 @@
 - **Related**:
   [ADR-0001](./0001-process-roles-and-responsibilities.md),
   [ADR-0003](./0003-config-via-resolved-config.md)
+- **Superseded in part by**:
+  [ADR-0009](./0009-workspace-and-content-model.md) — `tsm.toml` の置き場所を
+  `.tsm/` の中から `<workspace>/` 直下に変更
 
 ## Context
 
@@ -93,7 +96,7 @@ Rust エコシステムが XDG 系統を採用している慣例に揃えるた�
 ├── reject_words.txt              辞書 reject リスト（物理）
 ├── custom_terms.toml             カスタム用語設定（物理）
 ├── user_dict.csv                 形態素辞書 simpledic（物理）
-├── tsm.toml (任意)               ワークスペース固有設定（物理）
+│                                 （tsm.toml は ADR-0009 で <workspace>/ 直下へ移動）
 ├── logs/                         ログ（物理）
 ├── {daemon,embedder}.sock        IPC ソケット（物理）
 ├── {tsmd,embedder}.pid           PID ファイル（物理）
