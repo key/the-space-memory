@@ -1,7 +1,7 @@
 # ADR-0013: メタデータ抽出とスコアリングを Lua フックで拡張可能にする
 
-- **Status**: **Proposed**
-- **Date**: 2026-06-22 (Proposed)
+- **Status**: **Accepted**
+- **Date**: 2026-06-22 (Proposed) / 2026-06-22 (Accepted)
 - **Deciders**: key
 - **Related**:
   [ADR-0007](./0007-pipeline-stages.md)（パイプライン段の確定）,

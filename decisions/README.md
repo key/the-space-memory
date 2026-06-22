@@ -20,7 +20,7 @@
 | [0010](./0010-per-project-daemon.md) | tsmd の per-project identity と socket 競合解決 | Proposed | 2026-05-19 |
 | [0011](./0011-uninitialized-db-failfast-and-readonly-doctor.md) | 未初期化 DB での fail-fast と doctor の read-only 化 | Accepted | 2026-06-22 |
 | [0012](./0012-output-channel-model.md) | 出力チャネルモデル（ユーザー出力 / ログ / エラーの分離） | Accepted | 2026-06-22 |
-| [0013](./0013-lua-metadata-scoring-hooks.md) | メタデータ抽出とスコアリングを Lua フックで拡張可能にする | Proposed | 2026-06-22 |
+| [0013](./0013-lua-metadata-scoring-hooks.md) | メタデータ抽出とスコアリングを Lua フックで拡張可能にする | Accepted | 2026-06-22 |
 
 新規 ADR 追加時は上記表にも 1 行追加すること。
 
@@ -63,8 +63,9 @@ ADR は **target state（到達したい状態）** の定義に専念する。
 | `Deprecated` | 後続の ADR で置換された。Related で置換先を示す |
 | `Superseded by ADR-NNNN` | 部分的に上書きされた場合 |
 
-PR でのマージは原則 `Proposed` のまま行い、合意形成完了後の別コミットで
-`Accepted` に更新する運用も可（決定タイミングを明確化したい場合）。
+ドラフト中の PR は `Proposed`。**マージするときは Status を `Accepted` に変更する**
+（マージ＝決定確定）。マージ前の最終コミットで本文 Status と上記索引行を
+`Accepted` に更新し、Date に `/ YYYY-MM-DD (Accepted)` を追記する。
 
 ### 番号付け
 
