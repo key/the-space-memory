@@ -480,16 +480,31 @@ pub fn cmd_vector_fill(batch_size: usize) -> anyhow::Result<()> {
         if !resp.ok {
             anyhow::bail!("{}", resp.error.unwrap_or_default());
         }
+        // The backfill ran daemon-side; its summary travels back in the
+        // payload so we can show it here rather than losing it to the log.
+        if let Some(summary) = resp
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("summary"))
+            .and_then(|v| v.as_str())
+        {
+            println!("{summary}");
+        }
         return Ok(());
     }
     // tsmd not running — run directly
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
-    run_vector_fill(&conn, batch_size)
+    println!("{}", run_vector_fill(&conn, batch_size)?);
+    Ok(())
 }
 
 /// Run vector backfill via the embedder socket (daemon-safe).
-pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow::Result<()> {
+///
+/// Returns the user-facing summary line instead of printing it: when invoked
+/// daemon-side the worker's stdout goes to the daemon log, so the caller (the
+/// CLI directly, or via the IPC response payload) surfaces it to the user.
+pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow::Result<String> {
     use crate::status;
 
     let state_dir = config::state_dir();
@@ -522,11 +537,10 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
 
     let stats = indexer::backfill_vectors(conn, &encode_fn, batch_size, Some(&progress_cb))?;
 
-    if stats.filled > 0 {
-        println!("Backfilled {} vectors.", stats.filled);
-    } else {
-        println!("No missing vectors.");
-    }
+    let skipped: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks_vec_skip", [], |r| r.get(0))
+        .unwrap_or(0);
+    let summary = vector_fill_summary(stats.filled, skipped);
     if stats.errors > 0 {
         log::warn!("{} errors during backfill.", stats.errors);
     }
@@ -536,7 +550,26 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
         s.backfill = None;
     });
 
-    Ok(())
+    Ok(summary)
+}
+
+/// Build the user-facing summary line for `vector-fill`.
+///
+/// Distinguishes "nothing to do" from "chunks are stuck on the skip list",
+/// so a `0 filled` result with skip-marked chunks is not silently reported as
+/// "No missing vectors." (skip-marked chunks are not retried by `vector-fill`;
+/// `tsm reindex vectors` clears the skip list and retries them).
+fn vector_fill_summary(filled: usize, skipped: i64) -> String {
+    if filled > 0 {
+        return format!("Backfilled {filled} vectors.");
+    }
+    if skipped > 0 {
+        return format!(
+            "No vectors filled; {skipped} chunk(s) on the skip list after repeated \
+             embed failures. Run `tsm reindex vectors` to clear the skip list and retry."
+        );
+    }
+    "No missing vectors.".to_string()
 }
 
 pub fn cmd_import_wordnet(wordnet_db: &Path) -> anyhow::Result<()> {
@@ -946,6 +979,20 @@ fn doctor_check_with_conn(
             status: CheckStatus::Ok,
             message: format!("Vectors: {vecs} (matches all chunks)"),
             hint: None,
+        });
+    }
+
+    // Chunks on the skip list are excluded from backfill, so `vector-fill`
+    // will not retry them — surface them explicitly with a recovery hint,
+    // otherwise they read as a permanent unexplained vector mismatch.
+    let skipped: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks_vec_skip", [], |r| r.get(0))
+        .unwrap_or(0);
+    if skipped > 0 {
+        emb_section.items.push(CheckItem {
+            status: CheckStatus::Warning,
+            message: format!("Vectors: {skipped} chunk(s) on the skip list after embed failures"),
+            hint: Some("Run `tsm reindex vectors` to clear the skip list and retry.".to_string()),
         });
     }
 
@@ -2018,6 +2065,85 @@ mod tests {
         assert!(text.contains("2. [research]"));
         assert!(text.contains("status: outdated"));
         assert!(!text.contains("No results found"));
+    }
+
+    #[test]
+    fn test_vector_fill_summary_reports_filled() {
+        let msg = vector_fill_summary(7, 0);
+        assert!(
+            msg.contains('7'),
+            "should report filled count, got: {msg:?}"
+        );
+        assert!(
+            msg.to_lowercase().contains("backfilled"),
+            "should announce backfilled vectors, got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn test_vector_fill_summary_no_missing_when_nothing_skipped() {
+        let msg = vector_fill_summary(0, 0);
+        assert_eq!(msg, "No missing vectors.");
+    }
+
+    #[test]
+    fn test_vector_fill_summary_warns_when_skipped() {
+        let msg = vector_fill_summary(0, 3);
+        assert!(
+            msg.contains('3'),
+            "should report skipped count, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("reindex vectors"),
+            "should point to `reindex vectors` to retry skipped chunks, got: {msg:?}"
+        );
+        assert_ne!(
+            msg, "No missing vectors.",
+            "skip-blocked chunks must not be reported as no-op"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_surfaces_skipped_vectors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
+        let db_path = dir.path().join("test.db");
+        db::init_db(&db_path).unwrap();
+        {
+            let conn = db::get_connection(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO documents(id, file_path, source_type, file_hash, indexed_at)
+                 VALUES (1, 'daily/notes/a.md', 'note', 'h', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks(id, document_id, chunk_index, content)
+                 VALUES (1, 1, 0, 'one'), (2, 1, 1, 'two')",
+                [],
+            )
+            .unwrap();
+            // One chunk is stuck on the skip list (vector-fill will not retry it).
+            conn.execute(
+                "INSERT INTO chunks_vec_skip(chunk_id, reason) VALUES (1, 'encode_error')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let report = doctor_check(&db_path);
+        let issues = report.issues();
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("skip") && s.contains("reindex vectors")),
+            "doctor should surface skip-marked chunks with a `reindex vectors` hint, got: {issues:?}"
+        );
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
     }
 
     #[test]
