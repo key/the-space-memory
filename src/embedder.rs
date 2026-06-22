@@ -315,6 +315,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "bench-counters", serial_test::serial(embedder_counter))]
     fn test_embed_via_socket_nonexistent_path() {
         let result = embed_via_socket_at(Path::new("/tmp/nonexistent.sock"), &[]);
         assert!(result.is_none());
@@ -332,12 +333,30 @@ mod tests {
     #[cfg(feature = "bench-counters")]
     #[test]
     #[serial_test::serial(embedder_counter)]
+    fn test_embedder_call_counter_accumulates() {
+        // Each call bumps the counter by exactly one; guards against an
+        // off-by-N regression that the count==1 test alone would miss.
+        counters::reset_embedder_calls();
+        let _ = embed_via_socket_at(Path::new("/tmp/nonexistent.sock"), &[]);
+        let _ = embed_via_socket_at(Path::new("/tmp/nonexistent.sock"), &[]);
+        assert_eq!(counters::embedder_call_count(), 2);
+    }
+
+    #[cfg(feature = "bench-counters")]
+    #[test]
+    #[serial_test::serial(embedder_counter)]
     fn test_embedder_call_counter_reset_zeroes() {
+        // Dirty the counter first, otherwise this only asserts that a freshly
+        // initialized (or already-reset) counter reads zero — a no-op `reset`
+        // would still pass. Reset must actually clear a non-zero value.
+        let _ = embed_via_socket_at(Path::new("/tmp/nonexistent.sock"), &[]);
+        assert_ne!(counters::embedder_call_count(), 0);
         counters::reset_embedder_calls();
         assert_eq!(counters::embedder_call_count(), 0);
     }
 
     #[test]
+    #[cfg_attr(feature = "bench-counters", serial_test::serial(embedder_counter))]
     fn test_embed_via_socket_integration() {
         // Start a mock server that echoes fixed embeddings
         let dir = tempfile::TempDir::new().unwrap();

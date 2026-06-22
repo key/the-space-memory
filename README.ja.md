@@ -102,6 +102,47 @@ tsm rebuild --apply   # DB削除して再構築
 
 `tsm doctor` でシステムの状態とデーモンのステータスを確認できる。
 
+## ベンチマーク
+
+検索・インデックスパイプラインの性能ベンチ。現状は検索レイテンシのベンチのみ
+実装済みで、インデックスベンチと CI のリグレッションゲートは後続 PR で追加する
+（[#181](https://github.com/key/the-space-memory/issues/181) 参照）。
+
+### 前提条件
+
+- `tsmd` が embedder 準備完了で稼働中（`tsm start` 後 `tsm status` で確認）
+- 標準の testdata コーパスがインデックス済み:
+
+  ```bash
+  export TSM_INDEX_ROOT=$(pwd)/tests/e2e/testdata
+  tsm init && tsm index
+  ```
+
+### 実行
+
+```bash
+# 検索レイテンシ（ハイブリッド: FTS5 + ベクター + エンティティ）
+cargo bench --bench search_latency
+```
+
+### Embedder 呼び出しカウンタ
+
+embedder の呼び出し回数を検証したいベンチでは、`bench-counters` フィーチャを
+有効にしてビルドする。デフォルトでは無効で、リリースビルドではカウンタが
+完全にコンパイルアウトされる。
+
+```bash
+cargo build --features bench-counters
+```
+
+```rust
+use the_space_memory::embedder::counters;
+
+counters::reset_embedder_calls();
+// ... embed_via_socket_at を呼ぶコードを実行 ...
+println!("calls: {}", counters::embedder_call_count());
+```
+
 ## ドキュメント
 
 - [コマンドリファレンス](docs/command-reference.md) — CLIコマンド、フラグ、使用例

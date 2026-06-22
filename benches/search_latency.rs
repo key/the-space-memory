@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use the_space_memory::{config, db, searcher};
+use the_space_memory::{config, db, embedder, searcher};
 
 const QUERIES: &[&str] = &["銀河", "坊っちゃん", "メロス", "夏目", "走れ"];
 const TOP_K: usize = 5;
@@ -29,6 +29,18 @@ fn bench_search_hybrid(c: &mut Criterion) {
             db_path.display()
         );
     });
+
+    // Preflight: confirm the embedder is reachable so the bench actually
+    // measures the hybrid path. `searcher::search` is called with
+    // `require_vector=false`, which silently falls back to FTS5/entity-only
+    // when the embedder socket is down — that would mislabel FTS-only numbers
+    // as "search_hybrid". Fail loudly instead.
+    let probe = embedder::embed_via_socket(&[String::from("preflight")]);
+    assert!(
+        probe.is_some(),
+        "Embedder not reachable — the hybrid bench would silently measure \
+         FTS-only latency. Run `tsm start` and verify `tsm status` before benching."
+    );
 
     let mut group = c.benchmark_group("search_hybrid");
     group.measurement_time(Duration::from_secs(10));

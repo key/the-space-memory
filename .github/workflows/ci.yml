@@ -38,6 +38,9 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Run tests (bench-counters feature)
+        run: cargo test --features bench-counters
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cca35edeb1d01366c2843b68fc3ca441446d73d3  # v2.77.1
         with:
