@@ -12,31 +12,28 @@
 ## Context
 
 [ADR-0009](./0009-workspace-and-content-model.md) はプロジェクトの境界（CWD 直下
-`tsm.toml` → `--project-root` で確定する `project_root`）を定義した。
+`tsm.toml` → `--project-root` で確定する `project_root`）を定義した。socket と DB は
+プロジェクトごとに `<project_root>/.tsm/` 配下で分離されるため、複数プロジェクトで
+daemon を並列稼働させること自体は既に可能である。
 
-socket と DB はプロジェクトごとに `<project_root>/.tsm/` 配下で分離されているため、
-複数のプロジェクトで daemon を並列稼働させること自体は既に可能である。しかし、
-稼働中の daemon の所属が外から判別できず、起動時の socket 競合にも穴がある。
+本 ADR は、その `project_root` を前提に次の 2 つの方式を決める。
 
-本 ADR は、その `project_root` を前提にプロセスの境界を定義する。具体的には、どの
-`tsmd` がどのプロジェクト用かを `ps` で識別できるようにする方法と、起動時の競合
-（直接起動による silent clobber と、並行起動による多重起動レース）を防ぐ方法を扱う。
-現状、以下の不都合が残っている。
+1. 稼働中の `tsmd` が**どのプロジェクトのものか**を外部から識別する方式
+2. 同一プロジェクトで **daemon を二重起動させない**仲裁の方式
 
-### 課題
+きっかけは現行設計の次の 2 点である。
 
-1. **`ps -ef` で daemon の所属が判別できない**
-   `tsmd` / `tsmd --embedder` / `tsmd --fs-watcher` がどのプロジェクト用か、argv からも
-   env からも分からない。複数プロジェクトを並列稼働させたとき、どの daemon がどの
-   プロジェクトを担当しているかを追えず、トラブルシュートが困難である。
+- `ps` / `pgrep` を見ても daemon の所属プロジェクトが分からない（argv にも env にも
+  出ていない）。複数プロジェクトを並列稼働させるとトラブルシュートが困難になる。
+- 起動時の socket 競合検知が check-then-act で非アトミックなため、直接起動が生存
+  daemon の socket を黙って奪い、並行 `tsm start` が双方 bind して daemon が多重起動
+  しうるバグがある（[#200](https://github.com/key/the-space-memory/issues/200)。
+  `daemon_mode.rs` が既存 socket を無条件削除してから bind し、`cmd_start` 側にも
+  spawn 前の削除経路がある）。
 
-2. **socket 競合の検知が check-then-act で、silent clobber と多重起動レースを許す**
-   （[#200](https://github.com/key/the-space-memory/issues/200)）
-   `src/bin/tsmd/daemon_mode.rs:44-50` は既存 socket を無条件に削除してから bind する。
-   `tsm start`（`src/main.rs` の `cmd_start`）側にも spawn 前の socket 削除経路があり、
-   いずれも「確認してから削除して bind する」という非アトミックな手順である。結果、
-   (a) バイナリ直接起動では生存 daemon の socket を黙って奪い、(b) 並行 `tsm start` が
-   双方とも「socket は不在 / stale」と判定して双方 bind し、daemon が多重起動しうる。
+socket 削除の順序を直すだけならバグ修正で済む。本 ADR が決めるのは「**何を
+所有権の正とするか**（PID file / socket / lock）」という、daemon の起動・停止・restart
+全体の挙動を左右する設計判断である。
 
 ## Decision
 
@@ -91,9 +88,8 @@ env での暗黙伝達は使わない（`ps` 可視性のため）。通常運�
   保証される（後述）。したがって既存の `daemon.sock` は必ず stale であり、安全に unlink
   して bind できる。「Ping して PID を確認して…」という check-then-act は不要になり、
   起動シーケンス全体が単一の不可分なゲートで直列化される。
-- 取得失敗時は socket を一切触らない。これにより
-  [#200](https://github.com/key/the-space-memory/issues/200) の silent clobber と、並行
-  `tsm start` による多重起動レースの双方が、同じ 1 つの仕組みで構造的に解決する。
+- 取得失敗時は socket を一切触らない。これにより silent clobber と、並行 `tsm start`
+  による多重起動レースの双方が、同じ 1 つの仕組みで構造的に解決する。
 - `tsmd.lock` は**ロック保持中に unlink しない**。`flock` は open file description に紐づく
   ため、ファイルを消して別プロセスが再生成すると inode が分かれ、別々の対象をロックして
   排他が崩れる。stale な lock ファイルが残ること自体は無害（次回 `flock` で取得できる）
@@ -185,10 +181,10 @@ platform 差・16 文字制限・実装の複雑さがあり、`Command::arg()` 
 いた）が消える。`rustix` / `libc` は既に依存ツリーにあり、追加依存は不要である。
 
 **socket を CLI 側で消さない理由**:
-[#200](https://github.com/key/the-space-memory/issues/200) の核心は「生存 daemon の
-socket を奪うと、別 daemon を黙って壊す」点にある。stale 判定を `tsmd` 側のロック取得後
-に一本化し、`cmd_start` と `tsmd` の双方にあった socket 削除経路を `tsmd` のロック後の
-一箇所へ集約することで、ロック判定をすり抜けて socket を奪う経路を無くす。
+silent clobber の核心は「生存 daemon の socket を奪うと、別 daemon を黙って壊す」点に
+ある。stale 判定を `tsmd` 側のロック取得後に一本化し、`cmd_start` と `tsmd` の双方に
+あった socket 削除経路を `tsmd` のロック後の一箇所へ集約することで、ロック判定を
+すり抜けて socket を奪う経路を無くす。
 
 **daemon が `chdir(project_root)` する理由**:
 主目的は子プロセスへ継承される CWD を一意化し、相対パス解決の基準を確定させることで
@@ -219,8 +215,7 @@ ADR-0009 はプロジェクトの境界とコンテンツ参照を扱い、本 A
   hook はプロジェクトルートに cd 済みのため、追加変更は不要である。
 - 起動シーケンスが単一の `flock` ゲートで直列化され、並行 `tsm start` による daemon の
   多重起動が原理的に起きない。
-- [#200](https://github.com/key/the-space-memory/issues/200) の silent socket clobber が
-  構造的に解決し、生存 daemon を誤って壊さない。
+- 起動時の silent socket clobber が構造的に解決し、生存 daemon を誤って壊さない。
 - `flock` がプロセス死でカーネルにより自動解放されるため、stale PID / PID 再利用に伴う
   誤判定や手動介入が不要になる。
 - DB・socket・log の境界がプロジェクト単位で完全に分離され、片方の障害が他方に波及
@@ -241,12 +236,12 @@ ADR-0009 はプロジェクトの境界とコンテンツ参照を扱い、本 A
 - 同一の `TSM_STATE_DIR`（ADR-0009 §6 の escape hatch）を 2 つのプロジェクトで共有する
   と、lock・socket・DB の境界も共有され、per-project 分離が黙って壊れる。escape hatch を
   使う場合はプロジェクトごとに別ディレクトリを指す必要がある。
-- 親 daemon が異常終了すると、`--no-idle-timeout` の embedder 子プロセスが孤児として
-  残存しうる。ロック fd を close-on-exec にすることで孤児は新 daemon の起動をブロック
-  しないが（ロックは継承されない）、`embedder.pid` / `embedder.sock` 等の状態を残し、
-  次の daemon の子プロセス起動チェックに影響しうる。孤児の刈り取り（親死亡検知）は
-  プロセス lifecycle の領域（[ADR-0001](./0001-process-roles-and-responsibilities.md)）で
-  あり、`PR_SET_PDEATHSIG` が Linux 限定・macOS は kqueue / `getppid` 監視が要るなど
-  クロスプラットフォームで非自明なため、本 ADR のスコープ外の別決定とする。本 ADR が
-  確立する per-project な argv identity は、将来その孤児をプロジェクトへ紐付けて刈り取る
-  前提を与える。
+- **孤児 embedder は本 ADR では刈り取らない（意識的に受け入れる制限）。** 親 daemon が
+  異常終了すると `--no-idle-timeout` の embedder 子プロセスが孤児として残存する。ロック
+  fd を close-on-exec にしたため新 daemon の起動はブロックしないが（ロックは継承され
+  ない）、`embedder.pid` / `embedder.sock` 等の状態を残し、次の daemon の子プロセス起動
+  チェックに影響しうる。親死亡検知（孤児の刈り取り）は `PR_SET_PDEATHSIG` が Linux 限定・
+  macOS は kqueue / `getppid` 監視が要るなどクロスプラットフォームで非自明なため、
+  プロセス lifecycle を扱う別 ADR（[ADR-0001](./0001-process-roles-and-responsibilities.md)
+  圏）の決定に委ねる。本 ADR が確立する per-project な argv identity は、その孤児を
+  プロジェクトへ紐付けて刈り取る前提を与える。
