@@ -327,10 +327,9 @@ mod tests {
         ResolvedConfig::from_config_file(&file_cfg, root.to_path_buf())
     }
 
-    /// Build a walker anchored entirely at `tempdir` (both `index_root`
-    /// and `project_root`). Project-root-aware tests that need the two to
-    /// differ should call `cfg_for` variants and `ContentWalker::from_config`
-    /// directly.
+    /// Build a walker anchored entirely at `tempdir` as the project root.
+    /// Tests that need custom configuration should call `cfg_for` and
+    /// `ContentWalker::from_config` directly.
     fn walker_in(tempdir: &TempDir) -> ContentWalker {
         ContentWalker::from_config(&cfg_for(tempdir.path()))
     }
