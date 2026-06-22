@@ -1,0 +1,16 @@
+# tsm default ignore patterns. Edit to taste — `tsm init` will not
+# overwrite an existing file.
+
+# Hidden directories (.git/, .obsidian/, .venv/, etc.)
+.*/
+
+# Build / dependency directories
+target/
+node_modules/
+.venv/
+dist/
+
+# Large binary artifacts that bloat the index
+*.parquet
+*.zip
+*.db
