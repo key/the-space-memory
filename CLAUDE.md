@@ -40,6 +40,10 @@ npx jscpd                                                  # Duplicate detection
 
 # E2E tests (requires release build + model download)
 bash tests/e2e.sh
+
+# Benchmarks (requires live tsmd + indexed corpus; see README "Benchmarks")
+cargo bench --bench search_latency
+cargo test --features bench-counters   # counter-instrumented tests (off by default)
 ```
 
 ## Architecture
@@ -238,6 +242,11 @@ A change is merge-ready when **all** of the following hold:
 - **Segmenter is cached** — `tokenizer::get_segmenter()` caches the Segmenter
   (including user dict). Call `reset_segmenter()` after writing new simpledic
   if rebuilding FTS in the same process
+- **macOS tempdir tests fail locally, pass on Linux CI** — `tempfile::tempdir()`
+  returns `/var/...` but `current_dir()` resolves the symlink to `/private/var/...`,
+  so tests asserting `path == cwd` (e.g.
+  `config::tests::test_load_config_relative_path_resolves_against_cwd`) fail on
+  macOS only. Not a regression — verify on Linux CI before chasing it
 
 ## Design Decisions (ADR)
 
