@@ -137,6 +137,54 @@ pub fn hooks() -> Arc<HookSources> {
     arc
 }
 
+/// Convert a YAML sequence to a 1-indexed Lua array table of scalar strings.
+/// Non-scalar items are skipped.
+fn yaml_seq_to_lua_table(lua: &Lua, seq: &[serde_yaml::Value]) -> mlua::Result<mlua::Table> {
+    let arr = lua.create_table()?;
+    let mut idx = 1usize;
+    for item in seq {
+        let s = match item {
+            serde_yaml::Value::String(s) => Some(s.clone()),
+            serde_yaml::Value::Number(n) => Some(n.to_string()),
+            serde_yaml::Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        };
+        if let Some(s) = s {
+            arr.set(idx, s)?;
+            idx += 1;
+        }
+    }
+    Ok(arr)
+}
+
+/// Set a single YAML value into a Lua table under the given key.
+/// Null and nested mappings are skipped (no entry set).
+fn set_yaml_value(
+    lua: &Lua,
+    tbl: &mlua::Table,
+    key: &str,
+    val: &serde_yaml::Value,
+) -> anyhow::Result<()> {
+    match val {
+        serde_yaml::Value::String(s) => tbl.set(key, s.clone())?,
+        serde_yaml::Value::Bool(b) => tbl.set(key, *b)?,
+        serde_yaml::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                tbl.set(key, i)?;
+            } else if let Some(f) = n.as_f64() {
+                tbl.set(key, f)?;
+            }
+        }
+        serde_yaml::Value::Sequence(seq) => {
+            tbl.set(key, yaml_seq_to_lua_table(lua, seq)?)?;
+        }
+        // Null and nested mappings are skipped (already excluded by parse_map,
+        // but guard here for direct callers with raw maps)
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Build the `ctx.frontmatter` table from the full parsed YAML map.
 ///
 /// Converts each top-level key to the matching Lua value type:
@@ -149,43 +197,43 @@ fn frontmatter_table(
 ) -> anyhow::Result<mlua::Table> {
     let t = lua.create_table()?;
     for (key, val) in fm_map {
-        match val {
-            serde_yaml::Value::String(s) => {
-                t.set(key.clone(), s.clone())?;
-            }
-            serde_yaml::Value::Bool(b) => {
-                t.set(key.clone(), *b)?;
-            }
-            serde_yaml::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    t.set(key.clone(), i)?;
-                } else if let Some(f) = n.as_f64() {
-                    t.set(key.clone(), f)?;
+        set_yaml_value(lua, &t, key, val)?;
+    }
+    Ok(t)
+}
+
+/// Build a Lua table from a JSON object map (scalar values only).
+///
+/// String/Bool/Number entries are set; non-scalar values are skipped.
+/// Integers are represented as f64 (via `as_f64()`).
+fn json_map_to_lua_table(lua: &Lua, map: &Map<String, Value>) -> mlua::Result<mlua::Table> {
+    let tbl = lua.create_table()?;
+    for (k, v) in map {
+        match v {
+            Value::String(s) => tbl.set(k.as_str(), s.as_str())?,
+            Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    tbl.set(k.as_str(), f)?;
                 }
             }
-            serde_yaml::Value::Sequence(seq) => {
-                let arr = lua.create_table()?;
-                let mut idx = 1usize;
-                for item in seq {
-                    let s = match item {
-                        serde_yaml::Value::String(s) => Some(s.clone()),
-                        serde_yaml::Value::Number(n) => Some(n.to_string()),
-                        serde_yaml::Value::Bool(b) => Some(b.to_string()),
-                        _ => None,
-                    };
-                    if let Some(s) = s {
-                        arr.set(idx, s)?;
-                        idx += 1;
-                    }
-                }
-                t.set(key.clone(), arr)?;
-            }
-            // Null and nested mappings are skipped (already excluded by parse_map,
-            // but guard here for direct callers with raw maps)
+            Value::Bool(b) => tbl.set(k.as_str(), *b)?,
             _ => {}
         }
     }
-    Ok(t)
+    Ok(tbl)
+}
+
+/// Parse optional metadata JSON into a Lua table.
+///
+/// Returns an empty table when `json` is `None`, unparseable, or not an object.
+fn metadata_json_to_lua(lua: &Lua, json: Option<&str>) -> mlua::Result<mlua::Table> {
+    let Some(raw) = json else {
+        return lua.create_table();
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw) else {
+        return lua.create_table();
+    };
+    json_map_to_lua_table(lua, &map)
 }
 
 /// Convert a Lua table of scalars into JSON object entries (present keys only).
@@ -238,24 +286,7 @@ fn run_one_extract(
     ctx.set("body", body)?;
     ctx.set("frontmatter", frontmatter_table(&lua, fm_map)?)?;
     // Accumulated metadata so far, for earlier-wins/conditional policies.
-    let meta = lua.create_table()?;
-    for (k, v) in acc.iter() {
-        match v {
-            Value::String(s) => {
-                meta.set(k.clone(), s.clone())?;
-            }
-            Value::Number(n) => {
-                if let Some(f) = n.as_f64() {
-                    meta.set(k.clone(), f)?;
-                }
-            }
-            Value::Bool(b) => {
-                meta.set(k.clone(), *b)?;
-            }
-            _ => {}
-        }
-    }
-    ctx.set("metadata", meta)?;
+    ctx.set("metadata", json_map_to_lua_table(&lua, acc)?)?;
     let f: mlua::Function = lua.globals().get("extract")?;
     let ret: mlua::Table = f.call(ctx)?;
     lua_table_to_json(&ret, acc);
@@ -290,24 +321,7 @@ fn run_one_score(
     register_score_builtins(&lua)?;
     lua.load(&script.source).exec()?;
     let ctx = lua.create_table()?;
-    let meta = lua.create_table()?;
-    if let Some(json) = metadata_json {
-        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(json) {
-            for (k, v) in map {
-                match v {
-                    Value::String(s) => meta.set(k, s)?,
-                    Value::Number(n) => {
-                        if let Some(f) = n.as_f64() {
-                            meta.set(k, f)?;
-                        }
-                    }
-                    Value::Bool(b) => meta.set(k, b)?,
-                    _ => {}
-                }
-            }
-        }
-    }
-    ctx.set("metadata", meta)?;
+    ctx.set("metadata", metadata_json_to_lua(&lua, metadata_json)?)?;
     ctx.set("rrf", rrf)?;
     ctx.set("source_type", source_type)?;
     ctx.set("path", path)?;
