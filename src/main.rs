@@ -684,9 +684,11 @@ fn read_daemon_pid() -> Option<u32> {
 fn wait_for_pid_exit(pid: u32, timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
-        // kill(pid, 0) sends no signal: 0 = alive, -1/ESRCH = gone.
-        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-        if !alive {
+        // kill(pid, 0) sends no signal, only probes existence. Treat the process
+        // as gone ONLY on ESRCH; rc == 0 (alive) or EPERM (alive but not ours)
+        // both mean keep waiting, so a permission quirk can't be misread as exit.
+        let rc = unsafe { libc::kill(pid as i32, 0) };
+        if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
             return true;
         }
         if start.elapsed() >= timeout {
