@@ -901,6 +901,18 @@ pub fn models_dir_complete() -> Option<PathBuf> {
     }
 }
 
+// ─── Lua hook directories ───────────────────────────────────────
+
+/// Directory for user-defined extract hooks: `{state_dir}/hooks/extract/`.
+pub fn hooks_extract_dir() -> PathBuf {
+    state_dir().join("hooks/extract")
+}
+
+/// Directory for user-defined score hooks: `{state_dir}/hooks/score/`.
+pub fn hooks_score_dir() -> PathBuf {
+    state_dir().join("hooks/score")
+}
+
 // ─── Machine-wide cache helpers (ADR-0008) ─────────────────────
 
 /// Cache directory for the ruri-v3-30m model: `{cache_dir}/models/ruri-v3-30m/`.
