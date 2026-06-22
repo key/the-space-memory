@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 
 use the_space_memory::config;
 use the_space_memory::daemon;
+use the_space_memory::daemon_lock;
 use the_space_memory::daemon_protocol::{
     read_request, write_response, DaemonRequest, DaemonResponse,
 };
@@ -25,6 +26,33 @@ pub fn run(args: Args) -> Result<()> {
     let db_path = args.db.unwrap_or_else(config::db_path);
     let project_root = config::project_root();
 
+    // Acquire the per-project startup lock FIRST — before opening the DB or
+    // touching the socket — and hold it for the daemon's whole lifetime. The
+    // lock (not the PID file) is the sole ownership oracle: acquiring it proves
+    // no other live daemon owns this project, so a leftover socket is stale and
+    // safe to reclaim; failing to acquire means a live (possibly hung) daemon
+    // owns it and we must not steal its socket. Taking it before the DB open
+    // makes ownership the first semantic gate, so a losing concurrent
+    // `tsm start` sees a clear message rather than a spurious DB error. This
+    // serializes concurrent starts on one atomic gate and closes the silent
+    // socket clobber.
+    let lock_path = config::state_dir().join("tsmd.lock");
+    let _startup_lock = match daemon_lock::try_acquire(&lock_path)
+        .context(format!("Failed to open lock file {}", lock_path.display()))?
+    {
+        daemon_lock::LockOutcome::Acquired(guard) => guard,
+        daemon_lock::LockOutcome::Held => {
+            // current_dir() is the project root tsmd chdir'd to, so it
+            // matches what `ps`/`pgrep` show for the owning daemon — unlike
+            // config::project_root(), which can diverge under $TSM_CONFIG.
+            let here = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            anyhow::bail!(
+                "another tsmd already owns this project ({}). Run `tsm stop` first.",
+                here.display()
+            );
+        }
+    };
+
     // Open DB connection
     let conn = db::get_connection(&db_path)
         .context(format!("Failed to open DB at {}", db_path.display()))?;
@@ -40,9 +68,10 @@ pub fn run(args: Args) -> Result<()> {
 
     let conn = Arc::new(Mutex::new(conn));
 
-    // Clean up stale socket
+    // We hold the lock, so no live daemon exists: a leftover socket is stale.
     if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
+        std::fs::remove_file(&socket_path)
+            .with_context(|| format!("Failed to remove stale socket {}", socket_path.display()))?;
     }
 
     // Bind listener
@@ -84,6 +113,11 @@ pub fn run(args: Args) -> Result<()> {
             crate::signal_handler as *const () as libc::sighandler_t,
         );
     }
+
+    // Load + validate Lua hooks before serving. Fail-fast on a broken hook
+    // (ADR-0011 philosophy: refuse to start in a broken state).
+    the_space_memory::lua_hooks::init_hooks()
+        .map_err(|e| anyhow::anyhow!("hook load failed: {e}"))?;
 
     // ─── Start embedder child process ────────────────────────────────
     let embedder_pid_path = state_dir.join("embedder.pid");

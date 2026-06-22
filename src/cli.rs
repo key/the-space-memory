@@ -125,6 +125,7 @@ pub fn cmd_init_with(paths: &InitPaths<'_>) -> anyhow::Result<()> {
         DEFAULT_SYNONYMS_CSV,
         "synonyms.csv",
     )?;
+    install_default_hooks(paths.state_dir)?;
 
     // WordNet import — graceful skip when the resource is missing so
     // offline `tsm init` and pre-`tsm setup` invocations both succeed.
@@ -199,6 +200,22 @@ fn install_default_tsmignore(project_root: &Path) -> anyhow::Result<()> {
         &project_root.join(".tsmignore"),
         DEFAULT_TSMIGNORE,
         ".tsmignore",
+    )
+}
+
+/// Scaffold editable copies of the two default Lua hooks into
+/// `state_dir/hooks/{extract,score}/`. Existing files are never overwritten,
+/// so user customizations survive repeated `tsm init` invocations.
+fn install_default_hooks(state_dir: &Path) -> anyhow::Result<()> {
+    install_default_file(
+        &state_dir.join("hooks/extract/10-md_frontmatter.lua"),
+        crate::lua_hooks::DEFAULT_EXTRACT_HOOK,
+        "hooks/extract/10-md_frontmatter.lua",
+    )?;
+    install_default_file(
+        &state_dir.join("hooks/score/10-default.lua"),
+        crate::lua_hooks::DEFAULT_SCORE_HOOK,
+        "hooks/score/10-default.lua",
     )
 }
 
@@ -1795,6 +1812,16 @@ mod tests {
             state_dir.join("synonyms.csv").is_file(),
             "synonyms.csv was not created"
         );
+        assert!(
+            state_dir
+                .join("hooks/extract/10-md_frontmatter.lua")
+                .is_file(),
+            "hooks/extract/10-md_frontmatter.lua was not created"
+        );
+        assert!(
+            state_dir.join("hooks/score/10-default.lua").is_file(),
+            "hooks/score/10-default.lua was not created"
+        );
     }
 
     #[test]
@@ -1806,12 +1833,25 @@ mod tests {
         let state_dir = dir.path().join(".tsm");
         std::fs::create_dir_all(&state_dir).unwrap();
 
+        let hook_extract_dir = state_dir.join("hooks/extract");
+        let hook_score_dir = state_dir.join("hooks/score");
+        std::fs::create_dir_all(&hook_extract_dir).unwrap();
+        std::fs::create_dir_all(&hook_score_dir).unwrap();
+
         let user_files = [
             (dir.path().join(".tsmignore"), "user_pattern/\n"),
             (dir.path().join("tsm.toml"), "# user config\n"),
             (state_dir.join("user_dict.simpledic"), "user word\n"),
             (state_dir.join("custom_terms.toml"), "# user terms\n"),
             (state_dir.join("synonyms.csv"), "# user synonyms\n"),
+            (
+                hook_extract_dir.join("10-md_frontmatter.lua"),
+                "-- user extract hook\n",
+            ),
+            (
+                hook_score_dir.join("10-default.lua"),
+                "-- user score hook\n",
+            ),
         ];
         for (path, content) in &user_files {
             std::fs::write(path, content).unwrap();
@@ -2178,5 +2218,18 @@ mod tests {
         );
         std::env::remove_var("TSM_STATE_DIR");
         config::reload();
+    }
+
+    #[test]
+    fn test_init_scaffolds_default_hooks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join(".tsm");
+        std::fs::create_dir_all(&state).unwrap();
+        install_default_hooks(&state).unwrap();
+        let ex =
+            std::fs::read_to_string(state.join("hooks/extract/10-md_frontmatter.lua")).unwrap();
+        let sc = std::fs::read_to_string(state.join("hooks/score/10-default.lua")).unwrap();
+        assert!(ex.contains("function extract"));
+        assert!(sc.contains("function score"));
     }
 }

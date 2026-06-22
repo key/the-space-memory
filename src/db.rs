@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS documents (
     updated TEXT,
     tags TEXT,
     file_hash TEXT NOT NULL,
-    indexed_at TEXT NOT NULL
+    indexed_at TEXT NOT NULL,
+    metadata TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -199,12 +200,30 @@ pub fn ensure_chunk_hash_column(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Add the `documents.metadata` column to pre-existing DBs (no-op if present).
+///
+/// No-op when the `documents` table is absent: a freshly initialized DB already has
+/// the column via `SCHEMA_SQL`, and an uninitialized DB has no table to migrate.
+fn ensure_metadata_column(conn: &Connection) -> anyhow::Result<()> {
+    if !table_exists(conn, "documents") {
+        return Ok(());
+    }
+    let exists: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('documents') WHERE name = 'metadata'")?
+        .exists([])?;
+    if !exists {
+        conn.execute("ALTER TABLE documents ADD COLUMN metadata TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// Get a connection to the database at the given path.
 pub fn get_connection(db_path: &Path) -> anyhow::Result<Connection> {
     ensure_vec_extension();
     let conn = Connection::open(db_path)?;
     apply_pragmas(&conn)?;
     ensure_chunk_hash_column(&conn)?;
+    ensure_metadata_column(&conn)?;
     Ok(conn)
 }
 
@@ -465,5 +484,25 @@ mod tests {
         let db_path = dir.path().join("uninit.db");
         let conn = get_connection(&db_path).unwrap();
         assert!(!is_initialized(&conn));
+    }
+
+    #[test]
+    fn test_memory_db_has_metadata_column() {
+        let conn = get_memory_connection().unwrap();
+        // Column exists and accepts JSON text.
+        conn.execute(
+            "INSERT INTO documents (file_path, source_type, file_hash, indexed_at, metadata)
+             VALUES ('a.md', 'note', 'h', '2026-01-01', '{\"status\":\"current\"}')",
+            [],
+        )
+        .unwrap();
+        let got: Option<String> = conn
+            .query_row(
+                "SELECT metadata FROM documents WHERE file_path='a.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("{\"status\":\"current\"}"));
     }
 }

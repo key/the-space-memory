@@ -31,12 +31,18 @@ cargo fmt --check
 # Lint (Markdown / Shell / YAML / TOML)
 rumdl check <file>.md
 shellcheck <file>.sh
-yamllint <file>.yml
+ryl <file>.yml
 taplo check <file>.toml
 
 # Code metrics
 lizard src/ --language rust -Tcyclomatic_complexity=15 -w  # CCN warnings
 npx jscpd                                                  # Duplicate detection
+
+# Git hooks (prek). Run once after cloning. Hooks live in the shared .git, so
+# they apply across all worktrees; a branch without .pre-commit-config.yaml is
+# blocked until it picks up the config. See .pre-commit-config.yaml for the
+# stage split (fast file-scoped checks pre-commit; CI-mirroring gates pre-push).
+prek install --hook-type pre-commit --hook-type pre-push
 
 # E2E tests (requires release build + model download)
 bash tests/e2e.sh
@@ -58,6 +64,9 @@ src/
 ├── indexer.rs           — Indexer (diff detection, FTS5/vector registration)
 ├── searcher.rs          — FTS5 + vector search, RRF fusion, scoring
 ├── embedder.rs          — candle + ruri-v3-30m inference (pure library)
+├── lua_hooks.rs         — Embedded Lua runtime for extract/score hooks (ADR-0013)
+├── hooks/extract/       — Embedded default extract hook (10-md_frontmatter.lua)
+├── hooks/score/         — Embedded default score hook (10-default.lua)
 ├── chunker.rs           — Markdown → H2/H3/paragraph chunking
 ├── session_chunker.rs   — Claude session JSONL → Q&A chunking
 ├── frontmatter.rs       — YAML frontmatter parser
@@ -85,8 +94,14 @@ src/
 
 - **FTS5**: lindera tokenization + unicode61 tokenizer
 - **Vector search**: ruri-v3-30m (256-dim) semantic search. Embedder child process (`tsmd --embedder`) runs on UNIX socket
-- **Scoring**: RRF (Reciprocal Rank Fusion) combining FTS5 and vector results. Time decay + status penalty applied
-- **DB schema changes require `rebuild --apply`** (e.g. FTS tokenizer changes)
+- **Extract hooks** (index time): Lua scripts in `.tsm/hooks/extract/` produce a scalar metadata map
+  stored in `documents.metadata` (JSON). `ctx.frontmatter` exposes top-level YAML keys
+  (scalars + sequences; nested mappings not passed). Embedded default reproduces `frontmatter.rs`
+  (status + effective\_date).
+- **Score hooks** (search time): Lua scripts in `.tsm/hooks/score/` each return a multiplier;
+  `final = rrf × weight × Π(score hooks)`. Embedded default reproduces time\_decay × status\_penalty.
+- **DB schema changes require `rebuild --apply`** (e.g. FTS tokenizer changes) — the `metadata`
+  column is added automatically on connect (idempotent migration) and does not require a rebuild
 - **Live re-indexing**: `tsm reindex {all|fts|vectors}` — daemon runs batched
   re-index in background, yielding to search between batches
 
@@ -220,6 +235,19 @@ A change is merge-ready when **all** of the following hold:
 
 ## Gotchas
 
+- **Lua hooks dir layout** — `.tsm/hooks/{extract,score}/NN-name.lua` (sorted by file name, `.lua` only).
+  Empty or absent dir → embedded defaults. Disable a hook by renaming away the `.lua` extension.
+- **Editing a hook requires `tsm restart`** — daemon validates and loads all hooks at startup
+  (fail-fast on broken script). CLI uses a lazy per-process cache. Neither reloads hooks at runtime.
+- **`metadata` column is added automatically** — `documents.metadata` (JSON) is added by an
+  idempotent `ALTER TABLE` migration on connect. Existing rows have NULL metadata; the searcher
+  synthesizes scoring from `status`/`updated` columns, so scoring is unaffected. To populate
+  metadata for existing documents after writing custom extract hooks, run `tsm reindex` — a full
+  destructive rebuild is not required.
+- **Lua VMs are sandboxed** — `StdLib::NONE` + 64 MiB memory ceiling per VM.
+  No `io`/`os`/`package` available; hooks cannot touch the filesystem, network, or spawn processes.
+  Infinite loops are NOT bounded (op-count/timeout limit is deferred); hooks are user-owned scripts,
+  not untrusted third-party code.
 - **Hook stdin JSON key is `prompt`** (not `user_prompt`).
   Hook output must wrap `additionalContext` in
   `hookSpecificOutput: { hookEventName, additionalContext }`
@@ -266,11 +294,12 @@ A change is merge-ready when **all** of the following hold:
 - **All log modes default to `info`** (`logging::default_log_spec`). User-facing
   command output is `println!`, not the logger, so it shows regardless of level.
   Set `RUST_LOG=warn` to quiet the CLI terminal, or `debug` for more detail
-- **macOS tempdir tests fail locally, pass on Linux CI** — `tempfile::tempdir()`
-  returns `/var/...` but `current_dir()` resolves the symlink to `/private/var/...`,
-  so tests asserting `path == cwd` (e.g.
-  `config::tests::test_load_config_relative_path_resolves_against_cwd`) fail on
-  macOS only. Not a regression — verify on Linux CI before chasing it
+- **macOS tempdir vs `current_dir()` symlinks** — `tempfile::tempdir()` returns
+  `/var/...` but after `set_current_dir`, `current_dir()` resolves the symlink to
+  `/private/var/...`. A test asserting `path == cwd` must canonicalize the tempdir
+  path up front and use it for both `set_current_dir` and the assertion (see
+  `config::tests::test_load_config_relative_path_resolves_against_cwd`); otherwise
+  it fails on macOS only while passing on Linux CI
 
 ## Design Decisions (ADR)
 

@@ -992,6 +992,18 @@ pub fn models_dir_complete() -> Option<PathBuf> {
     }
 }
 
+// ─── Lua hook directories ───────────────────────────────────────
+
+/// Directory for user-defined extract hooks: `{state_dir}/hooks/extract/`.
+pub fn hooks_extract_dir() -> PathBuf {
+    state_dir().join("hooks/extract")
+}
+
+/// Directory for user-defined score hooks: `{state_dir}/hooks/score/`.
+pub fn hooks_score_dir() -> PathBuf {
+    state_dir().join("hooks/score")
+}
+
 // ─── Machine-wide cache helpers (ADR-0008) ─────────────────────
 
 /// Cache directory for the ruri-v3-30m model: `{cache_dir}/models/ruri-v3-30m/`.
@@ -1057,15 +1069,6 @@ pub fn ensure_model_cache_env() {
 }
 
 // ─── Pure functions (no config dependency) ───────────────────────
-
-pub fn status_penalty(status: Option<&str>) -> f64 {
-    match status {
-        Some("superseded") => 0.2,
-        Some("rejected") | Some("dropped") => 0.3,
-        Some("outdated") => 0.4,
-        _ => 1.0,
-    }
-}
 
 /// Half-life in days, resolved from content_dirs config by file path prefix.
 /// Falls back to source_type-based defaults when content_dirs is empty or unmatched.
@@ -1287,7 +1290,7 @@ mod tests {
         assert_eq!(cfg.log_dir, PathBuf::from("/custom/logs"));
     }
 
-    // ─── cache_dir resolution (ADR-0008 Task 1) ─────────────────────
+    // ─── cache_dir resolution ────────────────────────────────────────
     // env-mutating tests below MUST be #[serial] because XDG_CACHE_HOME /
     // HOME are process-global and other tests (and library code) read them.
     // HOME is save/restored explicitly to avoid corrupting other tests
@@ -1393,7 +1396,7 @@ mod tests {
         std::env::remove_var("TSM_CACHE_DIR");
     }
 
-    // ─── LinkMode resolution (ADR-0008 Task 2) ─────────────────────
+    // ─── LinkMode resolution ─────────────────────────────────────────
 
     #[test]
     fn test_link_mode_default_is_symlink() {
@@ -1780,13 +1783,14 @@ embedder_idle_timeout_secs = 999
     #[serial]
     fn test_load_config_relative_path_resolves_against_cwd() {
         // A bare relative candidate like "tsm.toml" must yield a
-        // project_root derived from CWD (not a bare empty path), with no
-        // canonicalize syscall in the picture. Avoids the race where the
-        // file could change between read and canonicalize.
+        // project_root derived from CWD (not a bare empty path). On macOS,
+        // tempdir returns /var/... but current_dir() resolves symlinks to
+        // /private/var/... — canonicalize upfront so both sides match.
         let dir = tempfile::tempdir().unwrap();
+        let dir_path = std::fs::canonicalize(dir.path()).unwrap();
         let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        std::fs::write(dir.path().join("tsm.toml"), r#"state_dir = "/rel""#).unwrap();
+        std::env::set_current_dir(&dir_path).unwrap();
+        std::fs::write(dir_path.join("tsm.toml"), r#"state_dir = "/rel""#).unwrap();
 
         let (cfg, root) = load_config_from(&[PathBuf::from("tsm.toml")]);
 
@@ -1794,7 +1798,7 @@ embedder_idle_timeout_secs = 999
 
         assert_eq!(cfg.state_dir, Some(PathBuf::from("/rel")));
         // project_root should be CWD (tempdir), not empty / None.
-        assert_eq!(root.unwrap(), dir.path());
+        assert_eq!(root.unwrap(), dir_path);
     }
 
     #[test]
@@ -1831,16 +1835,6 @@ embedder_idle_timeout_secs = 999
     #[test]
     fn test_directory_weight_session() {
         assert_eq!(directory_weight("session:abc123"), DEFAULT_SESSION_WEIGHT);
-    }
-
-    #[test]
-    fn test_status_penalty_values() {
-        assert_eq!(status_penalty(None), 1.0);
-        assert_eq!(status_penalty(Some("current")), 1.0);
-        assert_eq!(status_penalty(Some("outdated")), 0.4);
-        assert_eq!(status_penalty(Some("rejected")), 0.3);
-        assert_eq!(status_penalty(Some("dropped")), 0.3);
-        assert_eq!(status_penalty(Some("superseded")), 0.2);
     }
 
     #[test]
@@ -2463,7 +2457,7 @@ half_life_days = 180
         reload();
     }
 
-    // ─── cache_*_dir / cache_models_dir_complete (ADR-0008 Task 3) ──
+    // ─── cache_*_dir / cache_models_dir_complete ─────────────────────
 
     #[test]
     #[serial]
