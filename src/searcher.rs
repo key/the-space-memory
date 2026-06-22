@@ -281,7 +281,7 @@ pub fn search(
 }
 
 /// Decay multiplier 0.5^(age_days / half_life). Returns 0.5 if the date is
-/// absent, empty, or unparseable (matches the old `time_decay` sentinel).
+/// absent, empty, or unparseable (missing-date sentinel).
 pub(crate) fn decay_with_half_life(updated: Option<&str>, half_life: f64) -> f64 {
     let s = match updated {
         Some(s) if !s.is_empty() => s,
@@ -311,11 +311,6 @@ fn decay_factor(days: f64, half_life: f64) -> f64 {
 /// Today's date as a `%Y-%m-%d` string (UTC).
 pub(crate) fn today_string() -> String {
     Utc::now().date_naive().format("%Y-%m-%d").to_string()
-}
-
-#[allow(dead_code)]
-pub(crate) fn time_decay(updated: Option<&str>, file_path: &str, source_type: &str) -> f64 {
-    decay_with_half_life(updated, config::half_life_days(file_path, source_type))
 }
 
 /// Build an expanded FTS5 query: original terms (AND) OR expansion terms.
@@ -460,35 +455,51 @@ mod tests {
     #[test]
     fn test_recent_date_high_decay() {
         let now = Utc::now().format("%Y-%m-%d").to_string();
-        let decay = time_decay(Some(&now), "daily/notes/test.md", "note");
+        let decay = decay_with_half_life(
+            Some(&now),
+            config::half_life_days("daily/notes/test.md", "note"),
+        );
         assert!(decay > 0.9);
         assert!(decay <= 1.0);
     }
 
     #[test]
     fn test_none_returns_half() {
-        assert_eq!(time_decay(None, "daily/notes/test.md", "note"), 0.5);
+        assert_eq!(
+            decay_with_half_life(None, config::half_life_days("daily/notes/test.md", "note")),
+            0.5
+        );
     }
 
     #[test]
     fn test_invalid_date_returns_half() {
         assert_eq!(
-            time_decay(Some("not-a-date"), "daily/notes/test.md", "note"),
+            decay_with_half_life(
+                Some("not-a-date"),
+                config::half_life_days("daily/notes/test.md", "note")
+            ),
             0.5
         );
     }
 
     #[test]
     fn test_old_date_low_decay() {
-        let decay = time_decay(Some("2020-01-01"), "daily/notes/test.md", "note");
+        let decay = decay_with_half_life(
+            Some("2020-01-01"),
+            config::half_life_days("daily/notes/test.md", "note"),
+        );
         assert!(decay < 0.1);
     }
 
     #[test]
     fn test_source_type_half_life() {
         let date = "2025-01-01";
-        let session_decay = time_decay(Some(date), "session:abc", "session");
-        let note_decay = time_decay(Some(date), "daily/notes/test.md", "note");
+        let session_decay =
+            decay_with_half_life(Some(date), config::half_life_days("session:abc", "session"));
+        let note_decay = decay_with_half_life(
+            Some(date),
+            config::half_life_days("daily/notes/test.md", "note"),
+        );
         assert!(session_decay < note_decay);
     }
 
@@ -664,7 +675,7 @@ mod tests {
         let conn = db::get_memory_connection().unwrap();
         let dir = tempfile::TempDir::new().unwrap();
 
-        // Use today's date so time_decay doesn't push score below threshold
+        // Use today's date so decay doesn't push score below threshold
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let md = format!(
             "---\nstatus: current\nupdated: {today}\n---\n\n# 射撃ルール\n\n射撃場での安全管理。\n"
