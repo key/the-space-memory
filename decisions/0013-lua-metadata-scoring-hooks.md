@@ -37,10 +37,18 @@ ADR-0007 で Index / Search のパイプライン段を確定させ、プラグ�
 ### 全体方針: core を語彙非依存にし、ポリシーを Lua フックへ追い出す
 
 core は「ベクトル検索・RRF・フックを呼ぶ器」に徹し、メタデータの**意味付け**
-（どの status をどれだけ減点するか等）を一切持たない。`status_penalty()` の
-ハードコード語彙は廃止する。現状の `time_decay` / `status_penalty` の挙動は
-**デフォルト同梱スクリプトとして移植**し、ユーザー未設定時は現状の挙動を
-完全に再現する（リグレッションなし）。
+（どの status をどれだけ減点するか等）も**抽出**（frontmatter のどのキーを
+どう読むか）も一切持たない。`status_penalty()` のハードコード語彙と、
+`frontmatter.rs` が固定スキーマを core 内部の列に落とす現挙動は、どちらも
+**デフォルト同梱スクリプトへ移譲**する。
+
+- `extract/10-frontmatter.lua`（同梱）: `frontmatter.rs` 相当。core が渡す
+  解析済み frontmatter を `{status, effective_date, ...}` の正規化 map に落とす。
+- `score/10-default.lua`（同梱）: 現状の `time_decay` × `status_penalty` を再現。
+
+両者を同梱することで、**ユーザーがフックを 1 つも書かなくても現状の挙動を
+完全に再現する**（抽出・スコアともリグレッションなし）。core は frontmatter の
+構造を解析して Lua に渡すだけで、どのキーを採用するかは extract フック側が決める。
 
 ### スクリプトランタイム: 埋め込み Lua（mlua, vendored Lua 5.4）
 
@@ -70,10 +78,16 @@ core は「ベクトル検索・RRF・フックを呼ぶ器」に徹し、メタ
 -- ctx.frontmatter は core が YAML をパース済みで table として渡す
 -- (サンドボックス Lua に YAML パーサを持たせないため)
 -- ctx = { path, body, frontmatter = {...}, source_type, metadata = {累積} }
+
+-- 同梱の extract/10-frontmatter.lua（frontmatter.rs 相当・no-regression デフォルト）
 function extract(ctx)
-  return { status = "deprecated", effective_date = "2026-05-07" }
+  local fm = ctx.frontmatter
+  return { status = fm.status, effective_date = fm.updated }
 end
 ```
+
+ADR 本文（`- **Status**:` 等）からの抽出のように、ソース固有の抽出はユーザーが
+追加フック（例: `extract/20-adr.lua`）として書く。同梱デフォルトには含めない。
 
 - 出力は**任意キーの map**。core は中身の意味を知らず、1 ドキュメント 1 レコードの
   JSON として DB に保存する。
@@ -131,10 +145,10 @@ end
 ```text
 .tsm/hooks/
   extract/
-    10-frontmatter.lua
-    20-adr.lua
+    10-frontmatter.lua   # 同梱。frontmatter → {status, effective_date} の移植
+    20-adr.lua           # (例) ADR 本文の Status/Date を拾うワークスペース固有フック
   score/
-    10-default.lua   # 同梱。status_penalty + time_decay の移植
+    10-default.lua       # 同梱。status_penalty + time_decay の移植
 ```
 
 - 実行順 = ファイル名昇順。`tsm.toml` には一行も足さない。
@@ -215,7 +229,8 @@ Rank（hot path）の境界を曖昧にし、ユーザースクリプトを検�
   誤ったランキングになるため、`extract` を変更したら再インデックスが必要（下記 Negative）。
 - フックランナーが段の境界に統一され、将来 filter / mask / output などを
   同じ仕組みで段違いに足せる（本 ADR では実装しない）。
-- デフォルト同梱スクリプトにより、未設定時の挙動は現状と同一でリグレッションがない。
+- extract / score 双方のデフォルト同梱スクリプトにより、フック未記述でも
+  抽出・スコアリングの挙動は現状と同一でリグレッションがない。
 
 ### Negative
 
