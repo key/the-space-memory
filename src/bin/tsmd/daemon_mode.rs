@@ -26,6 +26,33 @@ pub fn run(args: Args) -> Result<()> {
     let db_path = args.db.unwrap_or_else(config::db_path);
     let index_root = config::index_root();
 
+    // Acquire the per-project startup lock FIRST — before opening the DB or
+    // touching the socket — and hold it for the daemon's whole lifetime. The
+    // lock (not the PID file) is the sole ownership oracle: acquiring it proves
+    // no other live daemon owns this project, so a leftover socket is stale and
+    // safe to reclaim; failing to acquire means a live (possibly hung) daemon
+    // owns it and we must not steal its socket. Taking it before the DB open
+    // makes ownership the first semantic gate, so a losing concurrent
+    // `tsm start` sees a clear message rather than a spurious DB error. This
+    // serializes concurrent starts on one atomic gate and closes the silent
+    // socket clobber (#200). (ADR-0010)
+    let lock_path = config::state_dir().join("tsmd.lock");
+    let _startup_lock = match daemon_lock::try_acquire(&lock_path)
+        .context(format!("Failed to open lock file {}", lock_path.display()))?
+    {
+        daemon_lock::LockOutcome::Acquired(guard) => guard,
+        daemon_lock::LockOutcome::Held => {
+            // current_dir() is the project root tsmd chdir'd to (ADR-0010), so it
+            // matches what `ps`/`pgrep` show for the owning daemon — unlike
+            // config::project_root(), which can diverge under $TSM_CONFIG.
+            let here = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            anyhow::bail!(
+                "another tsmd already owns this project ({}). Run `tsm stop` first.",
+                here.display()
+            );
+        }
+    };
+
     // Open DB connection
     let conn = db::get_connection(&db_path)
         .context(format!("Failed to open DB at {}", db_path.display()))?;
@@ -41,29 +68,10 @@ pub fn run(args: Args) -> Result<()> {
 
     let conn = Arc::new(Mutex::new(conn));
 
-    // Acquire the per-project startup lock BEFORE touching the socket, and hold
-    // it for the daemon's whole lifetime. The lock — not the PID file — is the
-    // sole ownership oracle: acquiring it proves no other live daemon owns this
-    // project, so any leftover socket is stale and safe to reclaim; failing to
-    // acquire it means a live daemon (possibly hung) owns the socket and we must
-    // not steal it. This serializes concurrent `tsm start` on one atomic gate
-    // and closes the silent socket clobber (#200). (ADR-0010)
-    let lock_path = config::state_dir().join("tsmd.lock");
-    let _startup_lock = match daemon_lock::try_acquire(&lock_path)
-        .context(format!("Failed to open lock file {}", lock_path.display()))?
-    {
-        daemon_lock::LockOutcome::Acquired(guard) => guard,
-        daemon_lock::LockOutcome::Held => {
-            anyhow::bail!(
-                "another tsmd already owns this project ({}). Run `tsm stop` first.",
-                config::project_root().display()
-            );
-        }
-    };
-
     // We hold the lock, so no live daemon exists: a leftover socket is stale.
     if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
+        std::fs::remove_file(&socket_path)
+            .with_context(|| format!("Failed to remove stale socket {}", socket_path.display()))?;
     }
 
     // Bind listener

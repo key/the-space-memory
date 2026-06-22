@@ -47,19 +47,25 @@ pub fn try_acquire(path: &Path) -> io::Result<LockOutcome> {
         .open(path)?;
 
     let fd = file.as_raw_fd();
-    // SAFETY: `fd` is a valid descriptor owned by `file` for the duration of
-    // this call. `flock` only consults the descriptor.
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(LockOutcome::Acquired(LockGuard { _file: file }));
-    }
+    loop {
+        // SAFETY: `fd` is a valid descriptor owned by `file` for the duration of
+        // this call. `flock` only consults the descriptor.
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(LockOutcome::Acquired(LockGuard { _file: file }));
+        }
 
-    let err = io::Error::last_os_error();
-    // LOCK_NB reports a conflicting lock via EWOULDBLOCK (== EAGAIN on the
-    // platforms in play). Anything else is a genuine failure.
-    match err.raw_os_error() {
-        Some(code) if code == libc::EWOULDBLOCK => Ok(LockOutcome::Held),
-        _ => Err(err),
+        let err = io::Error::last_os_error();
+        return match err.raw_os_error() {
+            // LOCK_NB reports a conflicting lock via EWOULDBLOCK (== EAGAIN on
+            // the platforms in play).
+            Some(code) if code == libc::EWOULDBLOCK => Ok(LockOutcome::Held),
+            // A signal can interrupt flock before it completes; retry rather
+            // than surfacing a confusing "Interrupted system call" at startup.
+            Some(code) if code == libc::EINTR => continue,
+            // Anything else is a genuine failure.
+            _ => Err(err),
+        };
     }
 }
 
