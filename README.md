@@ -116,7 +116,7 @@ the environment variable takes precedence. See
 
 | Variable | Default | `tsm.toml` key | Description |
 |---|---|---|---|
-| `TSM_CONFIG` | *(discovered)* | *(n/a)* | Path to the config file; its parent directory becomes the project root |
+| `TSM_CONFIG` | *(discovered)* | *(n/a)* | Path to the config file; the directory containing it becomes the project root |
 | `TSM_STATE_DIR` | `.tsm` | `state_dir` | Root directory for all tsm state (DB, sockets, PID, logs, user dict) |
 | `TSM_CACHE_DIR` | `$XDG_CACHE_HOME/tsm` (else `$HOME/.cache/tsm`) | `cache_dir` | Cache directory for the model and WordNet DB |
 | `TSM_INDEX_ROOT` | `/workspaces` | `index_root` | Root directory containing the content to index |

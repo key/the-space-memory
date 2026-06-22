@@ -20,7 +20,7 @@ tsm searches for a config file in the following order; the first file found wins
 
 | Env Var | Type | Default | toml field | Description |
 |---|---|---|---|---|
-| `TSM_CONFIG` | path | _(none)_ | _(no toml equiv)_ | Override path to the config file itself; its parent becomes the project root |
+| `TSM_CONFIG` | path | _(none)_ | _(no toml equiv)_ | Override path to the config file itself; the directory containing it becomes the project root |
 | `TSM_STATE_DIR` | path | `.tsm` | `state_dir` | Root directory for all tsm data (DB, sockets, PID, logs, user dict) |
 | `TSM_CACHE_DIR` | path | `{XDG_CACHE_HOME}/tsm` (else `$HOME/.cache/tsm`) | `cache_dir` | Cache directory for the model and WordNet DB |
 | `TSM_INDEX_ROOT` | path | `/workspaces` | `index_root` | Root directory containing content workspaces to index |

@@ -112,7 +112,7 @@ tsm rebuild --apply   # DB削除して再構築
 
 | 変数 | デフォルト | `tsm.toml` キー | 説明 |
 |---|---|---|---|
-| `TSM_CONFIG` | _(自動探索)_ | _(なし)_ | 設定ファイルのパス。その親ディレクトリがプロジェクトルートになる |
+| `TSM_CONFIG` | _(自動探索)_ | _(なし)_ | 設定ファイルのパス。それが置かれているディレクトリがプロジェクトルートになる |
 | `TSM_STATE_DIR` | `.tsm` | `state_dir` | tsm の状態一式（DB・ソケット・PID・ログ・ユーザー辞書）のルートディレクトリ |
 | `TSM_CACHE_DIR` | `$XDG_CACHE_HOME/tsm`（無ければ `$HOME/.cache/tsm`） | `cache_dir` | モデルと WordNet DB のキャッシュディレクトリ |
 | `TSM_INDEX_ROOT` | `/workspaces` | `index_root` | インデックス対象を含むルートディレクトリ |
