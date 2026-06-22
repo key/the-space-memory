@@ -2556,7 +2556,9 @@ mod tests {
     // ─── metadata JSON integration test (Task 4) ─────────────
 
     #[test]
+    #[serial_test::serial]
     fn test_index_file_stores_metadata_json() {
+        crate::lua_hooks::reset_hooks_cache();
         let conn = db::get_memory_connection().unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
         let f = tmp.path().join("doc.md");

@@ -208,12 +208,19 @@ fn run_one_extract(
     // Accumulated metadata so far, for earlier-wins/conditional policies.
     let meta = lua.create_table()?;
     for (k, v) in acc.iter() {
-        if let Value::String(s) = v {
-            meta.set(k.clone(), s.clone())?;
-        } else if let Value::Number(n) = v {
-            if let Some(f) = n.as_f64() {
-                meta.set(k.clone(), f)?;
+        match v {
+            Value::String(s) => {
+                meta.set(k.clone(), s.clone())?;
             }
+            Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    meta.set(k.clone(), f)?;
+                }
+            }
+            Value::Bool(b) => {
+                meta.set(k.clone(), *b)?;
+            }
+            _ => {}
         }
     }
     ctx.set("metadata", meta)?;
@@ -500,5 +507,42 @@ mod tests {
         };
         let v = run_extract(&s, "a.md", "body", &Frontmatter::default());
         assert_eq!(v["a"], serde_json::json!(1)); // first script's contribution kept
+    }
+
+    #[test]
+    fn test_run_extract_later_script_sees_accumulated_metadata() {
+        // Arrange: 2-script chain.  Script 1 sets a bool flag and a string.
+        // Script 2 reads ctx.metadata.flag and branches on it.
+        let s = HookSources {
+            extract: vec![
+                HookScript {
+                    name: "10-first".into(),
+                    source: "function extract(c) return { flag=true, kept='x' } end".into(),
+                },
+                HookScript {
+                    name: "20-second".into(),
+                    source: r#"function extract(c)
+                        if c.metadata.flag then
+                            return { saw='yes' }
+                        else
+                            return { saw='no' }
+                        end
+                    end"#
+                        .into(),
+                },
+            ],
+            score: vec![HookScript {
+                name: "s".into(),
+                source: "function score(c) return 1 end".into(),
+            }],
+        };
+
+        // Act
+        let v = run_extract(&s, "a.md", "body", &Frontmatter::default());
+
+        // Assert: bool propagated, string kept, second script saw the flag.
+        assert_eq!(v["flag"], serde_json::json!(true));
+        assert_eq!(v["kept"], serde_json::json!("x"));
+        assert_eq!(v["saw"], serde_json::json!("yes"));
     }
 }
