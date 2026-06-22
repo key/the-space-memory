@@ -1,5 +1,5 @@
 [global]
 line_length = 120
-# superpowers の作業ドキュメント（spec / plan）はコードブロック主体で、散文向けの
-# Markdown lint には馴染まないため除外する。
+# superpowers working docs (specs / plans) are code-block-heavy and don't suit
+# prose-oriented Markdown lint; exclude them.
 exclude = ["docs/superpowers/**"]
