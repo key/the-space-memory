@@ -270,12 +270,19 @@ A change is merge-ready when **all** of the following hold:
 - **Segmenter is cached** — `tokenizer::get_segmenter()` caches the Segmenter
   (including user dict). Call `reset_segmenter()` after writing new simpledic
   if rebuilding FTS in the same process
-- **Daemon fail-fasts on an uninitialized DB** — `tsmd` refuses to start when
-  the DB lacks the core schema (`db::is_initialized`), exiting with
-  "Run `tsm init` first" before binding the socket (ADR-0008: init is explicit,
-  never auto-created). `cmd_start` detects the early exit via `try_wait` and
-  surfaces the captured stderr, so auto-start fails immediately instead of
-  blocking on the 30s socket-wait timeout
+- **Daemon fail-fasts on an uninitialized DB — without creating `.tsm`** —
+  both `cmd_start` and `tsmd` call `db::probe_initialized` BEFORE the stderr log,
+  logger, startup lock, or socket touch the state directory. The probe returns
+  `Ok(false)` for an absent DB without opening anything (so nothing is
+  materialized), opens an existing DB read-write but with no `CREATE` flag (never
+  creates it, yet still recovers a hot WAL), and propagates genuine open failures
+  (permissions, corruption) as `Err` rather than misreporting "not initialized".
+  Starting in an unconfigured directory exits with "Run `tsm init` first" and
+  leaves no stray `.tsm` behind (ADR-0008: init is explicit, never
+  auto-created). The daemon re-checks `is_initialized` once more after taking the
+  startup lock to close the probe→open race. `cmd_start` also surfaces the
+  spawned daemon's captured stderr via `try_wait`, so a daemon that dies after
+  spawn fails immediately instead of blocking on the 30s socket-wait timeout
 - **`tsm doctor` never auto-starts the daemon** — it is a read-only diagnostic.
   Uses the daemon's report if already running, else falls back to a local
   `doctor_check` (which reports an uninitialized/missing DB gracefully and does

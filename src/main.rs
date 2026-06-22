@@ -584,6 +584,17 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
         }
     }
 
+    // Fail fast on an uninitialized DB BEFORE creating the stderr log file (which
+    // would materialize the state directory) or spawning tsmd. `init` is an
+    // explicit, separate step (ADR-0008); starting in an unconfigured directory
+    // must not leave a stray `.tsm` behind. The probe never creates the DB; a
+    // genuine open failure propagates instead of being misreported as "not
+    // initialized".
+    let db_path = config::db_path();
+    if !the_space_memory::db::probe_initialized(&db_path)? {
+        return Err(the_space_memory::db::uninitialized_error(&db_path));
+    }
+
     // Find the tsmd binary (same directory as tsm)
     let exe_dir = std::env::current_exe()?
         .parent()

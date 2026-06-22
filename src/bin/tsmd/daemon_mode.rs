@@ -19,12 +19,24 @@ use crate::{backfill, child, Args, SHUTDOWN};
 
 pub fn run(args: Args) -> Result<()> {
     config::ensure_model_cache_env();
+
+    let db_path = args.db.unwrap_or_else(config::db_path);
+
+    // Fail fast on an uninitialized DB BEFORE the logger's `create_dir_all` or
+    // the lock/socket operations touch the state directory. `init` is an
+    // explicit, separate step (ADR-0008); the daemon must never auto-create its
+    // schema, nor leave a stray `.tsm` when started in an unconfigured
+    // directory. The probe never creates the DB file; a genuine open failure
+    // (permissions, corruption) propagates here instead of being misreported.
+    if !db::probe_initialized(&db_path)? {
+        return Err(db::uninitialized_error(&db_path));
+    }
+
     the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
         name: "tsmd",
     })?;
 
     let socket_path = args.socket.unwrap_or_else(config::daemon_socket_path);
-    let db_path = args.db.unwrap_or_else(config::db_path);
     let project_root = config::project_root();
 
     // Acquire the per-project startup lock FIRST — before opening the DB or
@@ -54,17 +66,18 @@ pub fn run(args: Args) -> Result<()> {
         }
     };
 
-    // Open DB connection
+    // Open DB connection. The probe at the top of `run` confirmed the schema was
+    // present; `get_connection` opens read-write but never creates the schema
+    // (that is `tsm init`'s job).
     let conn = db::get_connection(&db_path)
         .context(format!("Failed to open DB at {}", db_path.display()))?;
 
-    // Fail fast on an uninitialized DB rather than serving a schemaless database.
-    // `init` is a deliberate, separate step (see ADR-0008); do not auto-create the schema.
+    // Re-check under the startup lock: closes the narrow window where the DB is
+    // deleted or replaced between the pre-flight probe and this open (the open
+    // has create-on-miss semantics, so a vanished DB would otherwise be served
+    // schemaless).
     if !db::is_initialized(&conn) {
-        anyhow::bail!(
-            "Database not initialized at {}. Run `tsm init` first.",
-            db_path.display()
-        );
+        return Err(db::uninitialized_error(&db_path));
     }
 
     // ADR-0009 §3: reject a config that still carries the removed `index_root`

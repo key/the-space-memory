@@ -170,6 +170,35 @@ sed -i \
     "$TSM_PROJECT_DIR"/notes/*.md \
     "$TSM_PROJECT_DIR"/sessions/*.jsonl
 
+# ── Fail-fast: uninitialized `tsm start` leaves no stray state ────────
+# Regression guard: starting with a tsm.toml present but no initialized DB must
+# fail with "Run `tsm init` first" WITHOUT materializing the state directory.
+# Both main.rs and daemon_mode.rs are excluded from unit coverage, so this
+# process-level check is the only automated guard for that ordering.
+log "=== Fail-fast on uninitialized DB (no stray state) ==="
+UNINIT_PROJECT="$(mktemp -d)"
+UNINIT_STATE_PARENT="$(mktemp -d)"
+UNINIT_STATE="$UNINIT_STATE_PARENT/state"   # deliberately does not exist yet
+printf '[[index.content_dirs]]\npath = "."\nweight = 1.0\n' > "$UNINIT_PROJECT/tsm.toml"
+# Capture both streams: the fail-fast error is printed to stderr. The `cd` runs
+# inside the command-substitution subshell, so the suite's CWD is untouched.
+set +e
+UNINIT_OUT=$(cd "$UNINIT_PROJECT" && TSM_STATE_DIR="$UNINIT_STATE" tsm start 2>&1)
+UNINIT_EXIT=$?
+set -e
+assert_fail "uninit-start: exits non-zero" "$UNINIT_EXIT"
+if echo "$UNINIT_OUT" | grep -q 'Run .tsm init. first'; then
+    pass "uninit-start: error tells user to run tsm init"
+else
+    fail "uninit-start: error tells user to run tsm init" "got: $UNINIT_OUT"
+fi
+if [[ ! -e "$UNINIT_STATE" ]]; then
+    pass "uninit-start: state dir not materialized"
+else
+    fail "uninit-start: state dir not materialized" "exists: $(ls -a "$UNINIT_STATE" 2>/dev/null)"
+fi
+rm -rf "$UNINIT_PROJECT" "$UNINIT_STATE_PARENT"
+
 # ── Init & start daemon ──────────────────────────────────────────────
 
 log "Initializing database..."
