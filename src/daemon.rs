@@ -137,7 +137,7 @@ pub fn handle_request(
         }
 
         DaemonRequest::VectorFill { batch_size } => match cli::run_vector_fill(conn, batch_size) {
-            Ok(()) => DaemonResponse::success_empty(),
+            Ok(summary) => DaemonResponse::success(serde_json::json!({ "summary": summary })),
             Err(e) => DaemonResponse::error(format!("{e}")),
         },
 
@@ -493,6 +493,25 @@ mod tests {
         let resp = handle_request(&conn, req, dir.path(), &flag);
         // Empty DB has no chunks to backfill — should succeed or error gracefully
         assert!(resp.ok || resp.error.is_some());
+    }
+
+    #[test]
+    fn test_vector_fill_returns_summary_payload() {
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+        let req = DaemonRequest::VectorFill { batch_size: 8 };
+        let resp = handle_request(&conn, req, dir.path(), &flag);
+        assert!(resp.ok);
+        // The summary must travel back over IPC so the CLI can show it to the
+        // user; in daemon mode the worker's stdout goes to the daemon log, not
+        // the terminal.
+        let summary = resp
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("summary"))
+            .and_then(|v| v.as_str())
+            .expect("VectorFill response should carry a summary string");
+        assert_eq!(summary, "No missing vectors.");
     }
 
     #[test]

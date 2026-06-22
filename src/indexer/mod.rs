@@ -873,12 +873,16 @@ pub fn backfill_vectors(
         return Ok(BackfillStats::default());
     }
 
-    // Count total missing for progress reporting
+    // Count total missing for progress reporting. Exclude skip-marked chunks
+    // so the reported total matches what the fetch query below will actually
+    // attempt; otherwise skipped chunks show up as permanent phantom "missing"
+    // work in doctor/status (matches the daemon's periodic-backfill count).
     let total: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM chunks c
              LEFT JOIN chunks_vec v ON c.id = v.rowid
-             WHERE v.rowid IS NULL",
+             LEFT JOIN chunks_vec_skip s ON c.id = s.chunk_id
+             WHERE v.rowid IS NULL AND s.chunk_id IS NULL",
             [],
             |row| row.get(0),
         )
@@ -1505,6 +1509,37 @@ mod tests {
         let stats2 = backfill_vectors(&conn, &mock_encode_fail, BACKFILL_BATCH_SIZE, None).unwrap();
         assert_eq!(stats2.filled, 0, "no chunks should be retried after skip");
         assert_eq!(stats2.errors, 0, "no errors on second run");
+    }
+
+    #[test]
+    fn test_backfill_count_excludes_skipped_chunks() {
+        let (conn, dir) = setup();
+        let path = write_md(
+            dir.path(),
+            "daily/notes/test.md",
+            "# Hello\n\nContent here.\n",
+        );
+        index_file(&conn, &path, dir.path()).unwrap();
+        clear_vectors(&conn);
+
+        // Mark all chunks as skipped via a persistently failing encode.
+        let stats = backfill_vectors(&conn, &mock_encode_fail, BACKFILL_BATCH_SIZE, None).unwrap();
+        assert!(stats.errors > 0);
+
+        // A subsequent healthy pass must NOT report skip-marked chunks as
+        // outstanding work: the progress total drives doctor/status display,
+        // so counting skipped chunks there produces a permanent phantom "missing".
+        let reported_totals = std::cell::RefCell::new(Vec::new());
+        let cb = |total: i64, _filled: usize, _errors: usize| {
+            reported_totals.borrow_mut().push(total);
+        };
+        backfill_vectors(&conn, &mock_encode, BACKFILL_BATCH_SIZE, Some(&cb)).unwrap();
+
+        assert!(
+            reported_totals.borrow().iter().all(|&t| t == 0),
+            "skip-marked chunks must not be counted as missing, got totals: {:?}",
+            reported_totals.borrow()
+        );
     }
 
     #[test]
