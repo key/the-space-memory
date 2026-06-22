@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use the_space_memory::config;
 use the_space_memory::embedder::Embedder;
-use the_space_memory::ipc::{read_message, write_message};
+use the_space_memory::ipc::{accept_blocking, read_message, write_message};
 
 use candle_core::Device;
 
@@ -83,7 +83,7 @@ fn run_daemon(socket_path: &Path, model_dir: Option<&Path>) -> Result<()> {
     }
 
     while running.load(Ordering::Relaxed) {
-        match listener.accept() {
+        match accept_blocking(&listener) {
             Ok((stream, _)) => {
                 *last_activity.lock().unwrap() = Instant::now();
                 if let Err(e) = handle_client(stream, &embedder) {
