@@ -1,4 +1,4 @@
-# ADR-0010: 出力チャネルモデル（ユーザー出力 / ログ / エラーの分離）
+# ADR-0012: 出力チャネルモデル（ユーザー出力 / ログ / エラーの分離）
 
 - **Status**: Accepted
 - **Date**: 2026-06-22 (Proposed) / 2026-06-22 (Accepted)
@@ -6,7 +6,7 @@
 - **Related**:
   [ADR-0001](./0001-process-roles-and-responsibilities.md),
   [ADR-0005](./0005-embedder-binary-consolidation.md),
-  [ADR-0009](./0009-uninitialized-db-failfast-and-readonly-doctor.md)
+  [ADR-0011](./0011-uninitialized-db-failfast-and-readonly-doctor.md)
 
 ## Context
 
@@ -20,7 +20,7 @@
 
 2. **背景 daemon の警告が端末へ漏れる**
    detached daemon の stderr を端末が継承し、WARN/ERROR が溢れる
-   （ADR-0009 の Bug1）。
+   （ADR-0011 の Bug1）。
 
 3. **ログファイルがプロセス別に分散**
    daemon / embedder / watcher が各自ファイル＋日次 7 世代で最大 ~24 ファイル。
@@ -77,7 +77,7 @@
   3 世代保持。daemon の通常ログ・警告は全てここに残る。
 - **`tsmd-stderr.log`** — daemon ツリー全体の raw stderr。`cmd_start` が spawn 時に
   リダイレクトし、子はこれを継承。pre-logger の起動失敗・fail-fast の理由
-  （ADR-0009、`cmd_start` がここを読んで表示）・致命的エラーが集まる。
+  （ADR-0011、`cmd_start` がここを読んで表示）・致命的エラーが集まる。
 
 `tsmd-stderr.log` は **rotate されない**ため、流入を絞って実質有界にする:
 

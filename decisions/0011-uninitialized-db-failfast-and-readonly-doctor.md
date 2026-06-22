@@ -1,4 +1,4 @@
-# ADR-0009: 未初期化 DB での fail-fast と doctor の read-only 化（auto-start 境界の整理）
+# ADR-0011: 未初期化 DB での fail-fast と doctor の read-only 化（auto-start 境界の整理）
 
 - **Status**: Accepted
 - **Date**: 2026-06-22 (Proposed) / 2026-06-22 (Accepted)
@@ -40,7 +40,7 @@ init は **明示的な 1 ステップ** であり、暗黙に DB を作成し�
 ## Decision
 
 「init は明示」という ADR-0008 の原則を、起動・診断経路まで一貫させる。
-出力・ログチャネルの全体方針は [ADR-0010](./0010-output-channel-model.md) で扱い、
+出力・ログチャネルの全体方針は [ADR-0012](./0012-output-channel-model.md) で扱い、
 ここではその上で「未初期化 DB の起動・診断」をどう振る舞わせるかを決める。
 
 ### 1. daemon は未初期化 DB で fail-fast する
@@ -56,7 +56,7 @@ no-op とする（新 DB は SCHEMA_SQL で `content_hash` を持ち、未初期
 ### 2. auto-start 境界を CLI 側で明示的に検知する
 
 `cmd_start` は spawn した daemon の stderr を `tsmd-stderr.log`
-（ADR-0010 で定義）へリダイレクトし捕捉する。起動待ちループで `try_wait` に
+（ADR-0012 で定義）へリダイレクトし捕捉する。起動待ちループで `try_wait` に
 より daemon の早期終了を検知し、捕捉した stderr の末尾を添えて即座にエラーを
 返す。30 秒の盲目的なポーリングは行わない。
 
@@ -66,15 +66,15 @@ daemon が起動済みならその in-process レポートを使い、未起動�
 `doctor_check` にフォールバックする。`doctor_check` は未初期化・不在 DB を
 グレースフルに報告し（`Run \`init\``）、`tsm.db` を生成しない。
 
-### 4. 出力・ログの方針は ADR-0010 に従う
+### 4. 出力・ログの方針は ADR-0012 に従う
 
-本 ADR の挙動は [ADR-0010](./0010-output-channel-model.md)（出力チャネルモデル）
+本 ADR の挙動は [ADR-0012](./0012-output-channel-model.md)（出力チャネルモデル）
 の上に乗る。関連する帰結:
 
 - fail-fast の理由（`Run \`tsm init\` first`）は daemon の致命的エラー（③ エラー
   出力）として`tsmd-stderr.log`に出て、`cmd_start` が読み出し端末に表示する。
 - `tsm doctor` のローカルレポートは ① ユーザー出力（stdout）として表示する。
-- daemon の auto-start は暗黙処理なので静音（ADR-0010 の不変条件）。
+- daemon の auto-start は暗黙処理なので静音（ADR-0012 の不変条件）。
 
 ## Consequences
 
@@ -86,7 +86,7 @@ daemon が起動済みならその in-process レポートを使い、未起動�
 - daemon が「初期化済み DB のみを扱う」前提が明文化・強制される
   （ADR-0001 の DB 所有権・ADR-0008 の init 明示と整合）。
 
-（出力・ログ集約に関する帰結は [ADR-0010](./0010-output-channel-model.md) を参照。）
+（出力・ログ集約に関する帰結は [ADR-0012](./0012-output-channel-model.md) を参照。）
 
 ### Negative
 
