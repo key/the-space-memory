@@ -163,6 +163,11 @@ function score(ctx)
 end
 ```
 
+The snippet above is a minimal example. The shipped default
+(`score/10-default.lua`) uses the full status→penalty table:
+`superseded=0.2`, `rejected=0.3`, `dropped=0.3`, `deprecated=0.3`,
+`outdated=0.4`, `proposed=0.7`, everything else `1.0`.
+
 Each hook returns a multiplier (`>= 0`). The final score is
 `rrf × weight × Π(score hooks)`. Invalid returns (negative, NaN, ±Inf) are
 treated as `1.0` with a warning.

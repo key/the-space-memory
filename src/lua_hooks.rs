@@ -721,6 +721,21 @@ mod tests {
     }
 
     #[test]
+    fn test_run_score_default_penalizes_deprecated_and_proposed() {
+        let s = sources_from(DEFAULT_EXTRACT_HOOK, DEFAULT_SCORE_HOOK);
+        let today = crate::searcher::today_string();
+        // effective_date today -> decay≈1.0, so the multiplier is the status penalty.
+        let score_for = |status: &str| {
+            let meta = format!("{{\"status\":\"{status}\",\"effective_date\":\"{today}\"}}");
+            run_score(&s, Some(&meta), 1.0, "note", "a.md", 90.0)
+        };
+        assert!((score_for("deprecated") - 0.3).abs() < 0.05, "deprecated");
+        assert!((score_for("proposed") - 0.7).abs() < 0.05, "proposed");
+        // accepted is not in the table -> neutral 1.0.
+        assert!((score_for("accepted") - 1.0).abs() < 0.05, "accepted");
+    }
+
+    #[test]
     fn test_run_score_invalid_return_is_neutral() {
         let s = sources_from(
             "function extract(c) return {} end",
