@@ -46,6 +46,12 @@ impl From<ReindexKindArg> for ReindexKind {
     about = "The Space Memory — knowledge search engine"
 )]
 struct Cli {
+    /// Project root: the directory holding `tsm.toml` (ADR-0009 §2).
+    /// Used when the current directory has no `tsm.toml`. Without either,
+    /// commands fail (except `tsm init`, which scaffolds in the CWD).
+    #[arg(long, global = true, value_name = "DIR")]
+    project_root: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -194,8 +200,23 @@ fn main() -> anyhow::Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     config::ensure_model_cache_env();
-    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Stderr)?;
     let args = Cli::parse();
+
+    // ADR-0009 §2: resolve the project root (the dir holding `tsm.toml`) from
+    // the CWD, `--project-root`, or `$TSM_CONFIG`, and inject it before any
+    // config access. `tsm init` tolerates an unresolved root — it scaffolds in
+    // the CWD; every other command fails fast with a guiding error.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let tsm_config = std::env::var_os("TSM_CONFIG").map(PathBuf::from);
+    let resolved_root =
+        config::resolve_project_root(&cwd, args.project_root.as_deref(), tsm_config.as_deref());
+    let project_root = match &args.command {
+        Commands::Init => resolved_root.unwrap_or(cwd),
+        _ => resolved_root?,
+    };
+    config::set_project_root(project_root);
+
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Stderr)?;
     match args.command {
         // ── Always direct ──
         Commands::Init => cli::cmd_init()?,

@@ -133,6 +133,11 @@ export TSM_STATE_DIR
 TSM_STATE_DIR="$(mktemp -d)"
 export TSM_INDEX_ROOT
 TSM_INDEX_ROOT="$(mktemp -d)"
+# ADR-0009 §2: tsm resolves the project root from the CWD's tsm.toml. Run from
+# a dedicated temp project dir so `tsm init` scaffolds tsm.toml there (not in
+# the repo) and every later command resolves to the same root.
+TSM_PROJECT_DIR="$(mktemp -d)"
+cd "$TSM_PROJECT_DIR" || exit 1
 export TSM_EMBEDDER_IDLE_TIMEOUT=0
 export TSM_EMBEDDER_BACKFILL_INTERVAL=0
 
@@ -153,7 +158,7 @@ log "TODAY=$TODAY  1Y_AGO=$ONE_YEAR_AGO  3M_AGO=$THREE_MONTHS_AGO"
 cleanup() {
     log "Cleaning up..."
     tsm stop 2>/dev/null || true
-    rm -rf "$TSM_STATE_DIR" "$TSM_INDEX_ROOT"
+    rm -rf "$TSM_STATE_DIR" "$TSM_INDEX_ROOT" "$TSM_PROJECT_DIR"
 }
 trap cleanup EXIT
 
