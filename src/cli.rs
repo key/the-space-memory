@@ -482,14 +482,15 @@ pub fn cmd_vector_fill(batch_size: usize) -> anyhow::Result<()> {
         }
         // The backfill ran daemon-side; its summary travels back in the
         // payload so we can show it here rather than losing it to the log.
-        if let Some(summary) = resp
+        // Fall back to a generic line if an older daemon omits the field, so
+        // a successful run is never silent.
+        let summary = resp
             .payload
             .as_ref()
             .and_then(|p| p.get("summary"))
             .and_then(|v| v.as_str())
-        {
-            println!("{summary}");
-        }
+            .unwrap_or("Vector fill complete.");
+        println!("{summary}");
         return Ok(());
     }
     // tsmd not running — run directly
@@ -537,9 +538,7 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
 
     let stats = indexer::backfill_vectors(conn, &encode_fn, batch_size, Some(&progress_cb))?;
 
-    let skipped: i64 = conn
-        .query_row("SELECT COUNT(*) FROM chunks_vec_skip", [], |r| r.get(0))
-        .unwrap_or(0);
+    let skipped: i64 = conn.query_row("SELECT COUNT(*) FROM chunks_vec_skip", [], |r| r.get(0))?;
     let summary = vector_fill_summary(stats.filled, skipped);
     if stats.errors > 0 {
         log::warn!("{} errors during backfill.", stats.errors);
@@ -560,16 +559,22 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
 /// "No missing vectors." (skip-marked chunks are not retried by `vector-fill`;
 /// `tsm reindex vectors` clears the skip list and retries them).
 fn vector_fill_summary(filled: usize, skipped: i64) -> String {
+    if filled == 0 && skipped == 0 {
+        return "No missing vectors.".to_string();
+    }
+    let mut parts = Vec::new();
     if filled > 0 {
-        return format!("Backfilled {filled} vectors.");
+        parts.push(format!("Backfilled {filled} vectors."));
     }
+    // Always surface the skip list when present, even alongside a successful
+    // fill — otherwise a partial run silently leaves chunks stuck.
     if skipped > 0 {
-        return format!(
-            "No vectors filled; {skipped} chunk(s) on the skip list after repeated \
-             embed failures. Run `tsm reindex vectors` to clear the skip list and retry."
-        );
+        parts.push(format!(
+            "{skipped} chunk(s) on the skip list after repeated embed failures. \
+             Run `tsm reindex vectors` to clear the skip list and retry."
+        ));
     }
-    "No missing vectors.".to_string()
+    parts.join(" ")
 }
 
 pub fn cmd_import_wordnet(wordnet_db: &Path) -> anyhow::Result<()> {
@@ -948,26 +953,39 @@ fn doctor_check_with_conn(
         None
     };
 
+    // Chunks on the skip list never get vectors and are not retried by
+    // `vector-fill`, so they are not part of the fillable target. Comparing
+    // `vecs` against the full chunk count would otherwise advise `vector-fill`
+    // for a gap only `reindex vectors` can close. Log (not swallow) a genuine
+    // query error rather than silently treating it as "0 skipped".
+    let skipped: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks_vec_skip", [], |r| r.get(0))
+        .unwrap_or_else(|e| {
+            log::warn!("doctor: could not query chunks_vec_skip: {e}");
+            0
+        });
+    let fillable = (chunks - skipped).max(0);
+
     if vecs < 0 {
         emb_section.items.push(CheckItem {
             status: CheckStatus::Error,
             message: "Vectors: chunks_vec unreadable".to_string(),
             hint: None,
         });
-    } else if vecs == 0 && chunks > 0 {
+    } else if vecs == 0 && fillable > 0 {
         emb_section.items.push(CheckItem {
             status: CheckStatus::Warning,
-            message: format!("Vectors: 0 / {chunks} chunks"),
+            message: format!("Vectors: 0 / {fillable} chunks"),
             hint: Some(
                 backfill_hint.unwrap_or_else(|| {
                     "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
                 }),
             ),
         });
-    } else if vecs < chunks {
+    } else if vecs < fillable {
         emb_section.items.push(CheckItem {
             status: CheckStatus::Warning,
-            message: format!("Vectors: {vecs} / {chunks} chunks (mismatch)"),
+            message: format!("Vectors: {vecs} / {fillable} chunks (mismatch)"),
             hint: Some(
                 backfill_hint.unwrap_or_else(|| {
                     "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
@@ -975,19 +993,20 @@ fn doctor_check_with_conn(
             ),
         });
     } else {
+        let detail = if skipped > 0 {
+            "all fillable chunks have vectors"
+        } else {
+            "matches all chunks"
+        };
         emb_section.items.push(CheckItem {
             status: CheckStatus::Ok,
-            message: format!("Vectors: {vecs} (matches all chunks)"),
+            message: format!("Vectors: {vecs} ({detail})"),
             hint: None,
         });
     }
 
-    // Chunks on the skip list are excluded from backfill, so `vector-fill`
-    // will not retry them — surface them explicitly with a recovery hint,
+    // Surface skip-listed chunks explicitly with their own recovery hint,
     // otherwise they read as a permanent unexplained vector mismatch.
-    let skipped: i64 = conn
-        .query_row("SELECT COUNT(*) FROM chunks_vec_skip", [], |r| r.get(0))
-        .unwrap_or(0);
     if skipped > 0 {
         emb_section.items.push(CheckItem {
             status: CheckStatus::Warning,
@@ -2104,6 +2123,26 @@ mod tests {
     }
 
     #[test]
+    fn test_vector_fill_summary_reports_both_filled_and_skipped() {
+        // A partial run fills some chunks while others stay stuck on the skip
+        // list. The skip warning must not be suppressed by the filled count —
+        // that is exactly the silent stuck-skip this change exists to prevent.
+        let msg = vector_fill_summary(7, 3);
+        assert!(
+            msg.contains('7'),
+            "should report filled count, got: {msg:?}"
+        );
+        assert!(
+            msg.contains('3'),
+            "should report skipped count, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("reindex vectors"),
+            "should still point to `reindex vectors`, got: {msg:?}"
+        );
+    }
+
+    #[test]
     #[serial_test::serial]
     fn test_doctor_surfaces_skipped_vectors() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2140,6 +2179,57 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("skip") && s.contains("reindex vectors")),
             "doctor should surface skip-marked chunks with a `reindex vectors` hint, got: {issues:?}"
+        );
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_skip_only_gap_does_not_advise_vector_fill() {
+        // When every vector-less chunk is on the skip list, `vector-fill`
+        // cannot help — doctor must not advise it (only `reindex vectors`),
+        // otherwise the two hints contradict each other.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
+        let db_path = dir.path().join("test.db");
+        db::init_db(&db_path).unwrap();
+        {
+            let conn = db::get_connection(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO documents(id, file_path, source_type, file_hash, indexed_at)
+                 VALUES (1, 'daily/notes/a.md', 'note', 'h', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks(id, document_id, chunk_index, content)
+                 VALUES (1, 1, 0, 'one'), (2, 1, 1, 'two')",
+                [],
+            )
+            .unwrap();
+            // Both chunks are stuck on the skip list — nothing is fillable.
+            conn.execute(
+                "INSERT INTO chunks_vec_skip(chunk_id, reason)
+                 VALUES (1, 'encode_error'), (2, 'encode_error')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let report = doctor_check(&db_path);
+        let issues = report.issues();
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("skip") && s.contains("reindex vectors")),
+            "should surface the skip list, got: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|s| s.contains("vector-fill")),
+            "must not advise `vector-fill` when the whole gap is skip-listed, got: {issues:?}"
         );
 
         std::env::remove_var("TSM_STATE_DIR");
