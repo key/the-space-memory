@@ -668,6 +668,34 @@ fn format_daemon_failure(stderr: &str) -> String {
     format!("\n{body}")
 }
 
+/// Read the running daemon's PID from its (diagnostic) PID file, if present.
+fn read_daemon_pid() -> Option<u32> {
+    std::fs::read_to_string(config::daemon_pid_path())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Poll until process `pid` has exited, or `timeout` elapses.
+///
+/// Returns `true` if the process is gone, `false` on timeout. Used so `tsm stop`
+/// does not return until the daemon has actually terminated and released its
+/// startup lock — otherwise `tsm restart` would race the dying daemon and the
+/// new tsmd would bail with "another tsmd already owns this project" (ADR-0010).
+fn wait_for_pid_exit(pid: u32, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        // kill(pid, 0) sends no signal: 0 = alive, -1/ESRCH = gone.
+        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        if !alive {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Stop the tsmd daemon by sending a Shutdown request.
 fn cmd_stop() -> anyhow::Result<()> {
     let socket_path = config::daemon_socket_path();
@@ -677,9 +705,23 @@ fn cmd_stop() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Capture the PID before shutdown so we can wait for the process to fully
+    // exit below; the daemon removes its PID file during cleanup.
+    let pid = read_daemon_pid();
+
     match daemon_protocol::send_request(&socket_path, &DaemonRequest::Shutdown) {
         Ok(resp) => {
             if resp.ok {
+                // Wait for the daemon to actually exit (releasing its startup
+                // lock) before returning, so `tsm restart` can start a fresh
+                // tsmd without colliding with the still-dying one. The daemon
+                // ACKs Shutdown before tearing down its accept loop and reaping
+                // children, so the process outlives this reply briefly. (ADR-0010)
+                if let Some(pid) = pid {
+                    if !wait_for_pid_exit(pid, std::time::Duration::from_secs(10)) {
+                        log::warn!("tsmd (pid {pid}) did not exit within 10s of shutdown");
+                    }
+                }
                 println!("tsmd stopped");
             } else {
                 log::warn!("tsmd reported error: {}", resp.error.unwrap_or_default());
@@ -725,5 +767,28 @@ mod tests {
         assert!(out.starts_with("\n  line4"));
         assert!(out.ends_with("  line8"));
         assert!(!out.contains("line3"));
+    }
+
+    #[test]
+    fn test_wait_for_pid_exit_returns_true_for_dead_process() {
+        // Spawn a process that exits immediately, reap it, then confirm the
+        // wait observes it as gone.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true`");
+        let pid = child.id();
+        child.wait().expect("reap child");
+
+        assert!(wait_for_pid_exit(pid, std::time::Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn test_wait_for_pid_exit_times_out_for_live_process() {
+        // Our own process is alive, so the wait must hit the (short) timeout.
+        let me = std::process::id();
+        assert!(!wait_for_pid_exit(
+            me,
+            std::time::Duration::from_millis(100)
+        ));
     }
 }
