@@ -42,7 +42,7 @@ core は「ベクトル検索・RRF・フックを呼ぶ器」に徹し、メタ
 `frontmatter.rs` が固定スキーマを core 内部の列に落とす現挙動は、どちらも
 **デフォルト同梱スクリプトへ移譲**する。
 
-- `extract/10-frontmatter.lua`（同梱）: `frontmatter.rs` 相当。core が渡す
+- `extract/10-md_frontmatter.lua`（同梱）: `frontmatter.rs` 相当。core が渡す
   解析済み frontmatter を `{status, effective_date, ...}` の正規化 map に落とす。
 - `score/10-default.lua`（同梱）: 現状の `time_decay` × `status_penalty` を再現。
 
@@ -79,7 +79,7 @@ core は「ベクトル検索・RRF・フックを呼ぶ器」に徹し、メタ
 -- (サンドボックス Lua に YAML パーサを持たせないため)
 -- ctx = { path, body, frontmatter = {...}, source_type, metadata = {累積} }
 
--- 同梱の extract/10-frontmatter.lua（frontmatter.rs 相当・no-regression デフォルト）
+-- 同梱の extract/10-md_frontmatter.lua（frontmatter.rs 相当・no-regression デフォルト）
 function extract(ctx)
   local fm = ctx.frontmatter
   return { status = fm.status, effective_date = fm.updated }
@@ -151,7 +151,7 @@ end
 ```text
 .tsm/hooks/
   extract/
-    10-frontmatter.lua   # 同梱。frontmatter → {status, effective_date} の移植
+    10-md_frontmatter.lua # 同梱。md frontmatter → {status, effective_date} の移植
     20-adr.lua           # (例) ADR 本文の Status/Date を拾うワークスペース固有フック
   score/
     10-default.lua       # 同梱。status_penalty + time_decay の移植
