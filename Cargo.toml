@@ -12,7 +12,7 @@ name = "tsmd"
 path = "src/bin/tsmd/main.rs"
 
 [dependencies]
-rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }
+rusqlite = { version = "0.40", features = ["bundled", "load_extension"] }
 lindera = { version = "2.3", features = ["embed-ipadic"] }
 candle-core = "0.10"
 candle-nn = "0.10"
