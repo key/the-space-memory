@@ -39,6 +39,7 @@ For the full quick-start tour, see the project
 | Document | Description |
 |---|---|
 | [Architecture](architecture.md) | Daemon / embedder / watcher topology and IPC layout |
+| [Pipeline Stages](pipeline.md) | Index / Search logical stages, invariants, and plugin hook points |
 | [Data Flow](data-flow.md) | Indexing and search pipelines end-to-end |
 | [Configuration](configuration.md) | `tsm.toml` and environment variable reference |
 | [Command Reference](command-reference.md) | Every `tsm` subcommand, flags, and examples |
