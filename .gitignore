@@ -1,5 +1,6 @@
 .env
 .claude/settings.local.json
+.claude/worktrees/
 tsm.toml
 
 # Rust
