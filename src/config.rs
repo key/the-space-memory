@@ -716,22 +716,6 @@ pub fn reload() -> Vec<String> {
     warnings
 }
 
-/// Reject a config file that still has an `index_root` key set (ADR-0009 §3).
-///
-/// Returns `Err` with a message describing the problem. The caller is responsible
-/// for printing the error and aborting if appropriate.
-fn check_no_index_root(file: &ConfigFile, path: &Path) -> Result<(), String> {
-    if file.index_root.is_some() {
-        Err(format!(
-            "`index_root` in '{}' is no longer supported (ADR-0009 §3); \
-             use `content_dirs` with paths relative to the project root",
-            path.display()
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 /// Merge config values from `candidates` in order; first non-None value for each field wins.
 ///
 /// Returns `(merged, project_root)` where `project_root` is the parent
@@ -771,9 +755,6 @@ fn load_config_from(candidates: &[PathBuf]) -> (ConfigFile, Option<PathBuf>) {
                 continue;
             }
         };
-        if let Err(e) = check_no_index_root(&file, path) {
-            log::warn!("{e}");
-        }
         if loaded_root.is_none() {
             loaded_root = project_root_from(path);
         }
@@ -1635,37 +1616,6 @@ embedder_idle_timeout_secs = 1200
         // project_root derives from the loaded file's parent — the same
         // absolute path that was passed in, no canonicalization applied.
         assert_eq!(root.as_deref(), config_path.parent());
-    }
-
-    #[test]
-    fn test_index_root_in_config_is_rejected() {
-        // check_no_index_root returns Err when index_root is present.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bad.toml");
-        let file: ConfigFile = toml::from_str(r#"index_root = "/old/root""#).unwrap();
-        let result = check_no_index_root(&file, &path);
-        assert!(result.is_err());
-        let msg = result.unwrap_err();
-        assert!(
-            msg.contains("index_root"),
-            "message should mention index_root: {msg}"
-        );
-        assert!(
-            msg.contains("ADR-0009"),
-            "message should reference ADR-0009: {msg}"
-        );
-        assert!(
-            msg.contains("content_dirs"),
-            "message should suggest content_dirs: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_check_no_index_root_passes_when_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ok.toml");
-        let file: ConfigFile = toml::from_str(r#"state_dir = "/some/dir""#).unwrap();
-        assert!(check_no_index_root(&file, &path).is_ok());
     }
 
     #[test]
