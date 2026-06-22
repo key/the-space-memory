@@ -20,6 +20,7 @@
 | [0010](./0010-per-project-daemon.md) | tsmd の per-project identity と socket 競合解決 | Proposed | 2026-05-19 |
 | [0011](./0011-uninitialized-db-failfast-and-readonly-doctor.md) | 未初期化 DB での fail-fast と doctor の read-only 化 | Accepted | 2026-06-22 |
 | [0012](./0012-output-channel-model.md) | 出力チャネルモデル（ユーザー出力 / ログ / エラーの分離） | Accepted | 2026-06-22 |
+| [0013](./0013-lua-metadata-scoring-hooks.md) | メタデータ抽出とスコアリングを Lua フックで拡張可能にする | Proposed | 2026-06-22 |
 
 新規 ADR 追加時は上記表にも 1 行追加すること。
 
