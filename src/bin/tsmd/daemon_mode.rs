@@ -28,6 +28,16 @@ pub fn run(args: Args) -> Result<()> {
     // Open DB connection
     let conn = db::get_connection(&db_path)
         .context(format!("Failed to open DB at {}", db_path.display()))?;
+
+    // Fail fast on an uninitialized DB rather than serving a schemaless database.
+    // `init` is a deliberate, separate step (see ADR-0008); do not auto-create the schema.
+    if !db::is_initialized(&conn) {
+        anyhow::bail!(
+            "Database not initialized at {}. Run `tsm init` first.",
+            db_path.display()
+        );
+    }
+
     let conn = Arc::new(Mutex::new(conn));
 
     // Clean up stale socket

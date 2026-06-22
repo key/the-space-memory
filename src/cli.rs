@@ -104,7 +104,7 @@ pub fn cmd_init() -> anyhow::Result<()> {
 /// cmd_init" is caught by the integration tests below.
 pub fn cmd_init_with(paths: &InitPaths<'_>) -> anyhow::Result<()> {
     db::init_db(paths.db_path)?;
-    log::info!("Database initialized at {}", paths.db_path.display());
+    println!("Database initialized at {}", paths.db_path.display());
 
     // Scaffold default files. Each call is idempotent — pre-existing
     // user-customized files are never overwritten.
@@ -132,7 +132,7 @@ pub fn cmd_init_with(paths: &InitPaths<'_>) -> anyhow::Result<()> {
     let synonyms_csv = paths.state_dir.join("synonyms.csv");
     let conn = db::get_connection(paths.db_path)?;
     if wordnet_db.is_file() {
-        log::info!(
+        println!(
             "Importing WordNet synonyms from {}...",
             wordnet_db.display()
         );
@@ -149,11 +149,9 @@ pub fn cmd_init_with(paths: &InitPaths<'_>) -> anyhow::Result<()> {
     // behavior obvious if a caller wires in a nonstandard path.
     if synonyms_csv.is_file() {
         let result = synonyms::sync_user_synonyms(&conn, &synonyms_csv)?;
-        log::info!(
+        println!(
             "User synonyms synced: {} pairs ({} deleted, {} skipped)",
-            result.total,
-            result.deleted,
-            result.skipped,
+            result.total, result.deleted, result.skipped,
         );
     }
 
@@ -182,10 +180,10 @@ fn install_default_file(path: &Path, content: &str, display_name: &str) -> anyho
     {
         Ok(mut f) => {
             f.write_all(content.as_bytes())?;
-            log::info!("Wrote default {} to {}", display_name, path.display());
+            println!("Wrote default {} to {}", display_name, path.display());
         }
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-            log::info!(
+            println!(
                 "{} already exists at {} — leaving untouched",
                 display_name,
                 path.display()
@@ -231,11 +229,9 @@ pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     };
 
     let stats = run_index(&conn, &file_paths, &index_root, &walker)?;
-    log::info!(
+    println!(
         "Indexed: {}, Skipped: {}, Removed: {}",
-        stats.indexed,
-        stats.skipped,
-        stats.removed
+        stats.indexed, stats.skipped, stats.removed
     );
     Ok(())
 }
@@ -451,9 +447,9 @@ pub fn cmd_ingest_session(session_file: &Path) -> anyhow::Result<()> {
         .unwrap_or_default()
         .to_string_lossy();
     if indexed {
-        log::info!("Session indexed: {name}");
+        println!("Session indexed: {name}");
     } else {
-        log::info!("Session unchanged: {name}");
+        println!("Session unchanged: {name}");
     }
     Ok(())
 }
@@ -510,9 +506,9 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
     let stats = indexer::backfill_vectors(conn, &encode_fn, batch_size, Some(&progress_cb))?;
 
     if stats.filled > 0 {
-        log::info!("Backfilled {} vectors.", stats.filled);
+        println!("Backfilled {} vectors.", stats.filled);
     } else {
-        log::info!("No missing vectors.");
+        println!("No missing vectors.");
     }
     if stats.errors > 0 {
         log::warn!("{} errors during backfill.", stats.errors);
@@ -537,19 +533,19 @@ pub fn cmd_import_wordnet(wordnet_db: &Path) -> anyhow::Result<()> {
     };
     let count = crate::synonyms::import_wordnet(&conn, wordnet_db, Some(&progress))?;
     eprint!("\r                              \r"); // clear progress line
-    log::info!("Imported {count} synonym pairs from WordNet.");
+    println!("Imported {count} synonym pairs from WordNet.");
 
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM synonyms", [], |r| r.get(0))
         .unwrap_or(0);
-    log::info!("Total synonyms: {total}");
+    println!("Total synonyms: {total}");
     Ok(())
 }
 
 pub fn cmd_synonym_sync() -> anyhow::Result<()> {
     let csv_path = config::user_synonyms_path();
     if !csv_path.is_file() {
-        log::info!(
+        println!(
             "No user synonyms file found at {}. Create it to define custom synonym pairs.",
             csv_path.display()
         );
@@ -558,11 +554,9 @@ pub fn cmd_synonym_sync() -> anyhow::Result<()> {
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
     let result = crate::synonyms::sync_user_synonyms(&conn, &csv_path)?;
-    log::info!(
+    println!(
         "User synonyms synced: {} pairs ({} deleted, {} skipped)",
-        result.total,
-        result.deleted,
-        result.skipped,
+        result.total, result.deleted, result.skipped,
     );
     Ok(())
 }
@@ -577,10 +571,10 @@ pub fn cmd_setup() -> anyhow::Result<()> {
     let config_path = repo.get("config.json")?;
     let tokenizer_path = repo.get("tokenizer.json")?;
     let weights_path = repo.get("model.safetensors")?;
-    log::info!("Model files downloaded:");
-    log::info!("  config:    {}", config_path.display());
-    log::info!("  tokenizer: {}", tokenizer_path.display());
-    log::info!("  weights:   {}", weights_path.display());
+    println!("Model files downloaded:");
+    println!("  config:    {}", config_path.display());
+    println!("  tokenizer: {}", tokenizer_path.display());
+    println!("  weights:   {}", weights_path.display());
 
     // Copy to models_dir for local access
     let dest = config::models_dir();
@@ -596,7 +590,7 @@ pub fn cmd_setup() -> anyhow::Result<()> {
             let dst = dest.join(name);
             std::fs::copy(src, &dst)?;
             copied.push(dst.clone());
-            log::info!("  copied: {}", dst.display());
+            println!("  copied: {}", dst.display());
         }
         Ok(())
     })();
@@ -607,14 +601,14 @@ pub fn cmd_setup() -> anyhow::Result<()> {
         }
         return Err(e);
     }
-    log::info!("Model files installed to {}", dest.display());
+    println!("Model files installed to {}", dest.display());
 
     // Download Japanese WordNet DB. Importing the synonyms into the
     // workspace DB is `tsm init`'s job: `tsm setup` is the pure
     // resource-fetch layer, with no workspace DB writes.
     setup_wordnet()?;
 
-    log::info!("Setup complete. Run `tsm init` in your workspace to finish.");
+    println!("Setup complete. Run `tsm init` in your workspace to finish.");
 
     Ok(())
 }
@@ -622,7 +616,7 @@ pub fn cmd_setup() -> anyhow::Result<()> {
 fn setup_wordnet() -> anyhow::Result<()> {
     let wordnet_dest = config::wordnet_db_path();
     if wordnet_dest.is_file() {
-        log::info!("WordNet DB already exists at {}", wordnet_dest.display());
+        println!("WordNet DB already exists at {}", wordnet_dest.display());
     } else {
         download_wordnet(&wordnet_dest)?;
     }
@@ -631,7 +625,7 @@ fn setup_wordnet() -> anyhow::Result<()> {
 
 fn download_wordnet(dest: &Path) -> anyhow::Result<()> {
     const WORDNET_URL: &str = "https://github.com/bond-lab/wnja/releases/download/v1.1/wnjpn.db.gz";
-    log::info!("Downloading WordNet DB from {WORDNET_URL}...");
+    println!("Downloading WordNet DB from {WORDNET_URL}...");
     let resp = ureq::get(WORDNET_URL).call()?;
     let mut gz_data = Vec::new();
     resp.into_body().as_reader().read_to_end(&mut gz_data)?;
@@ -642,7 +636,7 @@ fn download_wordnet(dest: &Path) -> anyhow::Result<()> {
     let mut out = std::fs::File::create(&tmp_path)?;
     std::io::copy(&mut decoder, &mut out)?;
     std::fs::rename(&tmp_path, dest)?;
-    log::info!("WordNet DB installed to {}", dest.display());
+    println!("WordNet DB installed to {}", dest.display());
     Ok(())
 }
 
@@ -1331,7 +1325,7 @@ pub fn cmd_dict_update(threshold: i64, apply: bool) -> anyhow::Result<()> {
 
     let candidates = user_dict::get_threshold_candidates(&conn, threshold);
     if candidates.is_empty() {
-        log::info!("No candidates meet the threshold (freq >= {threshold}).");
+        println!("No candidates meet the threshold (freq >= {threshold}).");
         return Ok(());
     }
 
@@ -1346,7 +1340,7 @@ pub fn cmd_dict_update(threshold: i64, apply: bool) -> anyhow::Result<()> {
     );
 
     if !apply {
-        log::info!("Dry run. Pass --apply to add words and rebuild FTS.");
+        println!("Dry run. Pass --apply to add words and rebuild FTS.");
         return Ok(());
     }
 
@@ -1354,10 +1348,10 @@ pub fn cmd_dict_update(threshold: i64, apply: bool) -> anyhow::Result<()> {
     let csv_path = config::user_dict_path();
     let exported = user_dict::export_candidates_to_csv(&conn, &csv_path, threshold)?;
     let count = exported.len();
-    log::info!("Wrote {count} word(s) to {}", csv_path.display());
+    println!("Wrote {count} word(s) to {}", csv_path.display());
 
     if count == 0 {
-        log::info!("All candidates were already in the dict file. Nothing to do.");
+        println!("All candidates were already in the dict file. Nothing to do.");
         return Ok(());
     }
 
@@ -1374,10 +1368,10 @@ pub fn cmd_dict_update(threshold: i64, apply: bool) -> anyhow::Result<()> {
         .is_some_and(|r| r.ok);
 
     if daemon_accepted {
-        log::info!("\nFTS reindex started in background. Run `tsm doctor` to check progress.");
+        println!("\nFTS reindex started in background. Run `tsm doctor` to check progress.");
     } else {
         crate::tokenizer::reset_segmenter();
-        log::info!("\nRebuilding FTS index...");
+        println!("\nRebuilding FTS index...");
         cmd_rebuild_fts()?;
     }
 
@@ -1392,7 +1386,7 @@ pub fn cmd_dict_reject(apply: bool, all: bool) -> anyhow::Result<()> {
     if all {
         let rejected = user_dict::get_rejected_candidates(&conn);
         if rejected.is_empty() {
-            log::info!("No rejected candidates.");
+            println!("No rejected candidates.");
             return Ok(());
         }
         eprintln!("=== Rejected Candidates ({} total) ===\n", rejected.len());
@@ -1405,7 +1399,7 @@ pub fn cmd_dict_reject(apply: bool, all: bool) -> anyhow::Result<()> {
     let reject_words = user_dict::load_reject_words(&reject_path)?;
 
     if reject_words.is_empty() {
-        log::info!(
+        println!(
             "reject_words.txt is empty or not found at {}",
             reject_path.display()
         );
@@ -1415,7 +1409,7 @@ pub fn cmd_dict_reject(apply: bool, all: bool) -> anyhow::Result<()> {
     let candidates = user_dict::get_pending_in_reject_list(&conn, &reject_words);
 
     if candidates.is_empty() {
-        log::info!("No pending candidates match reject_words.txt.");
+        println!("No pending candidates match reject_words.txt.");
         return Ok(());
     }
 
@@ -1426,12 +1420,12 @@ pub fn cmd_dict_reject(apply: bool, all: bool) -> anyhow::Result<()> {
     eprintln!("\n{} word(s) will be marked rejected.", candidates.len());
 
     if !apply {
-        log::info!("Dry run. Pass --apply to reject these words.");
+        println!("Dry run. Pass --apply to reject these words.");
         return Ok(());
     }
 
     let newly_rejected = user_dict::apply_reject_list(&conn, &reject_words)?;
-    log::info!("Rejected {} word(s).", newly_rejected.len());
+    println!("Rejected {} word(s).", newly_rejected.len());
     Ok(())
 }
 
@@ -1509,28 +1503,28 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
     if !socket.exists() {
         log::warn!("Embedder is not running. Rebuilding without vectors.");
     } else {
-        log::info!("Embedder: running");
+        println!("Embedder: running");
     }
 
     // Backup
     if db_path.exists() {
         let backup = db_path.with_extension("db.bak");
         std::fs::copy(&db_path, &backup)?;
-        log::info!("Backup: {}", backup.display());
+        println!("Backup: {}", backup.display());
         std::fs::remove_file(&db_path)?;
-        log::info!("Deleted: {}", db_path.display());
+        println!("Deleted: {}", db_path.display());
     }
 
     // Init
     db::init_db(&db_path)?;
-    log::info!("DB initialized");
+    println!("DB initialized");
 
     // Full index (synchronous, with progress)
     let conn = db::get_connection(&db_path)?;
     let walker = indexer::ContentWalker::from_env_with_index_root(&index_root);
     let file_paths = walker.collect_files();
     let total = file_paths.len();
-    log::info!("Indexing {total} files...");
+    println!("Indexing {total} files...");
 
     let progress = |current: usize, total: usize, path: &Path| {
         let rel = path.strip_prefix(&index_root).unwrap_or(path).display();
@@ -1543,11 +1537,9 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
         &walker,
         Some(&progress),
     )?;
-    log::info!(
+    println!(
         "Done: Indexed: {}, Skipped: {}, Removed: {}",
-        stats.indexed,
-        stats.skipped,
-        stats.removed
+        stats.indexed, stats.skipped, stats.removed
     );
 
     // Report & async backfill
@@ -1560,16 +1552,16 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
     drop(conn);
 
     if vecs >= chunks {
-        log::info!("Vectors: {vecs} (matches all chunks)");
+        println!("Vectors: {vecs} (matches all chunks)");
     } else if socket.exists() && chunks > 0 {
         let current_status = crate::status::read(&config::state_dir());
         if current_status.backfill.is_some() {
-            log::info!("Vectors: {vecs} / {chunks} — backfill already in progress");
+            println!("Vectors: {vecs} / {chunks} — backfill already in progress");
         } else {
-            log::info!("Vectors: {vecs} / {chunks} — starting backfill in background...");
+            println!("Vectors: {vecs} / {chunks} — starting backfill in background...");
             spawn_background_backfill();
         }
-        log::info!("Run `tsm doctor` to check progress.");
+        println!("Run `tsm doctor` to check progress.");
     } else if chunks > 0 {
         log::warn!("Vectors: {vecs} / {chunks} — embedder not running, skipping backfill");
     }
@@ -1590,14 +1582,14 @@ pub fn cmd_rebuild_fts() -> anyhow::Result<()> {
         .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
         .unwrap_or(0);
     log::warn!("This will clear and repopulate the FTS index ({chunk_count} chunks).");
-    log::info!("Rebuilding FTS index...");
+    println!("Rebuilding FTS index...");
 
     let progress = |current: usize, total: usize| {
         log::debug!("  [{current}/{total}]");
     };
 
     let inserted = indexer::rebuild_fts(&conn, Some(&progress))?;
-    log::info!("FTS rebuild complete: {inserted} chunks re-indexed.");
+    println!("FTS rebuild complete: {inserted} chunks re-indexed.");
 
     Ok(())
 }

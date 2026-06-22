@@ -18,6 +18,8 @@
 | [0008](./0008-setup-init-separation.md) | tsm setup と tsm init の責務分離 | Accepted（一部 → 0009） | 2026-05-08 |
 | [0009](./0009-workspace-and-content-model.md) | プロジェクトとコンテンツ参照モデル | Proposed | 2026-05-19 |
 | [0010](./0010-per-project-daemon.md) | tsmd の per-project identity と socket 競合解決 | Proposed | 2026-05-19 |
+| [0011](./0011-uninitialized-db-failfast-and-readonly-doctor.md) | 未初期化 DB での fail-fast と doctor の read-only 化 | Accepted | 2026-06-22 |
+| [0012](./0012-output-channel-model.md) | 出力チャネルモデル（ユーザー出力 / ログ / エラーの分離） | Accepted | 2026-06-22 |
 
 新規 ADR 追加時は上記表にも 1 行追加すること。
 
@@ -97,12 +99,15 @@ PR でのマージは原則 `Proposed` のまま行い、合意形成完了後�
 ## Consequences
 
 ### Positive
+
 - 期待される利点
 
 ### Negative
+
 - 受け入れるトレードオフ
 
 ### Follow-ups
+
 - 別途扱う関連事項（実装 PR の分割案、後続 ADR の予告など）
 ```
 

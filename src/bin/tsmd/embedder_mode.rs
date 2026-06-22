@@ -22,9 +22,9 @@ pub fn run(model: Option<PathBuf>, no_idle_timeout: bool) -> Result<()> {
         // SAFETY: called single-threaded before any thread spawn or logger init.
         unsafe { std::env::set_var("TSM_EMBEDDER_IDLE_TIMEOUT", "0") };
     }
-    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
-        name: "tsmd-embedder",
-    })?;
+    // Log to stderr (inherited from the daemon, captured into tsmd-stderr.log);
+    // children do not manage their own log files.
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::DaemonStderr)?;
     let socket_path = config::embedder_socket_path();
     run_daemon(&socket_path, model.as_deref())
 }
