@@ -51,3 +51,9 @@ jobs:
         run: bash tests/e2e.sh
         env:
           HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
+          # `tsm setup` (Download model step, no TSM_STATE_DIR) installs the model
+          # to the workspace `.tsm/models`. e2e.sh runs with a fresh mktemp
+          # TSM_STATE_DIR, so the embedder must find the model via the machine-wide
+          # cache lookup (`cache_models_dir`). Point TSM_CACHE_DIR at the workspace
+          # `.tsm` so `{cache_dir}/models/ruri-v3-30m` resolves to that install.
+          TSM_CACHE_DIR: ${{ github.workspace }}/.tsm
