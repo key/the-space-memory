@@ -56,7 +56,8 @@
 # Content directories to index. Each entry has:
 #   path           — directory path (required)
 #   weight         — scoring weight (default: 1.0)
-#   half_life_days — time decay half-life in days (default: 90.0)
+#   half_life_days — time decay half-life in days (default: 90.0).
+#                    Set to 0 to disable time decay (treat as timeless).
 #
 # Empty = auto-discover mode (recursively index all .md under index_root).
 #
@@ -72,5 +73,5 @@
 # weight = 0.3
 
 # Half-life in days for Claude Code session data time decay.
-# Default: 30.0
+# Default: 30.0. Set to 0 to disable time decay (treat as timeless).
 # half_life_days = 30.0

@@ -401,10 +401,11 @@ impl ResolvedConfig {
                         c.path
                     );
                 }
-                let half_life = c.half_life_days.unwrap_or(DEFAULT_HALF_LIFE_DAYS);
-                if !half_life.is_finite() || half_life <= 0.0 {
+                let raw_half_life = c.half_life_days.unwrap_or(DEFAULT_HALF_LIFE_DAYS);
+                let half_life = sanitize_half_life(raw_half_life, DEFAULT_HALF_LIFE_DAYS);
+                if half_life != raw_half_life {
                     log::warn!(
-                        "content_dirs '{}': half_life_days {half_life} is invalid; using {DEFAULT_HALF_LIFE_DAYS}",
+                        "content_dirs '{}': half_life_days {raw_half_life} is invalid; using {half_life}",
                         c.path
                     );
                 }
@@ -415,11 +416,7 @@ impl ResolvedConfig {
                     } else {
                         1.0
                     },
-                    half_life_days: if half_life.is_finite() && half_life > 0.0 {
-                        half_life
-                    } else {
-                        DEFAULT_HALF_LIFE_DAYS
-                    },
+                    half_life_days: half_life,
                 })
             })
             .collect();
@@ -432,11 +429,14 @@ impl ResolvedConfig {
             .weight
             .unwrap_or(DEFAULT_SESSION_WEIGHT);
 
-        let session_half_life_days = file_cfg
-            .index
-            .claude_session
-            .half_life_days
-            .unwrap_or(DEFAULT_SESSION_HALF_LIFE_DAYS);
+        let session_half_life_days = sanitize_half_life(
+            file_cfg
+                .index
+                .claude_session
+                .half_life_days
+                .unwrap_or(DEFAULT_SESSION_HALF_LIFE_DAYS),
+            DEFAULT_SESSION_HALF_LIFE_DAYS,
+        );
 
         let respect_gitignore = file_cfg.index.respect_gitignore.unwrap_or(true);
 
@@ -991,6 +991,20 @@ pub fn half_life_days(file_path: &str, source_type: &str) -> f64 {
         }
     }
     half_life_days_by_source_type(source_type)
+}
+
+/// Validate a configured half-life in days. `0.0` is a valid sentinel that
+/// disables time decay (ADR-0009): the searcher treats it as timeless and
+/// applies no decay. Negative, infinite, and NaN values are invalid and fall
+/// back to `default`.
+fn sanitize_half_life(value: f64, default: f64) -> f64 {
+    if value == 0.0 {
+        0.0
+    } else if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        default
+    }
 }
 
 /// Default half-life by source_type (used when content_dirs is empty or unmatched).
@@ -1940,7 +1954,7 @@ weight = -1.0
     }
 
     #[test]
-    fn test_content_dirs_validation_zero_half_life_clamped() {
+    fn test_content_dirs_zero_half_life_disables_decay() {
         let cfg = resolved_from_toml(
             r#"
 [[index.content_dirs]]
@@ -1948,7 +1962,43 @@ path = "daily/notes"
 half_life_days = 0.0
 "#,
         );
+        // 0 is the sentinel for "time decay disabled" (ADR-0009); kept as-is.
+        assert_eq!(cfg.content_dirs[0].half_life_days, 0.0);
+    }
+
+    #[test]
+    fn test_content_dirs_negative_half_life_falls_back_to_default() {
+        let cfg = resolved_from_toml(
+            r#"
+[[index.content_dirs]]
+path = "daily/notes"
+half_life_days = -5.0
+"#,
+        );
         assert_eq!(cfg.content_dirs[0].half_life_days, DEFAULT_HALF_LIFE_DAYS);
+    }
+
+    #[test]
+    fn test_session_zero_half_life_disables_decay() {
+        let cfg = resolved_from_toml(
+            r#"
+[index.claude_session]
+half_life_days = 0.0
+"#,
+        );
+        // 0 is the sentinel for "time decay disabled" (ADR-0009); kept as-is.
+        assert_eq!(cfg.session_half_life_days, 0.0);
+    }
+
+    #[test]
+    fn test_session_negative_half_life_falls_back_to_default() {
+        let cfg = resolved_from_toml(
+            r#"
+[index.claude_session]
+half_life_days = -5.0
+"#,
+        );
+        assert_eq!(cfg.session_half_life_days, DEFAULT_SESSION_HALF_LIFE_DAYS);
     }
 
     #[test]
