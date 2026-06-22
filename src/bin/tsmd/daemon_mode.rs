@@ -35,14 +35,14 @@ pub fn run(args: Args) -> Result<()> {
     // makes ownership the first semantic gate, so a losing concurrent
     // `tsm start` sees a clear message rather than a spurious DB error. This
     // serializes concurrent starts on one atomic gate and closes the silent
-    // socket clobber (#200). (ADR-0010)
+    // socket clobber.
     let lock_path = config::state_dir().join("tsmd.lock");
     let _startup_lock = match daemon_lock::try_acquire(&lock_path)
         .context(format!("Failed to open lock file {}", lock_path.display()))?
     {
         daemon_lock::LockOutcome::Acquired(guard) => guard,
         daemon_lock::LockOutcome::Held => {
-            // current_dir() is the project root tsmd chdir'd to (ADR-0010), so it
+            // current_dir() is the project root tsmd chdir'd to, so it
             // matches what `ps`/`pgrep` show for the owning daemon — unlike
             // config::project_root(), which can diverge under $TSM_CONFIG.
             let here = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));

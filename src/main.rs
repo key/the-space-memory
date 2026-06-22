@@ -516,8 +516,8 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
     // If a daemon is already serving this socket, we're done. Do NOT remove a
     // non-responding socket here: a hung-but-live daemon still holds the startup
     // lock, and deleting its socket before tsmd's lock check would reintroduce
-    // the silent clobber (#200). tsmd reclaims a genuinely stale socket itself,
-    // gated by the per-project lock. (ADR-0010)
+    // the silent clobber. tsmd reclaims a genuinely stale socket itself,
+    // gated by the per-project lock.
     if socket_path.exists() {
         if let Ok(resp) = daemon_protocol::send_request(&socket_path, &DaemonRequest::Ping) {
             if resp.ok {
@@ -555,7 +555,7 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to open daemon log {}: {e}", stderr_path.display()))?;
 
     // Pass the project root explicitly so tsmd chdir()s there and `ps`/`pgrep`
-    // reveal the owning project (ADR-0010).
+    // reveal the owning project.
     //
     // We pass `canonical(CWD)`, not `config::project_root()`. Today `state_dir`
     // (and thus the socket path) is resolved CWD-relative — `.tsm/…` — and is
@@ -680,7 +680,7 @@ fn read_daemon_pid() -> Option<u32> {
 /// Returns `true` if the process is gone, `false` on timeout. Used so `tsm stop`
 /// does not return until the daemon has actually terminated and released its
 /// startup lock — otherwise `tsm restart` would race the dying daemon and the
-/// new tsmd would bail with "another tsmd already owns this project" (ADR-0010).
+/// new tsmd would bail with "another tsmd already owns this project".
 fn wait_for_pid_exit(pid: u32, timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
@@ -718,7 +718,7 @@ fn cmd_stop() -> anyhow::Result<()> {
                 // lock) before returning, so `tsm restart` can start a fresh
                 // tsmd without colliding with the still-dying one. The daemon
                 // ACKs Shutdown before tearing down its accept loop and reaping
-                // children, so the process outlives this reply briefly. (ADR-0010)
+                // children, so the process outlives this reply briefly.
                 if let Some(pid) = pid {
                     if !wait_for_pid_exit(pid, std::time::Duration::from_secs(10)) {
                         log::warn!("tsmd (pid {pid}) did not exit within 10s of shutdown");

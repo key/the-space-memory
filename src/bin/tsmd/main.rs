@@ -25,7 +25,6 @@ pub(crate) struct Args {
     /// `tsm` always passes this so `ps`/`pgrep` reveal the owning project, and
     /// `tsmd` `chdir()`s here at startup so every relative state path (`.tsm/…`)
     /// resolves under it. Applies to the daemon and every spawned child.
-    /// (ADR-0010)
     #[arg(long)]
     pub project_root: Option<PathBuf>,
 
@@ -70,7 +69,7 @@ fn main() -> Result<()> {
     // the CWD on first use, and the daemon logger triggers that init — so the
     // chdir must happen here, right after arg parsing, ahead of every mode.
     // This makes all relative state paths resolve under the project root
-    // without touching config resolution. (ADR-0010)
+    // without touching config resolution.
     if let Some(root) = &args.project_root {
         let canonical = std::fs::canonicalize(root)
             .map_err(|e| anyhow::anyhow!("--project-root {}: {e}", root.display()))?;

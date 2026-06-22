@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 /// Spawn the current executable with additional arguments.
 fn start_child_self(extra_args: &[&str]) -> Result<Child> {
     let exe = std::env::current_exe().context("cannot determine own executable path")?;
-    // The daemon has already chdir'd to the project root (ADR-0010), so its CWD
+    // The daemon has already chdir'd to the project root, so its CWD
     // is the canonical project root. Pass it to every child as `--project-root`
     // so `ps`/`pgrep` reveal the owning project and the child resolves its own
     // relative state paths under the same root.

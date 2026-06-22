@@ -5,7 +5,7 @@
 //! PID file — is the sole ownership oracle: the kernel releases it automatically
 //! on process death, so a leftover socket can be reclaimed without PID-liveness
 //! guesswork, and concurrent `tsm start` invocations serialize on a single
-//! atomic gate (ADR-0010).
+//! atomic gate.
 //!
 //! The lock file is opened close-on-exec (the std `File` default) so spawned
 //! children never inherit the lock fd. An orphaned `--no-idle-timeout` embedder
