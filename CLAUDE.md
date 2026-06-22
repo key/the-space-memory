@@ -276,6 +276,9 @@ A change is merge-ready when **all** of the following hold:
 
 Design decisions and rationale are recorded in the directory below.
 Review existing records before making architectural changes.
+The ADR format authority is `decisions/README.md` (target-state only; no
+`Follow-ups`/task-list sections, no review-process attribution). Get the next
+ADR number from `main`, not your branch (renumbering may be in flight).
 
 | Directory | Contents |
 |---|---|
