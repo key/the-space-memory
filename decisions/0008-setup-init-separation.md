@@ -7,7 +7,7 @@
   [ADR-0001](./0001-process-roles-and-responsibilities.md),
   [ADR-0003](./0003-config-via-resolved-config.md)
 - **Superseded in part by**:
-  [ADR-0009](./0009-per-project-daemon.md) — `tsm.toml` の置き場所を
+  [ADR-0009](./0009-workspace-and-content-model.md) — `tsm.toml` の置き場所を
   `.tsm/` の中から `<workspace>/` 直下に変更
 
 ## Context
