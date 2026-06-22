@@ -1,9 +1,25 @@
 use std::io::{Read, Write};
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 
 use anyhow::Result;
 
 /// Maximum message size (64 MB). Prevents OOM from malformed length headers.
 const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
+/// Accept one connection and hand back a BLOCKING stream.
+///
+/// Callers keep the listener non-blocking so the accept loop can poll and check
+/// the shutdown flag. On BSD/macOS a socket accepted from a non-blocking
+/// listener inherits `O_NONBLOCK`, so a length-prefixed [`read_message`] then
+/// fails with `EAGAIN` ("Resource temporarily unavailable") instead of waiting
+/// for the request. Reset the accepted stream to blocking so reads behave
+/// identically on Linux and macOS. A `WouldBlock` error from the listener (no
+/// pending connection) is propagated unchanged for the caller's poll loop.
+pub fn accept_blocking(listener: &UnixListener) -> std::io::Result<(UnixStream, SocketAddr)> {
+    let (stream, addr) = listener.accept()?;
+    stream.set_nonblocking(false)?;
+    Ok((stream, addr))
+}
 
 /// Read a length-prefixed message from a stream.
 ///
@@ -121,5 +137,40 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         let err = read_message(&mut cursor).unwrap_err();
         assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn accept_blocking_clears_nonblocking_inherited_from_listener() {
+        use super::accept_blocking;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sock");
+
+        // Listener is non-blocking, exactly like the embedder/daemon accept loops.
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        // A connected client makes accept() return a stream.
+        let _client = UnixStream::connect(&path).unwrap();
+
+        let (stream, _addr) = loop {
+            match accept_blocking(&listener) {
+                Ok(pair) => break pair,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("accept_blocking failed: {e}"),
+            }
+        };
+
+        // The accepted stream must be blocking on every platform, even though the
+        // listener is non-blocking (on BSD/macOS the flag is otherwise inherited).
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL failed");
+        assert_eq!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "accepted stream must be blocking"
+        );
     }
 }
