@@ -46,8 +46,20 @@ jobs:
         run: tsm setup
         env:
           HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
+          # `tsm setup` installs the model to `{state_dir}/models/ruri-v3-30m`.
+          # Pin state_dir to an absolute `{workspace}/.tsm` so the install path is
+          # explicit (not dependent on the step's CWD) and matches the TSM_CACHE_DIR
+          # the test step points the embedder at.
+          TSM_STATE_DIR: ${{ github.workspace }}/.tsm
 
       - name: Run E2E tests
         run: bash tests/e2e.sh
         env:
           HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
+          # The model was installed under `{workspace}/.tsm/models/ruri-v3-30m`
+          # above. e2e.sh overrides TSM_STATE_DIR with a fresh mktemp dir, so the
+          # embedder's workspace lookup is empty and it falls back to the machine-
+          # wide cache (`cache_models_dir` = `{TSM_CACHE_DIR}/models/ruri-v3-30m`).
+          # Point TSM_CACHE_DIR at the same `{workspace}/.tsm` so it resolves to
+          # that install. (e2e.sh sets TSM_STATE_DIR but not TSM_CACHE_DIR.)
+          TSM_CACHE_DIR: ${{ github.workspace }}/.tsm
