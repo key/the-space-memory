@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Once;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use crate::config;
 
@@ -184,16 +184,32 @@ pub fn is_initialized(conn: &Connection) -> bool {
 /// Whether the DB at `path` exists and carries the core schema, WITHOUT
 /// creating it.
 ///
-/// Opens the file read-only (no `CREATE` flag) so a missing DB never
-/// materializes: starting an uninitialized project must not leave a stray
-/// state directory behind (ADR-0008 — `init` is an explicit, separate step).
-/// A missing, unopenable, or schemaless DB reports `false`. Used as a
-/// side-effect-free pre-flight gate before the daemon creates its logger,
-/// lock, and socket.
-pub fn probe_initialized(path: &Path) -> bool {
-    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map(|conn| is_initialized(&conn))
-        .unwrap_or(false)
+/// A missing file reports `Ok(false)` without opening anything, so starting an
+/// uninitialized project never materializes the state directory (ADR-0008 —
+/// `init` is an explicit, separate step). An existing file is opened read-write
+/// but **without** the `CREATE` flag: this never creates a new DB, yet still
+/// lets SQLite recover a hot WAL left by an unclean shutdown (a read-only open
+/// would fail with `SQLITE_READONLY_RECOVERY` and falsely block startup).
+/// Genuine open failures (permission denied, not-a-database) propagate as `Err`
+/// so callers surface the real problem instead of misreporting "not
+/// initialized". Used as a side-effect-free pre-flight gate before the daemon
+/// creates its logger, lock, and socket.
+pub fn probe_initialized(path: &Path) -> anyhow::Result<bool> {
+    if !path.try_exists().unwrap_or(false) {
+        return Ok(false);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| anyhow::anyhow!("Failed to open DB at {}: {e}", path.display()))?;
+    Ok(is_initialized(&conn))
+}
+
+/// The canonical "the DB has no schema yet" error, shared by the CLI and daemon
+/// fail-fast guards so the user-facing wording stays identical in one place.
+pub fn uninitialized_error(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Database not initialized at {}. Run `tsm init` first.",
+        path.display()
+    )
 }
 
 /// Ensure the `content_hash` column exists on the `chunks` table (migration for older DBs).
@@ -507,7 +523,7 @@ mod tests {
         // WITHOUT materializing the file (which would leave a stray `.tsm`).
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("missing.db");
-        assert!(!probe_initialized(&db_path));
+        assert!(!probe_initialized(&db_path).unwrap());
         assert!(!db_path.exists(), "probe must not create the DB file");
     }
 
@@ -517,7 +533,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("bare.db");
         Connection::open(&db_path).unwrap(); // creates an empty file, no schema
-        assert!(!probe_initialized(&db_path));
+        assert!(!probe_initialized(&db_path).unwrap());
     }
 
     #[test]
@@ -525,7 +541,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("ready.db");
         init_db(&db_path).unwrap();
-        assert!(probe_initialized(&db_path));
+        assert!(probe_initialized(&db_path).unwrap());
+    }
+
+    #[test]
+    fn test_probe_initialized_errors_when_path_is_unopenable() {
+        // An existing path that cannot be opened as a DB (here: a directory) must
+        // propagate the real error, NOT be misreported as "not initialized".
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("not-a-db");
+        std::fs::create_dir(&db_path).unwrap();
+        assert!(probe_initialized(&db_path).is_err());
+    }
+
+    #[test]
+    fn test_uninitialized_error_mentions_init() {
+        let err = uninitialized_error(Path::new("/x/.tsm/tsm.db"));
+        let msg = err.to_string();
+        assert!(msg.contains("/x/.tsm/tsm.db"));
+        assert!(msg.contains("Run `tsm init` first"));
     }
 
     #[test]

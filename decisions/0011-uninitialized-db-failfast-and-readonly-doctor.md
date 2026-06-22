@@ -89,11 +89,15 @@ daemon が起動済みならその in-process レポートを使い、未起動�
 - daemon-routed コマンドは未初期化時に 30 秒待たず、即座に理由付きで失敗する。
 - daemon が「初期化済み DB のみを扱う」前提が明文化・強制される
   （ADR-0001 の DB 所有権・ADR-0008 の init 明示と整合）。
+- daemon は起動前に DB が初期化済みかを副作用なしに確認する。`start` /
+  `restart` / auto-start は未初期化時、状態ディレクトリ（`tsm.db`・ログ・
+  ロック・ソケット）を一切生成せずに `Run \`tsm init\`` で失敗する。利便性の
+  ための暗黙初期化は行わない（ADR-0008 の init 明示と整合）。
 
 （出力・ログ集約に関する帰結は [ADR-0012](./0012-output-channel-model.md) を参照。）
 
 ### Negative
 
-- `search` / `index` 等は未初期化時に auto-start を試みて空の `tsm.db` を
-  生成する（`init_db` は `IF NOT EXISTS` なので後続の `tsm init` で正しく
-  初期化され、実害は無い）。doctor は read-only なので対象外。
+- 未初期化のディレクトリでは `search` / `index` 等が即座に失敗するため、
+  利用者は明示的に `tsm init` を実行する必要がある（暗黙の自動初期化による
+  利便性は提供しない）。doctor は read-only なので対象外。
