@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Stop `tsm status`/`doctor`/`search` from freezing during a reindex by serving read-only requests from a dedicated read-only connection pool, separate from the single writer connection.
+**Goal:** During a reindex, stop `tsm status`/`doctor`/`search` from freezing (read side) and let a file/interactive `tsm index` preempt the reindex within one batch (write side).
 
-**Architecture:** `tsmd` keeps one writer `Arc<Mutex<Connection>>` (all writes serialize here, unchanged). A new fixed-size pool of `query_only` read connections serves every read-only request. `handle_client` routes by a single `DaemonRequest::is_read_only()` classification. WAL (already enabled) gives readers consistent snapshots concurrent with the writer, so reads run in parallel up to the pool size. The `search_active`/`yield_to_search` DB-lock yield becomes dead and is removed.
+**Architecture:** `tsmd` keeps one writer `Arc<Mutex<Connection>>` (all writes serialize here, unchanged — SQLite is single-writer). A new fixed-size pool of `query_only` read connections serves every read-only request; `handle_client` routes by a single `DaemonRequest::is_read_only()` classification. WAL (already enabled) gives readers consistent snapshots concurrent with the writer. The `search_active`/`yield_to_search` read-yield is **flipped** into a `writes_pending`/`yield_to_pending_writes` write-yield: reindex/backfill steps back when an `Index` is waiting. The FTS reindex batch size becomes a config knob.
 
-**Tech Stack:** Rust, rusqlite (bundled SQLite, WAL), std threads + `Mutex`/`Condvar`. No new external crates.
+**Tech Stack:** Rust, rusqlite (bundled SQLite, WAL), std threads + `Mutex`/`Condvar` + `AtomicUsize`. No new external crates.
 
 ## Global Constraints
 
@@ -29,13 +29,13 @@
 - `src/read_pool.rs` — **Create.** `ReadPool` (fixed-size pool of read connections, checkout/return). Library module so it is unit-testable.
 - `src/lib.rs` — **Modify.** `pub mod read_pool;`.
 - `src/daemon_protocol.rs` — **Modify.** Add `DaemonRequest::is_read_only()` (exhaustive match) + tests.
-- `src/config.rs` — **Modify.** Add `reader_pool_size` (field, env, file, merge, accessor) defaulting to CPU core count.
-- `src/bin/tsmd/daemon_mode.rs` — **Modify.** Build the pool; route reads to it in `handle_client`; later remove `search_active` wiring.
-- `src/bin/tsmd/backfill.rs` — **Modify.** Remove `SearchActiveGuard`/`yield_to_search`/`search_active` params (Task 7).
-- `tests/e2e.sh` — **Modify.** Add a regression check: status/doctor respond promptly during reindex.
-- `CLAUDE.md`, `README.md`, `README.ja.md` — **Modify.** Document the connection model + new config key.
+- `src/config.rs` — **Modify.** Add `reader_pool_size` (default CPU cores) and `reindex_fts_batch_size` (default 200) — both field/env/file/merge/accessor.
+- `src/bin/tsmd/daemon_mode.rs` — **Modify.** Build the pool; route reads to it in `handle_client`; flip `search_active`→`writes_pending` (increment for write requests).
+- `src/bin/tsmd/backfill.rs` — **Modify.** Replace `SearchActiveGuard`/`yield_to_search` with `PendingWriteGuard`/`yield_to_pending_writes`; use `config::reindex_fts_batch_size()` (Task 7).
+- `tests/e2e.sh` — **Modify.** Regression checks: status responsive during reindex; `index` preempts reindex.
+- `CLAUDE.md`, `README.md`, `README.ja.md` — **Modify.** Document the connection model, write fairness, and new config keys.
 
-Task order: ADR → db pragmas/reader conn → pool → classification → config → wire routing → remove `search_active` → e2e → docs. Lib pieces land before the bin wiring that consumes them.
+Task order: ADR (separate PR) → db pragmas/reader conn → pool → classification → config → wire routing → flip `search_active`→`writes_pending` → e2e → docs. Lib pieces land before the bin wiring that consumes them.
 
 ---
 
@@ -593,16 +593,20 @@ git commit -m "feat(protocol): classify DaemonRequest read vs write"
 
 ---
 
-### Task 5: `reader_pool_size` config key (`config.rs`)
+### Task 5: config keys `reader_pool_size` + `reindex_fts_batch_size` (`config.rs`)
 
 **Files:**
-- Modify: `src/config.rs` (ConfigFile ~line 191; ResolvedConfig field ~line 245; `from_env` ~line 394; struct literal ~line 490; reload merge ~line 770; accessor ~line 904)
-- Modify: `tsm.toml.example` (document the key)
+- Modify: `src/config.rs` (ConfigFile ~line 191; ResolvedConfig field ~line 245; `from_env` ~line 394; struct literal ~line 490; reload merge ~line 770; accessor ~line 904; `REINDEX_FTS_BATCH_SIZE` const at line 18)
+- Modify: `tsm.toml.example` (document the keys)
 - Test: `src/config.rs` `#[cfg(test)] mod tests`
 
 **Interfaces:**
 - Consumes: existing `env_parse_u64`, `ResolvedConfig`, `ConfigFile`.
-- Produces: `pub fn reader_pool_size() -> usize` returning the resolved pool size (env `TSM_READER_POOL_SIZE` > `reader_pool_size` in tsm.toml > CPU core count).
+- Produces:
+  - `pub fn reader_pool_size() -> usize` (env `TSM_READER_POOL_SIZE` > tsm.toml `reader_pool_size` > CPU core count).
+  - `pub fn reindex_fts_batch_size() -> usize` (env `TSM_REINDEX_FTS_BATCH_SIZE` > tsm.toml `reindex_fts_batch_size` > `DEFAULT_REINDEX_FTS_BATCH_SIZE = 200`). Replaces the `REINDEX_FTS_BATCH_SIZE` const for the batch-loop call site.
+
+> Default 200 (not the old 1000, not 10): smaller bounds preemption latency, larger protects full-reindex throughput. 200 is the proposed middle; confirm against ADR-0007's ≤5% gate by measurement and adjust the default if needed.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -621,14 +625,28 @@ fn test_reader_pool_size_default_is_positive() {
     let cfg = resolved_from_toml("");
     assert!(cfg.reader_pool_size >= 1);
 }
+
+#[test]
+fn test_reindex_fts_batch_size_from_file() {
+    let cfg = resolved_from_toml("reindex_fts_batch_size = 10\n");
+    assert_eq!(cfg.reindex_fts_batch_size, 10);
+}
+
+#[test]
+fn test_reindex_fts_batch_size_default() {
+    let cfg = resolved_from_toml("");
+    assert_eq!(cfg.reindex_fts_batch_size, DEFAULT_REINDEX_FTS_BATCH_SIZE);
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib config::tests::test_reader_pool_size_from_file config::tests::test_reader_pool_size_default_is_positive`
-Expected: FAIL — field `reader_pool_size` does not exist.
+Run: `cargo test --lib config::tests::test_reader_pool_size_from_file config::tests::test_reindex_fts_batch_size_from_file`
+Expected: FAIL — fields `reader_pool_size` / `reindex_fts_batch_size` do not exist.
 
-- [ ] **Step 3: Implement — six edits**
+- [ ] **Step 3: Implement — six edits per key**
+
+Apply edits (a)–(f) below for **both** `reader_pool_size` and `reindex_fts_batch_size` (same pattern, listed once for the pool size; mirror it for the batch size with its own env var `TSM_REINDEX_FTS_BATCH_SIZE`, default `DEFAULT_REINDEX_FTS_BATCH_SIZE`, and the doc comment "FTS reindex batch size; smaller = finer preemption, more fsync (ADR-0015)").
 
 (a) `ConfigFile` (after `embedder_backfill_interval_secs: Option<u64>,`):
 
@@ -685,7 +703,23 @@ fn default_reader_pool_size() -> usize {
 pub fn reader_pool_size() -> usize {
     resolved().reader_pool_size
 }
+
+pub fn reindex_fts_batch_size() -> usize {
+    resolved().reindex_fts_batch_size
+}
 ```
+
+(g) Batch-size default const — replace the existing `pub const REINDEX_FTS_BATCH_SIZE: usize = 1000;` (line 18) with:
+
+```rust
+/// Default FTS reindex batch size when `reindex_fts_batch_size` is unset.
+/// Smaller = finer write preemption (ADR-0015), larger = better full-reindex
+/// throughput. 200 is the middle ground; tune via config + measurement.
+pub const DEFAULT_REINDEX_FTS_BATCH_SIZE: usize = 200;
+```
+
+(The batch-loop call site in `backfill.rs` switches from the const to the
+`config::reindex_fts_batch_size()` accessor in Task 7.)
 
 - [ ] **Step 4: Update `tsm.toml.example`**
 
@@ -695,18 +729,22 @@ Add near `embedder_backfill_interval_secs`:
 # Number of read-only DB connections the daemon keeps for status/doctor/search.
 # Caps concurrent reads. Default: CPU core count.
 # reader_pool_size = 4
+
+# FTS reindex batch size. Smaller = a file/interactive `index` preempts an
+# in-progress reindex sooner; larger = better full-reindex throughput. Default: 200.
+# reindex_fts_batch_size = 200
 ```
 
 - [ ] **Step 5: Run tests + verify**
 
 Run: `cargo test --lib config:: && cargo clippy --lib -- -D warnings`
-Expected: PASS (existing config tests + 2 new); clippy clean.
+Expected: PASS (existing config tests + 4 new); clippy clean.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add src/config.rs tsm.toml.example
-git commit -m "feat(config): add reader_pool_size (default CPU cores)"
+git commit -m "feat(config): add reader_pool_size and reindex_fts_batch_size knobs"
 ```
 
 ---
@@ -792,35 +830,62 @@ git commit -m "feat(tsmd): serve read-only requests from the reader pool"
 
 ---
 
-### Task 7: Remove the dead `search_active` mechanism
+### Task 7: Flip `search_active` (reads) → `writes_pending` (writes)
+
+The fairness counter changes sides. Reads no longer need a DB-lock yield (they're
+on the pool), but reindex/backfill must now yield to pending **writes** so a
+file/interactive `Index` preempts reindex within one batch. This is the mirror of
+the mechanism Task 6 left in place — rename + invert the polarity, then wire the
+write path and switch the FTS batch to the config knob.
 
 **Files:**
-- Modify: `src/bin/tsmd/backfill.rs` (remove `SearchActiveGuard`, `yield_to_search`, `search_active` params + the RAII test)
-- Modify: `src/bin/tsmd/daemon_mode.rs` (remove `search_active` atomic, the `_guard`, and the param from every call/signature)
+- Modify: `src/bin/tsmd/backfill.rs` (rename guard/yield, invert to `writes_pending`, use `config::reindex_fts_batch_size()`)
+- Modify: `src/bin/tsmd/daemon_mode.rs` (rename atomic to `writes_pending`; in `handle_client` increment it for **write** requests, not Search)
 
 **Interfaces:**
-- Consumes: nothing new.
-- Produces: new signatures —
-  - `run_backfill_pass(conn: &Arc<Mutex<Connection>>)`
-  - `periodic_backfill(conn: &Arc<Mutex<Connection>>, interval_secs: u64)`
-  - `run_reindex_fts_pass(conn: &Arc<Mutex<Connection>>, state_dir: &Path)`
-  - `run_reindex_vectors_pass(conn: &Arc<Mutex<Connection>>, state_dir: &Path)`
+- Consumes: `config::reindex_fts_batch_size()`.
+- Produces:
+  - `pub struct PendingWriteGuard(Arc<AtomicUsize>)` with `new(&Arc<AtomicUsize>) -> Self` (RAII inc/dec) — replaces `SearchActiveGuard`.
+  - `fn yield_to_pending_writes(writes_pending: &Arc<AtomicUsize>) -> bool` — replaces `yield_to_search`.
+  - Pass signatures gain `writes_pending` (same position the old `search_active` had):
+    - `run_backfill_pass(conn: &Arc<Mutex<Connection>>, writes_pending: &Arc<AtomicUsize>)`
+    - `periodic_backfill(conn: &Arc<Mutex<Connection>>, writes_pending: &Arc<AtomicUsize>, interval_secs: u64)`
+    - `run_reindex_fts_pass(conn: &Arc<Mutex<Connection>>, writes_pending: &Arc<AtomicUsize>, state_dir: &Path)`
+    - `run_reindex_vectors_pass(conn: &Arc<Mutex<Connection>>, writes_pending: &Arc<AtomicUsize>, state_dir: &Path)`
 
-Pre-check (Global Constraints): confirm `yield_to_search` couples no embedder pacing — it only spin-waits on the `search_active` counter and sleeps; the embedder is reached separately via `embedder::embed_via_socket`. Safe to delete.
+Pre-check (Global Constraints): confirm the old `yield_to_search` coupled no embedder pacing (it only spin-waits on a counter + sleeps; the embedder is reached separately via `embedder::embed_via_socket`). Keep `yield_to_pending_writes` equally pure.
 
-- [ ] **Step 1: Edit `backfill.rs`**
+- [ ] **Step 1: Edit `backfill.rs` — rename + invert**
 
-- Delete the `SearchActiveGuard` struct + its `impl`s (lines ~9-25) and the `yield_to_search` fn (lines ~27-40).
-- Remove `search_active: &Arc<AtomicUsize>` from all four pass signatures and the `yield_to_search(search_active)` / guard call sites within them (lines ~63-65, 198, 262-264, and the `run_backfill_pass(conn, search_active)` calls at lines ~133, 294 → `run_backfill_pass(conn)`).
-- Delete the `test_search_active_guard_raii` test (lines ~309-327).
-- Remove now-unused imports: `AtomicUsize` (keep `Ordering` if still used by `SHUTDOWN` loads — it is), and `Mutex`/`Arc` stay (still used).
+- Rename `SearchActiveGuard` → `PendingWriteGuard` (struct + `impl`s + `new`; logic identical — it just guards a different counter).
+- Rename `yield_to_search` → `yield_to_pending_writes`; body unchanged (spin while the counter > 0, checking `SHUTDOWN`). Update its doc comment to "yield while a write request is pending".
+- In all four pass fns, rename the `search_active` param to `writes_pending` and the `yield_to_search(search_active)` calls to `yield_to_pending_writes(writes_pending)` (call sites ~63-65, 198, 262-264; and the inner `run_backfill_pass(conn, search_active)` calls at ~133, 294 → `run_backfill_pass(conn, writes_pending)`).
+- In `run_reindex_fts_pass`, replace `let batch_size = config::REINDEX_FTS_BATCH_SIZE;` with `let batch_size = config::reindex_fts_batch_size();`.
+- Rename the `test_search_active_guard_raii` test → `test_pending_write_guard_raii` (same assertions, new type name).
 
-- [ ] **Step 2: Edit `daemon_mode.rs`**
+- [ ] **Step 2: Edit `daemon_mode.rs` — rename atomic + wire write path**
 
-- Delete `let search_active = Arc::new(AtomicUsize::new(0));` (line ~232) and every `let search_active = Arc::clone(&search_active);` / `&search_active` argument (startup backfill thread ~239/253, periodic backfill ~262/264, accept loop clone ~274, reindex thread ~357/372-381, `handle_client` signature + the `_guard` block from Task 6).
-- Update the reindex-thread calls to the new signatures: `run_reindex_fts_pass(&conn, &state_dir)`, `run_reindex_vectors_pass(&conn, &state_dir)`.
-- Update backfill thread calls: `backfill::run_backfill_pass(&conn)`, `backfill::periodic_backfill(&conn, backfill_interval_secs)`.
-- Remove the `AtomicUsize` import if now unused (keep `AtomicBool`/`AtomicU32`).
+- Rename `let search_active = Arc::new(AtomicUsize::new(0));` → `let writes_pending = Arc::new(AtomicUsize::new(0));` and every `Arc::clone(&search_active)` / `&search_active` → `writes_pending` (startup backfill thread, periodic backfill, accept-loop clone, reindex thread, `handle_client` signature). The pass calls keep passing it in the same position.
+- In `handle_client`, replace the Task 6 read-only Search guard block + dispatch with the write-side guard:
+
+```rust
+    let resp = if req.is_read_only() {
+        let conn = read_pool.checkout();
+        daemon::handle_request(&conn, req, project_root, &SHUTDOWN)
+    } else {
+        // Mark a write pending BEFORE locking so reindex/backfill yields the
+        // writer to us within one batch (mirror of the retired search yield).
+        let _pending = backfill::PendingWriteGuard::new(writes_pending);
+        let conn = conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        daemon::handle_request(&conn, req, project_root, &SHUTDOWN)
+    };
+    write_response(stream, &resp)?;
+    Ok(())
+```
+
+- `AtomicUsize` import stays (still used by `writes_pending`).
 
 - [ ] **Step 3: Build + test**
 
@@ -831,19 +896,19 @@ Expected: builds clean (no unused-import / dead-code warnings); all tests pass.
 
 ```bash
 git add src/bin/tsmd/backfill.rs src/bin/tsmd/daemon_mode.rs
-git commit -m "refactor(tsmd): remove search_active DB-lock yield (dead after pool split)"
+git commit -m "feat(tsmd): yield reindex to pending writes (flip search_active)"
 ```
 
 ---
 
-### Task 8: E2E regression — status/doctor stay responsive during reindex
+### Task 8: E2E regression — reads responsive AND writes preempt during reindex
 
 **Files:**
 - Modify: `tests/e2e.sh`
 
 **Interfaces:**
 - Consumes: the built `tsm`/`tsmd` binaries and the e2e harness's existing daemon setup.
-- Produces: a timed assertion in the e2e suite.
+- Produces: two timed assertions in the e2e suite (read responsiveness + write preemption).
 
 Read `tests/e2e.sh` first to match its existing helpers (daemon start/stop, project setup, assertion style, the date-placeholder convention for testdata).
 
@@ -868,16 +933,37 @@ echo "PASS: status responsive during reindex (${elapsed_ms}ms)"
 
 > The 2000ms bound is a generous ceiling — the freeze it guards against is multi-second to indefinite. Tune to the suite's corpus if it runs on a tiny dataset where reindex finishes instantly (in that case, also assert the reindex actually ran by checking a larger corpus or a `tsm doctor` field).
 
-- [ ] **Step 2: Run the e2e suite**
+- [ ] **Step 2: Add the write-preemption check**
+
+Set a small `reindex_fts_batch_size` (e.g. export `TSM_REINDEX_FTS_BATCH_SIZE=10` for the daemon under test, or set it in the test's tsm.toml), kick a reindex, then time a `tsm index` of one file:
+
+```bash
+# --- Regression: a file index preempts an in-progress reindex (ADR-0015) ---
+tsm reindex fts >/dev/null 2>&1 &
+reindex_kick=$!
+start_ns=$(date +%s%N)
+echo "$SOME_INDEXED_FILE" | tsm index --files-from-stdin >/dev/null
+elapsed_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+wait "$reindex_kick" 2>/dev/null || true
+if [ "$elapsed_ms" -gt 3000 ]; then
+  echo "FAIL: tsm index took ${elapsed_ms}ms during reindex (expected preemption < 3000ms)"
+  exit 1
+fi
+echo "PASS: index preempts reindex (${elapsed_ms}ms)"
+```
+
+> Use a file the corpus already contains so the index is a quick diff/no-op write, isolating scheduling latency from indexing work. The bound assumes the small batch size; if the harness corpus makes reindex finish before the index even starts, enlarge the corpus or raise the batch via env so the race is real.
+
+- [ ] **Step 3: Run the e2e suite**
 
 Run: `cargo build --release && bash tests/e2e.sh`
-Expected: the suite passes, including the new PASS line.
+Expected: the suite passes, including both new PASS lines.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add tests/e2e.sh
-git commit -m "test(e2e): assert status stays responsive during reindex"
+git commit -m "test(e2e): assert reads responsive and writes preempt during reindex"
 ```
 
 ---
@@ -890,17 +976,18 @@ git commit -m "test(e2e): assert status stays responsive during reindex"
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: docs describing the connection model + `reader_pool_size`.
+- Produces: docs describing the connection model, write fairness, and the new config keys.
 
 - [ ] **Step 1: Update `CLAUDE.md`**
 
 - In the daemon/data-flow description, note: tsmd owns one writer connection plus a read-only pool (`query_only`); reads (status/doctor/search/ping) are served from the pool concurrently with writes.
 - Add a Gotchas bullet: "Read requests are routed by `DaemonRequest::is_read_only()` (exhaustive match — a new request variant must be classified or it won't compile). Reads run on the `query_only` reader pool sized by `reader_pool_size` (default CPU cores); writes serialize on the single writer."
+- Add a Gotchas bullet on write fairness: "reindex/backfill yields the writer to a pending `Index` (`yield_to_pending_writes`), so a file/interactive index preempts an in-progress reindex within one batch. The FTS reindex batch is `reindex_fts_batch_size` (default 200); smaller = finer preemption, more fsync."
 - Note `busy_timeout` is now set on all connections.
 
 - [ ] **Step 2: Update `README.md` and `README.ja.md`**
 
-Add `reader_pool_size` to the configuration reference in both (English + Japanese), with the default (CPU core count) and meaning (caps concurrent reads). Keep wording parallel between the two files.
+Add `reader_pool_size` (default CPU cores; caps concurrent reads) and `reindex_fts_batch_size` (default 200; preemption granularity vs reindex throughput) to the configuration reference in both (English + Japanese). Keep wording parallel between the two files.
 
 - [ ] **Step 3: Lint docs**
 
@@ -911,7 +998,7 @@ Expected: no errors.
 
 ```bash
 git add CLAUDE.md README.md README.ja.md
-git commit -m "docs: describe read/write connection split and reader_pool_size"
+git commit -m "docs: describe read/write connection split, write fairness, config knobs"
 ```
 
 ---
