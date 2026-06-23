@@ -42,12 +42,15 @@ pub(crate) fn prepare(
         Some(format!("{:?}", fm.tags))
     };
     let chunk_inputs = chunk_markdown_default(body, directory, filename)
-        .iter()
-        .map(|c| ChunkInput {
-            chunk_index: c.chunk_index,
-            section_path: c.section_path.clone(),
-            content: c.content.clone(),
-            content_hash: chunk_hash(&c.content),
+        .into_iter()
+        .map(|c| {
+            let content_hash = chunk_hash(&c.content);
+            ChunkInput {
+                chunk_index: c.chunk_index,
+                section_path: c.section_path,
+                content: c.content,
+                content_hash,
+            }
         })
         .collect();
     Ok(PreparedFile {
@@ -79,5 +82,6 @@ mod tests {
         assert!(!p.chunk_inputs.is_empty());
         assert_eq!(p.chunk_inputs[0].content_hash.len(), 64); // sha-256 hex
         assert!(p.metadata_json.contains("status"));
+        assert!(p.text.contains("body text"));
     }
 }
