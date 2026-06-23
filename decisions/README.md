@@ -21,7 +21,7 @@
 | [0011](./0011-uninitialized-db-failfast-and-readonly-doctor.md) | 未初期化 DB での fail-fast と doctor の read-only 化 | Accepted | 2026-06-22 |
 | [0012](./0012-output-channel-model.md) | 出力チャネルモデル（ユーザー出力 / ログ / エラーの分離） | Accepted | 2026-06-22 |
 | [0013](./0013-lua-metadata-scoring-hooks.md) | メタデータ抽出とスコアリングを Lua フックで拡張可能にする | Accepted | 2026-06-22 |
-| [0014](./0014-search-vocabulary-model.md) | 検索語彙リソースの管理モデル（dict 判定 / synonym 軸分離 / reading） | Proposed | 2026-06-23 |
+| [0014](./0014-search-vocabulary-model.md) | 検索語彙リソースの管理モデル（判定 / synonym 軸分離 / 読み） | Proposed | 2026-06-23 |
 
 新規 ADR 追加時は上記表にも 1 行追加すること。
 
