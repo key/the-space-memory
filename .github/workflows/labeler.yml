@@ -2,7 +2,7 @@ name: PR Labeler
 
 on:
   pull_request_target:
-    types: [opened]
+    types: [opened, edited]
 
 permissions:
   contents: read
@@ -15,3 +15,25 @@ jobs:
       - uses: actions/labeler@f27b608878404679385c85cfa523b85ccb86e213 # v6.1.0
         with:
           configuration-path: .github/labeler.yml
+
+  # actions/labeler only matches branch/paths, so it cannot detect a *breaking*
+  # change (a semantic property). Apply the `breaking` label from the
+  # Conventional Commits marker instead: a `!` after the type in the PR title
+  # (e.g. `feat!:`, `fix(scope)!:`) or a `BREAKING CHANGE` footer in the body.
+  breaking:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Label breaking changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Read title/body from env (never interpolate untrusted PR text into
+          # the script) and grep for the breaking markers.
+          if printf '%s' "$TITLE" | grep -qE '^[a-z]+(\([^)]*\))?!:' \
+            || printf '%s' "$BODY" | grep -qE 'BREAKING[ -]CHANGE'; then
+            gh pr edit "$PR" --repo "$REPO" --add-label breaking
+          fi
