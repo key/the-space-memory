@@ -57,7 +57,7 @@ LoRa,名詞,LoRa
 ### reject_words.txt
 
 辞書に登録したくない単語のリスト。`tsm dict reject --apply` でDBに反映する。
-`rebuild --force` でDB がリセットされても、このファイルから再適用できる。
+`rebuild --apply` でDB がリセットされても、このファイルから再適用できる。
 
 ```text
 # English stop words
@@ -138,7 +138,7 @@ tsm start
 
 ### rebuild 後のリジェクト再適用
 
-`tsm rebuild --force` は DB を削除・再作成するため、
+`tsm rebuild --apply` は DB を削除・再作成するため、
 `dictionary_candidates` テーブルの rejected ステータスが失われる。
 `reject_words.txt` から再適用する:
 

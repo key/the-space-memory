@@ -10,7 +10,20 @@ env var  >  tsm.toml  >  built-in default
 
 ## Config File Search Order
 
-tsm searches for a config file in the following order; the first file found wins for each field:
+The `tsm` CLI resolves the **project root** first — the current directory if it
+contains `tsm.toml`, otherwise the directory given by `--project-root <DIR>` —
+then loads the config file from the first match (per field):
+
+1. `$TSM_CONFIG` — explicit override path
+2. `<project_root>/tsm.toml`
+
+There is no XDG (`~/.config/tsm/`) fallback on this path: an explicit project
+root is authoritative (ADR-0009 §2). If neither a `tsm.toml` in the current
+directory nor `--project-root` resolves a root, commands fail (except `tsm
+init`, which scaffolds in the current directory).
+
+The `tsmd` daemon, started without an injected root, uses legacy discovery,
+which additionally consults the XDG user config:
 
 1. `$TSM_CONFIG` — explicit override path
 2. `./tsm.toml` — working directory

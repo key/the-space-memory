@@ -10,6 +10,14 @@ Rustで構築されたクロスワークスペース・ナレッジ検索エン�
 複数ワークスペースのMarkdownドキュメントをインデックス化し、
 FTS5全文検索とベクトルセマンティック検索（ruri-v3-30m, 256次元）のハイブリッド検索を提供する。
 
+## Claude Code プラグイン
+
+本リポジトリが提供するのは `tsm` / `tsmd` バイナリのみ。Claude Code プラグイン
+（スキル・エージェント・hook）は別リポジトリ
+[`key/claude-code-plugins`](https://github.com/key/claude-code-plugins) の
+`plugins/the-space-memory/` にある。プラグインはそちらから導入し、`tsm` を
+`PATH` に通すこと。
+
 ## コンセプト
 
 - **ワークスペース横断検索** — 複数のリポジトリ（個人メモ、業務プロジェクト、テックノート等）をオーケストレーションリポジトリから一括検索

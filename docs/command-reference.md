@@ -4,6 +4,7 @@ Complete reference for all `tsm` CLI subcommands.
 
 ## Table of Contents
 
+- [Global Flags](#global-flags)
 - [Lifecycle Commands](#lifecycle-commands)
   - [tsm init](#tsm-init)
   - [tsm start](#tsm-start)
@@ -33,6 +34,16 @@ Complete reference for all `tsm` CLI subcommands.
   - [tsm synonym import](#tsm-synonym-import)
 - [Temporal Query Syntax](#temporal-query-syntax)
 - [Output Formats](#output-formats)
+
+---
+
+## Global Flags
+
+These flags apply to every subcommand.
+
+| Flag | Description |
+|---|---|
+| `--project-root <DIR>` | Directory holding `tsm.toml`, treated as the project root. Used when the current directory has no `tsm.toml`; content paths and state resolve against it. Without either, commands fail (except `tsm init`, which scaffolds in the current directory). See ADR-0009 §2. |
 
 ---
 
@@ -236,7 +247,7 @@ applied as date filters (see [Temporal Query Syntax](#temporal-query-syntax)).
 | `--recent` | | duration | | Return documents from the last N days/weeks/months |
 | `--year` | | integer | | Return documents from a specific year |
 | `--path` | | string | | Filter by path prefix (relative, repeatable — OR logic) |
-| `--fallback` | | `error`\|`fts-only` | `error` | Behavior when embedder is unavailable |
+| `--fallback` | | `error`\|`fts_only` | `error` | Behavior when embedder is unavailable |
 
 **Date format for `--after` / `--before`:** `YYYY-MM-DD`, `YYYY-MM`, or `YYYY`.
 
@@ -247,7 +258,7 @@ Example: `30d`, `2w`, `3m`.
 combined with OR logic (any match). Must be a relative path, not absolute.
 
 **`--fallback` flag:** When `error` (default), search fails if the embedder is
-not running. When `fts-only`, falls back to full-text search only.
+not running. When `fts_only`, falls back to full-text search only.
 
 **Examples:**
 
@@ -277,7 +288,7 @@ tsm search -q "API design" --path projects/ --path research/
 tsm search -q "deployment" -f json --include-content 3
 
 # FTS-only mode (no embedder required)
-tsm search -q "lindera tokenizer" --fallback fts-only
+tsm search -q "lindera tokenizer" --fallback fts_only
 ```
 
 ---
