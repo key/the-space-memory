@@ -1,19 +1,18 @@
+pub(crate) mod plan;
+
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde_json::json;
 
-use crate::classifier;
 use crate::config;
 use crate::db;
 use crate::doc_links;
 use crate::embedder;
 use crate::entity;
-use crate::synonyms;
 use crate::temporal::TimeFilter;
-use crate::tokenizer::{extract_search_keywords, wakachi};
-use crate::user_dict;
+use crate::tokenizer::wakachi;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
@@ -45,40 +44,25 @@ pub fn search(
     require_vector: bool,
     path_prefixes: Option<&[String]>,
 ) -> anyhow::Result<SearchOutput> {
-    // Query preprocessing: extract meaningful keywords, skip noise-only queries
-    let keywords = extract_search_keywords(query);
-    if keywords.len() < config::MIN_QUERY_KEYWORDS {
-        return Ok(SearchOutput {
-            results: Vec::new(),
-            total_hits: 0,
-        });
-    }
-    let query = &keywords.join(" ");
-
-    let limit = top_k * 3;
-    let cls = classifier::classify(conn, query);
-
-    // Lazy spawn stale synonym cleanup (once per process)
-    synonyms::maybe_spawn_cleanup(config::db_path());
-
-    // Collect query terms as dictionary candidates
-    user_dict::collect_from_query(conn, query);
-
-    // Expand query: entity graph + synonym dictionary
-    let entity_exp =
-        entity::expand_entities_by_ids(conn, &cls.matched_entity_ids, config::MAX_QUERY_EXPANSIONS);
-    let synonym_exp = synonyms::expand_query_synonyms(conn, query, 3, 0.3);
-    let mut all_expansions = entity_exp;
-    for s in synonym_exp {
-        if !all_expansions.contains(&s) {
-            all_expansions.push(s);
+    // Plan stage: keyword extraction, classification, side effects, expansions
+    let qp = match plan::plan(conn, query)? {
+        Some(p) => p,
+        None => {
+            return Ok(SearchOutput {
+                results: Vec::new(),
+                total_hits: 0,
+            })
         }
-    }
+    };
+    let query = qp.keywords_query.as_str();
+    let cls = &qp.classification;
+    let all_expansions = &qp.expansions;
+    let limit = top_k * 3;
 
     let fts_ranks = if all_expansions.is_empty() {
         fts_results(conn, query, limit)?
     } else {
-        let expanded = build_expanded_fts_query(query, &all_expansions);
+        let expanded = build_expanded_fts_query(query, all_expansions);
         fts_results_raw(conn, &expanded, limit)?
     };
     let vec_ranks = vec_results(conn, query, limit)?;
