@@ -26,6 +26,11 @@ Complete reference for all `tsm` CLI subcommands.
 - [Dictionary Management](#dictionary-management)
   - [tsm dict update](#tsm-dict-update)
   - [tsm dict reject](#tsm-dict-reject)
+- [Synonym Management](#synonym-management)
+  - [tsm synonym add](#tsm-synonym-add)
+  - [tsm synonym rm](#tsm-synonym-rm)
+  - [tsm synonym export](#tsm-synonym-export)
+  - [tsm synonym import](#tsm-synonym-import)
 - [Temporal Query Syntax](#temporal-query-syntax)
 - [Output Formats](#output-formats)
 
@@ -38,7 +43,7 @@ These commands run directly (not routed through the daemon).
 ### tsm init
 
 Initialize the workspace: schema, scaffold files, WordNet import, user
-synonym sync. All steps are idempotent and re-runnable.
+synonym import. All steps are idempotent and re-runnable.
 
 ```text
 tsm init
@@ -59,8 +64,9 @@ overwritten:
 3. Imports Japanese WordNet synonyms from `.tsm/wnjpn.db` if present.
    If missing, logs a warning and continues — run `tsm setup` to
    download the file, then re-run `tsm init` to import.
-4. Syncs user-defined synonyms from `.tsm/synonyms.csv` (diff-based,
-   safe to re-run).
+4. Imports user-defined synonyms from `.tsm/synonyms.csv` (mirrors the
+   `source = 'user'` subset, safe to re-run). See
+   [tsm synonym import](#tsm-synonym-import).
 
 **Flags:** none
 
@@ -655,22 +661,75 @@ tsm dict reject --all
 
 ---
 
-### tsm dict synonym sync
+## Synonym Management
 
-Sync user-defined synonym pairs from a CSV file to the database.
+`tsm dict` manages the lindera **user dictionary** (tokenization). Synonyms are a
+separate axis — query-expansion pairs applied at search time — and live under
+`tsm synonym`. The DB is the authority; `.tsm/synonyms.csv` is a portable,
+git-trackable record that round-trips via `export` / `import`.
+
+The four subcommands operate only on `source = 'user'` pairs. WordNet pairs
+(`tsm import-wordnet`) and learned pairs are left untouched.
+
+### tsm synonym add
+
+Add a single synonym pair to the database.
 
 ```text
-tsm dict synonym sync
+tsm synonym add <a> <b>
 ```
 
-Reads `.tsm/synonyms.csv` and syncs its contents to the synonyms table.
-The CSV file is the source of truth:
+Inserts the pair with `source = 'user'` (score 0.7, no decay). Words are
+lowercased, trimmed, and stored in a canonical order. Adding a pair that already
+exists with a lower score upgrades it to a user pair. Identical or empty words
+are rejected.
 
-- Pairs in the file are inserted with `source = 'user'` (score 0.7, no decay)
-- Pairs removed from the file are deleted from the database
-- Pairs from other sources (e.g. WordNet) are not affected
+```bash
+tsm synonym add 猟銃 散弾銃
+```
 
-`tsm setup` runs this automatically when the file exists.
+### tsm synonym rm
+
+Remove user synonym pair(s) from the database.
+
+```text
+tsm synonym rm <a> [<b>]
+```
+
+With both words, removes the single pair `(a, b)` (order-insensitive). With one
+word, removes every user pair involving it. Only `source = 'user'` rows are
+deleted; a matching WordNet pair is reported and left intact.
+
+```bash
+tsm synonym rm 猟銃 散弾銃   # remove one pair
+tsm synonym rm 猟銃          # remove all user pairs involving 猟銃
+```
+
+### tsm synonym export
+
+Write user synonym pairs from the database to `.tsm/synonyms.csv` (DB → file).
+
+```text
+tsm synonym export
+```
+
+Emits only `source = 'user'` pairs as `a,b` lines, sorted for stable diffs,
+under a header comment. Overwrites the file. Use it to capture DB state for git
+review or backup.
+
+### tsm synonym import
+
+Load user synonym pairs from `.tsm/synonyms.csv` into the database (file → DB).
+
+```text
+tsm synonym import
+```
+
+Mirrors the file onto the `source = 'user'` subset: pairs in the file are
+inserted, and user pairs absent from the file are deleted. Pairs from other
+sources (e.g. WordNet) are not affected. `tsm init` runs this automatically when
+the file exists. Inverse of `export`; the round-trip is exact over the user
+subset.
 
 **CSV format:**
 
@@ -683,14 +742,10 @@ LoRa,LPWAN
 
 Two columns, no header. Lines starting with `#` are ignored.
 
-**Example:**
-
 ```bash
-# Create synonyms file
+# Create synonyms file and import it
 echo "猟銃,散弾銃" > .tsm/synonyms.csv
-
-# Sync to database
-tsm dict synonym sync
+tsm synonym import
 ```
 
 ---
