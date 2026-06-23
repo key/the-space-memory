@@ -1,18 +1,13 @@
 pub(crate) mod plan;
-
-use std::collections::HashMap;
+pub(crate) mod retrieve;
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde_json::json;
 
 use crate::config;
-use crate::db;
 use crate::doc_links;
-use crate::embedder;
-use crate::entity;
 use crate::temporal::TimeFilter;
-use crate::tokenizer::wakachi;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
@@ -54,31 +49,16 @@ pub fn search(
             })
         }
     };
-    let query = qp.keywords_query.as_str();
     let cls = &qp.classification;
-    let all_expansions = &qp.expansions;
     let limit = top_k * 3;
 
-    let fts_ranks = if all_expansions.is_empty() {
-        fts_results(conn, query, limit)?
-    } else {
-        let expanded = build_expanded_fts_query(query, all_expansions);
-        fts_results_raw(conn, &expanded, limit)?
-    };
-    let vec_ranks = vec_results(conn, query, limit)?;
-    if require_vector && vec_ranks.is_empty() && db::has_vec_table(conn) {
-        anyhow::bail!(
-            "Embedder is not running. Vector search unavailable.\n\
-             Run `tsm restart` to restart, or use `--fallback fts_only` for FTS-only search."
-        );
-    }
-    let ent_ranks =
-        entity::entity_results_by_ids(conn, &cls.matched_entity_ids, limit).unwrap_or_default();
+    let candidates = retrieve::retrieve(conn, &qp, limit, require_vector)?;
 
-    let all_chunk_ids: Vec<i64> = fts_ranks
+    let all_chunk_ids: Vec<i64> = candidates
+        .fts
         .keys()
-        .chain(vec_ranks.keys())
-        .chain(ent_ranks.keys())
+        .chain(candidates.vec.keys())
+        .chain(candidates.entity.keys())
         .copied()
         .collect::<std::collections::HashSet<i64>>()
         .into_iter()
@@ -176,13 +156,13 @@ pub fn search(
             row?;
 
         let mut rrf = 0.0;
-        if let Some(&rank) = fts_ranks.get(&chunk_id) {
+        if let Some(&rank) = candidates.fts.get(&chunk_id) {
             rrf += cls.fts_weight / (config::RRF_K + rank as f64);
         }
-        if let Some(&rank) = vec_ranks.get(&chunk_id) {
+        if let Some(&rank) = candidates.vec.get(&chunk_id) {
             rrf += cls.vec_weight / (config::RRF_K + rank as f64);
         }
-        if let Some(&rank) = ent_ranks.get(&chunk_id) {
+        if let Some(&rank) = candidates.entity.get(&chunk_id) {
             rrf += 1.0 / (config::RRF_K + rank as f64);
         }
 
@@ -297,39 +277,6 @@ pub(crate) fn today_string() -> String {
     Utc::now().date_naive().format("%Y-%m-%d").to_string()
 }
 
-/// Build an expanded FTS5 query: original terms (AND) OR expansion terms.
-fn build_expanded_fts_query(query: &str, expansions: &[String]) -> String {
-    let wakachi_query = wakachi(query);
-    let tokens: Vec<&str> = wakachi_query.split_whitespace().collect();
-    if tokens.is_empty() {
-        return query.to_string();
-    }
-
-    let original = tokens
-        .iter()
-        .map(|t| format!("\"{t}\""))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-
-    if expansions.is_empty() {
-        return original;
-    }
-
-    let expansion_terms: Vec<String> = expansions
-        .iter()
-        .map(|e| {
-            let w = wakachi(e);
-            let toks: Vec<&str> = w.split_whitespace().collect();
-            toks.iter()
-                .map(|t| format!("\"{t}\""))
-                .collect::<Vec<_>>()
-                .join(" AND ")
-        })
-        .collect();
-
-    format!("({}) OR {}", original, expansion_terms.join(" OR "))
-}
-
 pub(crate) fn snippet(content: &str) -> String {
     let text = match content.split_once('\n') {
         Some((_, rest)) => rest,
@@ -337,98 +284,6 @@ pub(crate) fn snippet(content: &str) -> String {
     };
     let chars: String = text.chars().take(config::SNIPPET_MAX_CHARS).collect();
     chars.trim().to_string()
-}
-
-fn fts_results(
-    conn: &Connection,
-    query: &str,
-    limit: usize,
-) -> anyhow::Result<HashMap<i64, usize>> {
-    if query.trim().is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let wakachi_query = wakachi(query);
-    let tokens: Vec<&str> = wakachi_query.split_whitespace().collect();
-    if tokens.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let fts_query = tokens
-        .iter()
-        .map(|t| format!("\"{t}\""))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-
-    fts_results_raw(conn, &fts_query, limit)
-}
-
-fn fts_results_raw(
-    conn: &Connection,
-    fts_query: &str,
-    limit: usize,
-) -> anyhow::Result<HashMap<i64, usize>> {
-    if fts_query.trim().is_empty() {
-        return Ok(HashMap::new());
-    }
-    let fts_query = fts_query.to_string();
-
-    let mut stmt = conn.prepare(
-        "SELECT chunks_fts.rowid AS chunk_id
-         FROM chunks_fts
-         WHERE chunks_fts MATCH ?
-         ORDER BY rank
-         LIMIT ?",
-    )?;
-
-    let rows = stmt.query_map(rusqlite::params![fts_query, limit as i64], |row| {
-        row.get::<_, i64>(0)
-    })?;
-
-    let mut result = HashMap::new();
-    for (i, row) in rows.enumerate() {
-        result.insert(row?, i);
-    }
-    Ok(result)
-}
-
-fn vec_results(
-    conn: &Connection,
-    query: &str,
-    limit: usize,
-) -> anyhow::Result<HashMap<i64, usize>> {
-    if query.trim().is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    // Check if vec table exists
-    if !db::has_vec_table(conn) {
-        return Ok(HashMap::new());
-    }
-
-    // Get query embedding from embedder daemon
-    let texts = vec![query.to_string()];
-    let embeddings = match embedder::embed_via_socket(&texts) {
-        Some(e) if !e.is_empty() => e,
-        _ => return Ok(HashMap::new()), // Embedder not running, graceful fallback
-    };
-
-    let query_vec = serde_json::to_string(&embeddings[0])?;
-
-    let mut stmt = conn.prepare(
-        "SELECT rowid, distance FROM chunks_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-    )?;
-
-    let rows = stmt.query_map(rusqlite::params![query_vec, limit as i64], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
-    })?;
-
-    let mut result = HashMap::new();
-    for (i, row) in rows.enumerate() {
-        let (chunk_id, _distance) = row?;
-        result.insert(chunk_id, i);
-    }
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -516,73 +371,6 @@ mod tests {
     #[test]
     fn test_snippet_single_line() {
         assert_eq!(snippet("単一行テスト"), "単一行テスト");
-    }
-
-    #[test]
-    fn test_fts_insert_and_match() {
-        let conn = db::get_memory_connection().unwrap();
-        conn.execute(
-            "INSERT INTO documents (file_path, source_type, title, file_hash, indexed_at)
-             VALUES ('test.md', 'note', 'Test', 'hash', '2026-01-01')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO chunks (document_id, chunk_index, section_path, content)
-             VALUES (1, 0, 'Test', '射撃場のルールについて説明します。')",
-            [],
-        )
-        .unwrap();
-        let chunk_id: i64 = conn
-            .query_row("SELECT id FROM chunks WHERE document_id = 1", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let wakachi_text = wakachi("射撃場のルールについて説明します。");
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
-            rusqlite::params![chunk_id, wakachi_text],
-        )
-        .unwrap();
-
-        let ranks = fts_results(&conn, "射撃", 10).unwrap();
-        assert!(!ranks.is_empty());
-        assert!(ranks.contains_key(&chunk_id));
-    }
-
-    #[test]
-    fn test_fts_no_match() {
-        let conn = db::get_memory_connection().unwrap();
-        conn.execute(
-            "INSERT INTO documents (file_path, source_type, title, file_hash, indexed_at)
-             VALUES ('test.md', 'note', 'Test', 'hash', '2026-01-01')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO chunks (document_id, chunk_index, section_path, content)
-             VALUES (1, 0, 'Test', '射撃場のルール')",
-            [],
-        )
-        .unwrap();
-        let wakachi_text = wakachi("射撃場のルール");
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, content) VALUES (1, ?)",
-            rusqlite::params![wakachi_text],
-        )
-        .unwrap();
-
-        let ranks = fts_results(&conn, "ロケット", 10).unwrap();
-        assert!(ranks.is_empty());
-    }
-
-    #[test]
-    fn test_fts_empty_query() {
-        let conn = db::get_memory_connection().unwrap();
-        let ranks = fts_results(&conn, "", 10).unwrap();
-        assert!(ranks.is_empty());
-        let ranks = fts_results(&conn, "   ", 10).unwrap();
-        assert!(ranks.is_empty());
     }
 
     #[test]
@@ -731,30 +519,6 @@ mod tests {
         let SearchOutput { results, .. } =
             search(&conn, "射撃", 5, Some(&filter), false, None).unwrap();
         assert!(!results.is_empty());
-    }
-
-    // ─── query expansion tests ───────────────────────────────
-
-    #[test]
-    fn test_build_expanded_fts_query_no_expansions() {
-        let result = build_expanded_fts_query("射撃 ルール", &[]);
-        // Should just be the original wakachi'd AND query
-        assert!(result.contains("AND"));
-        assert!(!result.contains("OR"));
-    }
-
-    #[test]
-    fn test_build_expanded_fts_query_with_expansions() {
-        let result =
-            build_expanded_fts_query("rust", &["sqlite".to_string(), "lindera".to_string()]);
-        assert!(result.contains("OR"));
-        assert!(result.contains("rust"));
-    }
-
-    #[test]
-    fn test_build_expanded_fts_query_empty_query() {
-        let result = build_expanded_fts_query("", &["sqlite".to_string()]);
-        assert_eq!(result, "");
     }
 
     #[test]

@@ -1,9 +1,11 @@
 use rusqlite::Connection;
 
-use crate::{classifier, config, entity, synonyms, tokenizer::extract_search_keywords, user_dict};
+use crate::{
+    classifier, config, embedder, entity, synonyms, tokenizer::extract_search_keywords, user_dict,
+};
 
-/// Output of the Plan stage: extracted keywords, classification weights, and
-/// merged entity + synonym expansions for use by subsequent stages.
+/// Output of the Plan stage: extracted keywords, classification weights,
+/// merged entity + synonym expansions, and the embedded query vector.
 pub(crate) struct QueryPlan {
     /// Keyword-only form of the original query (space-joined after extraction).
     pub(crate) keywords_query: String,
@@ -11,10 +13,12 @@ pub(crate) struct QueryPlan {
     pub(crate) classification: classifier::QueryClassification,
     /// Merged entity-graph + synonym expansions (deduped).
     pub(crate) expansions: Vec<String>,
+    /// Query embedding from the embedder daemon; `None` when unavailable.
+    pub(crate) query_vec: Option<Vec<f32>>,
 }
 
 /// Plan stage: extract keywords, classify the query, run side-effect calls,
-/// and expand via entity graph and synonyms.
+/// expand via entity graph and synonyms, and embed the query for vector search.
 ///
 /// Returns `Ok(None)` if the query contains too few meaningful keywords to
 /// search (the caller should return an empty result set). Returns
@@ -48,10 +52,21 @@ pub(crate) fn plan(conn: &Connection, query: &str) -> anyhow::Result<Option<Quer
         }
     }
 
+    // Embed the query for vector search; None when embedder is unavailable.
+    let texts = vec![keywords_query.clone()];
+    let query_vec = embedder::embed_via_socket(&texts).and_then(|mut e| {
+        if e.is_empty() {
+            None
+        } else {
+            Some(e.remove(0))
+        }
+    });
+
     Ok(Some(QueryPlan {
         keywords_query,
         classification,
         expansions,
+        query_vec,
     }))
 }
 
