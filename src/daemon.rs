@@ -51,7 +51,7 @@ pub fn handle_request(
             };
             match cli::run_search(conn, &opts) {
                 Ok(output) => {
-                    let json_str = cli::format_json(
+                    let json_str = crate::searcher::format_json(
                         &output.results,
                         output.total_hits,
                         include_content,
