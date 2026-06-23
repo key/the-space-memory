@@ -61,7 +61,12 @@ src/
 ├── cli.rs              — CLI command implementations
 ├── config.rs           — Configuration (TSM_* env vars, config file, scoring params)
 ├── db.rs               — SQLite (rusqlite) DB init & connection management
-├── indexer.rs           — Indexer (diff detection, FTS5/vector registration)
+├── indexer/             — Index pipeline (Prepare/Persist/Embed stages, ADR-0007)
+│   ├── mod.rs           — Orchestration: index_file (prepare→persist→embed), index_all*, index_session
+│   ├── prepare.rs       — Prepare stage: file → PreparedFile (parse/chunk/metadata, no DB)
+│   ├── persist.rs       — Persist stage: one transaction (documents/chunks/FTS5/entity/links), diff, rebuild_fts
+│   ├── embed.rs         — Embed stage: async vector inference + writes (backfill)
+│   └── walker.rs        — File discovery + ingest policy
 ├── searcher.rs          — FTS5 + vector search, RRF fusion, scoring
 ├── embedder.rs          — candle + ruri-v3-30m inference (pure library)
 ├── lua_hooks.rs         — Embedded Lua runtime for extract/score hooks (ADR-0013)

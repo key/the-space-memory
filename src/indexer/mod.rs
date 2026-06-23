@@ -1,23 +1,22 @@
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-use crate::chunker::chunk_markdown_default;
-use crate::config;
-use crate::db;
-use crate::doc_links;
-use crate::embedder;
-use crate::entity;
-use crate::frontmatter;
 use crate::session_chunker::parse_session_jsonl;
-use crate::tokenizer::wakachi;
 use crate::user_dict;
 
 pub mod walker;
 
 pub use walker::ContentWalker;
+
+mod embed;
+pub use embed::{backfill_next_batch, backfill_vectors, BackfillStats, EncodeFn};
+
+mod prepare;
+
+mod persist;
+pub use persist::{rebuild_fts, rebuild_fts_next_batch};
 
 /// Decides whether a single path is allowed through the ingest pipeline.
 ///
@@ -50,15 +49,6 @@ pub struct IndexStats {
     pub removed: usize,
 }
 
-#[derive(Debug, Default)]
-pub struct BackfillStats {
-    pub filled: usize,
-    pub errors: usize,
-    pub panics: usize,
-    /// Keyset pagination cursor (last processed chunk ID).
-    pub last_id: i64,
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -89,205 +79,7 @@ fn directory_from_rel_path(rel_path: &str) -> String {
     }
 }
 
-/// Delete FTS, vector, skip, and entity entries for specific chunk IDs.
-fn delete_chunk_side_tables(conn: &Connection, chunk_ids: &[i64]) -> anyhow::Result<()> {
-    if chunk_ids.is_empty() {
-        return Ok(());
-    }
-    let placeholders = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk_ids
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
-        .collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-    conn.execute(
-        &format!("DELETE FROM chunks_fts WHERE rowid IN ({placeholders})"),
-        param_refs.as_slice(),
-    )?;
-
-    // chunks_vec may not exist in older DBs
-    conn.execute(
-        &format!("DELETE FROM chunks_vec WHERE rowid IN ({placeholders})"),
-        param_refs.as_slice(),
-    )
-    .or_else(|e| {
-        if e.to_string().contains("no such table") {
-            Ok(0)
-        } else {
-            Err(e)
-        }
-    })?;
-
-    // chunks_vec_skip — may not exist in older DBs
-    conn.execute(
-        &format!("DELETE FROM chunks_vec_skip WHERE chunk_id IN ({placeholders})"),
-        param_refs.as_slice(),
-    )
-    .or_else(|e| {
-        if e.to_string().contains("no such table") {
-            Ok(0)
-        } else {
-            Err(e)
-        }
-    })?;
-
-    // chunk_entities — may not exist in older DBs
-    conn.execute(
-        &format!("DELETE FROM chunk_entities WHERE chunk_id IN ({placeholders})"),
-        param_refs.as_slice(),
-    )
-    .or_else(|e| {
-        if e.to_string().contains("no such table") {
-            Ok(0)
-        } else {
-            Err(e)
-        }
-    })?;
-
-    Ok(())
-}
-
-fn delete_old_entries(conn: &Connection, doc_id: i64) -> anyhow::Result<()> {
-    let chunk_ids: Vec<i64> = conn
-        .prepare("SELECT id FROM chunks WHERE document_id = ?")?
-        .query_map([doc_id], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    delete_chunk_side_tables(conn, &chunk_ids)?;
-
-    // document_links
-    doc_links::delete_links(conn, doc_id);
-
-    // entity_edges reference doc_id directly
-    conn.execute("DELETE FROM entity_edges WHERE doc_id = ?", [doc_id])
-        .or_else(|e| {
-            if e.to_string().contains("no such table") {
-                Ok(0)
-            } else {
-                Err(e)
-            }
-        })?;
-
-    conn.execute("DELETE FROM documents WHERE id = ?", [doc_id])?;
-    Ok(())
-}
-
-struct ChunkInput {
-    chunk_index: usize,
-    section_path: String,
-    content: String,
-    content_hash: String,
-}
-
-struct DiffResult {
-    /// All chunk entries (new + existing) as (chunk_id, content) — for entity rebuild.
-    all_chunk_entries: Vec<(i64, String)>,
-    /// Chunks needing vector embedding (new + changed).
-    chunks_needing_vectors: Vec<(i64, String)>,
-    /// Whether any mutation occurred.
-    had_mutations: bool,
-}
-
-/// Compare freshly parsed chunks against stored chunks for a document.
-/// Inserts new chunks, updates changed chunks, deletes removed chunks, skips unchanged.
-///
-/// MUST be called within a transaction — the caller is responsible for wrapping
-/// this in `unchecked_transaction()` to ensure atomicity of the multi-statement diff.
-fn diff_chunks(
-    conn: &Connection,
-    doc_id: i64,
-    new_chunks: &[ChunkInput],
-) -> anyhow::Result<DiffResult> {
-    use std::collections::HashMap;
-
-    // Load existing chunks: chunk_index → (id, content_hash)
-    let mut existing: HashMap<usize, (i64, Option<String>)> = HashMap::new();
-    {
-        let mut stmt =
-            conn.prepare("SELECT id, chunk_index, content_hash FROM chunks WHERE document_id = ?")?;
-        let rows = stmt.query_map([doc_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)? as usize,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (id, idx, hash) = row?;
-            existing.insert(idx, (id, hash));
-        }
-    }
-
-    let mut all_chunk_entries: Vec<(i64, String)> = Vec::new();
-    let mut chunks_needing_vectors: Vec<(i64, String)> = Vec::new();
-    let mut had_mutations = false;
-
-    for chunk in new_chunks {
-        if let Some((existing_id, ref stored_hash)) = existing.remove(&chunk.chunk_index) {
-            // Chunk exists at this index
-            if stored_hash.as_deref() == Some(&chunk.content_hash) {
-                // Unchanged — skip
-                all_chunk_entries.push((existing_id, chunk.content.clone()));
-            } else {
-                // Content changed — update
-                had_mutations = true;
-                conn.execute(
-                    "UPDATE chunks SET content = ?, content_hash = ?, section_path = ? WHERE id = ?",
-                    rusqlite::params![chunk.content, chunk.content_hash, chunk.section_path, existing_id],
-                )?;
-                // FTS5 does not support UPDATE — delete + insert
-                delete_chunk_side_tables(conn, &[existing_id])?;
-                let wakachi_text = wakachi(&chunk.content);
-                conn.execute(
-                    "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
-                    rusqlite::params![existing_id, wakachi_text],
-                )?;
-                all_chunk_entries.push((existing_id, chunk.content.clone()));
-                chunks_needing_vectors.push((existing_id, chunk.content.clone()));
-            }
-        } else {
-            // New chunk — insert
-            had_mutations = true;
-            conn.execute(
-                "INSERT INTO chunks (document_id, chunk_index, section_path, content, content_hash)
-                 VALUES (?, ?, ?, ?, ?)",
-                rusqlite::params![
-                    doc_id,
-                    chunk.chunk_index as i64,
-                    chunk.section_path,
-                    chunk.content,
-                    chunk.content_hash,
-                ],
-            )?;
-            let chunk_id = conn.last_insert_rowid();
-            let wakachi_text = wakachi(&chunk.content);
-            conn.execute(
-                "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
-                rusqlite::params![chunk_id, wakachi_text],
-            )?;
-            all_chunk_entries.push((chunk_id, chunk.content.clone()));
-            chunks_needing_vectors.push((chunk_id, chunk.content.clone()));
-        }
-    }
-
-    // Delete chunks that no longer exist
-    if !existing.is_empty() {
-        had_mutations = true;
-        let removed_ids: Vec<i64> = existing.values().map(|(id, _)| *id).collect();
-        delete_chunk_side_tables(conn, &removed_ids)?;
-        for id in &removed_ids {
-            conn.execute("DELETE FROM chunks WHERE id = ?", [id])?;
-        }
-    }
-
-    Ok(DiffResult {
-        all_chunk_entries,
-        chunks_needing_vectors,
-        had_mutations,
-    })
-}
+use prepare::ChunkInput;
 
 /// Index a single file. Returns true if the file was (re-)indexed, false if skipped.
 pub fn index_file(
@@ -325,91 +117,19 @@ pub fn index_file(
         }
     }
 
-    // Parse file
-    let text = std::fs::read_to_string(file_path)?;
-    let (fm, body) = frontmatter::parse(&text);
-    let fm_map = frontmatter::parse_map(&text);
+    let prepared = prepare::prepare(file_path, &rel_path, &directory, &filename)?;
 
-    let metadata_json =
-        crate::lua_hooks::run_extract(&crate::lua_hooks::hooks(), &rel_path, body, &fm_map)
-            .to_string();
-
-    let now = chrono::Utc::now().to_rfc3339();
-    let source_type = config::source_type_from_dir(&directory);
-    let tags_str = if fm.tags.is_empty() {
-        None
-    } else {
-        Some(format!("{:?}", fm.tags))
-    };
-
-    // Build chunk inputs with content hashes
-    let chunks = chunk_markdown_default(body, &directory, &filename);
-    let chunk_inputs: Vec<ChunkInput> = chunks
-        .iter()
-        .map(|c| ChunkInput {
-            chunk_index: c.chunk_index,
-            section_path: c.section_path.clone(),
-            content: c.content.clone(),
-            content_hash: chunk_hash(&c.content),
-        })
-        .collect();
-
-    let tx = conn.unchecked_transaction()?;
-
-    let doc_id = if let Some((doc_id, _)) = existing {
-        // Update existing document row (preserves doc_id for entity_edges/doc_links)
-        tx.execute(
-            "UPDATE documents SET source_type=?, title=?, status=?, created=?, updated=?, tags=?, file_hash=?, indexed_at=?, metadata=?
-             WHERE id=?",
-            rusqlite::params![
-                source_type, filename, fm.status, fm.created, fm.updated,
-                tags_str, current_hash, now, metadata_json, doc_id,
-            ],
-        )?;
-        doc_id
-    } else {
-        tx.execute(
-            "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at, metadata)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            rusqlite::params![
-                rel_path, source_type, filename, fm.status, fm.created, fm.updated,
-                tags_str, current_hash, now, metadata_json,
-            ],
-        )?;
-        tx.last_insert_rowid()
-    };
-
-    let diff = diff_chunks(&tx, doc_id, &chunk_inputs)?;
-
-    if diff.had_mutations {
-        // Rebuild entity graph (document-level)
-        tx.execute("DELETE FROM entity_edges WHERE doc_id = ?", [doc_id])
-            .or_else(|e| {
-                if e.to_string().contains("no such table") {
-                    Ok(0)
-                } else {
-                    Err(e)
-                }
-            })?;
-        if let Err(e) = entity::insert_entities(&tx, doc_id, &diff.all_chunk_entries, &fm.tags) {
-            log::warn!("entity extraction warning: {e}");
-        }
-
-        // Rebuild document links
-        doc_links::delete_links(&tx, doc_id);
-        doc_links::build_links(&tx, doc_id, &text, &fm.tags);
-
-        // Collect dictionary candidates
-        for (_, content) in &diff.all_chunk_entries {
-            user_dict::collect_from_text(&tx, content, "document");
-        }
-    }
-
-    tx.commit()?;
+    let diff = persist::persist(
+        conn,
+        &rel_path,
+        &current_hash,
+        existing.map(|(id, _)| id),
+        &prepared,
+    )?;
 
     // Vector embedding outside transaction (socket I/O)
     if !diff.chunks_needing_vectors.is_empty() {
-        insert_vectors(conn, &diff.chunks_needing_vectors);
+        embed::insert_vectors(conn, &diff.chunks_needing_vectors);
     }
 
     Ok(true)
@@ -473,7 +193,7 @@ pub fn index_all_with_progress(
                 )
                 .ok();
             if let Some(doc_id) = existing {
-                delete_old_entries(conn, doc_id)?;
+                persist::delete_old_entries(conn, doc_id)?;
                 stats.removed += 1;
             }
             continue;
@@ -572,7 +292,7 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
         tx.last_insert_rowid()
     };
 
-    let diff = diff_chunks(&tx, doc_id, &chunk_inputs)?;
+    let diff = persist::diff_chunks(&tx, doc_id, &chunk_inputs)?;
 
     // Note: entity graph and doc_links are not rebuilt for sessions.
     // Sessions don't participate in entity co-occurrence or link graphs.
@@ -581,7 +301,7 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
 
     // Vector embedding outside transaction (socket I/O)
     if !diff.chunks_needing_vectors.is_empty() {
-        insert_vectors(conn, &diff.chunks_needing_vectors);
+        embed::insert_vectors(conn, &diff.chunks_needing_vectors);
     }
 
     // Learn synonyms from human messages in the session (wrapped in transaction)
@@ -652,451 +372,13 @@ fn learn_from_session_jsonl(conn: &Connection, jsonl_path: &Path) {
     }
 }
 
-/// Insert vectors for chunks if embedder is running and vec table exists.
-/// Write a single embedding row to chunks_vec. Returns true on success.
-fn write_vec_row(conn: &Connection, chunk_id: i64, emb: &[f32]) -> bool {
-    let json = match serde_json::to_string(emb) {
-        Ok(j) => j,
-        Err(_) => return false,
-    };
-    conn.execute(
-        "INSERT OR IGNORE INTO chunks_vec(rowid, embedding) VALUES (?, ?)",
-        rusqlite::params![chunk_id, json],
-    )
-    .is_ok()
-}
-
-fn insert_vectors(conn: &Connection, chunk_entries: &[(i64, String)]) {
-    if chunk_entries.is_empty() {
-        return;
-    }
-    if !db::has_vec_table(conn) {
-        return;
-    }
-    // Skip socket I/O if embedder is not running
-    if !config::embedder_socket_path().exists() {
-        return;
-    }
-
-    let texts: Vec<String> = chunk_entries.iter().map(|(_, text)| text.clone()).collect();
-    let embeddings = match embedder::embed_via_socket(&texts) {
-        Some(e) => e,
-        None => return,
-    };
-
-    for ((chunk_id, _), emb) in chunk_entries.iter().zip(embeddings.iter()) {
-        write_vec_row(conn, *chunk_id, emb);
-    }
-}
-
 pub use crate::config::BACKFILL_BATCH_SIZE;
-
-/// Encode function type: takes texts, returns embedding vectors.
-pub type EncodeFn<'a> = &'a dyn Fn(&[String]) -> anyhow::Result<Vec<Vec<f32>>>;
-
-/// Extract a human-readable message from a panic payload.
-fn panic_message(info: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = info.downcast_ref::<String>() {
-        s.clone()
-    } else if let Some(&s) = info.downcast_ref::<&str>() {
-        s.to_string()
-    } else {
-        "unknown panic".to_string()
-    }
-}
-
-/// Record a chunk in the skip table so it is not retried on subsequent backfill runs.
-/// The skip record is automatically cleaned up when the parent document is re-indexed
-/// (chunks are deleted and re-created with new IDs).
-fn mark_chunk_skip(conn: &Connection, chunk_id: i64, reason: &str) -> bool {
-    match conn.execute(
-        "INSERT OR IGNORE INTO chunks_vec_skip(chunk_id, reason) VALUES (?, ?)",
-        rusqlite::params![chunk_id, reason],
-    ) {
-        Ok(_) => true,
-        Err(e) => {
-            log::warn!("failed to write skip record for chunk {chunk_id}: {e} — chunk will be retried next run");
-            false
-        }
-    }
-}
-
-/// Retry each chunk in the batch individually, skipping persistent failures.
-fn retry_individually(
-    batch: &[(i64, String, String)],
-    encode_fn: EncodeFn,
-    conn: &Connection,
-    stats: &mut BackfillStats,
-) {
-    for (chunk_id, content, file_path) in batch {
-        let single = vec![content.clone()];
-        let result = catch_unwind(AssertUnwindSafe(|| encode_fn(&single)));
-        match result {
-            Ok(Ok(ref embeddings)) if !embeddings.is_empty() => {
-                if write_vec_row(conn, *chunk_id, &embeddings[0]) {
-                    stats.filled += 1;
-                } else {
-                    log::warn!("chunk {chunk_id} ({file_path}): insert error — skipping");
-                    mark_chunk_skip(conn, *chunk_id, "insert_error");
-                    stats.errors += 1;
-                }
-            }
-            Ok(Ok(_)) => {
-                log::warn!("chunk {chunk_id} ({file_path}): empty embedding — skipping");
-                mark_chunk_skip(conn, *chunk_id, "empty_embedding");
-                stats.errors += 1;
-            }
-            Ok(Err(e)) => {
-                log::warn!("chunk {chunk_id} ({file_path}): error ({e}) — skipping");
-                mark_chunk_skip(conn, *chunk_id, "encode_error");
-                stats.errors += 1;
-            }
-            Err(panic_info) => {
-                let msg = panic_message(&panic_info);
-                log::error!("chunk {chunk_id} ({file_path}): PANIC ({msg}) — skipping");
-                mark_chunk_skip(conn, *chunk_id, "panic");
-                stats.panics += 1;
-                stats.errors += 1;
-            }
-        }
-    }
-}
-
-/// Process one batch of missing vectors. Returns (stats, has_more).
-/// `last_id` is the keyset pagination cursor — pass 0 for the first call,
-/// then pass the returned `stats.last_id` for subsequent calls.
-pub fn backfill_next_batch(
-    conn: &Connection,
-    encode_fn: EncodeFn,
-    batch_size: usize,
-    last_id: i64,
-) -> anyhow::Result<(BackfillStats, bool)> {
-    if !db::has_vec_table(conn) {
-        return Ok((BackfillStats::default(), false));
-    }
-
-    let batch: Vec<(i64, String, String)> = conn
-        .prepare(
-            "SELECT c.id, c.content, d.file_path
-             FROM chunks c
-             LEFT JOIN chunks_vec v ON c.id = v.rowid
-             LEFT JOIN chunks_vec_skip s ON c.id = s.chunk_id
-             JOIN documents d ON c.document_id = d.id
-             WHERE v.rowid IS NULL AND s.chunk_id IS NULL AND c.id > ?
-             ORDER BY c.id
-             LIMIT ?",
-        )?
-        .query_map(rusqlite::params![last_id, batch_size as i64], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    if batch.is_empty() {
-        return Ok((BackfillStats::default(), false));
-    }
-
-    let mut stats = BackfillStats {
-        last_id: batch.last().unwrap().0,
-        ..BackfillStats::default()
-    };
-
-    let texts: Vec<String> = batch
-        .iter()
-        .map(|(_, content, _)| content.clone())
-        .collect();
-
-    match catch_unwind(AssertUnwindSafe(|| encode_fn(&texts))) {
-        Ok(Ok(embeddings)) if embeddings.len() == batch.len() => {
-            let tx = conn.unchecked_transaction()?;
-            for ((chunk_id, _, _), emb) in batch.iter().zip(embeddings.iter()) {
-                if write_vec_row(&tx, *chunk_id, emb) {
-                    stats.filled += 1;
-                } else {
-                    log::warn!("Insert error for chunk {chunk_id} — skipping");
-                    mark_chunk_skip(conn, *chunk_id, "insert_error");
-                    stats.errors += 1;
-                }
-            }
-            tx.commit()?;
-        }
-        Ok(Ok(embeddings)) => {
-            log::warn!(
-                "Embedding count mismatch (got {}, expected {})",
-                embeddings.len(),
-                batch.len()
-            );
-            if batch.len() > 1 {
-                retry_individually(&batch, encode_fn, conn, &mut stats);
-            } else {
-                let chunk_id = batch[0].0;
-                mark_chunk_skip(conn, chunk_id, "embedding_count_mismatch");
-                stats.errors += 1;
-            }
-        }
-        Ok(Err(e)) => {
-            log::warn!("Batch error: {e}");
-            if batch.len() > 1 {
-                retry_individually(&batch, encode_fn, conn, &mut stats);
-            } else {
-                mark_chunk_skip(conn, batch[0].0, "encode_error");
-                stats.errors += 1;
-            }
-        }
-        Err(panic_info) => {
-            let msg = panic_message(&panic_info);
-            log::error!("PANIC in encode: {msg}");
-            stats.panics += 1;
-            if batch.len() > 1 {
-                retry_individually(&batch, encode_fn, conn, &mut stats);
-            } else {
-                mark_chunk_skip(conn, batch[0].0, "panic");
-                stats.errors += 1;
-            }
-        }
-    }
-
-    Ok((stats, true))
-}
-
-/// Fill in missing vectors for chunks that have FTS5 entries but no vector entries.
-/// Uses keyset pagination to avoid loading all missing chunks into memory at once.
-/// Each INSERT auto-commits individually (rusqlite default autocommit mode).
-/// Failed batches are logged and skipped — the next run will retry them.
-pub fn backfill_vectors(
-    conn: &Connection,
-    encode_fn: EncodeFn,
-    batch_size: usize,
-    progress_cb: Option<&dyn Fn(i64, usize, usize)>,
-) -> anyhow::Result<BackfillStats> {
-    if !db::has_vec_table(conn) {
-        return Ok(BackfillStats::default());
-    }
-
-    // Count total missing for progress reporting. Exclude skip-marked chunks
-    // so the reported total matches what the fetch query below will actually
-    // attempt; otherwise skipped chunks show up as permanent phantom "missing"
-    // work in doctor/status (matches the daemon's periodic-backfill count).
-    let total: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM chunks c
-             LEFT JOIN chunks_vec v ON c.id = v.rowid
-             LEFT JOIN chunks_vec_skip s ON c.id = s.chunk_id
-             WHERE v.rowid IS NULL AND s.chunk_id IS NULL",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-
-    if total == 0 {
-        return Ok(BackfillStats::default());
-    }
-
-    log::info!("Backfilling {total} chunks...");
-    if let Some(cb) = &progress_cb {
-        cb(total, 0, 0);
-    }
-    let mut stats = BackfillStats::default();
-    let mut last_id: i64 = 0;
-
-    loop {
-        let batch: Vec<(i64, String, String)> = conn
-            .prepare(
-                "SELECT c.id, c.content, d.file_path
-                 FROM chunks c
-                 LEFT JOIN chunks_vec v ON c.id = v.rowid
-                 LEFT JOIN chunks_vec_skip s ON c.id = s.chunk_id
-                 JOIN documents d ON c.document_id = d.id
-                 WHERE v.rowid IS NULL AND s.chunk_id IS NULL AND c.id > ?
-                 ORDER BY c.id
-                 LIMIT ?",
-            )?
-            .query_map(rusqlite::params![last_id, batch_size as i64], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        if batch.is_empty() {
-            break;
-        }
-        last_id = batch.last().unwrap().0;
-
-        let files: Vec<&str> = batch.iter().map(|(_, _, f)| f.as_str()).collect();
-        let batch_start_id = batch.first().unwrap().0;
-        let batch_end_id = last_id;
-        log::debug!("batch {batch_start_id}..{batch_end_id}: {:?}", files);
-
-        let texts: Vec<String> = batch
-            .iter()
-            .map(|(_, content, _)| content.clone())
-            .collect();
-
-        match catch_unwind(AssertUnwindSafe(|| encode_fn(&texts))) {
-            Ok(Ok(embeddings)) if embeddings.len() == batch.len() => {
-                let tx = conn.unchecked_transaction()?;
-                for ((chunk_id, _, _), emb) in batch.iter().zip(embeddings.iter()) {
-                    if write_vec_row(&tx, *chunk_id, emb) {
-                        stats.filled += 1;
-                    } else {
-                        log::warn!("Insert error for chunk {chunk_id} — skipping");
-                        mark_chunk_skip(conn, *chunk_id, "insert_error");
-                        stats.errors += 1;
-                    }
-                }
-                tx.commit()?;
-            }
-            Ok(Ok(embeddings)) => {
-                log::warn!(
-                    "Embedding count mismatch (got {}, expected {}) for batch {batch_start_id}..{batch_end_id}",
-                    embeddings.len(),
-                    batch.len()
-                );
-                if batch.len() > 1 {
-                    log::warn!("Retrying {} chunks individually...", batch.len());
-                    retry_individually(&batch, encode_fn, conn, &mut stats);
-                } else {
-                    let chunk_id = batch[0].0;
-                    mark_chunk_skip(conn, chunk_id, "embedding_count_mismatch");
-                    stats.errors += 1;
-                }
-            }
-            Ok(Err(e)) => {
-                log::warn!("Batch error (chunks {batch_start_id}..{batch_end_id}): {e}");
-                if batch.len() > 1 {
-                    log::warn!("Retrying {} chunks individually...", batch.len());
-                    retry_individually(&batch, encode_fn, conn, &mut stats);
-                } else {
-                    let chunk_id = batch[0].0;
-                    log::warn!("chunk {chunk_id}: failed individually — skipping");
-                    mark_chunk_skip(conn, chunk_id, "encode_error");
-                    stats.errors += 1;
-                }
-            }
-            Err(panic_info) => {
-                let msg = panic_message(&panic_info);
-                log::error!("PANIC in encode (chunks {batch_start_id}..{batch_end_id}): {msg}");
-                stats.panics += 1;
-                if batch.len() > 1 {
-                    log::warn!("Retrying {} chunks individually...", batch.len());
-                    retry_individually(&batch, encode_fn, conn, &mut stats);
-                } else {
-                    let chunk_id = batch[0].0;
-                    log::warn!("chunk {chunk_id}: failed individually — skipping");
-                    mark_chunk_skip(conn, chunk_id, "panic");
-                    stats.errors += 1;
-                }
-            }
-        }
-
-        let processed = stats.filled + stats.errors;
-        log::debug!("{processed}/{total}");
-
-        if let Some(cb) = &progress_cb {
-            cb(total, stats.filled, stats.errors);
-        }
-    }
-
-    if stats.panics > 0 {
-        log::info!(
-            "Backfill complete: {} filled, {} errors, {} panics.",
-            stats.filled,
-            stats.errors,
-            stats.panics
-        );
-    } else {
-        log::info!(
-            "Backfill complete: {} filled, {} errors.",
-            stats.filled,
-            stats.errors
-        );
-    }
-    Ok(stats)
-}
-
-/// Rebuild only the FTS5 index by re-running wakachi on all chunks.
-/// Vectors, documents, entities, and other data are preserved.
-pub fn rebuild_fts(
-    conn: &Connection,
-    progress_cb: Option<&dyn Fn(usize, usize)>,
-) -> anyhow::Result<usize> {
-    let tx = conn.unchecked_transaction()?;
-
-    let total: i64 = tx.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
-    let total = total as usize;
-
-    let rows: Vec<(i64, String)> = {
-        let mut stmt = tx.prepare("SELECT id, content FROM chunks ORDER BY id")?;
-        let mapped = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        mapped
-    };
-
-    tx.execute("DELETE FROM chunks_fts", [])?;
-
-    for (i, (id, content)) in rows.iter().enumerate() {
-        let wakachi_text = wakachi(content);
-        tx.execute(
-            "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
-            rusqlite::params![id, wakachi_text],
-        )?;
-        if let Some(cb) = &progress_cb {
-            cb(i + 1, total);
-        }
-    }
-
-    tx.commit()?;
-    Ok(rows.len())
-}
-
-/// Re-tokenize one batch of chunks into the FTS5 index.
-///
-/// Uses keyset pagination (`WHERE id > last_id ORDER BY id LIMIT batch_size`).
-/// When `is_first_batch` is true, clears the entire FTS table before inserting.
-///
-/// Returns `(inserted_count, new_last_id, has_more)`.
-/// `has_more` is `true` when `batch.len() == batch_size`; callers should
-/// handle the case where the subsequent call returns `inserted_count == 0`.
-pub fn rebuild_fts_next_batch(
-    conn: &Connection,
-    last_id: i64,
-    batch_size: usize,
-    is_first_batch: bool,
-) -> anyhow::Result<(usize, i64, bool)> {
-    let batch: Vec<(i64, String)> = conn
-        .prepare("SELECT id, content FROM chunks WHERE id > ? ORDER BY id LIMIT ?")?
-        .query_map(rusqlite::params![last_id, batch_size as i64], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    if batch.is_empty() {
-        return Ok((0, last_id, false));
-    }
-
-    let new_last_id = batch.last().unwrap().0;
-
-    let tx = conn.unchecked_transaction()?;
-    if is_first_batch {
-        tx.execute("DELETE FROM chunks_fts", [])?;
-    }
-    for (id, content) in &batch {
-        let wakachi_text = wakachi(content);
-        tx.execute(
-            "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
-            rusqlite::params![id, wakachi_text],
-        )?;
-    }
-    tx.commit()?;
-
-    let has_more = batch.len() == batch_size;
-    Ok((batch.len(), new_last_id, has_more))
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
+    use crate::db;
 
     /// Test-only policy that accepts every path.
     /// Used by tests whose focus is indexer internals (chunking, FTS,
