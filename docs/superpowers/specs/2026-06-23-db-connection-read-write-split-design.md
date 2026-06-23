@@ -33,6 +33,8 @@ the daemon's connection architecture, not in SQLite configuration.
 
 - `Status` / `Doctor` / `Search` respond promptly while a reindex or backfill is
   running.
+- Read-only requests run **truly concurrently across threads**, bounded by the
+  reader pool size — not serialized through one connection.
 - Preserve the single-writer invariant and all existing transaction boundaries.
 
 ## Non-goals
@@ -64,9 +66,24 @@ tsmd daemon (sole DB owner — unchanged)
   `apply_pragmas` (`src/db.rs:137`) sets only `journal_mode=WAL` and
   `foreign_keys=ON`. Adding `busy_timeout` turns the rare `SQLITE_BUSY` (WAL
   checkpoint, writer-vs-writer) into a bounded retry instead of an error.
-- Pool size is a fixed `N` (default 4), configurable. Implementation is a
-  self-contained pool over `Vec<Mutex<Connection>>` with checkout/return
-  semantics — no external crate dependency.
+- Pool size is a fixed `N`, defaulting to the CPU core count
+  (`std::thread::available_parallelism`, clamped to a sane floor) and overridable
+  via config. `N` is the cap on concurrent reads: beyond the core count, extra
+  reader threads cannot make real parallel progress anyway, so a core-count
+  default maximizes true concurrency without unbounded connection/fd/`-shm`
+  growth under a read flood. Implementation is a self-contained pool over
+  `Vec<Mutex<Connection>>` with checkout/return semantics — no external crate
+  dependency.
+
+### Why a pool (the single-thread-per-connection constraint)
+
+`tsmd` already spawns a thread per client (`daemon_mode.rs:279`), so read
+requests already arrive on separate threads. WAL imposes no contention *between*
+reader connections — each reads a consistent snapshot in parallel. The one limit
+is that a single `Connection` cannot be used by two threads at once (concurrent
+use serializes on SQLite's internal mutex). The pool hands each concurrent reader
+its own connection, so `N` independent connections give `N`-way real parallel
+reads.
 
 ### Request routing (`handle_client`)
 
