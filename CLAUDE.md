@@ -213,8 +213,9 @@ containing `bin/{tsm,tsmd}` plus `LICENSE`, `README.md`, and `tsm.toml.example`.
 2. Open a `chore(release): vX.Y.Z` PR and merge to `main`.
 3. Tag the merged commit and push:
    `git tag vX.Y.Z origin/main && git push origin vX.Y.Z`.
-   This fires `release.yml` (trigger: `tags: ["v*"]`), which builds the four
-   targets and creates the GitHub Release (`generate_release_notes: true`).
+   This fires `release.yml` (trigger: `tags: ["v*"]`), which builds every
+   target in the release matrix and creates the GitHub Release
+   (`generate_release_notes: true`).
 
 - semver while 0.x: breaking changes → minor bump (e.g. 0.5.x → 0.6.0).
 - The tag MUST point at a commit whose `Cargo.toml` version equals the tag.
