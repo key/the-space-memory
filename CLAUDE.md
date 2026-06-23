@@ -190,7 +190,10 @@ cp -R tests/e2e/testdata/ .bench/proj/
 ln -sfn "$PWD/.tsm/models/ruri-v3-30m" .bench/state/models/ruri-v3-30m  # or `tsm setup`
 export TSM_STATE_DIR="$PWD/.bench/state" TSM_EMBEDDER_SOCKET="$PWD/.bench/e.sock" \
        TSM_DAEMON_SOCKET="$PWD/.bench/d.sock" TSM_EMBEDDER_IDLE_TIMEOUT=0
-( cd .bench/proj && tsm init && tsm start && tsm index )   # tsm status → Vectors N/N
+( cd .bench/proj && tsm init && tsm start && tsm index )   # .md notes only (sessions/*.jsonl skipped: ext=md)
+
+# wait for the async vector backfill before timing, else some chunks score zero-vector
+( cd .bench/proj && tsm status )   # proceed once it shows "Vectors N/N (100%)"
 
 # measure — `cargo bench` runs from the crate root, so config resolves via the pinned env
 cargo bench --bench search_latency
