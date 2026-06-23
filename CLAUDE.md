@@ -67,7 +67,12 @@ src/
 │   ├── persist.rs       — Persist stage: one transaction (documents/chunks/FTS5/entity/links), diff, rebuild_fts
 │   ├── embed.rs         — Embed stage: async vector inference + writes (backfill)
 │   └── walker.rs        — File discovery + ingest policy
-├── searcher.rs          — FTS5 + vector search, RRF fusion, scoring
+├── searcher/            — Search pipeline (Plan/Retrieve/Rank/Format stages, ADR-0007)
+│   ├── mod.rs           — Orchestration: search() (plan→retrieve→rank); SearchResult, SearchOutput
+│   ├── plan.rs          — Plan stage: keyword extraction, classify, expansion, query embedding → QueryPlan
+│   ├── retrieve.rs      — Retrieve stage: FTS5 + vector + entity candidate sets → CandidateSets
+│   ├── rank.rs          — Rank stage: metadata fetch (time/path filter), RRF fusion, score hook, sort
+│   └── format.rs        — Format stage: text / JSON output rendering
 ├── embedder.rs          — candle + ruri-v3-30m inference (pure library)
 ├── lua_hooks.rs         — Embedded Lua runtime for extract/score hooks (ADR-0013)
 ├── hooks/extract/       — Embedded default extract hook (10-md_frontmatter.lua)
