@@ -176,6 +176,11 @@ The PR labeler workflow (`.github/labeler.yml`) maps prefixes to labels:
 | `docs/` | documentation |
 | `perf/` | performance |
 
+Mark **breaking changes** with a Conventional Commits `!` in the PR title
+(e.g. `feat!:`, `fix(scope)!:`) or a `BREAKING CHANGE` footer in the body. The
+labeler then applies the `breaking` label, which surfaces the PR under
+"💥 Breaking Changes" in the generated release notes (`.github/release.yml`).
+
 ## Claude Code Plugin
 
 The Claude Code plugin definition (skills/agents/hooks) for `tsm` lives in a
