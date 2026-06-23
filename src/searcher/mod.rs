@@ -1,6 +1,9 @@
+pub mod format;
 pub(crate) mod plan;
 pub(crate) mod rank;
 pub(crate) mod retrieve;
+
+pub use format::{format_json, format_text};
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
