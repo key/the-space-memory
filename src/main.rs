@@ -470,7 +470,7 @@ fn render_search(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
                     .map_err(|e| anyhow::anyhow!("Failed to parse search results: {e}"))?;
             print!(
                 "{}",
-                the_space_memory::searcher::format::format_text(&results, total_hits)
+                the_space_memory::searcher::format_text(&results, total_hits)
             );
         }
     }

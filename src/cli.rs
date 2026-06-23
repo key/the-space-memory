@@ -344,21 +344,8 @@ pub fn cmd_search(opts: SearchOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn format_text(results: &[searcher::SearchResult], total_hits: usize) -> String {
-    searcher::format_text(results, total_hits)
-}
-
 fn print_text(results: &[searcher::SearchResult], total_hits: usize) {
     print!("{}", searcher::format_text(results, total_hits));
-}
-
-pub fn format_json(
-    results: &[searcher::SearchResult],
-    total_hits: usize,
-    include_content: Option<usize>,
-    project_root: &Path,
-) -> anyhow::Result<String> {
-    searcher::format_json(results, total_hits, include_content, project_root)
 }
 
 fn print_json(
@@ -369,7 +356,7 @@ fn print_json(
     let project_root = config::project_root();
     println!(
         "{}",
-        format_json(results, total_hits, include_content, &project_root)?
+        searcher::format_json(results, total_hits, include_content, &project_root)?
     );
     Ok(())
 }

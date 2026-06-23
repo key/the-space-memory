@@ -1,4 +1,4 @@
-pub mod format;
+pub(crate) mod format;
 pub(crate) mod plan;
 pub(crate) mod rank;
 pub(crate) mod retrieve;
@@ -55,13 +55,8 @@ pub fn search(
 
     let candidates = retrieve::retrieve(conn, &qp, limit, require_vector)?;
 
-    if candidates.fts.is_empty() && candidates.vec.is_empty() && candidates.entity.is_empty() {
-        return Ok(SearchOutput {
-            results: Vec::new(),
-            total_hits: 0,
-        });
-    }
-
+    // The all-empty candidate case is handled inside rank() (its union guard),
+    // which returns an empty SearchOutput — no need to peek at the sets here.
     rank::rank(conn, &qp, candidates, top_k, time_filter, path_prefixes)
 }
 

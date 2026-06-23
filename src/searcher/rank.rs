@@ -18,7 +18,7 @@ pub(crate) fn decay_factor(days: f64, half_life: f64) -> f64 {
     0.5_f64.powf(days / half_life)
 }
 
-pub(crate) fn snippet(content: &str) -> String {
+fn snippet(content: &str) -> String {
     let text = match content.split_once('\n') {
         Some((_, rest)) => rest,
         None => content,
@@ -27,45 +27,18 @@ pub(crate) fn snippet(content: &str) -> String {
     chars.trim().to_string()
 }
 
-/// Rank stage: metadata-fetch SQL join, RRF fusion, score hooks, threshold
-/// filtering, top-k truncation, and related-doc attachment.
-///
-/// Returns a `SearchOutput` with results sorted descending by score.
-pub(crate) fn rank(
-    conn: &Connection,
-    plan: &QueryPlan,
-    candidates: CandidateSets,
-    top_k: usize,
+/// Build the optional time/path `WHERE` fragments and their bound params for
+/// the metadata-fetch query. Returns `(time_sql, path_sql, extra_params)`;
+/// each SQL fragment is empty when its filter is absent. `extra_params` are
+/// ordered time-first, then path, to match the `?` placeholders in the
+/// fragments.
+fn build_filter_clauses(
     time_filter: Option<&TimeFilter>,
     path_prefixes: Option<&[String]>,
-) -> anyhow::Result<SearchOutput> {
-    let cls = &plan.classification;
-
-    let all_chunk_ids: Vec<i64> = candidates
-        .fts
-        .keys()
-        .chain(candidates.vec.keys())
-        .chain(candidates.entity.keys())
-        .copied()
-        .collect::<std::collections::HashSet<i64>>()
-        .into_iter()
-        .collect();
-
-    if all_chunk_ids.is_empty() {
-        return Ok(SearchOutput {
-            results: Vec::new(),
-            total_hits: 0,
-        });
-    }
-
-    let placeholders = all_chunk_ids
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(",");
+) -> (String, String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
     let mut time_clauses = Vec::new();
-    let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(tf) = time_filter {
         if let Some(ref after) = tf.after {
             time_clauses.push(
@@ -105,6 +78,48 @@ pub(crate) fn rank(
         }
         _ => String::new(),
     };
+
+    (time_sql, path_sql, extra_params)
+}
+
+/// Rank stage: metadata-fetch SQL join, RRF fusion, score hooks, threshold
+/// filtering, top-k truncation, and related-doc attachment.
+///
+/// Returns a `SearchOutput` with results sorted descending by score.
+pub(crate) fn rank(
+    conn: &Connection,
+    plan: &QueryPlan,
+    candidates: CandidateSets,
+    top_k: usize,
+    time_filter: Option<&TimeFilter>,
+    path_prefixes: Option<&[String]>,
+) -> anyhow::Result<SearchOutput> {
+    let cls = &plan.classification;
+
+    let all_chunk_ids: Vec<i64> = candidates
+        .fts
+        .keys()
+        .chain(candidates.vec.keys())
+        .chain(candidates.entity.keys())
+        .copied()
+        .collect::<std::collections::HashSet<i64>>()
+        .into_iter()
+        .collect();
+
+    if all_chunk_ids.is_empty() {
+        return Ok(SearchOutput {
+            results: Vec::new(),
+            total_hits: 0,
+        });
+    }
+
+    let placeholders = all_chunk_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let (time_sql, path_sql, extra_params) = build_filter_clauses(time_filter, path_prefixes);
 
     let sql = format!(
         "SELECT c.id AS chunk_id, c.section_path, c.content,

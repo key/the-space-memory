@@ -1,7 +1,8 @@
 use rusqlite::Connection;
 
 use crate::{
-    classifier, config, embedder, entity, synonyms, tokenizer::extract_search_keywords, user_dict,
+    classifier, config, db, embedder, entity, synonyms, tokenizer::extract_search_keywords,
+    user_dict,
 };
 
 /// Output of the Plan stage: extracted keywords, classification weights,
@@ -52,15 +53,20 @@ pub(crate) fn plan(conn: &Connection, query: &str) -> anyhow::Result<Option<Quer
         }
     }
 
-    // Embed the query for vector search; None when embedder is unavailable.
-    let texts = vec![keywords_query.clone()];
-    let query_vec = embedder::embed_via_socket(&texts).and_then(|mut e| {
-        if e.is_empty() {
-            None
-        } else {
-            Some(e.remove(0))
-        }
-    });
+    // Embed the query for vector search, matching the pre-refactor gate:
+    // skip the embedder round-trip entirely when there is no vector table.
+    // `None` when the table is absent or the embedder is unavailable.
+    let query_vec = if db::has_vec_table(conn) {
+        embedder::embed_via_socket(std::slice::from_ref(&keywords_query)).and_then(|mut e| {
+            if e.is_empty() {
+                None
+            } else {
+                Some(e.remove(0))
+            }
+        })
+    } else {
+        None
+    };
 
     Ok(Some(QueryPlan {
         keywords_query,
