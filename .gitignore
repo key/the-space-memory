@@ -13,6 +13,9 @@ tsm.toml
 # Runtime directory (workspace-local)
 .tsm/
 
+# Isolated benchmark / perf-test environment (see CLAUDE.md "Testing")
+.bench/
+
 # Legacy data directory
 /data/
 !/data/stopwords.txt

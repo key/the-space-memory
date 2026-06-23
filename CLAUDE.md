@@ -174,6 +174,35 @@ src/
   `tests/e2e.sh` の sed で実行時に置換する。直書きは time-decay スコアで
   flake する（session half-life は 30 日）。CI の `testdata-lint` job が機械的に検出する
 
+### Isolated benchmark / perf-test environment
+
+Unit tests need no setup (`cargo test`, in-memory SQLite). Benches/perf tests
+need a live daemon + indexed corpus — run them in a **gitignored project-local
+`.bench/`** dir, never an external `/tmp` path. Reasons: a running daemon and
+the repo `.tsm/` are never touched, and UNIX socket paths stay under the
+`SUN_LEN` (~104 char) limit (deep temp paths fail to bind with
+`path must be shorter than SUN_LEN`).
+
+```bash
+# setup — pinned env isolates from any running daemon; CWD = the testdata project
+mkdir -p .bench/proj .bench/state/models
+cp -R tests/e2e/testdata/ .bench/proj/
+ln -sfn "$PWD/.tsm/models/ruri-v3-30m" .bench/state/models/ruri-v3-30m  # or `tsm setup`
+export TSM_STATE_DIR="$PWD/.bench/state" TSM_EMBEDDER_SOCKET="$PWD/.bench/e.sock" \
+       TSM_DAEMON_SOCKET="$PWD/.bench/d.sock" TSM_EMBEDDER_IDLE_TIMEOUT=0
+( cd .bench/proj && tsm init && tsm start && tsm index )   # tsm status → Vectors N/N
+
+# measure — `cargo bench` runs from the crate root, so config resolves via the pinned env
+cargo bench --bench search_latency
+
+# teardown — keep the pinned env on stop, else `tsm stop` hits the default daemon
+( cd .bench/proj && tsm stop ); rm -rf .bench
+```
+
+Verify isolation before measuring: `ps -axo pid,etime,command | grep "[t]smd"`
+(the bracket avoids self-matching the grep) — confirm the new daemon's PID and
+that other projects' daemons survive teardown.
+
 ## Branch Naming
 
 Branch names must follow `<type>/<description>` format.
