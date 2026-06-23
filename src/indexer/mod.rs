@@ -3,11 +3,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-use crate::chunker::chunk_markdown_default;
-use crate::config;
 use crate::doc_links;
 use crate::entity;
-use crate::frontmatter;
 use crate::session_chunker::parse_session_jsonl;
 use crate::tokenizer::wakachi;
 use crate::user_dict;
@@ -18,6 +15,8 @@ pub use walker::ContentWalker;
 
 mod embed;
 pub use embed::{backfill_next_batch, backfill_vectors, BackfillStats, EncodeFn};
+
+mod prepare;
 
 /// Decides whether a single path is allowed through the ingest pipeline.
 ///
@@ -165,12 +164,7 @@ fn delete_old_entries(conn: &Connection, doc_id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-struct ChunkInput {
-    chunk_index: usize,
-    section_path: String,
-    content: String,
-    content_hash: String,
-}
+use prepare::ChunkInput;
 
 struct DiffResult {
     /// All chunk entries (new + existing) as (chunk_id, content) — for entity rebuild.
@@ -316,34 +310,8 @@ pub fn index_file(
         }
     }
 
-    // Parse file
-    let text = std::fs::read_to_string(file_path)?;
-    let (fm, body) = frontmatter::parse(&text);
-    let fm_map = frontmatter::parse_map(&text);
-
-    let metadata_json =
-        crate::lua_hooks::run_extract(&crate::lua_hooks::hooks(), &rel_path, body, &fm_map)
-            .to_string();
-
+    let prepared = prepare::prepare(file_path, &rel_path, &directory, &filename)?;
     let now = chrono::Utc::now().to_rfc3339();
-    let source_type = config::source_type_from_dir(&directory);
-    let tags_str = if fm.tags.is_empty() {
-        None
-    } else {
-        Some(format!("{:?}", fm.tags))
-    };
-
-    // Build chunk inputs with content hashes
-    let chunks = chunk_markdown_default(body, &directory, &filename);
-    let chunk_inputs: Vec<ChunkInput> = chunks
-        .iter()
-        .map(|c| ChunkInput {
-            chunk_index: c.chunk_index,
-            section_path: c.section_path.clone(),
-            content: c.content.clone(),
-            content_hash: chunk_hash(&c.content),
-        })
-        .collect();
 
     let tx = conn.unchecked_transaction()?;
 
@@ -353,8 +321,9 @@ pub fn index_file(
             "UPDATE documents SET source_type=?, title=?, status=?, created=?, updated=?, tags=?, file_hash=?, indexed_at=?, metadata=?
              WHERE id=?",
             rusqlite::params![
-                source_type, filename, fm.status, fm.created, fm.updated,
-                tags_str, current_hash, now, metadata_json, doc_id,
+                prepared.source_type, prepared.title, prepared.frontmatter.status,
+                prepared.frontmatter.created, prepared.frontmatter.updated,
+                prepared.tags_str, current_hash, now, prepared.metadata_json, doc_id,
             ],
         )?;
         doc_id
@@ -363,14 +332,15 @@ pub fn index_file(
             "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at, metadata)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params![
-                rel_path, source_type, filename, fm.status, fm.created, fm.updated,
-                tags_str, current_hash, now, metadata_json,
+                rel_path, prepared.source_type, prepared.title, prepared.frontmatter.status,
+                prepared.frontmatter.created, prepared.frontmatter.updated,
+                prepared.tags_str, current_hash, now, prepared.metadata_json,
             ],
         )?;
         tx.last_insert_rowid()
     };
 
-    let diff = diff_chunks(&tx, doc_id, &chunk_inputs)?;
+    let diff = diff_chunks(&tx, doc_id, &prepared.chunk_inputs)?;
 
     if diff.had_mutations {
         // Rebuild entity graph (document-level)
@@ -382,13 +352,18 @@ pub fn index_file(
                     Err(e)
                 }
             })?;
-        if let Err(e) = entity::insert_entities(&tx, doc_id, &diff.all_chunk_entries, &fm.tags) {
+        if let Err(e) = entity::insert_entities(
+            &tx,
+            doc_id,
+            &diff.all_chunk_entries,
+            &prepared.frontmatter.tags,
+        ) {
             log::warn!("entity extraction warning: {e}");
         }
 
         // Rebuild document links
         doc_links::delete_links(&tx, doc_id);
-        doc_links::build_links(&tx, doc_id, &text, &fm.tags);
+        doc_links::build_links(&tx, doc_id, &prepared.text, &prepared.frontmatter.tags);
 
         // Collect dictionary candidates
         for (_, content) in &diff.all_chunk_entries {
@@ -728,6 +703,7 @@ pub fn rebuild_fts_next_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
     use crate::db;
 
     /// Test-only policy that accepts every path.
