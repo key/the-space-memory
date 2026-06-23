@@ -117,6 +117,19 @@ pub fn expand_query_synonyms(
     expansions
 }
 
+/// Normalize and order a word pair: trim, lowercase, then sort so the result is
+/// `(lo, hi)` with `lo <= hi`. Shared by every site that stores or looks up a
+/// pair so the normalization rule lives in one place.
+fn normalize_pair(a: &str, b: &str) -> (String, String) {
+    let a = a.trim().to_lowercase();
+    let b = b.trim().to_lowercase();
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
 /// Upsert a synonym pair into the table.
 /// Words are normalized (lowercase, trimmed) and ordered (word_a < word_b).
 pub fn upsert_synonym(
@@ -130,13 +143,12 @@ pub fn upsert_synonym(
         return Ok(());
     }
 
-    let a = word_a.trim().to_lowercase();
-    let b = word_b.trim().to_lowercase();
-    if a == b || a.is_empty() || b.is_empty() {
+    // `lo` is the smaller of the two, so an empty input always lands in `lo`.
+    let (lo, hi) = normalize_pair(word_a, word_b);
+    if lo == hi || lo.is_empty() {
         return Ok(());
     }
 
-    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
     let score = score.min(SCORE_CAP);
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -375,36 +387,35 @@ pub fn remove_user_synonym(
         anyhow::bail!("synonym word must not be empty");
     }
 
-    let (removed, skipped_non_user) = match b {
+    // Each arm picks the DELETE/COUNT pair that matches its scope; both bind two
+    // string params, so the delete-then-count-on-miss tail is shared below.
+    let (del_sql, count_sql, p1, p2) = match b {
         Some(b) => {
             let nb = b.trim().to_lowercase();
             if nb.is_empty() {
                 anyhow::bail!("synonym word must not be empty");
             }
-            let (lo, hi) = if na < nb { (na, nb) } else { (nb, na) };
-            let removed = conn.execute(
+            let (lo, hi) = normalize_pair(&na, &nb);
+            (
                 "DELETE FROM synonyms WHERE word_a = ? AND word_b = ? AND source = 'user'",
-                rusqlite::params![lo, hi],
-            )?;
-            let skipped = if removed == 0 {
-                count_non_user_pair(conn, &lo, &hi)
-            } else {
-                0
-            };
-            (removed, skipped)
+                "SELECT COUNT(*) FROM synonyms WHERE word_a = ? AND word_b = ? AND source != 'user'",
+                lo,
+                hi,
+            )
         }
-        None => {
-            let removed = conn.execute(
-                "DELETE FROM synonyms WHERE (word_a = ? OR word_b = ?) AND source = 'user'",
-                rusqlite::params![na, na],
-            )?;
-            let skipped = if removed == 0 {
-                count_non_user_involving(conn, &na)
-            } else {
-                0
-            };
-            (removed, skipped)
-        }
+        None => (
+            "DELETE FROM synonyms WHERE (word_a = ? OR word_b = ?) AND source = 'user'",
+            "SELECT COUNT(*) FROM synonyms WHERE (word_a = ? OR word_b = ?) AND source != 'user'",
+            na.clone(),
+            na,
+        ),
+    };
+
+    let removed = conn.execute(del_sql, rusqlite::params![p1, p2])?;
+    let skipped_non_user = if removed == 0 {
+        count_non_user(conn, count_sql, &p1, &p2)
+    } else {
+        0
     };
 
     Ok(RemoveResult {
@@ -413,24 +424,11 @@ pub fn remove_user_synonym(
     })
 }
 
-/// Count non-user rows for an exact normalized pair.
-fn count_non_user_pair(conn: &Connection, lo: &str, hi: &str) -> usize {
-    conn.query_row(
-        "SELECT COUNT(*) FROM synonyms WHERE word_a = ? AND word_b = ? AND source != 'user'",
-        rusqlite::params![lo, hi],
-        |r| r.get::<_, i64>(0),
-    )
-    .unwrap_or(0) as usize
-}
-
-/// Count non-user rows involving a single word on either side.
-fn count_non_user_involving(conn: &Connection, word: &str) -> usize {
-    conn.query_row(
-        "SELECT COUNT(*) FROM synonyms WHERE (word_a = ? OR word_b = ?) AND source != 'user'",
-        rusqlite::params![word, word],
-        |r| r.get::<_, i64>(0),
-    )
-    .unwrap_or(0) as usize
+/// Count rows matching a two-param predicate whose `source` is not `'user'`.
+/// `sql` must be a `SELECT COUNT(*)` with two `?` placeholders.
+fn count_non_user(conn: &Connection, sql: &str, p1: &str, p2: &str) -> usize {
+    conn.query_row(sql, rusqlite::params![p1, p2], |r| r.get::<_, i64>(0))
+        .unwrap_or(0) as usize
 }
 
 /// Export user-defined synonym pairs to a CSV file (DB -> file).
@@ -465,9 +463,7 @@ pub fn export_user_synonyms(
 
 /// Record a hit on a synonym pair (increments hits, updates last_hit).
 pub fn record_hit(conn: &Connection, word_a: &str, word_b: &str) {
-    let a = word_a.trim().to_lowercase();
-    let b = word_b.trim().to_lowercase();
-    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let (lo, hi) = normalize_pair(word_a, word_b);
     let now = chrono::Utc::now().to_rfc3339();
 
     let _ = conn.execute(
