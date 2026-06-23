@@ -22,6 +22,7 @@
 | [0012](./0012-output-channel-model.md) | 出力チャネルモデル（ユーザー出力 / ログ / エラーの分離） | Accepted | 2026-06-22 |
 | [0013](./0013-lua-metadata-scoring-hooks.md) | メタデータ抽出とスコアリングを Lua フックで拡張可能にする | Accepted | 2026-06-22 |
 | [0014](./0014-search-vocabulary-model.md) | 検索語彙リソースの管理モデル（判定 / synonym 軸分離 / 読み） | Accepted | 2026-06-23 |
+| [0015](./0015-read-write-connection-split.md) | DB 接続の読み書き分離（reader pool）と書き込み公平化（yield to pending writes） | Accepted | 2026-06-23 |
 
 新規 ADR 追加時は上記表にも 1 行追加すること。
 
