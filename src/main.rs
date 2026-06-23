@@ -94,10 +94,18 @@ enum SynonymCommands {
         /// Optional partner; omit to remove every pair involving `a`
         b: Option<String>,
     },
-    /// Export user synonyms to synonyms.csv (DB -> file)
-    Export,
-    /// Import user synonyms from synonyms.csv (file -> DB)
-    Import,
+    /// Export user synonyms as CSV (DB -> stdout, or --file)
+    Export {
+        /// Write to this file instead of stdout
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
+    /// Import user synonyms from CSV (stdin -> DB, or --file)
+    Import {
+        /// Read from this file instead of stdin
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -301,8 +309,8 @@ fn main() -> anyhow::Result<()> {
         Commands::Synonym { command } => match command {
             SynonymCommands::Add { a, b } => cli::cmd_synonym_add(&a, &b)?,
             SynonymCommands::Rm { a, b } => cli::cmd_synonym_rm(&a, b.as_deref())?,
-            SynonymCommands::Export => cli::cmd_synonym_export()?,
-            SynonymCommands::Import => cli::cmd_synonym_import()?,
+            SynonymCommands::Export { file } => cli::cmd_synonym_export(file.as_deref())?,
+            SynonymCommands::Import { file } => cli::cmd_synonym_import(file.as_deref())?,
         },
 
         // ── Daemon-routed (auto-starts tsmd if needed) ──

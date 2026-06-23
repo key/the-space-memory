@@ -1,4 +1,4 @@
-use std::io::{BufRead, ErrorKind, Read, Write};
+use std::io::{BufRead, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config;
@@ -149,7 +149,8 @@ pub fn cmd_init_with(paths: &InitPaths<'_>) -> anyhow::Result<()> {
     // just scaffolded it, but we still gate on `is_file` to keep the
     // behavior obvious if a caller wires in a nonstandard path.
     if synonyms_csv.is_file() {
-        let result = synonyms::import_user_synonyms(&conn, &synonyms_csv)?;
+        let content = std::fs::read_to_string(&synonyms_csv)?;
+        let result = synonyms::import_user_synonyms(&conn, &content)?;
         println!(
             "User synonyms imported: {} pairs ({} deleted, {} skipped)",
             result.total, result.deleted, result.skipped,
@@ -621,28 +622,54 @@ pub fn cmd_synonym_rm(a: &str, b: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn cmd_synonym_export() -> anyhow::Result<()> {
-    let csv_path = config::user_synonyms_path();
+pub fn cmd_synonym_export(file: Option<&Path>) -> anyhow::Result<()> {
     let conn = db::get_connection(&config::db_path())?;
-    let count = crate::synonyms::export_user_synonyms(&conn, &csv_path)?;
-    println!(
-        "Exported {count} user synonym pair(s) to {}",
-        csv_path.display()
-    );
+    match file {
+        Some(path) => {
+            let mut f = std::fs::File::create(path)?;
+            let count = synonyms::export_user_synonyms(&conn, &mut f)?;
+            // File destination: CSV went to the file, so the count is user
+            // output on stdout.
+            println!(
+                "Exported {count} user synonym pair(s) to {}",
+                path.display()
+            );
+        }
+        None => {
+            // stdout destination: CSV is the user output, so the diagnostic
+            // count goes to stderr to keep the stream pipeable (ADR-0012).
+            let stdout = std::io::stdout();
+            let mut w = stdout.lock();
+            let count = synonyms::export_user_synonyms(&conn, &mut w)?;
+            eprintln!("Exported {count} user synonym pair(s).");
+        }
+    }
     Ok(())
 }
 
-pub fn cmd_synonym_import() -> anyhow::Result<()> {
-    let csv_path = config::user_synonyms_path();
-    if !csv_path.is_file() {
-        println!(
-            "No user synonyms file found at {}. Create it to define custom synonym pairs.",
-            csv_path.display()
-        );
-        return Ok(());
-    }
+pub fn cmd_synonym_import(file: Option<&Path>) -> anyhow::Result<()> {
+    let content = match file {
+        Some(path) => {
+            if !path.is_file() {
+                anyhow::bail!("synonyms CSV not found: {}", path.display());
+            }
+            std::fs::read_to_string(path)?
+        }
+        None => {
+            // Refuse to read an interactive TTY: an empty read would mirror-delete
+            // every user synonym. Require a pipe/redirect or an explicit --file.
+            if std::io::stdin().is_terminal() {
+                anyhow::bail!(
+                    "no input: pipe CSV into `tsm synonym import` or pass `--file <PATH>`"
+                );
+            }
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            buf
+        }
+    };
     let conn = db::get_connection(&config::db_path())?;
-    let result = crate::synonyms::import_user_synonyms(&conn, &csv_path)?;
+    let result = synonyms::import_user_synonyms(&conn, &content)?;
     println!(
         "User synonyms imported: {} pairs ({} deleted, {} skipped)",
         result.total, result.deleted, result.skipped,
