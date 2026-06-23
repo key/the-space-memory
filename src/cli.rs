@@ -147,13 +147,15 @@ pub fn cmd_init_with(paths: &InitPaths<'_>) -> anyhow::Result<()> {
 
     // User-synonym import. The CSV always exists at this point because we
     // just scaffolded it, but we still gate on `is_file` to keep the
-    // behavior obvious if a caller wires in a nonstandard path.
+    // behavior obvious if a caller wires in a nonstandard path. Insert-only
+    // (mirror = false): re-running init must never delete pairs added via
+    // `tsm synonym add` that aren't in the file.
     if synonyms_csv.is_file() {
         let content = std::fs::read_to_string(&synonyms_csv)?;
-        let result = synonyms::import_user_synonyms(&conn, &content)?;
+        let result = synonyms::import_user_synonyms(&conn, &content, false)?;
         println!(
-            "User synonyms imported: {} pairs ({} deleted, {} skipped)",
-            result.total, result.deleted, result.skipped,
+            "User synonyms imported: {} pairs ({} skipped)",
+            result.total, result.skipped,
         );
     }
 
@@ -517,8 +519,9 @@ pub fn cmd_import_wordnet(wordnet_db: &Path) -> anyhow::Result<()> {
 
 pub fn cmd_synonym_add(a: &str, b: &str) -> anyhow::Result<()> {
     let conn = db::get_connection(&config::db_path())?;
-    crate::synonyms::add_user_synonym(&conn, a, b)?;
-    println!("Added synonym: {a} <-> {b}");
+    // Echo the normalized pair as actually stored, not the raw input.
+    let (lo, hi) = crate::synonyms::add_user_synonym(&conn, a, b)?;
+    println!("Added synonym: {lo} <-> {hi}");
     Ok(())
 }
 
@@ -543,8 +546,14 @@ pub fn cmd_synonym_export(file: Option<&Path>) -> anyhow::Result<()> {
     let conn = db::get_connection(&config::db_path())?;
     match file {
         Some(path) => {
-            let mut f = std::fs::File::create(path)?;
+            // Write to a temp sibling then rename, so a mid-write failure cannot
+            // truncate an existing file (matches `download_wordnet`).
+            let tmp = path.with_extension("csv.tmp");
+            let mut f = std::fs::File::create(&tmp)?;
             let count = synonyms::export_user_synonyms(&conn, &mut f)?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, path)?;
             // File destination: CSV went to the file, so the count is user
             // output on stdout.
             println!(
@@ -573,8 +582,9 @@ pub fn cmd_synonym_import(file: Option<&Path>) -> anyhow::Result<()> {
             std::fs::read_to_string(path)?
         }
         None => {
-            // Refuse to read an interactive TTY: an empty read would mirror-delete
-            // every user synonym. Require a pipe/redirect or an explicit --file.
+            // Don't block on an interactive terminal waiting for input that isn't
+            // coming. (The empty-input mass-delete is guarded separately in
+            // `import_user_synonyms`.) Require a pipe/redirect or an explicit --file.
             if std::io::stdin().is_terminal() {
                 anyhow::bail!(
                     "no input: pipe CSV into `tsm synonym import` or pass `--file <PATH>`"
@@ -586,7 +596,8 @@ pub fn cmd_synonym_import(file: Option<&Path>) -> anyhow::Result<()> {
         }
     };
     let conn = db::get_connection(&config::db_path())?;
-    let result = synonyms::import_user_synonyms(&conn, &content)?;
+    // `synonym import` mirrors: pairs absent from the input are deleted.
+    let result = synonyms::import_user_synonyms(&conn, &content, true)?;
     println!(
         "User synonyms imported: {} pairs ({} deleted, {} skipped)",
         result.total, result.deleted, result.skipped,

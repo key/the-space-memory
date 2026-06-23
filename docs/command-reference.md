@@ -64,9 +64,9 @@ overwritten:
 3. Imports Japanese WordNet synonyms from `.tsm/wnjpn.db` if present.
    If missing, logs a warning and continues — run `tsm setup` to
    download the file, then re-run `tsm init` to import.
-4. Imports user-defined synonyms from `.tsm/synonyms.csv` (mirrors the
-   `source = 'user'` subset, safe to re-run). See
-   [tsm synonym import](#tsm-synonym-import).
+4. Imports user-defined synonyms from `.tsm/synonyms.csv` (insert-only — unlike
+   [tsm synonym import](#tsm-synonym-import) it never deletes, so re-running
+   `tsm init` never drops pairs added with `tsm synonym add`).
 
 **Flags:** none
 
@@ -721,7 +721,7 @@ that file and prints the count to stdout.
 
 ```bash
 tsm synonym export                          # dump CSV to stdout
-tsm synonym export | grep LoRa              # compose with other tools
+tsm synonym export | grep lora              # compose (pairs are stored lowercase)
 tsm synonym export --file .tsm/synonyms.csv  # refresh the git-tracked file
 ```
 
@@ -739,9 +739,11 @@ absent from it are deleted. Pairs from other sources (e.g. WordNet) are not
 affected. Inverse of `export`; the round-trip is exact over the user subset.
 `tsm init` imports `.tsm/synonyms.csv` automatically when it exists.
 
-Because import mirrors (absent pairs are deleted), reading an empty stream wipes
-all user pairs. To avoid an accidental wipe, importing from an interactive
-terminal with no input is rejected — pipe CSV in or pass `--file`.
+Because import mirrors (absent pairs are deleted), an empty or all-malformed
+input would wipe every user pair. As a guard, import **refuses** when the input
+parses to zero pairs while user pairs exist — delete them explicitly with
+`tsm synonym rm` instead. (Reading from an interactive terminal is also rejected,
+so the command never blocks waiting for input that isn't coming.)
 
 **CSV format:**
 
