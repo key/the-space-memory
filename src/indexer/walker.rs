@@ -123,17 +123,31 @@ impl ContentWalker {
         if has_forced_excluded_component(rel) {
             return true;
         }
+        // content_dirs may sit *above* project_root (registered via `..`), so
+        // the project_root-relative path can begin with one or more ParentDir
+        // (`..`) components. Those are path traversal, not real directory
+        // names — strip them before ignore matching so a `.*/` pattern (the
+        // default hidden-dir exclusion) does not match `..` and silently drop
+        // the entire tree. A path that is *only* `..` components (the traversal
+        // prefix itself) collapses to empty and is never pattern-excluded.
+        let rel_for_match: PathBuf = rel
+            .components()
+            .skip_while(|c| matches!(c, Component::ParentDir))
+            .collect();
+        if rel_for_match.as_os_str().is_empty() {
+            return false;
+        }
         // path.is_dir() returns false for paths that no longer exist (watcher
         // delete events). For directory-only patterns like `private/` we want
         // the path rejected whether or not the filesystem currently reports a
         // directory — so check both interpretations. A match in either form is
         // enough to exclude.
         self.matcher
-            .matched_path_or_any_parents(rel, false)
+            .matched_path_or_any_parents(&rel_for_match, false)
             .is_ignore()
             || self
                 .matcher
-                .matched_path_or_any_parents(rel, true)
+                .matched_path_or_any_parents(&rel_for_match, true)
                 .is_ignore()
     }
 
@@ -667,6 +681,41 @@ extensions = ["md", "txt"]
         assert!(!files
             .iter()
             .any(|p| p.components().any(|c| c.as_os_str() == "drop")));
+    }
+
+    // ─── content_dirs above project_root (`..` traversal) ──────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn content_dir_above_project_root_keeps_files_but_excludes_dotdirs() {
+        // Orchestration use case: content_dirs use `..` to register sibling
+        // trees that live *above* project_root. Their project_root-relative
+        // path then begins with `..`. A `.*/` ignore pattern (shipped by the
+        // default `tsm init` .tsmignore to drop hidden dirs) must NOT match
+        // the `..` traversal component — otherwise the entire content_dir is
+        // silently excluded. Dot-dirs *inside* the tree are still excluded.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        // Sibling content above project_root.
+        write_file(tmp.path(), "external/notes/keep.md", "keep");
+        write_file(tmp.path(), "external/notes/.obsidian/plugin.md", "no");
+        // Default hidden-dir pattern at the project root.
+        write_file(&root, ".tsmignore", ".*/\n");
+
+        let walker =
+            ContentWalker::from_config(&cfg_with_content_dirs(&root, &["../external/notes"]));
+        let files = walker.collect_files();
+        assert!(
+            files.iter().any(|p| p.ends_with("external/notes/keep.md")),
+            "content above project_root must be indexed; got {files:?}"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|p| p.components().any(|c| c.as_os_str() == ".obsidian")),
+            "dot-dirs within the content tree must still be excluded; got {files:?}"
+        );
     }
 
     // ─── new() constructor ─────────────────────────────────────────────
