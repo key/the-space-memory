@@ -207,6 +207,21 @@ Releases are published by CI on tagged commits as
 `tsm-v<version>-<os>-<arch>.tar.gz` (e.g. `tsm-v0.5.1-linux-x86_64.tar.gz`)
 containing `bin/{tsm,tsmd}` plus `LICENSE`, `README.md`, and `tsm.toml.example`.
 
+### Releasing
+
+1. Bump `version` in `Cargo.toml` (run `cargo check` to sync `Cargo.lock`).
+2. Open a `chore(release): vX.Y.Z` PR and merge to `main`.
+3. Tag the merged commit and push:
+   `git tag vX.Y.Z origin/main && git push origin vX.Y.Z`.
+   This fires `release.yml` (trigger: `tags: ["v*"]`), which builds every
+   target in the release matrix and creates the GitHub Release
+   (`generate_release_notes: true`).
+
+- semver while 0.x: breaking changes → minor bump (e.g. 0.5.x → 0.6.0).
+- The tag MUST point at a commit whose `Cargo.toml` version equals the tag.
+  Never tag without the bump — a dev build and a release sharing one version
+  string are indistinguishable by `tsm --version`.
+
 ## DevContainer
 
 - Base image: `mcr.microsoft.com/devcontainers/base:ubuntu`
