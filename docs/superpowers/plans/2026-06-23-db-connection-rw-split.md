@@ -41,6 +41,12 @@ Task order: ADR → db pragmas/reader conn → pool → classification → confi
 
 ### Task 1: ADR-0015 — read/write connection split
 
+> **Execution note (decided 2026-06-23):** This task ships as its **own PR**,
+> separate from the feature branch, and must be **Accepted (merged) before** the
+> feature PR (Tasks 2–9) merges. Subagents executing Tasks 2–9 must NOT create
+> the ADR — it is handled out of band on branch
+> `docs/adr-0015-read-write-connection-split`.
+
 **Files:**
 - Create: `decisions/0015-read-write-connection-split.md`
 - Modify: `decisions/README.md` (index table — add the row)
