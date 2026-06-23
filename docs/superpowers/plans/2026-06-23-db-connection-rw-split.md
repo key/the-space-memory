@@ -185,7 +185,11 @@ fn test_read_connection_rejects_writes() {
     init_db(&path).unwrap();
     let reader = get_read_connection(&path).unwrap();
     let err = reader
-        .execute("INSERT INTO documents (path, content_hash) VALUES ('x', 'y')", [])
+        .execute(
+            "INSERT INTO documents (file_path, source_type, file_hash, indexed_at) \
+             VALUES ('x', 'note', 'h', '2026-01-01')",
+            [],
+        )
         .unwrap_err();
     assert!(
         err.to_string().contains("readonly") || err.to_string().to_lowercase().contains("read"),
