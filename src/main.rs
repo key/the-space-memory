@@ -76,17 +76,36 @@ enum DictCommands {
         #[arg(long, conflicts_with = "apply")]
         all: bool,
     },
-    /// Manage user-defined synonyms (.tsm/synonyms.csv)
-    Synonym {
-        #[command(subcommand)]
-        command: SynonymCommands,
-    },
 }
 
 #[derive(Subcommand)]
 enum SynonymCommands {
-    /// Sync synonyms.csv to database
-    Sync,
+    /// Add a synonym pair to the DB
+    Add {
+        /// First word of the pair
+        a: String,
+        /// Second word of the pair
+        b: String,
+    },
+    /// Remove synonym pair(s) from the DB
+    Rm {
+        /// Word to remove
+        a: String,
+        /// Optional partner; omit to remove every pair involving `a`
+        b: Option<String>,
+    },
+    /// Export user synonyms as CSV (DB -> stdout, or --file)
+    Export {
+        /// Write to this file instead of stdout
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
+    /// Import user synonyms from CSV (stdin -> DB, or --file)
+    Import {
+        /// Read from this file instead of stdin
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -158,10 +177,17 @@ enum Commands {
         /// Path to wnjpn.db
         wordnet_db: PathBuf,
     },
-    /// Manage user dictionary
+    /// Manage the lindera user dictionary (tokenization). For query-expansion
+    /// synonyms, see `tsm synonym`.
     Dict {
         #[command(subcommand)]
         command: DictCommands,
+    },
+    /// Manage query-expansion synonyms (search). For the lindera user
+    /// dictionary, see `tsm dict`.
+    Synonym {
+        #[command(subcommand)]
+        command: SynonymCommands,
     },
     /// Show current system status
     Status,
@@ -279,11 +305,12 @@ fn main() -> anyhow::Result<()> {
             DictCommands::Reject { apply, all } => {
                 cli::cmd_dict_reject(apply, all)?;
             }
-            DictCommands::Synonym { command } => match command {
-                SynonymCommands::Sync => {
-                    cli::cmd_synonym_sync()?;
-                }
-            },
+        },
+        Commands::Synonym { command } => match command {
+            SynonymCommands::Add { a, b } => cli::cmd_synonym_add(&a, &b)?,
+            SynonymCommands::Rm { a, b } => cli::cmd_synonym_rm(&a, b.as_deref())?,
+            SynonymCommands::Export { file } => cli::cmd_synonym_export(file.as_deref())?,
+            SynonymCommands::Import { file } => cli::cmd_synonym_import(file.as_deref())?,
         },
 
         // ── Daemon-routed (auto-starts tsmd if needed) ──

@@ -1,4 +1,4 @@
-use std::io::{BufRead, ErrorKind, Read, Write};
+use std::io::{BufRead, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config;
@@ -94,7 +94,7 @@ pub fn cmd_init() -> anyhow::Result<()> {
 }
 
 /// Initialize the workspace: schema, scaffold files, WordNet import, user
-/// synonym sync. All steps are idempotent — re-running `tsm init` after
+/// synonym import. All steps are idempotent — re-running `tsm init` after
 /// `tsm setup` is the supported recovery path when WordNet is downloaded
 /// after the initial init.
 ///
@@ -145,14 +145,17 @@ pub fn cmd_init_with(paths: &InitPaths<'_>) -> anyhow::Result<()> {
         );
     }
 
-    // User-synonym sync. The CSV always exists at this point because we
+    // User-synonym import. The CSV always exists at this point because we
     // just scaffolded it, but we still gate on `is_file` to keep the
-    // behavior obvious if a caller wires in a nonstandard path.
+    // behavior obvious if a caller wires in a nonstandard path. Insert-only
+    // (mirror = false): re-running init must never delete pairs added via
+    // `tsm synonym add` that aren't in the file.
     if synonyms_csv.is_file() {
-        let result = synonyms::sync_user_synonyms(&conn, &synonyms_csv)?;
+        let content = std::fs::read_to_string(&synonyms_csv)?;
+        let result = synonyms::import_user_synonyms(&conn, &content, false)?;
         println!(
-            "User synonyms synced: {} pairs ({} deleted, {} skipped)",
-            result.total, result.deleted, result.skipped,
+            "User synonyms imported: {} pairs ({} skipped)",
+            result.total, result.skipped,
         );
     }
 
@@ -514,20 +517,89 @@ pub fn cmd_import_wordnet(wordnet_db: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn cmd_synonym_sync() -> anyhow::Result<()> {
-    let csv_path = config::user_synonyms_path();
-    if !csv_path.is_file() {
+pub fn cmd_synonym_add(a: &str, b: &str) -> anyhow::Result<()> {
+    let conn = db::get_connection(&config::db_path())?;
+    // Echo the normalized pair as actually stored, not the raw input.
+    let (lo, hi) = crate::synonyms::add_user_synonym(&conn, a, b)?;
+    println!("Added synonym: {lo} <-> {hi}");
+    Ok(())
+}
+
+pub fn cmd_synonym_rm(a: &str, b: Option<&str>) -> anyhow::Result<()> {
+    let conn = db::get_connection(&config::db_path())?;
+    let result = crate::synonyms::remove_user_synonym(&conn, a, b)?;
+    if result.removed > 0 {
+        println!("Removed {} synonym pair(s).", result.removed);
+    } else if result.skipped_non_user > 0 {
         println!(
-            "No user synonyms file found at {}. Create it to define custom synonym pairs.",
-            csv_path.display()
+            "No user synonym removed. {} matching pair(s) are not user-defined \
+             (e.g. WordNet) and were left intact.",
+            result.skipped_non_user
         );
-        return Ok(());
+    } else {
+        println!("No matching user synonym found.");
     }
-    let db_path = config::db_path();
-    let conn = db::get_connection(&db_path)?;
-    let result = crate::synonyms::sync_user_synonyms(&conn, &csv_path)?;
+    Ok(())
+}
+
+pub fn cmd_synonym_export(file: Option<&Path>) -> anyhow::Result<()> {
+    let conn = db::get_connection(&config::db_path())?;
+    match file {
+        Some(path) => {
+            // Write to a temp sibling then rename, so a mid-write failure cannot
+            // truncate an existing file (matches `download_wordnet`).
+            let tmp = path.with_extension("csv.tmp");
+            let mut f = std::fs::File::create(&tmp)?;
+            let count = synonyms::export_user_synonyms(&conn, &mut f)?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, path)?;
+            // File destination: CSV went to the file, so the count is user
+            // output on stdout.
+            println!(
+                "Exported {count} user synonym pair(s) to {}",
+                path.display()
+            );
+        }
+        None => {
+            // stdout destination: CSV is the user output, so the diagnostic
+            // count goes to stderr to keep the stream pipeable (ADR-0012).
+            let stdout = std::io::stdout();
+            let mut w = stdout.lock();
+            let count = synonyms::export_user_synonyms(&conn, &mut w)?;
+            eprintln!("Exported {count} user synonym pair(s).");
+        }
+    }
+    Ok(())
+}
+
+pub fn cmd_synonym_import(file: Option<&Path>) -> anyhow::Result<()> {
+    let content = match file {
+        Some(path) => {
+            if !path.is_file() {
+                anyhow::bail!("synonyms CSV not found: {}", path.display());
+            }
+            std::fs::read_to_string(path)?
+        }
+        None => {
+            // Don't block on an interactive terminal waiting for input that isn't
+            // coming. (The empty-input mass-delete is guarded separately in
+            // `import_user_synonyms`.) Require a pipe/redirect or an explicit --file.
+            if std::io::stdin().is_terminal() {
+                anyhow::bail!(
+                    "no input: pipe CSV into `tsm synonym import` or pass `--file <PATH>`"
+                );
+            }
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            buf
+        }
+    };
+    let conn = db::get_connection(&config::db_path())?;
+    // `synonym import` mirrors: pairs absent from the input are deleted.
+    let result = synonyms::import_user_synonyms(&conn, &content, true)?;
     println!(
-        "User synonyms synced: {} pairs ({} deleted, {} skipped)",
+        "User synonyms imported: {} pairs ({} deleted, {} skipped)",
         result.total, result.deleted, result.skipped,
     );
     Ok(())

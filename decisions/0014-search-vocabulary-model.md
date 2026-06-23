@@ -93,9 +93,21 @@ rebuild 後の復旧）は、この往復で保つ。本 ADR は「ファイル�
 ```text
 tsm synonym add <a> <b>
 tsm synonym rm  <a> [b]
-tsm synonym export   # DB -> synonyms.csv
-tsm synonym import   # synonyms.csv -> DB
+tsm synonym export   # DB -> stdout（既定）。--file <path> でファイルへ
+tsm synonym import   # stdin（既定）-> DB。--file <path> でファイルから
 ```
+
+synonym は単一ストリーム（`synonyms.csv` 相当の 1 リソース）なので、export / import は
+標準入出力を既定とし、出力先・入力元はユーザがリダイレクトや `--file <path>` で決める
+（[ADR-0012](./0012-output-channel-model.md) の「ユーザ出力は stdout」と整合）。これは
+2 ファイル（`reject_words.txt` と `user_dict.simpledic`）へ書き出す §2 の `dict export` が
+ファイルベースを採るのと対照的で、リソース数の違いに由来する。補足として、stdout への
+export 時は件数などの診断を stderr に出して CSV ストリームを汚さない。import は mirror
+（入力に無い user ペアを削除）なので、入力が 0 ペア（空または全行不正）で既存の user ペアが
+あるときは全削除事故を防ぐためエラーとする（明示削除は `synonym rm`）。対話 TTY からの
+読み取りも拒否し、来ない入力で待ち続けないようにする。一方 `tsm init` の取り込みは
+insert-only（mirror=false・削除しない）とし、再 init が `synonym add` 済みの DB ペアを
+消さないようにする。
 
 `dict` の名は「lindera 利用者辞書」として維持し、その旨をドキュメントで明示する。
 
