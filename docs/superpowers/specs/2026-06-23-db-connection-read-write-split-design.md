@@ -70,16 +70,43 @@ tsmd daemon (sole DB owner — unchanged)
 
 ### Request routing (`handle_client`)
 
-| Class | Requests | Connection |
-|---|---|---|
-| Write | Index, IngestSession, VectorFill, ImportWordnet, Rebuild | writer mutex |
-| Control (unchanged special handling) | Reindex (respond → bg thread), Reload (SIGHUP) | — |
-| Read | Status, Doctor, Search, Ping | reader pool |
+Routing is driven by a single read/write classification **carried by the request
+itself**, not by a per-variant `match`. `DaemonRequest` gains an `is_read_only()`
+(equivalently `access_mode()`) method, and `handle_client` selects the connection
+purely from it:
+
+- read-only → reader pool
+- write → writer mutex
+
+**All read-only requests are treated identically**: the same reader pool, no
+per-request special-casing, and no priority ordering between them. A future
+read-only request is routed to the reader pool the moment its classification says
+read-only — there is no enumeration in `handle_client` to keep in sync. This
+structurally prevents the regression where a newly added read request is
+forgotten, serializes on the writer, and freezes again.
+
+Classification of the current variants:
+
+| Access | Requests |
+|---|---|
+| read-only | Status, Doctor, Search, Ping |
+| write | Index, IngestSession, VectorFill, ImportWordnet, Rebuild |
+| control (kept as today's special handling, before classification) | Reindex (respond → bg thread), Reload (SIGHUP) |
 
 Reindex / backfill keep running on the **writer** connection. They are writes
 and must remain on the single writer; this is what preserves PR #238's Persist
 transaction boundary and Embed serial contract. Only read-only requests move to
 the reader pool.
+
+`Reindex` and `Reload` are handled by their existing special-case branches
+(immediate response + background thread; SIGHUP to the watcher) *before* the
+read/write classification is consulted — they are neither pool reads nor writer
+writes in `handle_client`.
+
+`is_read_only` matches **every** `DaemonRequest` variant exhaustively (no
+wildcard arm). Adding a new request variant then fails to compile until it is
+explicitly classified, so the "all reads treated the same" routing can never
+silently miss a new read request.
 
 ### `search_active` retirement
 
@@ -129,6 +156,9 @@ It does not contradict ADR-0001/0002 or ADR-0007.
 - A `query_only` reader rejects a write.
 - Pool checkout/return and the size bound (`N` honored; exhaustion blocks then
   recovers).
+- `is_read_only` classifies every variant as expected (read-only requests →
+  reader, writes → writer). The exhaustive match is enforced by the compiler;
+  the test pins the read/write verdict per current variant.
 
 ## Deliverables
 
