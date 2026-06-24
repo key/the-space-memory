@@ -700,11 +700,13 @@ log "=== ADR-0015 regression: reads responsive during reindex ==="
 tsm reindex all >/dev/null 2>&1 &
 _reindex_read_pid=$!
 _start_ns=$(date +%s%N)
-tsm status >/dev/null 2>&1 || true
+set +e; tsm status >/dev/null 2>&1; _rc=$?; set -e
 _elapsed_ms=$(( ($(date +%s%N) - _start_ns) / 1000000 ))
 wait "$_reindex_read_pid" 2>/dev/null || true
 
-if [ "$_elapsed_ms" -gt 2000 ]; then
+if [ "$_rc" -ne 0 ]; then
+    fail "rw-split: status responsive during reindex" "command failed (exit $_rc)"
+elif [ "$_elapsed_ms" -gt 2000 ]; then
     fail "rw-split: status responsive during reindex" \
         "took ${_elapsed_ms}ms (expected < 2000ms)"
 else
@@ -736,11 +738,13 @@ log "=== ADR-0015 regression: file index preempts reindex ==="
 tsm reindex fts >/dev/null 2>&1 &
 _reindex_write_pid=$!
 _start_ns=$(date +%s%N)
-echo "notes/botchan.md" | tsm index --files-from-stdin >/dev/null 2>&1 || true
+set +e; echo "notes/botchan.md" | tsm index --files-from-stdin >/dev/null 2>&1; _rc=$?; set -e
 _elapsed_ms=$(( ($(date +%s%N) - _start_ns) / 1000000 ))
 wait "$_reindex_write_pid" 2>/dev/null || true
 
-if [ "$_elapsed_ms" -gt 3000 ]; then
+if [ "$_rc" -ne 0 ]; then
+    fail "rw-split: index preempts reindex" "command failed (exit $_rc)"
+elif [ "$_elapsed_ms" -gt 3000 ]; then
     fail "rw-split: index preempts reindex" \
         "took ${_elapsed_ms}ms (expected preemption < 3000ms)"
 else

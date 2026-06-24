@@ -2671,12 +2671,14 @@ half_life_days = 180
     // ─── reader_pool_size ────────────────────────────────────────────
 
     #[test]
+    #[serial]
     fn test_reader_pool_size_from_file() {
         let cfg = resolved_from_toml("reader_pool_size = 8\n");
         assert_eq!(cfg.reader_pool_size, 8);
     }
 
     #[test]
+    #[serial]
     fn test_reader_pool_size_default_is_positive() {
         // No key set → defaults to CPU core count, which is always ≥ 1.
         let cfg = resolved_from_toml("");
@@ -2686,12 +2688,14 @@ half_life_days = 180
     // ─── reindex_fts_batch_size ──────────────────────────────────────
 
     #[test]
+    #[serial]
     fn test_reindex_fts_batch_size_from_file() {
         let cfg = resolved_from_toml("reindex_fts_batch_size = 10\n");
         assert_eq!(cfg.reindex_fts_batch_size, 10);
     }
 
     #[test]
+    #[serial]
     fn test_reindex_fts_batch_size_default() {
         let cfg = resolved_from_toml("");
         assert_eq!(cfg.reindex_fts_batch_size, DEFAULT_REINDEX_FTS_BATCH_SIZE);
