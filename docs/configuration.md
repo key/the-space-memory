@@ -140,6 +140,24 @@ half_life_days = 30.0
 
 ## content_dirs Details
 
+### Indexing Scope
+
+Indexing is **recursive**: every root is traversed all the way down, so all
+nested subdirectories are included.
+
+- **With `content_dirs` set**, indexing is _scoped_ to the listed directories
+  and everything nested under them. A directory that is neither listed nor
+  nested under a listed one is **not** indexed. Use this to restrict tsm to a
+  few trees inside a larger project root.
+- **With `content_dirs` empty**, tsm auto-discovers the immediate
+  subdirectories of the project root and indexes each recursively
+  (see [Auto-Discover Mode](#auto-discover-mode)).
+
+In both modes the same exclusions always apply: forced excludes (`.git/` and
+`.tsm/` at any depth), `.tsmignore` patterns, the optional root `.gitignore`
+(when `respect_gitignore` is set), and the extension allowlist (`extensions`,
+default `md`).
+
 ### Scoring Parameters
 
 Each entry carries two scoring knobs:

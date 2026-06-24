@@ -98,8 +98,11 @@ A typical directory layout:
     └── 2026-04.md
 ```
 
-All Markdown files under the project root are indexed automatically.
-The file watcher detects additions, modifications, and deletions in real time.
+By default (no `content_dirs` configured) every Markdown file under the project
+root is indexed. Set `content_dirs` in `tsm.toml` to scope indexing to specific
+directories — each listed directory is still scanned recursively, but anything
+outside them is skipped. The file watcher detects additions, modifications, and
+deletions in real time.
 
 ### Maintenance
 

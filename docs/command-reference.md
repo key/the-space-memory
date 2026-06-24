@@ -303,9 +303,11 @@ Index documents from the configured content directories.
 tsm index [--files-from-stdin]
 ```
 
-Without `--files-from-stdin`, scans directories configured in `tsm.toml`
-(`content_dirs`). If `content_dirs` is not configured, auto-discovers
-non-hidden subdirectories under the project root.
+Without `--files-from-stdin`, recursively scans the directories configured in
+`tsm.toml` (`content_dirs`) — only those trees are indexed, all the way down.
+If `content_dirs` is not configured, it instead recursively scans every
+subdirectory of the project root. Exclusions (`.tsmignore`, the forced
+`.git/` / `.tsm/` excludes, and the extension allowlist) apply in both cases.
 
 With `--files-from-stdin`, reads file paths (one per line) from stdin.
 Each path is resolved relative to the project root.
