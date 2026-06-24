@@ -95,6 +95,13 @@ pub fn run(args: Args) -> Result<()> {
 
     let conn = Arc::new(Mutex::new(conn));
 
+    // Read-only connection pool: serves Status/Doctor/Search/Ping concurrently
+    // with the writer (WAL snapshots). See ADR-0015.
+    let read_pool = Arc::new(
+        the_space_memory::read_pool::ReadPool::new(&db_path, config::reader_pool_size())
+            .context("Failed to open reader pool")?,
+    );
+
     // We hold the lock, so no live daemon exists: a leftover socket is stale.
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)
@@ -270,6 +277,7 @@ pub fn run(args: Args) -> Result<()> {
         match accept_blocking(&listener) {
             Ok((mut stream, _)) => {
                 let conn = Arc::clone(&conn);
+                let read_pool = Arc::clone(&read_pool);
                 let project_root = project_root.clone();
                 let search_active = Arc::clone(&search_active);
                 let watcher_pid = Arc::clone(&watcher_pid);
@@ -280,6 +288,7 @@ pub fn run(args: Args) -> Result<()> {
                     if let Err(e) = handle_client(
                         &mut stream,
                         &conn,
+                        &read_pool,
                         &project_root,
                         &search_active,
                         &watcher_pid,
@@ -325,9 +334,11 @@ pub fn run(args: Args) -> Result<()> {
 
 // ─── Client handling ──────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)] // Task 7 removes search_active, dropping back to 7 args
 fn handle_client(
     stream: &mut std::os::unix::net::UnixStream,
     conn: &Arc<Mutex<rusqlite::Connection>>,
+    read_pool: &Arc<the_space_memory::read_pool::ReadPool>,
     project_root: &std::path::Path,
     search_active: &Arc<AtomicUsize>,
     watcher_pid: &Arc<AtomicU32>,
@@ -410,17 +421,23 @@ fn handle_client(
         return Ok(());
     }
 
-    // Track active search requests so backfill can yield
+    // Track active search requests so backfill can yield (removed in a follow-up
+    // once the reader pool makes this redundant).
     let _guard = if matches!(req, DaemonRequest::Search { .. }) {
         Some(backfill::SearchActiveGuard::new(search_active))
     } else {
         None
     };
 
-    let conn = conn
-        .lock()
-        .map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
-    let resp = daemon::handle_request(&conn, req, project_root, &SHUTDOWN);
+    let resp = if req.is_read_only() {
+        let conn = read_pool.checkout();
+        daemon::handle_request(&conn, req, project_root, &SHUTDOWN)
+    } else {
+        let conn = conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        daemon::handle_request(&conn, req, project_root, &SHUTDOWN)
+    };
     write_response(stream, &resp)?;
     Ok(())
 }
