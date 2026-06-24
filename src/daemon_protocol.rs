@@ -86,6 +86,15 @@ impl DaemonRequest {
     /// writer. The match is exhaustive (no wildcard) on purpose: adding a new
     /// variant fails to compile until it is explicitly classified, so a new
     /// read request can never silently route onto the writer and freeze again.
+    ///
+    /// INVARIANT: a `true` classification means the daemon's handler for this
+    /// request issues NO DB write on the serving connection — reads run on a
+    /// `query_only` reader connection, so any write would fail `SQLITE_READONLY`.
+    /// If a handler classified `true` ever needs to write (including indirect
+    /// side effects like dictionary-candidate harvesting), route that write onto
+    /// a writer connection (e.g. a background `db::get_connection` thread, as the
+    /// search path does for `user_dict::spawn_collect_from_query`) rather than
+    /// reclassifying the request as a write.
     pub fn is_read_only(&self) -> bool {
         match self {
             // Genuine reads.
@@ -94,6 +103,8 @@ impl DaemonRequest {
             | DaemonRequest::Status
             | DaemonRequest::Ping => true,
             // No DB access on the daemon path (flag flip / refused-while-active).
+            // These reach a pooled `query_only` reader: their handlers must stay
+            // write-free (see the INVARIANT above) or be routed to a writer.
             DaemonRequest::Shutdown | DaemonRequest::Rebuild | DaemonRequest::DictUpdate { .. } => {
                 true
             }
