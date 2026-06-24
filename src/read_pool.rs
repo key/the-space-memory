@@ -77,10 +77,12 @@ impl Deref for PooledConn {
 impl Drop for PooledConn {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            if let Ok(mut guard) = self.inner.conns.lock() {
-                guard.push(conn);
-                self.inner.available.notify_one();
-            }
+            let mut guard = match self.inner.conns.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            guard.push(conn);
+            self.inner.available.notify_one();
         }
     }
 }
