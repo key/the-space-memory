@@ -43,7 +43,7 @@ These flags apply to every subcommand.
 
 | Flag | Description |
 |---|---|
-| `--project-root <DIR>` | Directory holding `tsm.toml`, treated as the project root. Used when the current directory has no `tsm.toml`; content paths and state resolve against it. When neither resolves a root, commands fail (except `tsm init` / `tsm setup`, which fall back to the current directory). See ADR-0009 §2. |
+| `--project-root <DIR>` | Directory holding `tsm.toml`, treated as the project root. Used when the current directory has no `tsm.toml`; `content_dirs` paths resolve against it (the `state_dir`, default `.tsm/`, stays relative to the working directory). When neither resolves a root, commands fail (except `tsm init` / `tsm setup`, which fall back to the current directory). See ADR-0009 §2. |
 
 ---
 
