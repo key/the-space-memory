@@ -215,7 +215,7 @@ ADR-0009 はプロジェクトの境界とコンテンツ参照を扱い、本 A
 - `ps -ef` や `pgrep -af tsmd` で、どの daemon がどのプロジェクト用かを即座に判別できる。
   複数プロジェクトの並列稼働は元々可能だが、本 ADR により稼働中の daemon の所属が
   外から追えるようになる。Claude Code プラグイン（別 repo
-  [`key/claude-code-plugins`](https://github.com/key/claude-code-plugins) で管理）の
+  [`key/tsm-plugin-cc`](https://github.com/key/tsm-plugin-cc) で管理）の
   hook はプロジェクトルートに cd 済みのため、追加変更は不要である。
 - 起動シーケンスが単一の `flock` ゲートで直列化され、並行 `tsm start` による daemon の
   多重起動が原理的に起きない。
