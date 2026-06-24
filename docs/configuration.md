@@ -105,8 +105,10 @@ user_dict_path = ".tsm/user_dict.simpledic"
 [[index.content_dirs]]
 # Directory path relative to the project root (required).
 path = "notes"
-# Score multiplier for results from this directory.
-# Non-finite or <= 0 values trigger a warning and fall back to 1.0.
+# Score multiplier for results from this directory. 1.0 is neutral;
+# > 1.0 boosts these results (e.g. 1.2, 1.5, 3.0 — no upper bound),
+# 0 < weight < 1.0 attenuates them. Non-finite or <= 0 values trigger a
+# warning and fall back to 1.0.
 # Default: 1.0
 weight = 1.2
 # Time-decay half-life in days for documents in this directory.
@@ -137,6 +139,20 @@ half_life_days = 30.0
 ```
 
 ## content_dirs Details
+
+### Scoring Parameters
+
+Each entry carries two scoring knobs:
+
+- **`weight`** — a multiplier applied to the final score of results from this
+  directory. `1.0` is neutral, `> 1.0` boosts (there is **no upper bound** —
+  `1.1`, `1.5`, `3.0` are all valid), and `0 < weight < 1.0` attenuates. Values
+  that are non-finite or `<= 0` are rejected with a warning and fall back to
+  `1.0`. To make one directory rank above the rest, raise its weight above
+  `1.0` rather than lowering every other directory.
+- **`half_life_days`** — time-decay half-life. `0` disables decay (timeless);
+  negative or non-finite values warn and fall back to the default (`90.0` for
+  `content_dirs`, `30.0` for Claude sessions).
 
 ### Path Matching
 
