@@ -127,6 +127,14 @@ path = "projects/work"
 weight = 0.8
 half_life_days = 90.0
 
+# Overlapping prefixes are fine. Entries are matched longest-first, so a file
+# under projects/work/ is scored by the entry above (weight 0.8) and every
+# other file under projects/ falls to this broader entry — never both.
+[[index.content_dirs]]
+path = "projects"
+weight = 1.1
+half_life_days = 90.0
+
 [index.claude_session]
 # Score weight for Claude Code session data.
 # Applied to all session: paths regardless of content_dirs configuration.
@@ -176,8 +184,18 @@ Each entry carries two scoring knobs:
 
 - Paths in `content_dirs` are relative to the project root; absolute paths are rejected with a warning
 - Matching uses prefix + `/` boundary check: `notes/foo.md` matches `path = "notes"`, but `notes-extra/bar.md` does not
-- Entries are sorted longest-first so more-specific paths take precedence over shorter prefixes
+- Entries are sorted longest-first and the **first** prefix match wins, so each
+  file is scored by exactly **one** entry — the most specific one. Overlapping
+  prefixes (e.g. `projects` and `projects/work`) are fine and never
+  double-counted
 - Unmatched files fall back to source-type defaults (see below)
+- **A root catch-all does not carry scoring.** `path = "."` (or `""`) makes the
+  walker index everything under the project root, but it never satisfies the
+  prefix + `/` boundary check, so its `weight` / `half_life_days` are inert —
+  those files fall back to the defaults (weight `1.0`, source-type half-life).
+  There is no way to set a non-default weight for _all_ files via `content_dirs`;
+  list the actual top-level directories instead, or leave `content_dirs` empty
+  to index everything with source-type defaults
 
 ### Auto-Discover Mode
 
