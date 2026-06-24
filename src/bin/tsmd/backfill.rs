@@ -195,7 +195,9 @@ pub fn run_reindex_fts_pass(
             break;
         }
 
-        yield_to_pending_writes(writes_pending);
+        if yield_to_pending_writes(writes_pending) {
+            break;
+        }
 
         let Ok(conn) = conn.lock() else {
             log::error!(

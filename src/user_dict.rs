@@ -239,10 +239,12 @@ pub fn spawn_collect_from_query(
     db_path: std::path::PathBuf,
     query: String,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        if let Ok(conn) = db::get_connection(&db_path) {
-            collect_from_query(&conn, &query);
-        }
+    std::thread::spawn(move || match db::get_connection(&db_path) {
+        Ok(conn) => collect_from_query(&conn, &query),
+        Err(e) => log::warn!(
+            "dict candidate harvest: failed to open writer connection ({}): {e}",
+            db_path.display()
+        ),
     })
 }
 
