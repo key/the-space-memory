@@ -10,11 +10,25 @@ env var  >  tsm.toml  >  built-in default
 
 ## Config File Search Order
 
-tsm searches for a config file in the following order; the first file found wins for each field:
+The `tsm` CLI resolves the **project root** in this order (first match wins),
+then loads `<project_root>/tsm.toml` from it (ADR-0009 §2):
+
+1. `$TSM_CONFIG` — its parent directory becomes the project root, and that file
+   is the config
+2. the current directory, if it contains `tsm.toml`
+3. `--project-root <DIR>`, if it contains `tsm.toml`
+
+There is no XDG (`~/.config/tsm/`) fallback on this path: an explicit project
+root is authoritative. When none of the above resolves a root, commands fail
+(except `tsm init` / `tsm setup`, which fall back to the current directory).
+
+The `tsmd` daemon, started without an injected root, uses legacy discovery,
+which additionally consults the user config directory:
 
 1. `$TSM_CONFIG` — explicit override path
 2. `./tsm.toml` — working directory
-3. `~/.config/tsm/config.toml` — user-level config (XDG)
+3. the platform user config directory (`~/.config/tsm/config.toml` on Linux;
+   `~/Library/Application Support/tsm/config.toml` on macOS)
 
 ## Environment Variables
 
@@ -91,8 +105,10 @@ user_dict_path = ".tsm/user_dict.simpledic"
 [[index.content_dirs]]
 # Directory path relative to the project root (required).
 path = "notes"
-# Score multiplier for results from this directory.
-# Non-finite or <= 0 values trigger a warning and fall back to 1.0.
+# Score multiplier for results from this directory. 1.0 is neutral;
+# > 1.0 boosts these results (e.g. 1.2, 1.5, 3.0 — no upper bound),
+# 0 < weight < 1.0 attenuates them. Non-finite or <= 0 values trigger a
+# warning and fall back to 1.0.
 # Default: 1.0
 weight = 1.2
 # Time-decay half-life in days for documents in this directory.
@@ -111,6 +127,14 @@ path = "projects/work"
 weight = 0.8
 half_life_days = 90.0
 
+# Overlapping prefixes are fine. Entries are matched longest-first, so a file
+# under projects/work/ is scored by the entry above (weight 0.8) and every
+# other file under projects/ falls to this broader entry — never both.
+[[index.content_dirs]]
+path = "projects"
+weight = 1.1
+half_life_days = 90.0
+
 [index.claude_session]
 # Score weight for Claude Code session data.
 # Applied to all session: paths regardless of content_dirs configuration.
@@ -124,12 +148,58 @@ half_life_days = 30.0
 
 ## content_dirs Details
 
+### Indexing Scope
+
+Indexing is **recursive**: every root is traversed all the way down, so all
+nested subdirectories are included.
+
+- **With `content_dirs` set**, indexing is _scoped_ to the listed directories
+  and everything nested under them. A directory that is neither listed nor
+  nested under a listed one is **not** indexed. Use this to restrict tsm to a
+  few trees inside a larger project root.
+- **With `content_dirs` empty**, tsm auto-discovers the immediate
+  subdirectories of the project root and indexes each recursively
+  (see [Auto-Discover Mode](#auto-discover-mode)).
+- **Files directly in the project root are only indexed via `path = "."`.**
+  Both auto-discover and specific-directory modes walk _subdirectories_, so a
+  file sitting at the root (e.g. `README.md`, `CLAUDE.md`) is skipped unless a
+  `content_dir` resolves to the project root itself.
+
+In both modes the same exclusions always apply: forced excludes (`.git/` and
+`.tsm/` at any depth), `.tsmignore` patterns, the optional root `.gitignore`
+(when `respect_gitignore` is set), and the extension allowlist (`extensions`,
+default `md`).
+
+### Scoring Parameters
+
+Each entry carries two scoring knobs:
+
+- **`weight`** — a multiplier applied to the final score of results from this
+  directory. `1.0` is neutral, `> 1.0` boosts (there is **no upper bound** —
+  `1.1`, `1.5`, `3.0` are all valid), and `0 < weight < 1.0` attenuates. Values
+  that are non-finite or `<= 0` are rejected with a warning and fall back to
+  `1.0`. To make one directory rank above the rest, raise its weight above
+  `1.0` rather than lowering every other directory.
+- **`half_life_days`** — time-decay half-life. `0` disables decay (timeless);
+  negative or non-finite values warn and fall back to the default (`90.0` for
+  `content_dirs`, `30.0` for Claude sessions).
+
 ### Path Matching
 
 - Paths in `content_dirs` are relative to the project root; absolute paths are rejected with a warning
 - Matching uses prefix + `/` boundary check: `notes/foo.md` matches `path = "notes"`, but `notes-extra/bar.md` does not
-- Entries are sorted longest-first so more-specific paths take precedence over shorter prefixes
+- Entries are sorted longest-first and the **first** prefix match wins, so each
+  file is scored by exactly **one** entry — the most specific one. Overlapping
+  prefixes (e.g. `projects` and `projects/work`) are fine and never
+  double-counted
 - Unmatched files fall back to source-type defaults (see below)
+- **A root catch-all does not carry scoring.** `path = "."` (or `""`) makes the
+  walker index everything under the project root, but it never satisfies the
+  prefix + `/` boundary check, so its `weight` / `half_life_days` are inert —
+  those files fall back to the defaults (weight `1.0`, source-type half-life).
+  There is no way to set a non-default weight for _all_ files via `content_dirs`;
+  list the actual top-level directories instead, or leave `content_dirs` empty
+  to index everything with source-type defaults
 
 ### Auto-Discover Mode
 

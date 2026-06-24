@@ -4,6 +4,7 @@ Complete reference for all `tsm` CLI subcommands.
 
 ## Table of Contents
 
+- [Global Flags](#global-flags)
 - [Lifecycle Commands](#lifecycle-commands)
   - [tsm init](#tsm-init)
   - [tsm start](#tsm-start)
@@ -33,6 +34,16 @@ Complete reference for all `tsm` CLI subcommands.
   - [tsm synonym import](#tsm-synonym-import)
 - [Temporal Query Syntax](#temporal-query-syntax)
 - [Output Formats](#output-formats)
+
+---
+
+## Global Flags
+
+These flags apply to every subcommand.
+
+| Flag | Description |
+|---|---|
+| `--project-root <DIR>` | Directory holding `tsm.toml`, treated as the project root. Used when the current directory has no `tsm.toml`; `content_dirs` paths resolve against it (the `state_dir`, default `.tsm/`, stays relative to the working directory). When neither resolves a root, commands fail (except `tsm init` / `tsm setup`, which fall back to the current directory). See ADR-0009 §2. |
 
 ---
 
@@ -247,7 +258,9 @@ Example: `30d`, `2w`, `3m`.
 combined with OR logic (any match). Must be a relative path, not absolute.
 
 **`--fallback` flag:** When `error` (default), search fails if the embedder is
-not running. When `fts-only`, falls back to full-text search only.
+not running. When `fts-only`, falls back to full-text search only. Note the
+CLI value is hyphenated (`fts-only`); the equivalent `tsm.toml` key uses an
+underscore (`search_fallback = "fts_only"`).
 
 **Examples:**
 
@@ -290,9 +303,11 @@ Index documents from the configured content directories.
 tsm index [--files-from-stdin]
 ```
 
-Without `--files-from-stdin`, scans directories configured in `tsm.toml`
-(`content_dirs`). If `content_dirs` is not configured, auto-discovers
-non-hidden subdirectories under the project root.
+Without `--files-from-stdin`, recursively scans the directories configured in
+`tsm.toml` (`content_dirs`) — only those trees are indexed, all the way down.
+If `content_dirs` is not configured, it instead recursively scans every
+subdirectory of the project root. Exclusions (`.tsmignore`, the forced
+`.git/` / `.tsm/` excludes, and the extension allowlist) apply in both cases.
 
 With `--files-from-stdin`, reads file paths (one per line) from stdin.
 Each path is resolved relative to the project root.

@@ -10,6 +10,21 @@ A cross-workspace knowledge search engine built in Rust.
 Indexes Markdown documents across multiple workspaces and provides hybrid search
 combining FTS5 full-text search with vector semantic search (ruri-v3-30m, 256-dim).
 
+## Claude Code Plugin
+
+This repository ships only the `tsm` / `tsmd` binaries. The Claude Code plugin
+(skills, agents, hooks) lives in a separate repository,
+[`key/tsm-plugin-cc`](https://github.com/key/tsm-plugin-cc), which doubles as
+its own plugin marketplace:
+
+```bash
+/plugin marketplace add key/tsm-plugin-cc
+/plugin install the-space-memory@tsm-plugin-cc
+```
+
+The plugin calls the `tsm` CLI, so install `tsm` separately (see below) and
+ensure it is on your `PATH`.
+
 ## Concept
 
 - **Cross-workspace search** — Index and search across multiple repositories
@@ -90,8 +105,11 @@ A typical directory layout:
     └── 2026-04.md
 ```
 
-All Markdown files under the project root are indexed automatically.
-The file watcher detects additions, modifications, and deletions in real time.
+By default (no `content_dirs` configured) every Markdown file under the project
+root is indexed. Set `content_dirs` in `tsm.toml` to scope indexing to specific
+directories — each listed directory is still scanned recursively, but anything
+outside them is skipped. The file watcher detects additions, modifications, and
+deletions in real time.
 
 ### Maintenance
 
