@@ -18,8 +18,12 @@ pub(crate) struct QueryPlan {
     pub(crate) query_vec: Option<Vec<f32>>,
 }
 
-/// Plan stage: extract keywords, classify the query, run side-effect calls,
-/// expand via entity graph and synonyms, and embed the query for vector search.
+/// Plan stage: extract keywords, classify the query, expand via entity graph
+/// and synonyms, and embed the query for vector search.
+///
+/// Side effects (synonym cleanup, dictionary-candidate harvest) are dispatched
+/// to background threads and do not write through `conn`. `conn` is read-only
+/// throughout this function.
 ///
 /// Returns `Ok(None)` if the query contains too few meaningful keywords to
 /// search (the caller should return an empty result set). Returns
@@ -36,8 +40,10 @@ pub(crate) fn plan(conn: &Connection, query: &str) -> anyhow::Result<Option<Quer
     // Lazy spawn stale synonym cleanup (once per process)
     synonyms::maybe_spawn_cleanup(config::db_path());
 
-    // Collect query terms as dictionary candidates
-    user_dict::collect_from_query(conn, &keywords_query);
+    // Collect query terms as dictionary candidates on a fresh writer connection.
+    // The daemon serves searches on a `query_only` reader conn, so the harvest
+    // must not run on the serving connection (fire-and-forget).
+    let _ = user_dict::spawn_collect_from_query(config::db_path(), keywords_query.clone());
 
     // Expand query: entity graph + synonym dictionary
     let entity_exp = entity::expand_entities_by_ids(
