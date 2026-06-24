@@ -700,7 +700,7 @@ log "=== ADR-0015 regression: reads responsive during reindex ==="
 tsm reindex all >/dev/null 2>&1 &
 _reindex_read_pid=$!
 _start_ns=$(date +%s%N)
-tsm status >/dev/null 2>&1
+tsm status >/dev/null 2>&1 || true
 _elapsed_ms=$(( ($(date +%s%N) - _start_ns) / 1000000 ))
 wait "$_reindex_read_pid" 2>/dev/null || true
 
@@ -719,6 +719,7 @@ for _i in $(seq 1 30); do
     fi
     sleep 1
 done
+if [ "$_i" -eq 30 ]; then log "WARNING: reindex did not drain within 30s"; fi
 
 # ── ADR-0015 regression: file index preempts in-progress reindex ──────
 #
@@ -735,7 +736,7 @@ log "=== ADR-0015 regression: file index preempts reindex ==="
 tsm reindex fts >/dev/null 2>&1 &
 _reindex_write_pid=$!
 _start_ns=$(date +%s%N)
-echo "notes/botchan.md" | tsm index --files-from-stdin >/dev/null 2>&1
+echo "notes/botchan.md" | tsm index --files-from-stdin >/dev/null 2>&1 || true
 _elapsed_ms=$(( ($(date +%s%N) - _start_ns) / 1000000 ))
 wait "$_reindex_write_pid" 2>/dev/null || true
 
@@ -754,6 +755,7 @@ for _i in $(seq 1 30); do
     fi
     sleep 1
 done
+if [ "$_i" -eq 30 ]; then log "WARNING: reindex did not drain within 30s"; fi
 
 # ══════════════════════════════════════════════════════════════════════
 # Summary
