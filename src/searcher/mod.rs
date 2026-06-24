@@ -774,4 +774,21 @@ mod tests {
             );
         }
     }
+
+    /// ADR-0015 guard: search() must succeed on a query_only connection.
+    /// A revert of searcher/plan.rs:46 that writes through the serving conn
+    /// would cause SQLITE_READONLY here.
+    #[test]
+    fn test_search_on_read_connection_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        crate::db::init_db(&path).unwrap();
+        let conn = crate::db::get_read_connection(&path).unwrap();
+        let result = search(&conn, "candle framework", 5, None, false, None);
+        assert!(
+            result.is_ok(),
+            "search on query_only connection must not return SQLITE_READONLY: {:?}",
+            result.err()
+        );
+    }
 }

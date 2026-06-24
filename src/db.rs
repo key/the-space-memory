@@ -617,6 +617,18 @@ mod tests {
     }
 
     #[test]
+    fn test_read_connection_busy_timeout_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        init_db(&path).unwrap();
+        let reader = get_read_connection(&path).unwrap();
+        let ms: i64 = reader
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, BUSY_TIMEOUT_MS as i64);
+    }
+
+    #[test]
     fn test_read_connection_rejects_writes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");

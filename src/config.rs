@@ -2696,4 +2696,66 @@ half_life_days = 180
         let cfg = resolved_from_toml("");
         assert_eq!(cfg.reindex_fts_batch_size, DEFAULT_REINDEX_FTS_BATCH_SIZE);
     }
+
+    // ─── reader_pool_size env overrides ─────────────────────────────
+
+    #[test]
+    #[serial]
+    fn test_reader_pool_size_env_override() {
+        std::env::set_var("TSM_READER_POOL_SIZE", "12");
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.reader_pool_size, 12);
+        std::env::remove_var("TSM_READER_POOL_SIZE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_reader_pool_size_zero_falls_back_to_cpu_default() {
+        std::env::set_var("TSM_READER_POOL_SIZE", "0");
+        let cfg = resolved_from_toml("");
+        assert!(
+            cfg.reader_pool_size >= 1,
+            "zero guard: TSM_READER_POOL_SIZE=0 must fall back to cpu count (>=1), got {}",
+            cfg.reader_pool_size
+        );
+        std::env::remove_var("TSM_READER_POOL_SIZE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_reader_pool_size_env_beats_file() {
+        std::env::set_var("TSM_READER_POOL_SIZE", "7");
+        let cfg = resolved_from_toml("reader_pool_size = 4\n");
+        assert_eq!(cfg.reader_pool_size, 7);
+        std::env::remove_var("TSM_READER_POOL_SIZE");
+    }
+
+    // ─── reindex_fts_batch_size env overrides ───────────────────────
+
+    #[test]
+    #[serial]
+    fn test_reindex_fts_batch_size_env_override() {
+        std::env::set_var("TSM_REINDEX_FTS_BATCH_SIZE", "99");
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.reindex_fts_batch_size, 99);
+        std::env::remove_var("TSM_REINDEX_FTS_BATCH_SIZE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_reindex_fts_batch_size_zero_falls_back_to_default() {
+        std::env::set_var("TSM_REINDEX_FTS_BATCH_SIZE", "0");
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.reindex_fts_batch_size, DEFAULT_REINDEX_FTS_BATCH_SIZE);
+        std::env::remove_var("TSM_REINDEX_FTS_BATCH_SIZE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_reindex_fts_batch_size_env_beats_file() {
+        std::env::set_var("TSM_REINDEX_FTS_BATCH_SIZE", "55");
+        let cfg = resolved_from_toml("reindex_fts_batch_size = 10\n");
+        assert_eq!(cfg.reindex_fts_batch_size, 55);
+        std::env::remove_var("TSM_REINDEX_FTS_BATCH_SIZE");
+    }
 }
