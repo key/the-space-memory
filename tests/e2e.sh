@@ -761,6 +761,79 @@ for _i in $(seq 1 30); do
 done
 if [ "$_i" -eq 30 ]; then log "WARNING: reindex did not drain within 30s"; fi
 
+# ── ADR-0015 regression (issue #151): search stays fast during reindex ─
+#
+# A burst of searches runs while a vectors reindex re-embeds the whole
+# corpus on the writer connection. With the ADR-0015 reader pool, search
+# is served from a query_only reader connection that never blocks on the
+# reindex writer, so every search must stay well under 2000ms. Before the
+# reader pool this would starve: searches blocked behind the reindex
+# writer for seconds. (Issue #151 was filed against the older
+# `yield_to_search` mechanism, which #266 replaced with the reader pool;
+# the reader pool is the property this now guards.)
+#
+# No-op guard: the e2e corpus is tiny, so a single `reindex vectors`
+# finishes in well under the burst duration and most searches would run
+# with no reindex in flight — proving nothing. A background loop keeps a
+# reindex continuously in flight (the daemon rejects overlapping requests
+# cheaply, so each finished pass is immediately re-kicked), and we assert
+# via doctor that a reindex was actually observed active.
+
+echo ""
+log "=== ADR-0015 regression (issue #151): search responsive during reindex ==="
+
+_keep_reindexing="$TSM_STATE_DIR/.keep_reindexing_151"
+: > "$_keep_reindexing"
+( while [ -f "$_keep_reindexing" ]; do tsm reindex vectors >/dev/null 2>&1 || true; done ) &
+_reindex_loop_pid=$!
+
+# Confirm the contention window opened: wait up to ~5s for doctor to
+# report an active Reindex. If it never appears, the burst would be a
+# no-op, so fail loudly rather than pass on an untested code path.
+_observed_active=0
+for _i in $(seq 1 50); do
+    if tsm doctor -f json 2>/dev/null | jq -e '.sections[] | select(.name == "Reindex")' >/dev/null 2>&1; then
+        _observed_active=1
+        break
+    fi
+    sleep 0.1
+done
+
+_slow=0
+for _i in $(seq 1 50); do
+    _start_ns=$(date +%s%N)
+    set +e; tsm search -q "メロス" -k 5 -f json >/dev/null 2>&1; set -e
+    _elapsed_ms=$(( ($(date +%s%N) - _start_ns) / 1000000 ))
+    if [ "$_elapsed_ms" -gt 2000 ]; then
+        _slow=$((_slow + 1))
+        echo "  slow search $_i: ${_elapsed_ms}ms"
+    fi
+done
+
+# Stop the reindex loop, then drain any pass still running in the daemon.
+rm -f "$_keep_reindexing"
+wait "$_reindex_loop_pid" 2>/dev/null || true
+
+if [ "$_observed_active" -eq 0 ]; then
+    fail "rw-split: search responsive during reindex" \
+        "reindex never observed in progress; burst was a no-op (corpus too small?)"
+elif [ "$_slow" -ne 0 ]; then
+    fail "rw-split: search responsive during reindex" \
+        "$_slow/50 searches exceeded 2000ms"
+else
+    pass "rw-split: search responsive during reindex (50/50 < 2000ms)"
+fi
+
+# Drain before cleanup.
+for _i in $(seq 1 30); do
+    _doc_json=$(tsm doctor -f json 2>/dev/null)
+    if ! echo "$_doc_json" | jq -e '.sections[] | select(.name == "Reindex")' >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+if [ "$_i" -eq 30 ]; then log "WARNING: reindex did not drain within 30s"; fi
+
 # ══════════════════════════════════════════════════════════════════════
 # Summary
 # ══════════════════════════════════════════════════════════════════════
