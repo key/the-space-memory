@@ -328,7 +328,7 @@ A change is merge-ready when **all** of the following hold:
 - `tsmd --embedder` spawned by tsmd has idle timeout disabled (`--no-idle-timeout`).
   If run standalone, it auto-stops after 10 min idle (configurable via `TSM_EMBEDDER_IDLE_TIMEOUT`)
 - Search errors by default when embedder is down (`search_fallback = "error"`).
-  Use `--fallback fts_only` or config for FTS-only mode
+  Use `--fallback fts-only` or config for FTS-only mode
 - **User dictionary POS is `名詞`** — simpledic format: `surface,名詞,reading`.
   Uses standard POS so existing noun filters work without special handling.
   `#` comment lines are stripped before passing to lindera
