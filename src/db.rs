@@ -134,11 +134,16 @@ fn create_vec_table(conn: &Connection) {
     let _ = conn.execute_batch(&sql);
 }
 
+/// Busy timeout (ms) applied to every connection. Turns the rare SQLITE_BUSY
+/// (WAL checkpoint, writer-vs-writer) into a bounded retry instead of an error.
+pub const BUSY_TIMEOUT_MS: u64 = 5000;
+
 fn apply_pragmas(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "PRAGMA journal_mode=WAL;
-         PRAGMA foreign_keys=ON;",
-    )?;
+         PRAGMA foreign_keys=ON;
+         PRAGMA busy_timeout={BUSY_TIMEOUT_MS};",
+    ))?;
     Ok(())
 }
 
@@ -255,6 +260,23 @@ pub fn get_connection(db_path: &Path) -> anyhow::Result<Connection> {
     apply_pragmas(&conn)?;
     ensure_chunk_hash_column(&conn)?;
     ensure_metadata_column(&conn)?;
+    Ok(conn)
+}
+
+/// Open a read-only connection for the daemon's reader pool.
+///
+/// Opened READ_WRITE (not READ_ONLY: a read-only handle on a WAL DB can fail to
+/// recover a hot WAL with SQLITE_READONLY_RECOVERY), then constrained with
+/// `PRAGMA query_only=ON` so writes are rejected. Runs the same idempotent
+/// column migrations as `get_connection` so a reader opened before the writer
+/// still sees `content_hash` / `metadata`.
+pub fn get_read_connection(db_path: &Path) -> anyhow::Result<Connection> {
+    ensure_vec_extension();
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    apply_pragmas(&conn)?;
+    ensure_chunk_hash_column(&conn)?;
+    ensure_metadata_column(&conn)?;
+    conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
 }
 
@@ -580,5 +602,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(got.as_deref(), Some("{\"status\":\"current\"}"));
+    }
+
+    #[test]
+    fn test_busy_timeout_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        init_db(&path).unwrap();
+        let conn = get_connection(&path).unwrap();
+        let ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, BUSY_TIMEOUT_MS as i64);
+    }
+
+    #[test]
+    fn test_read_connection_busy_timeout_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        init_db(&path).unwrap();
+        let reader = get_read_connection(&path).unwrap();
+        let ms: i64 = reader
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, BUSY_TIMEOUT_MS as i64);
+    }
+
+    #[test]
+    fn test_read_connection_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        init_db(&path).unwrap();
+        let reader = get_read_connection(&path).unwrap();
+        let err = reader
+            .execute(
+                "INSERT INTO documents (file_path, source_type, file_hash, indexed_at) VALUES ('x', 'note', 'h', '2026-01-01')",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("readonly") || err.to_string().to_lowercase().contains("read"),
+            "expected a read-only rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_read_connection_sees_snapshot_during_writer_delete() {
+        // Reader must read chunks_vec without error while the writer holds a
+        // transaction that has DELETEd from it (WAL snapshot isolation across the
+        // vec0 virtual table's shadow tables).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        init_db(&path).unwrap();
+
+        let writer = get_connection(&path).unwrap();
+        writer
+            .execute_batch("BEGIN; DELETE FROM chunks_vec; ")
+            .unwrap(); // open write txn, not yet committed
+
+        let reader = get_read_connection(&path).unwrap();
+        let n: i64 = reader
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .expect("reader should read a snapshot, not error");
+        assert_eq!(n, 0); // empty DB; the point is it returns, not the value
+
+        writer.execute_batch("ROLLBACK;").unwrap();
     }
 }

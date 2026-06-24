@@ -33,6 +33,14 @@
 # Env: TSM_EMBEDDER_BACKFILL_INTERVAL
 # embedder_backfill_interval_secs = 300
 
+# Number of read-only DB connections the daemon keeps for status/doctor/search.
+# Caps concurrent reads. Default: CPU core count.
+# reader_pool_size = 4
+
+# FTS reindex batch size. Smaller = a file/interactive `index` preempts an
+# in-progress reindex sooner; larger = better full-reindex throughput. Default: 200.
+# reindex_fts_batch_size = 200
+
 # Behavior when the embedder is stopped during search.
 # Options: "error" (refuse to search) | "fts_only" (FTS5 fallback with warning)
 # Default: "error"

@@ -561,11 +561,14 @@ mod tests {
 
     #[test]
     fn test_candidates_collected_on_search() {
-        use crate::indexer;
+        use crate::{indexer, user_dict};
         use std::io::Write;
 
-        let conn = db::get_memory_connection().unwrap();
+        // Arrange: real file-based DB (the spawn opens its own writer connection)
         let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("tsm.db");
+        db::init_db(&db_path).unwrap();
+        let conn = db::get_connection(&db_path).unwrap();
 
         let md = "---\nstatus: current\n---\n\n# Test\n\nSome content for candle search.\n";
         let full = dir.path().join("daily/notes/test.md");
@@ -574,12 +577,16 @@ mod tests {
         f.write_all(md.as_bytes()).unwrap();
         indexer::index_file(&conn, &full, dir.path()).unwrap();
 
-        // Clear candidates from indexing
-        let _ = conn.execute("DELETE FROM dictionary_candidates", []);
+        // Clear candidates from indexing so we only count those from the query
+        conn.execute("DELETE FROM dictionary_candidates", [])
+            .unwrap();
 
-        // Search should collect query candidates
-        let _ = search(&conn, "candle framework", 5, None, false, None);
+        // Act: spawn harvest on the file-based DB and join for determinism
+        user_dict::spawn_collect_from_query(db_path.clone(), "candle framework".to_string())
+            .join()
+            .unwrap();
 
+        // Assert: candidates were written by the spawned writer connection
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM dictionary_candidates", [], |r| {
                 r.get(0)
@@ -766,5 +773,22 @@ mod tests {
                 cur.score
             );
         }
+    }
+
+    /// ADR-0015 guard: search() must succeed on a query_only connection.
+    /// A revert of searcher/plan.rs:46 that writes through the serving conn
+    /// would cause SQLITE_READONLY here.
+    #[test]
+    fn test_search_on_read_connection_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        crate::db::init_db(&path).unwrap();
+        let conn = crate::db::get_read_connection(&path).unwrap();
+        let result = search(&conn, "candle framework", 5, None, false, None);
+        assert!(
+            result.is_ok(),
+            "search on query_only connection must not return SQLITE_READONLY: {:?}",
+            result.err()
+        );
     }
 }

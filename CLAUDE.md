@@ -142,7 +142,9 @@ src/
 
 **Ownership:**
 
-- **tsmd (daemon)** — sole DB owner. All reads/writes go through here
+- **tsmd (daemon)** — sole DB owner. Holds one writer connection plus a `query_only` reader
+  pool (sized by `reader_pool_size`, default CPU cores). Read requests (status/doctor/search/ping)
+  are served from the pool concurrently with writes; all writes serialize on the single writer.
 - **tsmd --embedder** — stateless inference server. No DB access
 - **tsmd --fs-watcher** — stateless file monitor. Sends Index requests to daemon via daemon.sock
 
@@ -376,6 +378,15 @@ A change is merge-ready when **all** of the following hold:
 - **All log modes default to `info`** (`logging::default_log_spec`). User-facing
   command output is `println!`, not the logger, so it shows regardless of level.
   Set `RUST_LOG=warn` to quiet the CLI terminal, or `debug` for more detail
+- **Read/write routing is exhaustive** — `DaemonRequest::is_read_only()` is an exhaustive
+  match. Adding a new request variant without classifying it causes a compile error.
+  Reads run on the `query_only` reader pool (sized by `reader_pool_size`, default CPU cores);
+  writes serialize on the single writer. `busy_timeout` (5 000 ms) is set on all connections.
+- **Write fairness / reindex preemption** — reindex and backfill yield the writer to a pending
+  `Index` request (`yield_to_pending_writes`) so a file or interactive index preempts an
+  in-progress reindex within one batch. The FTS reindex batch size is `reindex_fts_batch_size`
+  (default 200): smaller = finer preemption granularity but more fsync overhead; larger = better
+  reindex throughput but coarser preemption.
 - **macOS tempdir vs `current_dir()` symlinks** — `tempfile::tempdir()` returns
   `/var/...` but after `set_current_dir`, `current_dir()` resolves the symlink to
   `/private/var/...`. A test asserting `path == cwd` must canonicalize the tempdir

@@ -20,6 +20,8 @@ pub fn handle_request(
     match req {
         DaemonRequest::Ping => DaemonResponse::success_empty(),
 
+        // Classified read-only (see DaemonRequest::is_read_only): reaches a
+        // query_only reader connection, so this arm must not write the DB.
         DaemonRequest::Shutdown => {
             shutdown_flag.store(true, Ordering::SeqCst);
             DaemonResponse::success_empty()
@@ -151,6 +153,8 @@ pub fn handle_request(
             }
         }
 
+        // Refused while the daemon is active, so write-free on this path —
+        // classified read-only and may reach a query_only reader connection.
         DaemonRequest::DictUpdate { .. } => DaemonResponse::error(
             "dict update --apply cannot run while tsmd is active. Run `tsm stop` first.",
         ),
@@ -159,6 +163,8 @@ pub fn handle_request(
             "reindex must be intercepted by daemon_mode. If you see this, it's a bug.",
         ),
 
+        // Refused while the daemon is active, so write-free on this path —
+        // classified read-only and may reach a query_only reader connection.
         DaemonRequest::Rebuild => {
             DaemonResponse::error("rebuild cannot run while tsmd is active. Run `tsm stop` first.")
         }
