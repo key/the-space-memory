@@ -753,6 +753,37 @@ impl DoctorReport {
     }
 }
 
+/// Build the "Build" doctor section from compile-time version metadata.
+///
+/// `TSM_GIT_DESCRIBE` / `TSM_BUILD_DATE` are injected by `build.rs`
+/// (`git describe` + build date). When unavailable (e.g. a build without the
+/// build script or git), fall back to the crate version and "unknown".
+pub fn build_section() -> DoctorSection {
+    let version = match option_env!("TSM_GIT_DESCRIBE") {
+        Some(d) if !d.is_empty() => d.to_string(),
+        _ => format!("v{}", env!("CARGO_PKG_VERSION")),
+    };
+    let built = match option_env!("TSM_BUILD_DATE") {
+        Some(d) if !d.is_empty() => d,
+        _ => "unknown",
+    };
+    DoctorSection {
+        name: "Build".to_string(),
+        items: vec![
+            CheckItem {
+                status: CheckStatus::Ok,
+                message: format!("Version: {version}"),
+                hint: None,
+            },
+            CheckItem {
+                status: CheckStatus::Ok,
+                message: format!("Built: {built}"),
+                hint: None,
+            },
+        ],
+    }
+}
+
 /// Run doctor check with an existing DB connection.
 pub fn run_doctor(conn: &rusqlite::Connection, db_path: &Path) -> DoctorReport {
     let mut report = DoctorReport::default();
@@ -773,6 +804,8 @@ pub fn run_doctor(conn: &rusqlite::Connection, db_path: &Path) -> DoctorReport {
     }
 
     doctor_check_with_conn(conn, &mut report, db_section);
+    // Build metadata first (matches the local `cmd_doctor` path).
+    report.sections.insert(0, build_section());
     report
 }
 
@@ -1069,7 +1102,9 @@ fn doctor_check_with_conn(
 
 pub fn cmd_doctor(format: &str) -> anyhow::Result<()> {
     let db_path = config::db_path();
-    let report = doctor_check(&db_path);
+    let mut report = doctor_check(&db_path);
+    // Surface build metadata first so it is visible even when the DB is absent.
+    report.sections.insert(0, build_section());
     match format {
         "json" => {
             let json = report.to_json();
@@ -1669,6 +1704,37 @@ pub fn cmd_rebuild_fts() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_section_reports_version_and_date() {
+        let section = build_section();
+        assert_eq!(section.name, "Build");
+        assert_eq!(section.items.len(), 2);
+        // All build items are informational (never warnings/errors).
+        assert!(section.items.iter().all(|i| i.status == CheckStatus::Ok));
+        // Version line is always populated: a git describe at build time, or
+        // the crate version as a fallback when git info is unavailable.
+        let version = &section.items[0].message;
+        assert!(version.starts_with("Version: "), "got {version:?}");
+        assert!(
+            version.len() > "Version: ".len(),
+            "version must not be empty"
+        );
+        // Build date line is always present (real date or "unknown").
+        assert!(section.items[1].message.starts_with("Built: "));
+    }
+
+    #[test]
+    fn test_run_doctor_includes_build_section_first() {
+        // The daemon path renders `run_doctor`'s report; it must carry the
+        // same build metadata as the local `cmd_doctor` path, listed first.
+        let conn = crate::test_utils::setup_db();
+        let report = run_doctor(&conn, Path::new(":memory:"));
+        assert_eq!(
+            report.sections.first().map(|s| s.name.as_str()),
+            Some("Build")
+        );
+    }
 
     // Walker behavior is covered by indexer::walker::tests. In this module
     // `cmd_rebuild` constructs ContentWalker via from_env_with_project_root

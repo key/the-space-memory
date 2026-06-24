@@ -39,10 +39,17 @@ impl From<ReindexKindArg> for ReindexKind {
     }
 }
 
+/// `git describe` + build date injected by `build.rs`, falling back to the
+/// crate version when the build script did not run.
+const LONG_VERSION: &str = match option_env!("TSM_VERSION_LONG") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
 #[command(
     name = "tsm",
-    version,
+    version = LONG_VERSION,
     about = "The Space Memory — knowledge search engine"
 )]
 struct Cli {
