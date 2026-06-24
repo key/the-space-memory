@@ -227,11 +227,15 @@ labeler then applies the `breaking` label, which surfaces the PR under
 
 The Claude Code plugin definition (skills/agents/hooks) for `tsm` lives in a
 separate repository:
-[`key/claude-code-plugins`](https://github.com/key/claude-code-plugins),
-under `plugins/the-space-memory/`.
+[`key/tsm-plugin-cc`](https://github.com/key/tsm-plugin-cc).
 
-This repo only ships the `tsm` / `tsmd` binaries. Install the plugin from the
-plugins repo and ensure `tsm` is on `PATH`.
+This repo only ships the `tsm` / `tsmd` binaries. Install the plugin from its
+marketplace and ensure `tsm` is on `PATH`:
+
+```text
+/plugin marketplace add key/tsm-plugin-cc
+/plugin install the-space-memory@tsm-plugin-cc
+```
 
 ## Build & Deploy
 
