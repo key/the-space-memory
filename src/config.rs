@@ -16,6 +16,10 @@ pub const SNIPPET_MAX_CHARS: usize = 200;
 pub const MIN_SESSION_MESSAGE_LEN: usize = 10;
 pub const BACKFILL_BATCH_SIZE: usize = 8;
 pub const REINDEX_FTS_BATCH_SIZE: usize = 1000;
+/// Default FTS reindex batch size when `reindex_fts_batch_size` is unset.
+/// Smaller = finer write preemption (ADR-0015), larger = better full-reindex
+/// throughput. 200 is the middle ground; tune via config + measurement.
+pub const DEFAULT_REINDEX_FTS_BATCH_SIZE: usize = 200;
 pub const MAX_QUERY_EXPANSIONS: usize = 5;
 pub const RECENT_DAYS: i64 = 30;
 pub const DICT_CANDIDATE_FREQ_THRESHOLD: i64 = 5;
@@ -189,6 +193,8 @@ pub(crate) struct ConfigFile {
     log_dir: Option<PathBuf>,
     embedder_idle_timeout_secs: Option<u64>,
     embedder_backfill_interval_secs: Option<u64>,
+    reader_pool_size: Option<u64>,
+    reindex_fts_batch_size: Option<u64>,
     search_fallback: Option<SearchFallback>,
     user_dict_path: Option<PathBuf>,
     #[serde(default)]
@@ -243,6 +249,16 @@ pub struct ResolvedConfig {
     /// Default: 300.
     /// Env: `TSM_EMBEDDER_BACKFILL_INTERVAL`. Config: `embedder_backfill_interval_secs`.
     pub embedder_backfill_interval_secs: u64,
+
+    /// Number of read-only connections in the daemon's reader pool.
+    /// Default: CPU core count. Env: `TSM_READER_POOL_SIZE`. Config: `reader_pool_size`.
+    /// Caps concurrent reads (see ADR-0015).
+    pub reader_pool_size: usize,
+
+    /// FTS reindex batch size; smaller = finer preemption, more fsync (ADR-0015).
+    /// Default: `DEFAULT_REINDEX_FTS_BATCH_SIZE`. Env: `TSM_REINDEX_FTS_BATCH_SIZE`.
+    /// Config: `reindex_fts_batch_size`.
+    pub reindex_fts_batch_size: usize,
 
     /// Behavior when the embedder is stopped during search.
     /// Default: `Error` (refuse to search without vector search).
@@ -393,6 +409,19 @@ impl ResolvedConfig {
         )
         .unwrap_or(DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS);
 
+        let reader_pool_size = env_parse_u64("TSM_READER_POOL_SIZE", file_cfg.reader_pool_size)
+            .map(|n| n as usize)
+            .filter(|&n| n > 0)
+            .unwrap_or_else(default_reader_pool_size);
+
+        let reindex_fts_batch_size = env_parse_u64(
+            "TSM_REINDEX_FTS_BATCH_SIZE",
+            file_cfg.reindex_fts_batch_size,
+        )
+        .map(|n| n as usize)
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_REINDEX_FTS_BATCH_SIZE);
+
         let search_fallback = env_parse_fallback(file_cfg.search_fallback);
 
         let user_dict_path = env_or("TSM_USER_DICT", file_cfg.user_dict_path.as_ref())
@@ -488,6 +517,8 @@ impl ResolvedConfig {
             log_dir,
             embedder_idle_timeout_secs,
             embedder_backfill_interval_secs,
+            reader_pool_size,
+            reindex_fts_batch_size,
             search_fallback,
             user_dict_path,
             setup_link_mode,
@@ -578,6 +609,13 @@ fn env_parse_link_mode(var: &str, file_val: Option<LinkMode>) -> LinkMode {
         }
     }
     file_val.unwrap_or_default()
+}
+
+/// Default reader pool size: the machine's parallelism, floored at 1.
+fn default_reader_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 /// Read an env var as u64, falling back to a config file value.
@@ -770,6 +808,10 @@ fn load_config_from(candidates: &[PathBuf]) -> (ConfigFile, Option<PathBuf>) {
         merged.embedder_backfill_interval_secs = merged
             .embedder_backfill_interval_secs
             .or(file.embedder_backfill_interval_secs);
+        merged.reader_pool_size = merged.reader_pool_size.or(file.reader_pool_size);
+        merged.reindex_fts_batch_size = merged
+            .reindex_fts_batch_size
+            .or(file.reindex_fts_batch_size);
         merged.search_fallback = merged.search_fallback.or(file.search_fallback);
         merged.user_dict_path = merged.user_dict_path.or(file.user_dict_path);
         if merged.index.content_dirs.is_empty() {
@@ -902,6 +944,14 @@ pub fn embedder_idle_timeout_secs() -> u64 {
 
 pub fn embedder_backfill_interval_secs() -> u64 {
     resolved().embedder_backfill_interval_secs
+}
+
+pub fn reader_pool_size() -> usize {
+    resolved().reader_pool_size
+}
+
+pub fn reindex_fts_batch_size() -> usize {
+    resolved().reindex_fts_batch_size
 }
 
 pub fn search_fallback() -> SearchFallback {
@@ -2617,5 +2667,34 @@ half_life_days = 180
 
         std::env::remove_var("TSM_CACHE_DIR");
         reload();
+    }
+
+    // ─── reader_pool_size ────────────────────────────────────────────
+
+    #[test]
+    fn test_reader_pool_size_from_file() {
+        let cfg = resolved_from_toml("reader_pool_size = 8\n");
+        assert_eq!(cfg.reader_pool_size, 8);
+    }
+
+    #[test]
+    fn test_reader_pool_size_default_is_positive() {
+        // No key set → defaults to CPU core count, which is always ≥ 1.
+        let cfg = resolved_from_toml("");
+        assert!(cfg.reader_pool_size >= 1);
+    }
+
+    // ─── reindex_fts_batch_size ──────────────────────────────────────
+
+    #[test]
+    fn test_reindex_fts_batch_size_from_file() {
+        let cfg = resolved_from_toml("reindex_fts_batch_size = 10\n");
+        assert_eq!(cfg.reindex_fts_batch_size, 10);
+    }
+
+    #[test]
+    fn test_reindex_fts_batch_size_default() {
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.reindex_fts_batch_size, DEFAULT_REINDEX_FTS_BATCH_SIZE);
     }
 }
