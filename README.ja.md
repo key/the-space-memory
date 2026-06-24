@@ -215,6 +215,8 @@ end
 | `TSM_USER_DICT` | `{state_dir}/user_dict.simpledic` | `user_dict_path` | lindera ユーザー辞書のパス |
 | `TSM_SETUP_LINK_MODE` | `symlink` | `[setup].link_mode` | `tsm setup` がキャッシュ資源を配置する方式: `symlink` または `copy` |
 | `TSM_INIT_LINK_MODE` | `symlink` | `[init].link_mode` | `tsm init` がワークスペース資源をキャッシュへ紐付ける方式: `symlink` または `copy` |
+| `TSM_READER_POOL_SIZE` | CPU コア数 | `reader_pool_size` | デーモンの `query_only` リーダープールの接続数。同時読み取り数の上限 |
+| `TSM_REINDEX_FTS_BATCH_SIZE` | `200` | `reindex_fts_batch_size` | FTS reindex の 1 バッチあたりのドキュメント数。小さいほど割り込み粒度が細かく fsync が増加、大きいほど reindex スループットが向上 |
 
 このほか `RUST_LOG`（ログレベル、デフォルト `info`）と `NO_COLOR`（カラー出力の
 無効化）を尊重する。

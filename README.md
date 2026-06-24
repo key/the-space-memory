@@ -221,6 +221,8 @@ the environment variable takes precedence. See
 | `TSM_USER_DICT` | `{state_dir}/user_dict.simpledic` | `user_dict_path` | Path to the lindera user dictionary |
 | `TSM_SETUP_LINK_MODE` | `symlink` | `[setup].link_mode` | How `tsm setup` materializes cached resources: `symlink` or `copy` |
 | `TSM_INIT_LINK_MODE` | `symlink` | `[init].link_mode` | How `tsm init` links workspace resources to the cache: `symlink` or `copy` |
+| `TSM_READER_POOL_SIZE` | CPU cores | `reader_pool_size` | Number of `query_only` reader connections in the daemon's reader pool; caps concurrent reads |
+| `TSM_REINDEX_FTS_BATCH_SIZE` | `200` | `reindex_fts_batch_size` | Documents per FTS reindex batch; smaller = finer preemption granularity and more fsync, larger = better reindex throughput |
 
 tsm also honors `RUST_LOG` (log level, default `info`) and `NO_COLOR`
 (disable colored output).
