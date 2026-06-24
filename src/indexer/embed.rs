@@ -164,7 +164,9 @@ fn retry_or_skip(
         log::warn!("Retrying {} chunks individually...", batch.len());
         retry_individually(batch, encode_fn, conn, stats);
     } else {
-        mark_chunk_skip(conn, batch[0].0, skip_reason);
+        let chunk_id = batch[0].0;
+        log::warn!("chunk {chunk_id}: failed — marking skip ({skip_reason})");
+        mark_chunk_skip(conn, chunk_id, skip_reason);
         stats.errors += 1;
     }
 }
@@ -179,6 +181,10 @@ fn process_batch(
     batch: &[(i64, String, String)],
     stats: &mut BackfillStats,
 ) -> anyhow::Result<()> {
+    debug_assert!(
+        !batch.is_empty(),
+        "process_batch requires a non-empty batch"
+    );
     let start_id = batch.first().map_or(0, |c| c.0);
     let end_id = batch.last().map_or(0, |c| c.0);
 
@@ -287,8 +293,8 @@ fn log_summary(stats: &BackfillStats) {
 
 /// Fill in missing vectors for chunks that have FTS5 entries but no vector entries.
 /// Uses keyset pagination to avoid loading all missing chunks into memory at once.
-/// Each INSERT auto-commits individually (rusqlite default autocommit mode).
-/// Failed batches are logged and skipped — the next run will retry them.
+/// Each batch's successful inserts are committed in one transaction; failed
+/// batches fall back to per-chunk retry or skip, and the next run retries skips.
 pub fn backfill_vectors(
     conn: &Connection,
     encode_fn: EncodeFn,
