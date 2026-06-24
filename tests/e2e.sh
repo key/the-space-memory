@@ -139,6 +139,9 @@ TSM_PROJECT_DIR="$(mktemp -d)"
 cd "$TSM_PROJECT_DIR" || exit 1
 export TSM_EMBEDDER_IDLE_TIMEOUT=0
 export TSM_EMBEDDER_BACKFILL_INTERVAL=0
+# Small batch so a reindex-in-progress spans multiple yields; lets the
+# write-preemption test observe real preemption rather than a no-op race.
+export TSM_REINDEX_FTS_BATCH_SIZE=10
 
 # Compute dynamic dates
 TODAY=$(date +%Y-%m-%d)
@@ -680,6 +683,77 @@ else
         # say "running". We rely on search exit code / error instead.
     fi
 fi
+
+# ── ADR-0015 regression: reads stay responsive during reindex ─────────
+#
+# Kick a background reindex and immediately time a `tsm status` call.
+# Before ADR-0015 (reader pool), status blocked on the writer lock and
+# could freeze for the full reindex duration. The 2000ms ceiling is a
+# generous guard — the freeze it protects against was multi-second to
+# indefinite; the read should complete in <100ms with a reader pool.
+# After timing, drain the reindex so it doesn't contaminate the next
+# block.
+
+echo ""
+log "=== ADR-0015 regression: reads responsive during reindex ==="
+
+tsm reindex all >/dev/null 2>&1 &
+_reindex_read_pid=$!
+_start_ns=$(date +%s%N)
+tsm status >/dev/null 2>&1
+_elapsed_ms=$(( ($(date +%s%N) - _start_ns) / 1000000 ))
+wait "$_reindex_read_pid" 2>/dev/null || true
+
+if [ "$_elapsed_ms" -gt 2000 ]; then
+    fail "rw-split: status responsive during reindex" \
+        "took ${_elapsed_ms}ms (expected < 2000ms)"
+else
+    pass "rw-split: status responsive during reindex (${_elapsed_ms}ms)"
+fi
+
+# Drain the reindex before the next block.
+for _i in $(seq 1 30); do
+    _doc_json=$(tsm doctor -f json 2>/dev/null)
+    if ! echo "$_doc_json" | jq -e '.sections[] | select(.name == "Reindex")' >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+# ── ADR-0015 regression: file index preempts in-progress reindex ──────
+#
+# Kick a background reindex (small batch via TSM_REINDEX_FTS_BATCH_SIZE=10
+# set before daemon start), then immediately pipe a real corpus file into
+# `tsm index --files-from-stdin`. The reindex yields after each batch so
+# the index request should be served before all batches complete.
+# The 3000ms ceiling guards against the pre-ADR-0015 behaviour where a
+# file index had to wait for the entire reindex to finish.
+
+echo ""
+log "=== ADR-0015 regression: file index preempts reindex ==="
+
+tsm reindex fts >/dev/null 2>&1 &
+_reindex_write_pid=$!
+_start_ns=$(date +%s%N)
+echo "notes/botchan.md" | tsm index --files-from-stdin >/dev/null 2>&1
+_elapsed_ms=$(( ($(date +%s%N) - _start_ns) / 1000000 ))
+wait "$_reindex_write_pid" 2>/dev/null || true
+
+if [ "$_elapsed_ms" -gt 3000 ]; then
+    fail "rw-split: index preempts reindex" \
+        "took ${_elapsed_ms}ms (expected preemption < 3000ms)"
+else
+    pass "rw-split: index preempts reindex (${_elapsed_ms}ms)"
+fi
+
+# Drain before cleanup.
+for _i in $(seq 1 30); do
+    _doc_json=$(tsm doctor -f json 2>/dev/null)
+    if ! echo "$_doc_json" | jq -e '.sections[] | select(.name == "Reindex")' >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
 
 # ══════════════════════════════════════════════════════════════════════
 # Summary
