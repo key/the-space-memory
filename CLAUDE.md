@@ -169,6 +169,11 @@ src/
 - DB tests use in-memory SQLite (`:memory:`) to prevent state leakage
 - Embedder tests should use mockable trait design
 - Tests must not depend on external daemon state (embedder, etc.)
+- **CLI ↔ docs structural sync is gated** — `tests/cli_docs.rs` walks `tsm --help`
+  and fails if a command/flag is undocumented in `docs/command-reference.md`, or
+  if a doc example names a command that no longer exists. Update the reference
+  when you change the CLI surface. (Semantic prose drift is the `verify-docs`
+  skill's job, not this test's.)
 - **E2E testdata の日付は placeholder 化必須** — `tests/e2e/testdata/**` 内で
   日付を直書きしない。`__TODAY__` / `__1Y_AGO__` / `__3M_AGO__` 等を使い、
   `tests/e2e.sh` の sed で実行時に置換する。直書きは time-decay スコアで
