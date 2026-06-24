@@ -114,6 +114,10 @@ src/
   column is added automatically on connect (idempotent migration) and does not require a rebuild
 - **Live re-indexing**: `tsm reindex {all|fts|vectors}` — daemon runs batched
   re-index in background, yielding to search between batches
+- **Build metadata**: `build.rs` injects `git describe` + build date as
+  compile-time env vars, surfaced by `tsm --version` and the `tsm doctor` Build
+  section (honors `SOURCE_DATE_EPOCH` for reproducible builds; falls back to the
+  crate version when git is unavailable)
 
 ## Data Flow
 
