@@ -42,7 +42,7 @@ fn yield_to_pending_writes(writes_pending: &Arc<AtomicUsize>) -> bool {
 // ─── Backfill ───────────────────────────────────────────────────────
 
 /// Run one full backfill pass, releasing the DB lock between batches
-/// so search/index requests can proceed.
+/// so pending write requests can proceed.
 pub fn run_backfill_pass(
     conn: &Arc<Mutex<rusqlite::Connection>>,
     writes_pending: &Arc<AtomicUsize>,

@@ -269,7 +269,7 @@ pub fn get_connection(db_path: &Path) -> anyhow::Result<Connection> {
 /// recover a hot WAL with SQLITE_READONLY_RECOVERY), then constrained with
 /// `PRAGMA query_only=ON` so writes are rejected. Runs the same idempotent
 /// column migrations as `get_connection` so a reader opened before the writer
-/// still sees `chunk_hash` / `metadata`.
+/// still sees `content_hash` / `metadata`.
 pub fn get_read_connection(db_path: &Path) -> anyhow::Result<Connection> {
     ensure_vec_extension();
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
