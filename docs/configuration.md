@@ -160,6 +160,10 @@ nested subdirectories are included.
 - **With `content_dirs` empty**, tsm auto-discovers the immediate
   subdirectories of the project root and indexes each recursively
   (see [Auto-Discover Mode](#auto-discover-mode)).
+- **Files directly in the project root are only indexed via `path = "."`.**
+  Both auto-discover and specific-directory modes walk _subdirectories_, so a
+  file sitting at the root (e.g. `README.md`, `CLAUDE.md`) is skipped unless a
+  `content_dir` resolves to the project root itself.
 
 In both modes the same exclusions always apply: forced excludes (`.git/` and
 `.tsm/` at any depth), `.tsmignore` patterns, the optional root `.gitignore`

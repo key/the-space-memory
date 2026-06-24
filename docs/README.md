@@ -38,6 +38,7 @@ For the full quick-start tour, see the project
 
 | Document | Description |
 |---|---|
+| [Getting Started](getting-started.md) | First-time setup, end to end: install → configure → index → search |
 | [Architecture](architecture.md) | Daemon / embedder / watcher topology and IPC layout |
 | [Pipeline Stages](pipeline.md) | Index / Search logical stages, invariants, and plugin hook points |
 | [Data Flow](data-flow.md) | Indexing and search pipelines end-to-end |
