@@ -14,8 +14,15 @@ FTS5全文検索とベクトルセマンティック検索（ruri-v3-30m, 256次
 
 本リポジトリが提供するのは `tsm` / `tsmd` バイナリのみ。Claude Code プラグイン
 （スキル・エージェント・hook）は別リポジトリ
-[`key/claude-code-plugins`](https://github.com/key/claude-code-plugins) の
-`plugins/the-space-memory/` にある。プラグインはそちらから導入し、`tsm` を
+[`key/tsm-plugin-cc`](https://github.com/key/tsm-plugin-cc) にある
+（リポジトリ単体がマーケットプレイスを兼ねる）。
+
+```bash
+/plugin marketplace add key/tsm-plugin-cc
+/plugin install the-space-memory@tsm-plugin-cc
+```
+
+プラグインは `tsm` CLI を呼び出すため、`tsm` は別途インストールし（下記）、
 `PATH` に通すこと。
 
 ## コンセプト

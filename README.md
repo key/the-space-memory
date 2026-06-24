@@ -14,9 +14,16 @@ combining FTS5 full-text search with vector semantic search (ruri-v3-30m, 256-di
 
 This repository ships only the `tsm` / `tsmd` binaries. The Claude Code plugin
 (skills, agents, hooks) lives in a separate repository,
-[`key/claude-code-plugins`](https://github.com/key/claude-code-plugins),
-under `plugins/the-space-memory/`. Install it from there and ensure `tsm` is on
-`PATH`.
+[`key/tsm-plugin-cc`](https://github.com/key/tsm-plugin-cc), which doubles as
+its own plugin marketplace:
+
+```bash
+/plugin marketplace add key/tsm-plugin-cc
+/plugin install the-space-memory@tsm-plugin-cc
+```
+
+The plugin calls the `tsm` CLI, so install `tsm` separately (see below) and
+ensure it is on your `PATH`.
 
 ## Concept
 
