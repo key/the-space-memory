@@ -6,29 +6,29 @@ use the_space_memory::{config, embedder, indexer, status, tokenizer};
 
 use crate::SHUTDOWN;
 
-// ─── Search-active guard ────────────────────────────────────────────
+// ─── Pending-write guard ────────────────────────────────────────────
 
 /// RAII guard that increments a counter on creation and decrements on drop.
-pub struct SearchActiveGuard(Arc<AtomicUsize>);
+pub struct PendingWriteGuard(Arc<AtomicUsize>);
 
-impl SearchActiveGuard {
+impl PendingWriteGuard {
     pub fn new(counter: &Arc<AtomicUsize>) -> Self {
         counter.fetch_add(1, Ordering::AcqRel);
         Self(Arc::clone(counter))
     }
 }
 
-impl Drop for SearchActiveGuard {
+impl Drop for PendingWriteGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-/// Spin-wait until no search requests are in-flight, checking SHUTDOWN.
+/// Spin-wait while a write request is pending, checking SHUTDOWN.
 /// Returns `true` if shutdown was requested during the wait.
-fn yield_to_search(search_active: &Arc<AtomicUsize>) -> bool {
+fn yield_to_pending_writes(writes_pending: &Arc<AtomicUsize>) -> bool {
     for _ in 0..200 {
-        if search_active.load(Ordering::Acquire) == 0 {
+        if writes_pending.load(Ordering::Acquire) == 0 {
             return false;
         }
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -45,7 +45,7 @@ fn yield_to_search(search_active: &Arc<AtomicUsize>) -> bool {
 /// so search/index requests can proceed.
 pub fn run_backfill_pass(
     conn: &Arc<Mutex<rusqlite::Connection>>,
-    search_active: &Arc<AtomicUsize>,
+    writes_pending: &Arc<AtomicUsize>,
 ) {
     let encode_fn = |texts: &[String]| {
         embedder::embed_via_socket(texts).ok_or_else(|| anyhow::anyhow!("embedder not available"))
@@ -60,7 +60,7 @@ pub fn run_backfill_pass(
             break;
         }
 
-        if yield_to_search(search_active) {
+        if yield_to_pending_writes(writes_pending) {
             return;
         }
 
@@ -91,10 +91,10 @@ pub fn run_backfill_pass(
     }
 }
 
-/// Run periodic backfill in tsmd, yielding to search requests.
+/// Run periodic backfill in tsmd, yielding to pending write requests.
 pub fn periodic_backfill(
     conn: &Arc<Mutex<rusqlite::Connection>>,
-    search_active: &Arc<AtomicUsize>,
+    writes_pending: &Arc<AtomicUsize>,
     interval_secs: u64,
 ) {
     let interval = std::time::Duration::from_secs(interval_secs);
@@ -130,7 +130,7 @@ pub fn periodic_backfill(
 
         if missing > 0 {
             log::debug!("periodic backfill: {missing} vectors missing");
-            run_backfill_pass(conn, search_active);
+            run_backfill_pass(conn, writes_pending);
         }
 
         sleep_interruptible(interval);
@@ -153,12 +153,12 @@ pub fn sleep_interruptible(duration: std::time::Duration) {
 
 // ─── Reindex passes ────────────────────────────────────────────────
 
-/// Run a full FTS re-tokenization pass, yielding to search between batches.
+/// Run a full FTS re-tokenization pass, yielding to pending writes between batches.
 ///
 /// Resets the lindera segmenter (picks up user dict changes) before starting.
 pub fn run_reindex_fts_pass(
     conn: &Arc<Mutex<rusqlite::Connection>>,
-    search_active: &Arc<AtomicUsize>,
+    writes_pending: &Arc<AtomicUsize>,
     state_dir: &Path,
 ) {
     // Get total chunk count (short lock)
@@ -185,7 +185,7 @@ pub fn run_reindex_fts_pass(
         });
     });
 
-    let batch_size = config::REINDEX_FTS_BATCH_SIZE;
+    let batch_size = config::reindex_fts_batch_size();
     let mut last_id: i64 = 0;
     let mut total_inserted: usize = 0;
     let mut is_first = true;
@@ -195,7 +195,7 @@ pub fn run_reindex_fts_pass(
             break;
         }
 
-        yield_to_search(search_active);
+        yield_to_pending_writes(writes_pending);
 
         let Ok(conn) = conn.lock() else {
             log::error!(
@@ -256,10 +256,10 @@ pub fn run_reindex_fts_pass(
 /// cleared until backfill completes. FTS results remain unaffected.
 pub fn run_reindex_vectors_pass(
     conn: &Arc<Mutex<rusqlite::Connection>>,
-    search_active: &Arc<AtomicUsize>,
+    writes_pending: &Arc<AtomicUsize>,
     state_dir: &Path,
 ) {
-    if yield_to_search(search_active) {
+    if yield_to_pending_writes(writes_pending) {
         return;
     }
 
@@ -291,7 +291,7 @@ pub fn run_reindex_vectors_pass(
     });
 
     log::info!("reindex vectors: cleared, starting backfill...");
-    run_backfill_pass(conn, search_active);
+    run_backfill_pass(conn, writes_pending);
 
     if SHUTDOWN.load(Ordering::SeqCst) {
         log::warn!("reindex vectors interrupted by shutdown");
@@ -307,16 +307,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_search_active_guard_raii() {
+    fn test_pending_write_guard_raii() {
         let counter = Arc::new(AtomicUsize::new(0));
         assert_eq!(counter.load(Ordering::Acquire), 0);
 
         {
-            let _guard = SearchActiveGuard::new(&counter);
+            let _guard = PendingWriteGuard::new(&counter);
             assert_eq!(counter.load(Ordering::Acquire), 1);
 
             {
-                let _guard2 = SearchActiveGuard::new(&counter);
+                let _guard2 = PendingWriteGuard::new(&counter);
                 assert_eq!(counter.load(Ordering::Acquire), 2);
             }
             // guard2 dropped

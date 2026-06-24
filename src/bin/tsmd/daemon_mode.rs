@@ -235,15 +235,15 @@ pub fn run(args: Args) -> Result<()> {
         None
     };
 
-    // Search-active counter: backfill yields when search requests are in-flight.
-    let search_active = Arc::new(AtomicUsize::new(0));
+    // Writes-pending counter: backfill yields when write requests are in-flight.
+    let writes_pending = Arc::new(AtomicUsize::new(0));
     // Reindex-active flag: at most one reindex runs at a time.
     let reindex_active = Arc::new(AtomicBool::new(false));
 
     // Startup backfill — waits for embedder socket then runs one pass.
     if !args.no_embedder {
         let conn = Arc::clone(&conn);
-        let search_active = Arc::clone(&search_active);
+        let writes_pending = Arc::clone(&writes_pending);
         std::thread::spawn(move || {
             let sock = config::embedder_socket_path();
             for _ in 0..120 {
@@ -257,7 +257,7 @@ pub fn run(args: Args) -> Result<()> {
                 return;
             }
             log::info!("starting startup backfill...");
-            backfill::run_backfill_pass(&conn, &search_active);
+            backfill::run_backfill_pass(&conn, &writes_pending);
             log::info!("startup backfill complete");
         });
     }
@@ -266,9 +266,9 @@ pub fn run(args: Args) -> Result<()> {
     let backfill_interval_secs = config::embedder_backfill_interval_secs();
     if backfill_interval_secs > 0 && !args.no_embedder {
         let conn = Arc::clone(&conn);
-        let search_active = Arc::clone(&search_active);
+        let writes_pending = Arc::clone(&writes_pending);
         std::thread::spawn(move || {
-            backfill::periodic_backfill(&conn, &search_active, backfill_interval_secs);
+            backfill::periodic_backfill(&conn, &writes_pending, backfill_interval_secs);
         });
     }
 
@@ -279,7 +279,7 @@ pub fn run(args: Args) -> Result<()> {
                 let conn = Arc::clone(&conn);
                 let read_pool = Arc::clone(&read_pool);
                 let project_root = project_root.clone();
-                let search_active = Arc::clone(&search_active);
+                let writes_pending = Arc::clone(&writes_pending);
                 let watcher_pid = Arc::clone(&watcher_pid);
                 let reindex_active = Arc::clone(&reindex_active);
                 let state_dir = state_dir.clone();
@@ -290,7 +290,7 @@ pub fn run(args: Args) -> Result<()> {
                         &conn,
                         &read_pool,
                         &project_root,
-                        &search_active,
+                        &writes_pending,
                         &watcher_pid,
                         &reindex_active,
                         &state_dir,
@@ -334,13 +334,13 @@ pub fn run(args: Args) -> Result<()> {
 
 // ─── Client handling ──────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)] // Task 7 removes search_active, dropping back to 7 args
+#[allow(clippy::too_many_arguments)]
 fn handle_client(
     stream: &mut std::os::unix::net::UnixStream,
     conn: &Arc<Mutex<rusqlite::Connection>>,
     read_pool: &Arc<the_space_memory::read_pool::ReadPool>,
     project_root: &std::path::Path,
-    search_active: &Arc<AtomicUsize>,
+    writes_pending: &Arc<AtomicUsize>,
     watcher_pid: &Arc<AtomicU32>,
     reindex_active: &Arc<AtomicBool>,
     state_dir: &std::path::Path,
@@ -365,7 +365,7 @@ fn handle_client(
         }
 
         let conn = Arc::clone(conn);
-        let search_active = Arc::clone(search_active);
+        let writes_pending = Arc::clone(writes_pending);
         let reindex_active = Arc::clone(reindex_active);
         let state_dir = state_dir.to_path_buf();
         std::thread::spawn(move || {
@@ -380,15 +380,15 @@ fn handle_client(
 
             match kind {
                 ReindexKind::Fts => {
-                    backfill::run_reindex_fts_pass(&conn, &search_active, &state_dir);
+                    backfill::run_reindex_fts_pass(&conn, &writes_pending, &state_dir);
                 }
                 ReindexKind::Vectors => {
-                    backfill::run_reindex_vectors_pass(&conn, &search_active, &state_dir);
+                    backfill::run_reindex_vectors_pass(&conn, &writes_pending, &state_dir);
                 }
                 ReindexKind::All => {
-                    backfill::run_reindex_fts_pass(&conn, &search_active, &state_dir);
+                    backfill::run_reindex_fts_pass(&conn, &writes_pending, &state_dir);
                     if !SHUTDOWN.load(Ordering::SeqCst) {
-                        backfill::run_reindex_vectors_pass(&conn, &search_active, &state_dir);
+                        backfill::run_reindex_vectors_pass(&conn, &writes_pending, &state_dir);
                     }
                 }
             }
@@ -421,18 +421,13 @@ fn handle_client(
         return Ok(());
     }
 
-    // Track active search requests so backfill can yield (removed in a follow-up
-    // once the reader pool makes this redundant).
-    let _guard = if matches!(req, DaemonRequest::Search { .. }) {
-        Some(backfill::SearchActiveGuard::new(search_active))
-    } else {
-        None
-    };
-
     let resp = if req.is_read_only() {
         let conn = read_pool.checkout();
         daemon::handle_request(&conn, req, project_root, &SHUTDOWN)
     } else {
+        // Mark a write pending BEFORE locking so reindex/backfill yields the
+        // writer to us within one batch (mirror of the retired search yield).
+        let _pending = backfill::PendingWriteGuard::new(writes_pending);
         let conn = conn
             .lock()
             .map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;

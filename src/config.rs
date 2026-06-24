@@ -15,7 +15,6 @@ pub const DEFAULT_HALF_LIFE_DAYS: f64 = 90.0;
 pub const SNIPPET_MAX_CHARS: usize = 200;
 pub const MIN_SESSION_MESSAGE_LEN: usize = 10;
 pub const BACKFILL_BATCH_SIZE: usize = 8;
-pub const REINDEX_FTS_BATCH_SIZE: usize = 1000;
 /// Default FTS reindex batch size when `reindex_fts_batch_size` is unset.
 /// Smaller = finer write preemption (ADR-0015), larger = better full-reindex
 /// throughput. 200 is the middle ground; tune via config + measurement.
