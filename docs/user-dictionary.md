@@ -150,6 +150,14 @@ tsm dict import
 `import` は insert-only で、ファイルにある語を upsert する（ファイルに無い語の
 判定は変更しない。削除は `tsm dict rm` / `tsm dict reject` で明示的に行う）。
 
+明示的に `import` を実行しなくても、`add` / `reject` / `rm` は判定変更の前に
+`user_dict.simpledic` / `reject_words.txt` を DB へ自動 reconcile する。これにより
+rebuild 後や手編集でファイルにのみ存在する採用語が、最初の判定変更時の再生成で
+失われない（自己修復）。ただしファイルが矛盾している場合（同じ語が両ファイルに
+ある、ファイルの判定が DB と逆）や `user_dict.simpledic` の行が壊れている場合は、
+**何も変更せずに中断**して該当語・行番号を表示する。ファイルを修正するか
+`tsm dict export` で DB から両ファイルを書き直してから再実行する。
+
 ### 現在の状態を確認する
 
 ```bash

@@ -1497,26 +1497,69 @@ fn reindex_fts_after_dict_change() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Apply a verdict change to the user dictionary: when the accepted set changed,
-/// regenerate `user_dict.simpledic` from the DB and rebuild FTS (ADR-0014).
-/// Takes `conn` by value so it is dropped before the local FTS rebuild opens its
-/// own writer. A change that does not touch the accepted set is a no-op.
-fn apply_verdict_change(
-    conn: rusqlite::Connection,
-    t: &user_dict::Transition,
-) -> anyhow::Result<()> {
-    if !t.affected_dict {
-        return Ok(());
+/// Reconcile the on-disk verdict files into the DB and apply the user's verdict
+/// change in ONE transaction (ADR-0014; fixes #281/#288). The reconcile pulls
+/// terms present in `user_dict.simpledic` / `reject_words.txt` but absent from
+/// (or only `pending` in) the DB into it BEFORE the change, so the subsequent
+/// `user_dict.simpledic` rewrite cannot silently drop them. Any file conflict or
+/// malformed line is detected before the first write, so an abort leaves the DB
+/// completely unchanged (the transaction is never committed).
+fn mutate_verdict(
+    conn: &rusqlite::Connection,
+    surface: &str,
+    to: user_dict::Verdict,
+    reading: Option<&str>,
+) -> anyhow::Result<(user_dict::Transition, user_dict::ReconcileOutcome)> {
+    let tx = conn.unchecked_transaction()?;
+    let reconciled = user_dict::reconcile_files_into_db(
+        &tx,
+        &config::user_dict_path(),
+        &config::reject_words_path(),
+    )?;
+    let t = user_dict::set_verdict_in(&tx, surface, to, reading)?;
+    tx.commit()?;
+    Ok((t, reconciled))
+}
+
+/// Surface the implicit DB change when the reconcile recovered on-disk terms.
+fn report_reconcile(r: &user_dict::ReconcileOutcome) {
+    if !r.is_empty() {
+        eprintln!(
+            "Recovered {} accepted and {} rejected term(s) from the on-disk files into the database.",
+            r.accepted_healed, r.rejected_healed
+        );
     }
+}
+
+/// Materialize the DB's accepted set to `user_dict.simpledic` and reload the
+/// tokenizer when the file content changed. Always regenerates (cheap, atomic
+/// temp+rename) so a retry after a previously failed regenerate re-converges
+/// from the on-disk/DB divergence — no dirty marker needed. A regenerate failure
+/// is surfaced (the DB is already committed); the next mutation retries. (A
+/// reindex that fails *after* a successful regenerate is surfaced as an error but
+/// not auto-retried here, since the file then matches the DB — see #286/#282 for
+/// reindex-error handling.) Takes `conn` by value so it is dropped before any
+/// local FTS rebuild opens its own writer.
+fn materialize_dict(conn: rusqlite::Connection) -> anyhow::Result<()> {
     let csv_path = config::user_dict_path();
-    let n = user_dict::regenerate_user_dict(&conn, &csv_path)?;
-    println!(
-        "Regenerated {} ({n} accepted term{}).",
-        csv_path.display(),
-        if n == 1 { "" } else { "s" }
-    );
-    drop(conn);
-    reindex_fts_after_dict_change()
+    let regen = user_dict::regenerate_user_dict(&conn, &csv_path).map_err(|e| {
+        anyhow::anyhow!(
+            "the database was updated, but regenerating {} failed: {e}. \
+             Re-run the command (or `tsm dict export`) to retry.",
+            csv_path.display()
+        )
+    })?;
+    if regen.changed {
+        println!(
+            "Regenerated {} ({} accepted term{}).",
+            csv_path.display(),
+            regen.written,
+            if regen.written == 1 { "" } else { "s" }
+        );
+        drop(conn);
+        reindex_fts_after_dict_change()?;
+    }
+    Ok(())
 }
 
 /// `tsm dict add <surface> [<yomi>]` — accept a term (ADR-0014 §1, §4).
@@ -1530,34 +1573,38 @@ pub fn cmd_dict_add(surface: &str, yomi: Option<&str>) -> anyhow::Result<()> {
              Provide one with `tsm dict add {surface} <yomi>`."
         );
     }
-    let t = user_dict::set_verdict(&conn, surface, user_dict::Verdict::Accepted, Some(&reading))?;
+    let (t, reconciled) =
+        mutate_verdict(&conn, surface, user_dict::Verdict::Accepted, Some(&reading))?;
+    report_reconcile(&reconciled);
     match t.from {
         Some(user_dict::Verdict::Accepted) => println!("'{surface}' is already accepted."),
         _ => println!("Accepted '{surface}'."),
     }
-    apply_verdict_change(conn, &t)
+    materialize_dict(conn)
 }
 
 /// `tsm dict rm <word>` — reset a term to pending (ADR-0014 §1).
 /// Errors when the term was never registered (nothing to reset).
 pub fn cmd_dict_rm(word: &str) -> anyhow::Result<()> {
     let conn = db::get_connection(&config::db_path())?;
-    let t = user_dict::set_verdict(&conn, word, user_dict::Verdict::Pending, None)?;
+    let (t, reconciled) = mutate_verdict(&conn, word, user_dict::Verdict::Pending, None)?;
+    report_reconcile(&reconciled);
     match t.from {
         Some(user_dict::Verdict::Pending) => println!("'{word}' is already pending."),
         _ => println!("Reset '{word}' to pending."),
     }
-    apply_verdict_change(conn, &t)
+    materialize_dict(conn)
 }
 
 /// `tsm dict reject <word>` — move a word to the `rejected` verdict (ADR-0014).
 /// Inserts a manual row when the word was never seen (preemptive reject). When
-/// the word was accepted, the accepted set shrinks, so `apply_verdict_change`
-/// regenerates `user_dict.simpledic` and reloads the tokenizer.
+/// the word was accepted, the accepted set shrinks, so `user_dict.simpledic` is
+/// regenerated and the tokenizer reloaded.
 pub fn cmd_dict_reject(word: &str) -> anyhow::Result<()> {
     user_dict::validate_surface(word)?;
     let conn = db::get_connection(&config::db_path())?;
-    let t = user_dict::set_verdict(&conn, word, user_dict::Verdict::Rejected, None)?;
+    let (t, reconciled) = mutate_verdict(&conn, word, user_dict::Verdict::Rejected, None)?;
+    report_reconcile(&reconciled);
     match t.from {
         None => println!("Rejected '{word}' (new entry)."),
         Some(user_dict::Verdict::Rejected) => println!("'{word}' is already rejected."),
@@ -1566,7 +1613,7 @@ pub fn cmd_dict_reject(word: &str) -> anyhow::Result<()> {
         }
         Some(user_dict::Verdict::Pending) => println!("Rejected '{word}'."),
     }
-    apply_verdict_change(conn, &t)
+    materialize_dict(conn)
 }
 
 /// `tsm dict export` — write the DB's verdicts to disk (ADR-0014 §2): the
@@ -1578,7 +1625,7 @@ pub fn cmd_dict_export() -> anyhow::Result<()> {
     let conn = db::get_connection(&config::db_path())?;
 
     let dict_path = config::user_dict_path();
-    let accepted = user_dict::regenerate_user_dict(&conn, &dict_path)?;
+    let accepted = user_dict::regenerate_user_dict(&conn, &dict_path)?.written;
     eprintln!(
         "Wrote {accepted} accepted word(s) to {}",
         dict_path.display()
@@ -1605,23 +1652,32 @@ pub fn cmd_dict_export() -> anyhow::Result<()> {
 /// DB state and the tokenizer reloaded — once. Counts go to stderr.
 pub fn cmd_dict_import() -> anyhow::Result<()> {
     let conn = db::get_connection(&config::db_path())?;
-
     let dict_path = config::user_dict_path();
-    let acc = user_dict::import_user_dict_from_file(&conn, &dict_path)?;
+    let reject_path = config::reject_words_path();
+
+    // Fail closed before importing if a surface is in both files — otherwise the
+    // accepted-then-rejected pass would silently demote it.
+    user_dict::assert_no_cross_file_conflict(&dict_path, &reject_path)?;
+
+    // One transaction for the whole import: a mid-file failure rolls back rather
+    // than leaving a partial set of verdicts committed (#287).
+    let (acc, rej) = {
+        let tx = conn.unchecked_transaction()?;
+        let acc = user_dict::import_user_dict_from_file(&tx, &dict_path)?;
+        let rej = user_dict::import_reject_words_from_file(&tx, &reject_path)?;
+        tx.commit()?;
+        (acc, rej)
+    };
     eprintln!(
         "Imported {} accepted word(s) from {}",
         acc.imported,
         dict_path.display()
     );
-
-    let reject_path = config::reject_words_path();
-    let rej = user_dict::import_reject_words_from_file(&conn, &reject_path)?;
     eprintln!(
         "Imported {} rejected word(s) from {}",
         rej.imported,
         reject_path.display()
     );
-
     println!(
         "Imported {} accepted, {} rejected word(s).",
         acc.imported, rej.imported
@@ -1631,13 +1687,7 @@ pub fn cmd_dict_import() -> anyhow::Result<()> {
     // between the two files, or a reject that demoted an accepted word, leaves
     // simpledic consistent with the DB before the tokenizer reloads.
     if acc.dict_affected + rej.dict_affected > 0 {
-        let n = user_dict::regenerate_user_dict(&conn, &dict_path)?;
-        eprintln!(
-            "Regenerated {} ({n} accepted term(s)).",
-            dict_path.display()
-        );
-        drop(conn);
-        reindex_fts_after_dict_change()?;
+        materialize_dict(conn)?;
     }
     Ok(())
 }

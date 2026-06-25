@@ -740,6 +740,16 @@ surface-based today). Omit it for an all-kana surface, where the surface is its
 own reading. A surface containing kanji with no reading is accepted with a
 warning, storing the surface as a substitute.
 
+Before applying the change, `add` / `reject` / `rm` reconcile the on-disk files
+(`user_dict.simpledic`, `reject_words.txt`) into the database, so terms you
+hand-edited into a file — or that survived a `rebuild` in the file but not the
+database — are preserved rather than dropped by the regenerate (ADR-0014). If a
+file is internally inconsistent (the same term in both files, or a term whose
+file verdict contradicts the database), the command **aborts with no changes**
+and names the offending term; resolve the files (or run `tsm dict export` to
+rewrite both from the database) and retry. A malformed `user_dict.simpledic` line
+aborts the same way.
+
 **Examples:**
 
 ```bash
