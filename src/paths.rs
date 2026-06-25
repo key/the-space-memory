@@ -54,13 +54,23 @@ pub fn is_within(candidate: &Path, dir: &Path) -> bool {
 /// Build the SQL operands for a directory-boundary match against
 /// `documents.file_path`: `(eq_value, like_pattern)`. Caller uses
 /// `d.file_path = ?eq COLLATE NOCASE OR d.file_path LIKE ?like ESCAPE '\'`.
+///
+/// The child pattern is `<dir>/%`, except when `dir` is the root `/` (the only
+/// absolutized path that ends in `/`): there the boundary separator is already
+/// present, so the pattern is `/%` — matching every file under root — rather
+/// than `//%`, which would match nothing.
 pub fn boundary_like(dir: &Path) -> (String, String) {
     let s = dir.to_string_lossy();
     let escaped = s
         .replace('\\', r"\\")
         .replace('%', r"\%")
         .replace('_', r"\_");
-    (s.to_string(), format!("{escaped}/%"))
+    let like = if escaped.ends_with('/') {
+        format!("{escaped}%")
+    } else {
+        format!("{escaped}/%")
+    };
+    (s.to_string(), like)
 }
 
 /// Build a path-scope SQL fragment + bind params over an aliased `d.file_path`
@@ -143,6 +153,13 @@ mod tests {
         let (eq, like) = boundary_like(Path::new("/r/daily_notes"));
         assert_eq!(eq, "/r/daily_notes");
         assert_eq!(like, r"/r/daily\_notes/%");
+    }
+    #[test]
+    fn boundary_like_root_matches_all() {
+        // Root `/` must yield `/%` (match every file), not `//%` (matches none).
+        let (eq, like) = boundary_like(Path::new("/"));
+        assert_eq!(eq, "/");
+        assert_eq!(like, "/%");
     }
     #[test]
     fn scope_clause_none_is_empty() {
