@@ -80,6 +80,11 @@ pub fn run(args: Args) -> Result<()> {
         return Err(db::uninitialized_error(&db_path));
     }
 
+    // ADR-0017: reject an index that predates absolute-path storage (a relative
+    // file_path row would silently mis-match every --path). Same fail-fast path
+    // as the guards above — surfaced to the user via `tsm start`.
+    db::check_path_schema(&conn)?;
+
     // ADR-0009 §3: reject a config that still carries the removed `index_root`
     // key.  `anyhow::bail!` here keeps the accept loop clean — no socket is
     // bound, no children are spawned, and `tsm start` surfaces the stderr via

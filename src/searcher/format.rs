@@ -2,11 +2,21 @@ use std::path::Path;
 
 use super::SearchResult;
 
+/// Render a stored (absolute, ADR-0017) path for human output: relative to
+/// `cwd` when it sits under it, else the absolute path unchanged.
+fn display_path(file_path: &str, cwd: &Path) -> String {
+    Path::new(file_path)
+        .strip_prefix(cwd)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| file_path.to_string())
+}
+
 /// Render search results as human-readable text.
 ///
-/// Returns a formatted multi-line string suitable for terminal output.
-/// When `results` is empty, returns "No results found.".
-pub fn format_text(results: &[SearchResult], total_hits: usize) -> String {
+/// Paths are shown relative to `cwd` (ADR-0017: storage is absolute, text output
+/// is CWD-relative for readability). Returns a formatted multi-line string
+/// suitable for terminal output. When `results` is empty, returns "No results found.".
+pub fn format_text(results: &[SearchResult], total_hits: usize, cwd: &Path) -> String {
     if results.is_empty() {
         return "No results found.".to_string();
     }
@@ -16,7 +26,7 @@ pub fn format_text(results: &[SearchResult], total_hits: usize) -> String {
             "{}. [{}] {} — {} (score: {:.4})\n",
             i + 1,
             r.source_type,
-            r.source_file,
+            display_path(&r.source_file, cwd),
             r.section_path,
             r.score
         ));
@@ -100,7 +110,7 @@ mod tests {
 
     #[test]
     fn test_format_text_empty() {
-        let result = format_text(&[], 0);
+        let result = format_text(&[], 0, Path::new("/"));
         assert_eq!(result, "No results found.");
     }
 
@@ -115,7 +125,7 @@ mod tests {
             status: Some("current".to_string()),
             related_docs: vec![],
         }];
-        let text = format_text(&results, results.len());
+        let text = format_text(&results, results.len(), Path::new("/"));
         assert!(text.contains("1. [note]"));
         assert!(text.contains("daily/notes/test.md"));
         assert!(text.contains("0.5000"));
@@ -133,7 +143,7 @@ mod tests {
             status: None,
             related_docs: vec![],
         }];
-        let text = format_text(&results, results.len());
+        let text = format_text(&results, results.len(), Path::new("/"));
         assert!(!text.contains("status:"));
     }
 
@@ -159,11 +169,46 @@ mod tests {
                 related_docs: vec![],
             },
         ];
-        let text = format_text(&results, results.len());
+        let text = format_text(&results, results.len(), Path::new("/"));
         assert!(text.contains("1. [note]"));
         assert!(text.contains("2. [research]"));
         assert!(text.contains("status: outdated"));
         assert!(!text.contains("No results found"));
+    }
+
+    #[test]
+    fn text_is_cwd_relative_json_is_absolute() {
+        let results = vec![SearchResult {
+            source_file: "/cwd/daily/x.md".to_string(),
+            source_type: "note".to_string(),
+            section_path: "S".to_string(),
+            snippet: "c".to_string(),
+            score: 0.5,
+            status: None,
+            related_docs: vec![],
+        }];
+        // text: relative to cwd
+        let text = format_text(&results, 1, Path::new("/cwd"));
+        assert!(text.contains("daily/x.md"));
+        assert!(!text.contains("/cwd/daily/x.md"));
+        // json: absolute, unchanged
+        let json = format_json(&results, 1, None, Path::new("/cwd")).unwrap();
+        assert!(json.contains("/cwd/daily/x.md"));
+    }
+
+    #[test]
+    fn text_keeps_absolute_when_outside_cwd() {
+        let results = vec![SearchResult {
+            source_file: "/other/x.md".to_string(),
+            source_type: "note".to_string(),
+            section_path: "S".to_string(),
+            snippet: "c".to_string(),
+            score: 0.5,
+            status: None,
+            related_docs: vec![],
+        }];
+        let text = format_text(&results, 1, Path::new("/cwd"));
+        assert!(text.contains("/other/x.md"));
     }
 
     #[test]

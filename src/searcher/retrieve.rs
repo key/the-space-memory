@@ -25,28 +25,44 @@ pub(crate) fn retrieve(
     plan: &QueryPlan,
     limit: usize,
     require_vector: bool,
+    path_prefixes: Option<&[String]>,
 ) -> anyhow::Result<CandidateSets> {
     let query = plan.keywords_query.as_str();
 
     let fts = if plan.expansions.is_empty() {
-        fts_results(conn, query, limit)?
+        fts_results(conn, query, limit, path_prefixes)?
     } else {
         let expanded = build_expanded_fts_query(query, &plan.expansions);
-        fts_results_raw(conn, &expanded, limit)?
+        fts_results_raw(conn, &expanded, limit, path_prefixes)?
     };
 
-    let vec = vec_results_from_embedding(conn, plan.query_vec.as_deref(), limit)?;
+    let vec = vec_results_from_embedding(conn, plan.query_vec.as_deref(), limit, path_prefixes)?;
 
-    if require_vector && vec.is_empty() && db::has_vec_table(conn) {
+    // Entity candidates are computed before the embedder-health check so the
+    // check can tell "scope/query matched nothing" from "embedder down".
+    let entity = entity::entity_results_by_ids(
+        conn,
+        &plan.classification.matched_entity_ids,
+        limit,
+        path_prefixes,
+    )
+    .unwrap_or_default();
+
+    // Treat an empty vector set as "embedder down" only when some non-vector
+    // retriever *did* find in-scope candidates: then the embedder should have
+    // produced vectors too. When FTS and entity are both empty the scope/query
+    // simply matched nothing (e.g. a `--path` scope with no in-scope chunks) —
+    // that is not an embedder failure and must not error (ADR-0017).
+    if require_vector
+        && vec.is_empty()
+        && (!fts.is_empty() || !entity.is_empty())
+        && db::has_vec_table(conn)
+    {
         anyhow::bail!(
             "Embedder is not running. Vector search unavailable.\n\
              Run `tsm restart` to restart, or use `--fallback fts_only` for FTS-only search."
         );
     }
-
-    let entity =
-        entity::entity_results_by_ids(conn, &plan.classification.matched_entity_ids, limit)
-            .unwrap_or_default();
 
     Ok(CandidateSets { fts, vec, entity })
 }
@@ -56,6 +72,7 @@ fn fts_results(
     conn: &Connection,
     query: &str,
     limit: usize,
+    path_prefixes: Option<&[String]>,
 ) -> anyhow::Result<HashMap<i64, usize>> {
     if query.trim().is_empty() {
         return Ok(HashMap::new());
@@ -73,31 +90,56 @@ fn fts_results(
         .collect::<Vec<_>>()
         .join(" AND ");
 
-    fts_results_raw(conn, &fts_query, limit)
+    fts_results_raw(conn, &fts_query, limit, path_prefixes)
 }
 
 /// Run FTS5 search using a pre-built query string (e.g. expanded with synonyms).
+///
+/// When `path_prefixes` is set, the candidates are restricted in-scope at
+/// retrieval time (ADR-0017 Gap 3) by joining `chunks`/`documents` and applying
+/// the directory-boundary clause, so the `limit` budget is spent on in-scope rows.
 fn fts_results_raw(
     conn: &Connection,
     fts_query: &str,
     limit: usize,
+    path_prefixes: Option<&[String]>,
 ) -> anyhow::Result<HashMap<i64, usize>> {
     if fts_query.trim().is_empty() {
         return Ok(HashMap::new());
     }
     let fts_query = fts_query.to_string();
 
-    let mut stmt = conn.prepare(
+    let (scope_sql, scope_params) = crate::paths::scope_clause(path_prefixes);
+    // MATCH must reference the FTS table by name (no alias). When scoped, join
+    // chunks/documents so the boundary clause can filter on `d.file_path`.
+    let sql = if scope_sql.is_empty() {
         "SELECT chunks_fts.rowid AS chunk_id
          FROM chunks_fts
          WHERE chunks_fts MATCH ?
          ORDER BY rank
-         LIMIT ?",
-    )?;
+         LIMIT ?"
+            .to_string()
+    } else {
+        format!(
+            "SELECT chunks_fts.rowid AS chunk_id
+             FROM chunks_fts
+             JOIN chunks c ON c.id = chunks_fts.rowid
+             JOIN documents d ON d.id = c.document_id
+             WHERE chunks_fts MATCH ?{scope_sql}
+             ORDER BY rank
+             LIMIT ?"
+        )
+    };
+    let mut stmt = conn.prepare(&sql)?;
 
-    let rows = stmt.query_map(rusqlite::params![fts_query, limit as i64], |row| {
-        row.get::<_, i64>(0)
-    })?;
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&fts_query];
+    for p in &scope_params {
+        binds.push(p);
+    }
+    let limit = limit as i64;
+    binds.push(&limit);
+
+    let rows = stmt.query_map(binds.as_slice(), |row| row.get::<_, i64>(0))?;
 
     let mut result = HashMap::new();
     for (i, row) in rows.enumerate() {
@@ -109,11 +151,15 @@ fn fts_results_raw(
 /// Run vector MATCH search using an already-computed query embedding.
 ///
 /// Returns an empty map when the embedding is `None` (embedder unavailable)
-/// or the vec table does not exist.
+/// or the vec table does not exist. When `path_prefixes` is set, the KNN is
+/// constrained to in-scope chunks via a bound `rowid IN (SELECT ...)` subquery
+/// (ADR-0017 Gap 3) — never a materialized id list (an empty scope would make
+/// `rowid in ()` invalid, and a broad scope would explode the query).
 fn vec_results_from_embedding(
     conn: &Connection,
     query_vec: Option<&[f32]>,
     limit: usize,
+    path_prefixes: Option<&[String]>,
 ) -> anyhow::Result<HashMap<i64, usize>> {
     let vec = match query_vec {
         Some(v) if !v.is_empty() => v,
@@ -126,11 +172,30 @@ fn vec_results_from_embedding(
 
     let query_vec_json = serde_json::to_string(vec)?;
 
-    let mut stmt = conn.prepare(
-        "SELECT rowid, distance FROM chunks_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-    )?;
+    let (scope_sql, scope_params) = crate::paths::scope_clause(path_prefixes);
+    let sql = if scope_sql.is_empty() {
+        "SELECT rowid, distance FROM chunks_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?"
+            .to_string()
+    } else {
+        format!(
+            "SELECT rowid, distance FROM chunks_vec \
+             WHERE embedding MATCH ? \
+               AND rowid IN (SELECT c.id FROM chunks c \
+                             JOIN documents d ON d.id = c.document_id \
+                             WHERE 1=1{scope_sql}) \
+             ORDER BY distance LIMIT ?"
+        )
+    };
+    let mut stmt = conn.prepare(&sql)?;
 
-    let rows = stmt.query_map(rusqlite::params![query_vec_json, limit as i64], |row| {
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&query_vec_json];
+    for p in &scope_params {
+        binds.push(p);
+    }
+    let limit = limit as i64;
+    binds.push(&limit);
+
+    let rows = stmt.query_map(binds.as_slice(), |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
     })?;
 
@@ -207,7 +272,7 @@ mod tests {
         )
         .unwrap();
 
-        let ranks = fts_results(&conn, "射撃", 10).unwrap();
+        let ranks = fts_results(&conn, "射撃", 10, None).unwrap();
         assert!(!ranks.is_empty());
         assert!(ranks.contains_key(&chunk_id));
     }
@@ -234,16 +299,16 @@ mod tests {
         )
         .unwrap();
 
-        let ranks = fts_results(&conn, "ロケット", 10).unwrap();
+        let ranks = fts_results(&conn, "ロケット", 10, None).unwrap();
         assert!(ranks.is_empty());
     }
 
     #[test]
     fn test_fts_empty_query() {
         let conn = db::get_memory_connection().unwrap();
-        let ranks = fts_results(&conn, "", 10).unwrap();
+        let ranks = fts_results(&conn, "", 10, None).unwrap();
         assert!(ranks.is_empty());
-        let ranks = fts_results(&conn, "   ", 10).unwrap();
+        let ranks = fts_results(&conn, "   ", 10, None).unwrap();
         assert!(ranks.is_empty());
     }
 

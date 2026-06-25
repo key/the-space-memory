@@ -53,7 +53,7 @@ pub fn search(
     };
     let limit = top_k * 3;
 
-    let candidates = retrieve::retrieve(conn, &qp, limit, require_vector)?;
+    let candidates = retrieve::retrieve(conn, &qp, limit, require_vector, path_prefixes)?;
 
     // The all-empty candidate case is handled inside rank() (its union guard),
     // which returns an empty SearchOutput — no need to peek at the sets here.
@@ -357,15 +357,16 @@ mod tests {
         indexer::index_file(&conn, &daily_path, dir.path()).unwrap();
         indexer::index_file(&conn, &project_path, dir.path()).unwrap();
 
-        // Filter to daily/ only
-        let paths = vec!["daily/".to_string()];
+        // Filter to <dir>/daily only (absolute, ADR-0017)
+        let daily = dir.path().join("daily").to_string_lossy().to_string();
+        let paths = vec![daily.clone()];
         let SearchOutput { results, .. } =
             search(&conn, "MTG", 5, None, false, Some(&paths)).unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert!(
-                r.source_file.starts_with("daily/"),
-                "Expected daily/ prefix, got: {}",
+                r.source_file.starts_with(&format!("{daily}/")),
+                "Expected {daily}/ prefix, got: {}",
                 r.source_file
             );
         }
@@ -386,11 +387,72 @@ mod tests {
         f.write_all(md.as_bytes()).unwrap();
         indexer::index_file(&conn, &path, dir.path()).unwrap();
 
-        // Filter to projects/ — should exclude daily/
-        let paths = vec!["projects/".to_string()];
+        // Filter to <dir>/projects — should exclude daily/
+        let projects = dir.path().join("projects").to_string_lossy().to_string();
+        let paths = vec![projects];
         let SearchOutput { results, .. } =
             search(&conn, "MTG", 5, None, false, Some(&paths)).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn empty_scope_returns_no_results_not_error() {
+        // A scope matching nothing must return Ok(empty), never an SQL error —
+        // guards the vector retriever's `rowid IN (SELECT ...)` subquery against
+        // the invalid `rowid in ()` that a materialized empty id list would emit.
+        use crate::indexer;
+        use std::io::Write;
+
+        let conn = db::get_memory_connection().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let md = "---\nstatus: current\n---\n\n# MTG\n\nMTG content here.\n";
+        let path = dir.path().join("daily/notes/mtg.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(md.as_bytes())
+            .unwrap();
+        indexer::index_file(&conn, &path, dir.path()).unwrap();
+
+        let nope = dir
+            .path()
+            .join("does-not-exist")
+            .to_string_lossy()
+            .to_string();
+        // require_vector = true: an empty scope yields an empty vector set, but
+        // that must NOT be misread as "embedder down" — FTS is also empty, so
+        // the scope simply matched nothing. (Regression guard for the
+        // require_vector + empty-scope interaction.)
+        let out = search(&conn, "MTG", 5, None, true, Some(&[nope]));
+        let SearchOutput { results, .. } = out.expect("empty scope must not error");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn entity_only_match_errors_when_embedder_down() {
+        // FTS misses (body lacks the term) but the frontmatter tag matches an
+        // entity. With require_vector=true and no embedder (query_vec None →
+        // empty vec), this must error rather than silently return entity-only
+        // results — otherwise the embedder outage is hidden under fallback=error.
+        use crate::indexer;
+        use std::io::Write;
+
+        let conn = db::get_memory_connection().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let md = "---\nstatus: current\ntags: [rust]\n---\n\n# Topic\n\nUnrelated body content.\n";
+        let full = dir.path().join("notes/x.md");
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::File::create(&full)
+            .unwrap()
+            .write_all(md.as_bytes())
+            .unwrap();
+        indexer::index_file(&conn, &full, dir.path()).unwrap();
+
+        let out = search(&conn, "rust", 5, None, true, None);
+        assert!(
+            out.is_err(),
+            "embedder-down with an entity-only match must surface the outage"
+        );
     }
 
     #[test]
@@ -415,14 +477,17 @@ mod tests {
             indexer::index_file(&conn, &full, dir.path()).unwrap();
         }
 
-        // Filter to daily/ and docs/ (OR)
-        let paths = vec!["daily/".to_string(), "docs/".to_string()];
+        // Filter to <dir>/daily and <dir>/docs (OR, absolute)
+        let daily = dir.path().join("daily").to_string_lossy().to_string();
+        let docs = dir.path().join("docs").to_string_lossy().to_string();
+        let paths = vec![daily.clone(), docs.clone()];
         let SearchOutput { results, .. } =
             search(&conn, "MTG", 10, None, false, Some(&paths)).unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert!(
-                r.source_file.starts_with("daily/") || r.source_file.starts_with("docs/"),
+                r.source_file.starts_with(&format!("{daily}/"))
+                    || r.source_file.starts_with(&format!("{docs}/")),
                 "Unexpected path: {}",
                 r.source_file
             );
@@ -471,13 +536,14 @@ mod tests {
             indexer::index_file(&conn, &full, dir.path()).unwrap();
         }
 
-        // Filter to a specific file
-        let paths = vec!["docs/api.md".to_string()];
+        // Filter to a specific file (absolute) — matched via the equality branch.
+        let api = dir.path().join("docs/api.md").to_string_lossy().to_string();
+        let paths = vec![api.clone()];
         let SearchOutput { results, .. } =
             search(&conn, "Authentication", 10, None, false, Some(&paths)).unwrap();
         assert!(!results.is_empty());
         for r in &results {
-            assert_eq!(r.source_file, "docs/api.md");
+            assert_eq!(r.source_file, api);
         }
     }
 
@@ -504,14 +570,15 @@ mod tests {
         }
 
         // _ in path must be literal, not a wildcard
-        let paths = vec!["daily_notes/".to_string()];
+        let dn = dir.path().join("daily_notes").to_string_lossy().to_string();
+        let paths = vec![dn.clone()];
         let SearchOutput { results, .. } =
             search(&conn, "MTG", 10, None, false, Some(&paths)).unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert!(
-                r.source_file.starts_with("daily_notes/"),
-                "Expected daily_notes/ prefix, got: {}",
+                r.source_file.starts_with(&format!("{dn}/")),
+                "Expected {dn}/ prefix, got: {}",
                 r.source_file
             );
         }
@@ -542,18 +609,22 @@ mod tests {
             indexer::index_file(&conn, &full, dir.path()).unwrap();
         }
 
-        // Combine path filter + time filter
-        let paths = vec!["daily/".to_string()];
+        // Combine path filter + time filter (absolute path, ADR-0017)
+        let daily = dir.path().join("daily").to_string_lossy().to_string();
+        let paths = vec![daily.clone()];
         let filter = TimeFilter {
             after: Some("2025-01-01".to_string()),
             before: None,
         };
         let SearchOutput { results, .. } =
             search(&conn, "MTG", 10, Some(&filter), false, Some(&paths)).unwrap();
+        // daily/recent.md (today) is in scope + recent; daily/old.md is filtered
+        // by time; projects/recent.md is out of path scope.
+        assert!(!results.is_empty());
         for r in &results {
             assert!(
-                r.source_file.starts_with("daily/"),
-                "Expected daily/ prefix, got: {}",
+                r.source_file.starts_with(&format!("{daily}/")),
+                "Expected {daily}/ prefix, got: {}",
                 r.source_file
             );
         }

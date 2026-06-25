@@ -287,6 +287,54 @@ assert_json "options: --include-content adds content field" \
 set +e; CAPTURED_OUTPUT=$(tsm search -q "メロス" -k 1 2>/dev/null); CAPTURED_EXIT=$?; set -e
 assert_contains "options: text format shows source file" "hashire-melos" "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
+# ── Path scoping (--path, ADR-0017) ──────────────────────────────────
+# Stored file_path is absolute; --path accepts CWD-relative or absolute input
+# and matches at a directory boundary. CWD is TSM_PROJECT_DIR.
+
+echo ""
+log "=== Path scoping (--path) ==="
+
+# In-scope, CWD-relative: a bare relative path is resolved against the CWD
+# (TSM_PROJECT_DIR) before matching — `notes` → `<project>/notes`.
+run search_json "メロス" --path notes
+assert_json "path: relative --path notes includes hashire-melos" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# In-scope, CWD-relative with explicit `./` prefix resolves the same way.
+run search_json "メロス" --path ./notes
+assert_json "path: relative --path ./notes includes hashire-melos" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# In-scope: absolute directory also works (same hit as the relative form).
+run search_json "メロス" --path "$TSM_PROJECT_DIR/notes"
+assert_json "path: absolute --path includes hashire-melos" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# In-scope, parent traversal: a `../` round-trip back into the project resolves
+# lexically to `<project>/notes`. CWD is TSM_PROJECT_DIR, so `../<base>/notes`
+# folds to the same in-scope directory. Verifies `..` is resolved (ADR-0017).
+PROJECT_BASE="$(basename "$TSM_PROJECT_DIR")"
+run search_json "メロス" --path "../$PROJECT_BASE/notes"
+assert_json "path: parent-traversal --path ../<base>/notes includes hashire-melos" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# Out-of-scope parent path: `../<base>/note` (boundary) must NOT match notes/.
+run search_json "メロス" --path "../$PROJECT_BASE/note"
+assert_json "path: parent-traversal --path ../<base>/note excludes notes/ (boundary)" \
+    'all(.results[]; (.source_file | contains("hashire-melos")) | not)' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# Case-insensitive (ADR-0017, deliberate owner-accepted tradeoff): an upper-case
+# `NOTES` still matches the lower-case `notes/` directory. This pins the chosen
+# forgiving behavior so a future change to case-sensitive matching is caught.
+run search_json "メロス" --path NOTES
+assert_json "path: --path is case-insensitive (NOTES matches notes/)" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# Boundary: `note` must NOT match the `notes/` directory (no substring leak)
+run search_json "メロス" --path note
+assert_json "path: --path note excludes notes/ (boundary)" \
+    'all(.results[]; (.source_file | contains("hashire-melos")) | not)' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
 # ── Entity search (tag boost) ────────────────────────────────────────
 
 echo ""

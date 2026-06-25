@@ -1147,10 +1147,10 @@ pub fn half_life_days(file_path: &str, source_type: &str) -> f64 {
     if file_path.starts_with("session:") {
         return cfg.session_half_life_days;
     }
+    let fp = std::path::Path::new(file_path);
     for dir in &cfg.content_dirs {
-        if file_path.starts_with(dir.path.as_str())
-            && file_path.as_bytes().get(dir.path.len()) == Some(&b'/')
-        {
+        let dir_abs = crate::paths::absolutize(std::path::Path::new(&dir.path), &cfg.project_root);
+        if crate::paths::is_within(fp, &dir_abs) {
             return dir.half_life_days;
         }
     }
@@ -1204,10 +1204,10 @@ pub fn directory_weight(file_path: &str) -> f64 {
     if file_path.starts_with("session:") {
         return cfg.session_weight;
     }
+    let fp = std::path::Path::new(file_path);
     for dir in &cfg.content_dirs {
-        if file_path.starts_with(dir.path.as_str())
-            && file_path.as_bytes().get(dir.path.len()) == Some(&b'/')
-        {
+        let dir_abs = crate::paths::absolutize(std::path::Path::new(&dir.path), &cfg.project_root);
+        if crate::paths::is_within(fp, &dir_abs) {
             return dir.weight;
         }
     }
@@ -2404,31 +2404,29 @@ path = "company/knowledge"
 weight = 1.5
 "#,
         );
-        // Simulate directory_weight logic against config
-        let file_path = "company/knowledge/foo.md";
-        let weight = cfg
-            .content_dirs
-            .iter()
-            .find(|d| {
-                file_path.starts_with(d.path.as_str())
-                    && file_path.as_bytes().get(d.path.len()) == Some(&b'/')
-            })
-            .map(|d| d.weight)
-            .unwrap_or(1.0);
-        assert_eq!(weight, 1.5);
-
+        // Mirror directory_weight's production matching (ADR-0017): file_path is
+        // absolute, content_dir resolved to absolute against project_root, matched
+        // at a directory boundary.
+        let weight_of = |file_path: &std::path::Path| {
+            cfg.content_dirs
+                .iter()
+                .find(|d| {
+                    let dir_abs =
+                        crate::paths::absolutize(std::path::Path::new(&d.path), &cfg.project_root);
+                    crate::paths::is_within(file_path, &dir_abs)
+                })
+                .map(|d| d.weight)
+                .unwrap_or(1.0)
+        };
+        assert_eq!(
+            weight_of(&cfg.project_root.join("company/knowledge/foo.md")),
+            1.5
+        );
         // Boundary: similar prefix should NOT match
-        let file_path2 = "company/knowledge_extra/foo.md";
-        let weight2 = cfg
-            .content_dirs
-            .iter()
-            .find(|d| {
-                file_path2.starts_with(d.path.as_str())
-                    && file_path2.as_bytes().get(d.path.len()) == Some(&b'/')
-            })
-            .map(|d| d.weight)
-            .unwrap_or(1.0);
-        assert_eq!(weight2, 1.0);
+        assert_eq!(
+            weight_of(&cfg.project_root.join("company/knowledge_extra/foo.md")),
+            1.0
+        );
     }
 
     #[test]
@@ -2440,13 +2438,14 @@ path = "daily/notes"
 half_life_days = 180
 "#,
         );
-        let file_path = "daily/notes/test.md";
+        let file_path = cfg.project_root.join("daily/notes/test.md");
         let hl = cfg
             .content_dirs
             .iter()
             .find(|d| {
-                file_path.starts_with(d.path.as_str())
-                    && file_path.as_bytes().get(d.path.len()) == Some(&b'/')
+                let dir_abs =
+                    crate::paths::absolutize(std::path::Path::new(&d.path), &cfg.project_root);
+                crate::paths::is_within(&file_path, &dir_abs)
             })
             .map(|d| d.half_life_days)
             .unwrap_or(DEFAULT_HALF_LIFE_DAYS);

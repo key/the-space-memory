@@ -14,6 +14,7 @@ pub mod indexer;
 pub mod ipc;
 pub mod logging;
 pub mod lua_hooks;
+pub mod paths;
 pub mod read_pool;
 pub mod searcher;
 pub mod session_chunker;

@@ -322,25 +322,41 @@ pub fn entity_results(
     limit: usize,
 ) -> anyhow::Result<HashMap<i64, usize>> {
     let entity_ids = find_entity_ids(conn, query);
-    entity_results_by_ids(conn, &entity_ids, limit)
+    entity_results_by_ids(conn, &entity_ids, limit, None)
 }
 
 /// Search for chunks by pre-computed entity IDs (avoids redundant lookup).
+///
+/// When `path_prefixes` is set, both the direct and 2nd-hop chunk lookups are
+/// restricted to chunks whose document is in-scope (ADR-0017 Gap 4), so the
+/// entity retriever does not spend its budget on out-of-scope chunks.
 pub fn entity_results_by_ids(
     conn: &Connection,
     entity_ids: &[i64],
     limit: usize,
+    path_prefixes: Option<&[String]>,
 ) -> anyhow::Result<HashMap<i64, usize>> {
     if entity_ids.is_empty() || !db::has_entity_tables(conn) {
         return Ok(HashMap::new());
     }
+
+    // In-scope chunk restriction (over `d.file_path`), shared by both hops.
+    let (scope_sql, scope_params) = crate::paths::scope_clause(path_prefixes);
+    let scope_in = if scope_sql.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " AND ce.chunk_id IN (SELECT c.id FROM chunks c \
+             JOIN documents d ON d.id = c.document_id WHERE 1=1{scope_sql})"
+        )
+    };
 
     // Direct matches: chunks containing these entities
     let placeholders = entity_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
         "SELECT ce.chunk_id, COUNT(*) as match_count
          FROM chunk_entities ce
-         WHERE ce.entity_id IN ({placeholders})
+         WHERE ce.entity_id IN ({placeholders}){scope_in}
          GROUP BY ce.chunk_id
          ORDER BY match_count DESC
          LIMIT ?",
@@ -350,6 +366,9 @@ pub fn entity_results_by_ids(
         .iter()
         .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
         .collect();
+    for s in &scope_params {
+        params.push(Box::new(s.clone()));
+    }
     params.push(Box::new(limit as i64));
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
@@ -364,45 +383,69 @@ pub fn entity_results_by_ids(
     }
 
     // 2nd hop: chunks related via co-occurring entities (lower priority)
-    let related_ids = find_related_entity_ids(conn, entity_ids, 5);
-    if !related_ids.is_empty() {
-        let ph2 = related_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql2 = format!(
-            "SELECT ce.chunk_id, COUNT(*) as match_count
-             FROM chunk_entities ce
-             WHERE ce.entity_id IN ({ph2})
-               AND ce.chunk_id NOT IN (SELECT chunk_id FROM chunk_entities WHERE entity_id IN ({placeholders}))
-             GROUP BY ce.chunk_id
-             ORDER BY match_count DESC
-             LIMIT ?",
-        );
-
-        let mut params2: Vec<Box<dyn rusqlite::types::ToSql>> = related_ids
-            .iter()
-            .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
-            .collect();
-        for id in entity_ids {
-            params2.push(Box::new(*id));
-        }
-        params2.push(Box::new(limit as i64));
-        let refs2: Vec<&dyn rusqlite::types::ToSql> = params2.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt2 = conn.prepare(&sql2)?;
-        let rows2 = stmt2.query_map(refs2.as_slice(), |row| row.get::<_, i64>(0))?;
-
-        let base_rank = result.len();
-        for (i, row) in rows2.enumerate() {
-            if let Ok(chunk_id) = row {
-                result.entry(chunk_id).or_insert(base_rank + i);
-            }
-        }
+    let base_rank = result.len();
+    let hop2 = second_hop_chunk_ids(
+        conn,
+        entity_ids,
+        &placeholders,
+        &scope_in,
+        &scope_params,
+        limit,
+    )?;
+    for (i, chunk_id) in hop2.into_iter().enumerate() {
+        result.entry(chunk_id).or_insert(base_rank + i);
     }
 
     Ok(result)
+}
+
+/// 2nd-hop expansion: chunks reachable via entities co-occurring with
+/// `entity_ids`, excluding chunks already matched directly. `scope_in` /
+/// `scope_params` carry the in-scope `--path` restriction (ADR-0017 Gap 4).
+/// Returns chunk ids in rank order (empty when no related entities).
+fn second_hop_chunk_ids(
+    conn: &Connection,
+    entity_ids: &[i64],
+    placeholders: &str,
+    scope_in: &str,
+    scope_params: &[String],
+    limit: usize,
+) -> anyhow::Result<Vec<i64>> {
+    let related_ids = find_related_entity_ids(conn, entity_ids, 5);
+    if related_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ph2 = related_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql2 = format!(
+        "SELECT ce.chunk_id, COUNT(*) as match_count
+         FROM chunk_entities ce
+         WHERE ce.entity_id IN ({ph2})
+           AND ce.chunk_id NOT IN (SELECT chunk_id FROM chunk_entities WHERE entity_id IN ({placeholders})){scope_in}
+         GROUP BY ce.chunk_id
+         ORDER BY match_count DESC
+         LIMIT ?",
+    );
+
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = related_ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
+    for id in entity_ids {
+        params.push(Box::new(*id));
+    }
+    for s in scope_params {
+        params.push(Box::new(s.clone()));
+    }
+    params.push(Box::new(limit as i64));
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let mut stmt = conn.prepare(&sql2)?;
+    let rows = stmt.query_map(refs.as_slice(), |row| row.get::<_, i64>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 /// Find entity IDs that co-occur with the given entities (1 hop via entity_edges).
@@ -750,6 +793,50 @@ mod tests {
         let conn = db::get_memory_connection().unwrap();
         let results = entity_results(&conn, "", 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn entity_results_respect_path_scope() {
+        // Two docs under different dirs share a tag entity; scoping to one dir
+        // must return only that doc's chunk (ADR-0017 Gap 4).
+        let conn = db::get_memory_connection().unwrap();
+        let chunk_of = |path: &str| -> i64 {
+            conn.execute(
+                "INSERT INTO documents (file_path, source_type, title, file_hash, indexed_at) \
+                 VALUES (?, 'note', 'T', 'h', '2026-01-01')",
+                [path],
+            )
+            .unwrap();
+            let doc_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO chunks (document_id, chunk_index, section_path, content) \
+                 VALUES (?, 0, 'S', 'c')",
+                [doc_id],
+            )
+            .unwrap();
+            let cid = conn.last_insert_rowid();
+            insert_entities(
+                &conn,
+                doc_id,
+                &[(cid, "c".to_string())],
+                &["Shared".to_string()],
+            )
+            .unwrap();
+            cid
+        };
+        let cid_daily = chunk_of("/r/daily/a.md");
+        let _cid_other = chunk_of("/r/other/b.md");
+
+        let shared_id: i64 = conn
+            .query_row("SELECT id FROM entities WHERE name = 'shared'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let scope = vec!["/r/daily".to_string()];
+        let results = entity_results_by_ids(&conn, &[shared_id], 10, Some(&scope)).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results.contains_key(&cid_daily));
     }
 
     #[test]

@@ -369,6 +369,31 @@ pub fn has_vec_table(conn: &Connection) -> bool {
         > 0
 }
 
+/// Reject a DB created before absolute-path storage. The `file_path` column
+/// changed meaning (relative → absolute, ADR-0017); a stored relative path
+/// would silently mis-match every `--path`. The check is data-driven: it fails
+/// iff a legacy relative `file_path` row exists, so empty and fully-migrated DBs
+/// pass and the check self-heals after a rebuild.
+///
+/// Filesystem documents are absolute (start with `/`). Session documents are a
+/// non-filesystem kind keyed `session:<stem>` and are exempt — they were never
+/// path-based and are unaffected by the storage change.
+pub fn check_path_schema(conn: &Connection) -> anyhow::Result<()> {
+    let has_legacy_relative: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM documents \
+         WHERE file_path NOT LIKE '/%' AND file_path NOT LIKE 'session:%')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_legacy_relative {
+        anyhow::bail!(
+            "This index predates absolute-path storage and must be rebuilt. \
+             Run `tsm rebuild --apply`."
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,5 +778,49 @@ mod tests {
         assert_eq!(n, 0); // empty DB; the point is it returns, not the value
 
         writer.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn check_path_schema_ok_for_empty_db() {
+        let conn = get_memory_connection().unwrap(); // schema, no rows
+        assert!(check_path_schema(&conn).is_ok());
+    }
+
+    #[test]
+    fn check_path_schema_ok_for_absolute_rows() {
+        let conn = get_memory_connection().unwrap();
+        conn.execute(
+            "INSERT INTO documents (file_path, source_type, file_hash, indexed_at) \
+             VALUES ('/r/daily/x.md', 'note', 'h', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        assert!(check_path_schema(&conn).is_ok());
+    }
+
+    #[test]
+    fn check_path_schema_rejects_relative_rows() {
+        let conn = get_memory_connection().unwrap();
+        conn.execute(
+            "INSERT INTO documents (file_path, source_type, file_hash, indexed_at) \
+             VALUES ('daily/x.md', 'note', 'h', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        assert!(check_path_schema(&conn).is_err());
+    }
+
+    #[test]
+    fn check_path_schema_ok_for_session_rows() {
+        // Session documents are keyed `session:<stem>` (not filesystem paths)
+        // and must NOT be mistaken for legacy relative paths.
+        let conn = get_memory_connection().unwrap();
+        conn.execute(
+            "INSERT INTO documents (file_path, source_type, file_hash, indexed_at) \
+             VALUES ('session:abc', 'session', 'h', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        assert!(check_path_schema(&conn).is_ok());
     }
 }

@@ -84,6 +84,9 @@ tsm index
 
 # 7. Search
 tsm search -q "query" -k 5
+
+# Scope to a directory (absolute or relative to the current directory)
+tsm search -q "query" --path notes/
 ```
 
 `tsm setup` sets `HF_HUB_CACHE` automatically; override it to redirect the

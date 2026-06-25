@@ -61,23 +61,13 @@ fn build_filter_clauses(
         format!(" AND {}", time_clauses.join(" AND "))
     };
 
-    let path_sql = match path_prefixes {
-        Some(prefixes) if !prefixes.is_empty() => {
-            let conditions: Vec<String> = prefixes
-                .iter()
-                .map(|_| "d.file_path LIKE ? ESCAPE '\\'".to_string())
-                .collect();
-            for p in prefixes {
-                let escaped = p
-                    .replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_");
-                extra_params.push(Box::new(format!("{}%", escaped)));
-            }
-            format!(" AND ({})", conditions.join(" OR "))
-        }
-        _ => String::new(),
-    };
+    // Directory-boundary path scope (ADR-0017). Built by the shared, pure,
+    // unit-tested `paths::scope_clause` so the final JOIN, retrieval, and entity
+    // queries all use one source of truth (no divergence between filters).
+    let (path_sql, path_params) = crate::paths::scope_clause(path_prefixes);
+    for p in path_params {
+        extra_params.push(Box::new(p));
+    }
 
     (time_sql, path_sql, extra_params)
 }
