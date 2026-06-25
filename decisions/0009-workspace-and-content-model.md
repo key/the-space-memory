@@ -1,7 +1,7 @@
 ---
 status: proposed
 created: 2026-05-19
-updated: 2026-05-19
+updated: 2026-06-25
 ---
 
 # ADR-0009: プロジェクトとコンテンツ参照モデル
@@ -11,7 +11,10 @@ updated: 2026-05-19
   [ADR-0001](./0001-process-roles-and-responsibilities.md),
   [ADR-0003](./0003-config-via-resolved-config.md),
   [ADR-0008](./0008-setup-init-separation.md)（partially supersedes）,
-  [ADR-0010](./0010-per-project-daemon.md)（本 ADR の `project_root` を前提とする）
+  [ADR-0010](./0010-per-project-daemon.md)（本 ADR の `project_root` を前提とする）,
+  [ADR-0017](./0017-absolute-source-file-and-path-filter.md)（§4 の source_file 保存
+  方式・表示・`--path` マッチ規則を supersede。§4 の gitignore / `.tsmignore` の扱いと
+  §1〜3,5,6 は本 ADR のまま有効）
 
 ## Context
 
@@ -195,6 +198,12 @@ half_life_days = 180
 分かりにくい失敗を生むため、起動時にエラーで気付かせる。
 
 ### 4. `source_file` は正規化済み絶対パスで保存
+
+> **Note**: 本節の保存方式（canonical 化）・表示（`~` 短縮）・`--path` マッチ規則
+> （floating component match）は
+> [ADR-0017](./0017-absolute-source-file-and-path-filter.md) で supersede された。
+> 確定版（lexical 絶対化・JSON 絶対 / text 相対・CWD アンカー境界一致・retrieval 段
+> 適用）は ADR-0017 を参照。本節の gitignore / `.tsmignore` の扱いは引き続き有効。
 
 複数ルートでは単一の相対基準が存在しないため、`source_file` は canonical 化した
 絶対パスで DB に保存する。
