@@ -1006,6 +1006,40 @@ mod tests {
         assert!(lines[1].starts_with("zebra,"));
     }
 
+    #[test]
+    fn test_regenerate_user_dict_emits_stored_readings() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user_dict.simpledic");
+        // accepted with a distinct reading, accepted without (NULL reading),
+        // plus rejected/pending noise that must not be written.
+        set_verdict(
+            &conn,
+            "ハンドロード",
+            Verdict::Accepted,
+            Some("はんどろーど"),
+        )
+        .unwrap();
+        set_verdict(&conn, "クラウド", Verdict::Accepted, None).unwrap();
+        set_verdict(&conn, "noise", Verdict::Rejected, None).unwrap();
+        seed(&conn, "foo", "pending");
+
+        let written = regenerate_user_dict(&conn, &path).unwrap();
+
+        assert_eq!(written, 2, "only accepted surfaces are written");
+        let body = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<&str> = body.lines().collect();
+        // Sorted by surface; the stored reading is emitted, falling back to the
+        // surface when NULL.
+        assert_eq!(
+            rows,
+            vec![
+                format!("クラウド,{},クラウド", USER_DICT_POS),
+                format!("ハンドロード,{},はんどろーど", USER_DICT_POS),
+            ]
+        );
+    }
+
     // ─── is_valid_candidate tests ────────────────────────────
 
     #[test]
