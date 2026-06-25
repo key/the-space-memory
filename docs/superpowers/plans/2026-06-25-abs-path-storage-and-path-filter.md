@@ -277,6 +277,8 @@ git commit -m "feat(indexer): store file_path as absolute (ADR-0017)"
 **Interfaces:**
 - Produces: `pub fn check_path_schema(conn: &Connection) -> anyhow::Result<()>` — returns `Err` with a "run `tsm rebuild`" message when the DB predates absolute storage. Called from the daemon startup path (where `is_initialized` is checked).
 
+> **Verified**: `PRAGMA user_version` is currently unused anywhere in `src/` — free to use as the path-schema marker. It is independent of the existing additive column migrations (`ensure_content_hash_column`, `ensure_metadata_column`), which run on connect and stay as-is; those upgrade old DBs in place but never touch `user_version`, so a pre-absolute DB still reads `0` and is correctly rejected.
+
 - [ ] **Step 1: Write the failing test**
 
 ```rust
