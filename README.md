@@ -1,5 +1,10 @@
 # The Space Memory
 
+[![CI](https://github.com/key/the-space-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/key/the-space-memory/actions/workflows/ci.yml)
+[![E2E](https://github.com/key/the-space-memory/actions/workflows/e2e.yml/badge.svg)](https://github.com/key/the-space-memory/actions/workflows/e2e.yml)
+[![Code Metrics](https://github.com/key/the-space-memory/actions/workflows/metrics.yml/badge.svg)](https://github.com/key/the-space-memory/actions/workflows/metrics.yml)
+[![Lint](https://github.com/key/the-space-memory/actions/workflows/lint.yml/badge.svg)](https://github.com/key/the-space-memory/actions/workflows/lint.yml)
+
 ![The Space Memory](docs/assets/cover.png)
 
 [日本語](README.ja.md) · [Documentation](https://key.github.io/the-space-memory/)
