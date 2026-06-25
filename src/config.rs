@@ -554,7 +554,9 @@ fn cwd_fallback() -> PathBuf {
 /// Read an env var as PathBuf, falling back to a config file value.
 fn env_or(var: &str, file_val: Option<&PathBuf>) -> Option<PathBuf> {
     if let Ok(val) = std::env::var(var) {
-        return Some(PathBuf::from(val));
+        if !val.is_empty() {
+            return Some(PathBuf::from(val));
+        }
     }
     file_val.cloned()
 }
@@ -1281,6 +1283,45 @@ mod tests {
         assert!(cfg.respect_gitignore);
         assert_eq!(cfg.ignore_file, DEFAULT_IGNORE_FILE);
         assert_eq!(cfg.extensions, vec![DEFAULT_INDEX_EXTENSION.to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_or_skips_empty_string() {
+        // Arrange: a TSM_* env set to "" must be treated as unset, falling
+        // through to the file value (or None) instead of yielding Some("").
+        let var = "TSM_TEST_ENV_OR_EMPTY";
+        let file_val = PathBuf::from("/from/file");
+
+        // Act + Assert: empty env -> falls through to the file value.
+        std::env::set_var(var, "");
+        assert_eq!(
+            env_or(var, Some(&file_val)),
+            Some(file_val.clone()),
+            "empty env var must fall through to the file value"
+        );
+        // Empty env with no file value -> None (caller then applies default).
+        assert_eq!(env_or(var, None), None, "empty env + no file -> None");
+
+        // A non-empty env value still takes precedence over the file value.
+        std::env::set_var(var, "/from/env");
+        assert_eq!(
+            env_or(var, Some(&file_val)),
+            Some(PathBuf::from("/from/env"))
+        );
+
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    #[serial]
+    fn test_empty_env_falls_through_to_toml() {
+        // An empty TSM_STATE_DIR must not override the TOML state_dir; it
+        // should fall through as if unset.
+        std::env::set_var("TSM_STATE_DIR", "");
+        let cfg = resolved_from_toml(r#"state_dir = "/custom/data""#);
+        std::env::remove_var("TSM_STATE_DIR");
+        assert_eq!(cfg.state_dir, PathBuf::from("/custom/data"));
     }
 
     #[test]
