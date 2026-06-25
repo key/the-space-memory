@@ -605,9 +605,12 @@ pub fn format_simpledic_row(surface: &str) -> String {
 fn surface_has_kanji(s: &str) -> bool {
     s.chars().any(|c| {
         matches!(c,
-            '\u{3400}'..='\u{4DBF}'   // CJK Unified Ideographs Extension A
-            | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
-            | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+            '\u{3400}'..='\u{4DBF}'     // CJK Unified Ideographs Extension A
+            | '\u{4E00}'..='\u{9FFF}'   // CJK Unified Ideographs
+            | '\u{F900}'..='\u{FAFF}'   // CJK Compatibility Ideographs
+            | '\u{20000}'..='\u{2EBEF}' // Extension B..F (supplementary plane)
+            | '\u{2F800}'..='\u{2FA1F}' // CJK Compatibility Ideographs Supplement
+            | '\u{30000}'..='\u{3134F}' // Extension G
         )
     })
 }
@@ -634,24 +637,31 @@ pub fn resolve_reading(surface: &str, yomi: Option<&str>) -> (String, bool) {
 /// rows written. Readings are not emitted yet — lindera matching is surface-only
 /// today; reading-based rows are future work.
 pub fn regenerate_user_dict(conn: &Connection, csv_path: &Path) -> anyhow::Result<usize> {
+    // Propagate per-row errors rather than silently dropping a term.
     let surfaces: Vec<String> = conn
         .prepare(
             "SELECT surface FROM dictionary_candidates
              WHERE status = 'accepted' ORDER BY surface ASC",
         )?
-        .query_map([], |r| r.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
 
     if let Some(parent) = csv_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    use std::io::Write;
-    let mut file = std::fs::File::create(csv_path)?; // truncate: full rewrite
-    for surface in &surfaces {
-        writeln!(file, "{}", format_simpledic_row(surface))?;
+    // Write to a sibling temp file then atomically rename, so a crash or write
+    // failure mid-rewrite never leaves lindera reading a truncated/partial dict.
+    let tmp_path = csv_path.with_extension("simpledic.tmp");
+    {
+        use std::io::Write;
+        let mut tmp = std::fs::File::create(&tmp_path)?;
+        for surface in &surfaces {
+            writeln!(tmp, "{}", format_simpledic_row(surface))?;
+        }
+        tmp.sync_all()?;
     }
+    std::fs::rename(&tmp_path, csv_path)?;
     Ok(surfaces.len())
 }
 
@@ -914,6 +924,17 @@ mod tests {
             "surface is used as a substitute reading"
         );
         assert!(warned, "kanji surface without yomi surfaces the data debt");
+    }
+
+    #[test]
+    fn test_resolve_reading_supplementary_plane_kanji_warns() {
+        // U+20BB7 (𠮷) is a CJK Extension B ideograph outside the BMP.
+        let (reading, warned) = resolve_reading("𠮷", None);
+        assert_eq!(reading, "𠮷");
+        assert!(
+            warned,
+            "supplementary-plane kanji must also warn (ADR-0014 §4)"
+        );
     }
 
     // ─── regenerate_user_dict tests ──────────────────────────
