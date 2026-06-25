@@ -1497,10 +1497,6 @@ fn reindex_fts_after_dict_change() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Apply a verdict change to the user dictionary: when the accepted set changed,
-/// regenerate `user_dict.simpledic` from the DB and rebuild FTS (ADR-0014).
-/// Takes `conn` by value so it is dropped before the local FTS rebuild opens its
-/// own writer. A change that does not touch the accepted set is a no-op.
 /// Reconcile the on-disk verdict files into the DB and apply the user's verdict
 /// change in ONE transaction (ADR-0014; fixes #281/#288). The reconcile pulls
 /// terms present in `user_dict.simpledic` / `reject_words.txt` but absent from
@@ -1537,11 +1533,13 @@ fn report_reconcile(r: &user_dict::ReconcileOutcome) {
 
 /// Materialize the DB's accepted set to `user_dict.simpledic` and reload the
 /// tokenizer when the file content changed. Always regenerates (cheap, atomic
-/// temp+rename) so a retry after a previously failed regenerate or reindex
-/// re-converges from the on-disk/DB divergence — no dirty marker needed. A
-/// regenerate failure is surfaced (the DB is already committed); the next
-/// mutation retries. Takes `conn` by value so it is dropped before any local
-/// FTS rebuild opens its own writer.
+/// temp+rename) so a retry after a previously failed regenerate re-converges
+/// from the on-disk/DB divergence — no dirty marker needed. A regenerate failure
+/// is surfaced (the DB is already committed); the next mutation retries. (A
+/// reindex that fails *after* a successful regenerate is surfaced as an error but
+/// not auto-retried here, since the file then matches the DB — see #286/#282 for
+/// reindex-error handling.) Takes `conn` by value so it is dropped before any
+/// local FTS rebuild opens its own writer.
 fn materialize_dict(conn: rusqlite::Connection) -> anyhow::Result<()> {
     let csv_path = config::user_dict_path();
     let regen = user_dict::regenerate_user_dict(&conn, &csv_path).map_err(|e| {
@@ -1656,6 +1654,10 @@ pub fn cmd_dict_import() -> anyhow::Result<()> {
     let conn = db::get_connection(&config::db_path())?;
     let dict_path = config::user_dict_path();
     let reject_path = config::reject_words_path();
+
+    // Fail closed before importing if a surface is in both files — otherwise the
+    // accepted-then-rejected pass would silently demote it.
+    user_dict::assert_no_cross_file_conflict(&dict_path, &reject_path)?;
 
     // One transaction for the whole import: a mid-file failure rolls back rather
     // than leaving a partial set of verdicts committed (#287).

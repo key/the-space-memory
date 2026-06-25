@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -580,7 +580,9 @@ pub fn regenerate_user_dict(conn: &Connection, csv_path: &Path) -> anyhow::Resul
     // on-disk/DB divergence and re-materializes (no dirty-marker needed).
     let changed = match std::fs::read_to_string(csv_path) {
         Ok(existing) => existing != content,
-        Err(_) => true, // missing/unreadable file → treat as changed
+        // Any read error (missing file, permissions, non-UTF-8) → treat as
+        // changed and rewrite; at worst this is one redundant reindex, never loss.
+        Err(_) => true,
     };
 
     if let Some(parent) = csv_path.parent() {
@@ -671,20 +673,35 @@ fn parse_simpledic_line(line: &str) -> anyhow::Result<Option<(String, Option<Str
 
 /// Read `user_dict.simpledic` into `(surface, reading)` rows, failing closed on
 /// any malformed line (reported with its 1-based line number and path) so a
-/// hand-edit typo never gets silently dropped by a later rewrite. Missing file
-/// → empty vec.
+/// hand-edit typo never gets silently dropped by a later rewrite. A surface that
+/// repeats with a *different* reading also fails closed (collapsing it would
+/// silently drop one reading); an exact duplicate is harmless and deduped.
+/// Missing file → empty vec.
 fn read_simpledic_surfaces(path: &Path) -> anyhow::Result<Vec<(String, Option<String>)>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
     let content = std::fs::read_to_string(path)?;
-    let mut out = Vec::new();
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let mut seen: HashMap<String, Option<String>> = HashMap::new();
     for (i, line) in content.lines().enumerate() {
-        match parse_simpledic_line(line) {
-            Ok(Some(row)) => out.push(row),
-            Ok(None) => {}
+        let row = match parse_simpledic_line(line) {
+            Ok(Some(row)) => row,
+            Ok(None) => continue,
             Err(e) => anyhow::bail!("{}:{}: {e}", path.display(), i + 1),
+        };
+        match seen.get(&row.0) {
+            Some(prev) if *prev == row.1 => continue, // exact duplicate: dedupe
+            Some(_) => anyhow::bail!(
+                "{}:{}: surface '{}' appears more than once with different readings",
+                path.display(),
+                i + 1,
+                row.0
+            ),
+            None => {}
         }
+        seen.insert(row.0.clone(), row.1.clone());
+        out.push(row);
     }
     Ok(out)
 }
@@ -819,8 +836,7 @@ pub fn reconcile_files_into_db(
     // Apply: insert/promote only (overrides already ruled out by the check above).
     let mut outcome = ReconcileOutcome::default();
     for (surface, reading) in &accepted {
-        if db_status(conn, surface)? != Some(Verdict::Accepted) {
-            set_verdict_in(conn, surface, Verdict::Accepted, reading.as_deref())?;
+        if reconcile_accepted_surface(conn, surface, reading.as_deref())? {
             outcome.accepted_healed += 1;
         }
     }
@@ -831,6 +847,72 @@ pub fn reconcile_files_into_db(
         }
     }
     Ok(outcome)
+}
+
+/// Bring one simpledic surface into the DB during reconcile: insert it / promote
+/// `pending` to `accepted`, or — when it is already `accepted` — sync an explicit
+/// hand-edited reading from the file (so a reading edit on an existing term is
+/// not silently dropped by the later rewrite). A file reading of `None` is left
+/// untouched (it is the normal serialization of a NULL reading, so it must not
+/// clear a DB reading). Returns whether the DB changed.
+fn reconcile_accepted_surface(
+    conn: &Connection,
+    surface: &str,
+    reading: Option<&str>,
+) -> anyhow::Result<bool> {
+    if db_status(conn, surface)? != Some(Verdict::Accepted) {
+        set_verdict_in(conn, surface, Verdict::Accepted, reading)?;
+        return Ok(true);
+    }
+    match reading {
+        Some(r) if db_reading(conn, surface)?.as_deref() != Some(r) => {
+            set_verdict_in(conn, surface, Verdict::Accepted, Some(r))?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Current stored reading for `surface` (its candidate row's `reading` column),
+/// or `None` when the row is absent or the reading is NULL.
+fn db_reading(conn: &Connection, surface: &str) -> anyhow::Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT reading FROM dictionary_candidates WHERE surface = ?1",
+            [surface],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Fail closed if a surface appears in BOTH verdict files — an unresolvable
+/// contradiction. `dict import` calls this before importing, since its
+/// accepted-then-rejected pass would otherwise apply the overlap as a silent
+/// demotion. Read-only; also surfaces a malformed `user_dict.simpledic`.
+pub fn assert_no_cross_file_conflict(
+    simpledic_path: &Path,
+    reject_path: &Path,
+) -> anyhow::Result<()> {
+    let accepted = read_simpledic_surfaces(simpledic_path)?;
+    let rejected = read_reject_surfaces(reject_path)?;
+    let reject_set: HashSet<&str> = rejected.iter().map(String::as_str).collect();
+    let both: Vec<&str> = accepted
+        .iter()
+        .map(|(s, _)| s.as_str())
+        .filter(|s| reject_set.contains(s))
+        .collect();
+    if !both.is_empty() {
+        anyhow::bail!(
+            "dictionary file conflict — no changes were made. Resolve, then retry:\n  - {}\n\
+             Each term must appear in only one of user_dict.simpledic / reject_words.txt.",
+            both.iter()
+                .map(|s| format!("'{s}' is in both user_dict.simpledic and reject_words.txt"))
+                .collect::<Vec<_>>()
+                .join("\n  - ")
+        );
+    }
+    Ok(())
 }
 
 /// Read-only check for [`reconcile_files_into_db`]: errors (listing every
@@ -2044,5 +2126,72 @@ mod tests {
 
         let second = regenerate_user_dict(&conn, &path).unwrap();
         assert!(!second.changed, "re-running with no DB change is unchanged");
+    }
+
+    // ─── review follow-ups: dup lines, reading sync, import overlap ───
+
+    #[test]
+    fn test_read_simpledic_dedupes_identical_but_errors_on_conflicting_dup() {
+        let dir = tempfile::tempdir().unwrap();
+        let ident = dir.path().join("a.simpledic");
+        std::fs::write(&ident, "x,名詞,x\nx,名詞,x\n").unwrap();
+        assert_eq!(
+            read_simpledic_surfaces(&ident).unwrap().len(),
+            1,
+            "identical dup deduped"
+        );
+
+        let conflicting = dir.path().join("b.simpledic");
+        std::fs::write(&conflicting, "x,名詞,r1\nx,名詞,r2\n").unwrap();
+        let err = read_simpledic_surfaces(&conflicting)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different readings"), "{err}");
+    }
+
+    #[test]
+    fn test_reconcile_syncs_hand_edited_reading_on_accepted() {
+        // An already-accepted term whose file reading was hand-edited must have
+        // the new reading synced, else regenerate overwrites the edit.
+        let conn = setup();
+        set_verdict_in(&conn, "漢字", Verdict::Accepted, None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (sp, rp) = write_files(dir.path(), "漢字,名詞,かんじ\n", "");
+
+        let out = reconcile_files_into_db(&conn, &sp, &rp).unwrap();
+
+        assert_eq!(out.accepted_healed, 1, "reading edit counts as a heal");
+        assert_eq!(reading_of(&conn, "漢字").as_deref(), Some("かんじ"));
+    }
+
+    #[test]
+    fn test_reconcile_accepted_no_reading_edit_is_noop() {
+        let conn = setup();
+        set_verdict_in(&conn, "漢字", Verdict::Accepted, Some("かんじ")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // File reading == surface → None → must not clear the DB reading.
+        let (sp, rp) = write_files(dir.path(), "漢字,名詞,漢字\n", "");
+
+        let out = reconcile_files_into_db(&conn, &sp, &rp).unwrap();
+
+        assert_eq!(out.accepted_healed, 0);
+        assert_eq!(
+            reading_of(&conn, "漢字").as_deref(),
+            Some("かんじ"),
+            "a None file reading does not clear the DB reading"
+        );
+    }
+
+    #[test]
+    fn test_assert_no_cross_file_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sp, rp) = write_files(dir.path(), "dup,名詞,dup\nok\n", "dup\n");
+        let err = assert_no_cross_file_conflict(&sp, &rp)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'dup'") && err.contains("both"), "{err}");
+
+        let (sp2, rp2) = write_files(dir.path(), "ok\n", "other\n");
+        assert!(assert_no_cross_file_conflict(&sp2, &rp2).is_ok());
     }
 }
