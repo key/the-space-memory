@@ -733,7 +733,10 @@ Use this for compounds lindera mis-splits (e.g. `ハンドロード` → `ハン
 which never surface as frequency candidates and so cannot be added via
 `dict update`. The accepted set is the authority in the database; the change
 regenerates `user_dict.simpledic` and triggers an FTS re-index so the tokenizer
-picks it up (via the daemon if running, otherwise a direct rebuild).
+picks it up (via the daemon if running, otherwise a direct rebuild). If a running
+daemon cannot reindex (IPC error or rejection), the command reports an error
+instead of silently leaving the index stale; run `tsm reindex fts` (or
+`tsm restart`) to recover.
 
 The optional reading (`yomi`) is stored but not yet used for matching (search is
 surface-based today). Omit it for an all-kana surface, where the surface is its

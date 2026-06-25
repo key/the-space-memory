@@ -1474,27 +1474,64 @@ pub fn cmd_dict_update(threshold: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What to do with the daemon's response to a dict-triggered FTS reindex.
+#[derive(Debug, PartialEq, Eq)]
+enum ReindexPlan {
+    /// No daemon is running — rebuild the FTS index locally.
+    Local,
+    /// The daemon accepted the request and is reindexing in the background.
+    BackgroundStarted,
+    /// The daemon was reachable but the reindex failed; surface this rather than
+    /// silently falling back to a local rebuild that races the daemon's writer.
+    Failed(String),
+}
+
+/// Classify a daemon reindex response. Only a missing daemon (`None`) warrants a
+/// local rebuild; an IPC error (`Some(Err)`) or an explicit rejection
+/// (`Some(Ok)` with `ok == false`) is surfaced so the caller does not quietly
+/// run a competing local rebuild against the daemon-owned DB (#286/#282).
+fn classify_reindex(
+    resp: Option<anyhow::Result<crate::daemon_protocol::DaemonResponse>>,
+) -> ReindexPlan {
+    match resp {
+        None => ReindexPlan::Local,
+        Some(Ok(r)) if r.ok => ReindexPlan::BackgroundStarted,
+        Some(Ok(r)) => ReindexPlan::Failed(
+            r.error
+                .unwrap_or_else(|| "daemon rejected the reindex request".to_string()),
+        ),
+        Some(Err(e)) => ReindexPlan::Failed(e.to_string()),
+    }
+}
+
 /// Rebuild the FTS index so the tokenizer picks up a user-dictionary change.
-/// If the daemon is running, send a reindex over IPC (the daemon resets its own
-/// segmenter); otherwise reset the local segmenter and rebuild directly.
+/// A reachable daemon reindexes over IPC (it resets its own segmenter); with no
+/// daemon, rebuild locally. An IPC error or a daemon rejection is surfaced (not
+/// silently retried as a local rebuild that would race the daemon's writer):
+/// the search index is then stale until `tsm reindex fts` / `tsm restart`.
 fn reindex_fts_after_dict_change() -> anyhow::Result<()> {
     let daemon_socket = config::daemon_socket_path();
     let reindex_req = crate::daemon_protocol::DaemonRequest::Reindex {
         kind: crate::daemon_protocol::ReindexKind::Fts,
     };
-    let daemon_accepted = crate::daemon_protocol::try_send_request(&daemon_socket, &reindex_req)
-        .and_then(|r| r.ok())
-        .is_some_and(|r| r.ok);
+    let resp = crate::daemon_protocol::try_send_request(&daemon_socket, &reindex_req);
 
-    if daemon_accepted {
-        println!("\nFTS reindex started in background. Run `tsm doctor` to check progress.");
-    } else {
-        crate::tokenizer::reset_segmenter();
-        println!("\nRebuilding FTS index...");
-        cmd_rebuild_fts()?;
+    match classify_reindex(resp) {
+        ReindexPlan::BackgroundStarted => {
+            println!("\nFTS reindex started in background. Run `tsm doctor` to check progress.");
+            Ok(())
+        }
+        ReindexPlan::Local => {
+            crate::tokenizer::reset_segmenter();
+            println!("\nRebuilding FTS index...");
+            cmd_rebuild_fts()
+        }
+        ReindexPlan::Failed(msg) => anyhow::bail!(
+            "the dictionary changed but the daemon could not reindex FTS: {msg}. \
+             The search index is stale until you run `tsm reindex fts` (or `tsm restart` \
+             to reload the dictionary).",
+        ),
     }
-
-    Ok(())
 }
 
 /// Reconcile the on-disk verdict files into the DB and apply the user's verdict
@@ -1865,6 +1902,48 @@ pub fn cmd_rebuild_fts() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon_protocol::DaemonResponse;
+
+    fn resp(ok: bool, error: Option<&str>) -> DaemonResponse {
+        DaemonResponse {
+            ok,
+            error: error.map(str::to_string),
+            payload: None,
+        }
+    }
+
+    #[test]
+    fn classify_reindex_none_is_local() {
+        assert_eq!(classify_reindex(None), ReindexPlan::Local);
+    }
+
+    #[test]
+    fn classify_reindex_ok_true_is_background() {
+        assert_eq!(
+            classify_reindex(Some(Ok(resp(true, None)))),
+            ReindexPlan::BackgroundStarted
+        );
+    }
+
+    #[test]
+    fn classify_reindex_daemon_rejection_is_failed_with_message() {
+        // Some(Ok{ok:false}) must surface, not fall back to a local rebuild.
+        assert_eq!(
+            classify_reindex(Some(Ok(resp(false, Some("queue full"))))),
+            ReindexPlan::Failed("queue full".to_string())
+        );
+        // Missing error string still fails (with a default message), never Local.
+        assert_eq!(
+            classify_reindex(Some(Ok(resp(false, None)))),
+            ReindexPlan::Failed("daemon rejected the reindex request".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_reindex_ipc_error_is_failed() {
+        let plan = classify_reindex(Some(Err(anyhow::anyhow!("broken pipe"))));
+        assert_eq!(plan, ReindexPlan::Failed("broken pipe".to_string()));
+    }
 
     #[test]
     fn normalize_path_filters_abs_and_rel_and_dedup() {
