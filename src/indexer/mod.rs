@@ -123,7 +123,10 @@ pub fn index_file(
         }
     }
 
-    let prepared = prepare::prepare(file_path, &stored_path, &directory, &filename)?;
+    // Hook API contract: extract hooks see the project-relative path as
+    // `ctx.path` (unchanged by ADR-0017). Only DB persistence uses the absolute
+    // `stored_path` (file identity). Keep these two separate.
+    let prepared = prepare::prepare(file_path, &rel_for_label, &directory, &filename)?;
 
     let diff = persist::persist(
         conn,

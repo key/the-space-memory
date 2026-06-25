@@ -419,7 +419,11 @@ mod tests {
             .join("does-not-exist")
             .to_string_lossy()
             .to_string();
-        let out = search(&conn, "MTG", 5, None, false, Some(&[nope]));
+        // require_vector = true: an empty scope yields an empty vector set, but
+        // that must NOT be misread as "embedder down" — FTS is also empty, so
+        // the scope simply matched nothing. (Regression guard for the
+        // require_vector + empty-scope interaction.)
+        let out = search(&conn, "MTG", 5, None, true, Some(&[nope]));
         let SearchOutput { results, .. } = out.expect("empty scope must not error");
         assert!(results.is_empty());
     }
