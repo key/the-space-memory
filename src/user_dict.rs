@@ -600,6 +600,61 @@ pub fn format_simpledic_row(surface: &str) -> String {
     format!("{surface},{},{surface}", USER_DICT_POS)
 }
 
+/// Whether `s` contains a CJK ideograph (kanji), whose reading cannot be
+/// inferred from the surface alone.
+fn surface_has_kanji(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(c,
+            '\u{3400}'..='\u{4DBF}'   // CJK Unified Ideographs Extension A
+            | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+            | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+        )
+    })
+}
+
+/// Resolve the reading stored by `dict add` per ADR-0014 §4.
+///
+/// An explicit `yomi` is used verbatim. When omitted, the surface stands in as
+/// its own reading; the returned bool is `true` when the surface contains kanji,
+/// so the caller can warn and surface the data debt (automatic readings are
+/// never inferred — added terms are exactly the words lindera does not know).
+/// Readings are stored only; search is surface-based today.
+pub fn resolve_reading(surface: &str, yomi: Option<&str>) -> (String, bool) {
+    match yomi {
+        Some(y) => (y.to_string(), false),
+        None => (surface.to_string(), surface_has_kanji(surface)),
+    }
+}
+
+/// Regenerate `user_dict.simpledic` from the DB's accepted terms (full rewrite).
+///
+/// The shared primitive every verdict change relies on: ADR-0014 specifies that
+/// a verdict change regenerates simpledic and reloads the tokenizer. `export`
+/// reuses it for the simpledic half of its round-trip. Returns the number of
+/// rows written. Readings are not emitted yet — lindera matching is surface-only
+/// today; reading-based rows are future work.
+pub fn regenerate_user_dict(conn: &Connection, csv_path: &Path) -> anyhow::Result<usize> {
+    let surfaces: Vec<String> = conn
+        .prepare(
+            "SELECT surface FROM dictionary_candidates
+             WHERE status = 'accepted' ORDER BY surface ASC",
+        )?
+        .query_map([], |r| r.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if let Some(parent) = csv_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    use std::io::Write;
+    let mut file = std::fs::File::create(csv_path)?; // truncate: full rewrite
+    for surface in &surfaces {
+        writeln!(file, "{}", format_simpledic_row(surface))?;
+    }
+    Ok(surfaces.len())
+}
+
 /// Export threshold candidates to a CSV file (appending).
 /// Returns the list of newly written candidates.
 /// Output format is simpledic (3 fields: surface, pos, reading).
@@ -826,6 +881,91 @@ mod tests {
         // A later transition without a reading must not clobber it.
         set_verdict(&conn, "term", Verdict::Rejected, None).unwrap();
         assert_eq!(reading_of(&conn, "term").as_deref(), Some("yomi"));
+    }
+
+    // ─── resolve_reading tests (ADR-0014 §4) ─────────────────
+
+    #[test]
+    fn test_resolve_reading_explicit_yomi_used() {
+        let (reading, warned) = resolve_reading("宇宙記憶", Some("うちゅうきおく"));
+        assert_eq!(reading, "うちゅうきおく");
+        assert!(!warned);
+    }
+
+    #[test]
+    fn test_resolve_reading_all_kana_falls_back_to_surface() {
+        let (reading, warned) = resolve_reading("ハンドロード", None);
+        assert_eq!(reading, "ハンドロード");
+        assert!(!warned, "all-kana surface is its own reading; no warning");
+    }
+
+    #[test]
+    fn test_resolve_reading_ascii_falls_back_to_surface() {
+        let (reading, warned) = resolve_reading("candle", None);
+        assert_eq!(reading, "candle");
+        assert!(!warned);
+    }
+
+    #[test]
+    fn test_resolve_reading_kanji_without_yomi_warns() {
+        let (reading, warned) = resolve_reading("宇宙記憶", None);
+        assert_eq!(
+            reading, "宇宙記憶",
+            "surface is used as a substitute reading"
+        );
+        assert!(warned, "kanji surface without yomi surfaces the data debt");
+    }
+
+    // ─── regenerate_user_dict tests ──────────────────────────
+
+    #[test]
+    fn test_regenerate_user_dict_writes_accepted_only() {
+        let conn = setup();
+        seed(&conn, "accepted_a", "accepted");
+        seed(&conn, "accepted_b", "accepted");
+        seed(&conn, "pending_x", "pending");
+        seed(&conn, "rejected_y", "rejected");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("user_dict.simpledic");
+
+        let count = regenerate_user_dict(&conn, &path).unwrap();
+
+        assert_eq!(count, 2);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("accepted_a,"));
+        assert!(body.contains("accepted_b,"));
+        assert!(!body.contains("pending_x"));
+        assert!(!body.contains("rejected_y"));
+    }
+
+    #[test]
+    fn test_regenerate_user_dict_is_full_rewrite() {
+        let conn = setup();
+        seed(&conn, "keep", "accepted");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("user_dict.simpledic");
+        std::fs::write(&path, "stale_word,名詞,stale_word\n").unwrap();
+
+        regenerate_user_dict(&conn, &path).unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("keep,"));
+        assert!(!body.contains("stale_word"), "regen truncates, not appends");
+    }
+
+    #[test]
+    fn test_regenerate_user_dict_empty_accepted_set() {
+        let conn = setup();
+        seed(&conn, "pending_only", "pending");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("user_dict.simpledic");
+        std::fs::write(&path, "stale,名詞,stale\n").unwrap();
+
+        let count = regenerate_user_dict(&conn, &path).unwrap();
+
+        assert_eq!(count, 0);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.is_empty(), "no accepted terms => empty dict file");
     }
 
     // ─── is_valid_candidate tests ────────────────────────────
