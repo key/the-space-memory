@@ -656,7 +656,9 @@ never seen inserts a preemptive `rejected` row.
 
 When the word was previously `accepted`, the accepted set shrinks, so
 `user_dict.simpledic` is regenerated from the database and the tokenizer is
-reloaded (FTS re-index via the daemon if running, else a direct rebuild).
+reloaded (FTS re-index via the daemon if running, else a direct rebuild; if the
+daemon is running but fails to reindex, the command reports an error — run
+`tsm reindex fts` or `tsm restart` to recover).
 
 **Examples:**
 
@@ -708,7 +710,9 @@ Import is **insert-only**: words present in the files are upserted; verdicts for
 words *absent* from the files are left untouched. Removal is explicit — use
 [tsm dict reject](#tsm-dict-reject) or `tsm dict rm`. When accepted words are
 imported, the tokenizer is reloaded (FTS re-index via the daemon if running,
-else a direct rebuild). Counts go to stderr; a status line goes to stdout.
+else a direct rebuild; a daemon that is up but fails to reindex makes the command
+report an error — run `tsm reindex fts` or `tsm restart` to recover). Counts go
+to stderr; a status line goes to stdout.
 
 **Examples:**
 
@@ -733,7 +737,10 @@ Use this for compounds lindera mis-splits (e.g. `ハンドロード` → `ハン
 which never surface as frequency candidates and so cannot be added via
 `dict update`. The accepted set is the authority in the database; the change
 regenerates `user_dict.simpledic` and triggers an FTS re-index so the tokenizer
-picks it up (via the daemon if running, otherwise a direct rebuild).
+picks it up (via the daemon if running, otherwise a direct rebuild). If a running
+daemon cannot reindex (IPC error or rejection), the command reports an error
+instead of silently leaving the index stale; run `tsm reindex fts` (or
+`tsm restart`) to recover.
 
 The optional reading (`yomi`) is stored but not yet used for matching (search is
 surface-based today). Omit it for an all-kana surface, where the surface is its
@@ -772,8 +779,10 @@ tsm dict rm <word>
 
 Removes the word from whichever side it is on — the user dictionary (accepted)
 or the reject list — returning it to **pending**. If the word was accepted, the
-change regenerates `user_dict.simpledic` and triggers an FTS re-index. Resetting
-a word that was never registered is an error (there is nothing to reset).
+change regenerates `user_dict.simpledic` and triggers an FTS re-index (a running
+daemon that fails to reindex makes the command report an error — run
+`tsm reindex fts` or `tsm restart` to recover). Resetting a word that was never
+registered is an error (there is nothing to reset).
 
 **Examples:**
 
