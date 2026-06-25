@@ -519,9 +519,11 @@ fn render_search(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
             let results: Vec<the_space_memory::searcher::SearchResult> =
                 serde_json::from_value(payload["results"].clone())
                     .map_err(|e| anyhow::anyhow!("Failed to parse search results: {e}"))?;
+            // Text output is relative to the caller's CWD (ADR-0017).
+            let cwd = std::env::current_dir().unwrap_or_default();
             print!(
                 "{}",
-                the_space_memory::searcher::format_text(&results, total_hits)
+                the_space_memory::searcher::format_text(&results, total_hits, &cwd)
             );
         }
     }

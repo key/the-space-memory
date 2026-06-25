@@ -367,7 +367,9 @@ pub fn cmd_search(opts: SearchOptions) -> anyhow::Result<()> {
 }
 
 fn print_text(results: &[searcher::SearchResult], total_hits: usize) {
-    print!("{}", searcher::format_text(results, total_hits));
+    // Text output is relative to the caller's CWD (ADR-0017).
+    let cwd = std::env::current_dir().unwrap_or_default();
+    print!("{}", searcher::format_text(results, total_hits, &cwd));
 }
 
 fn print_json(

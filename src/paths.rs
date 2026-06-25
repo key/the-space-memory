@@ -63,6 +63,28 @@ pub fn boundary_like(dir: &Path) -> (String, String) {
     (s.to_string(), format!("{escaped}/%"))
 }
 
+/// Build a path-scope SQL fragment + bind params over an aliased `d.file_path`
+/// (callers must alias the `documents` table as `d`). Returns `("", [])` when
+/// there is no filter. Each `--path` prefix becomes a case-insensitive
+/// directory-boundary clause; multiple prefixes are OR-joined (ADR-0017). The
+/// fragment is appended to an existing WHERE, e.g. `... WHERE 1=1{frag}`.
+pub fn scope_clause(path_prefixes: Option<&[String]>) -> (String, Vec<String>) {
+    match path_prefixes {
+        Some(prefixes) if !prefixes.is_empty() => {
+            let mut conds = Vec::new();
+            let mut params = Vec::new();
+            for p in prefixes {
+                let (eq, like) = boundary_like(Path::new(p));
+                conds.push("(d.file_path = ? COLLATE NOCASE OR d.file_path LIKE ? ESCAPE '\\')");
+                params.push(eq);
+                params.push(like);
+            }
+            (format!(" AND ({})", conds.join(" OR ")), params)
+        }
+        _ => (String::new(), Vec::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +143,26 @@ mod tests {
         let (eq, like) = boundary_like(Path::new("/r/daily_notes"));
         assert_eq!(eq, "/r/daily_notes");
         assert_eq!(like, r"/r/daily\_notes/%");
+    }
+    #[test]
+    fn scope_clause_none_is_empty() {
+        let (sql, params) = scope_clause(None);
+        assert!(sql.is_empty());
+        assert!(params.is_empty());
+        let (sql, params) = scope_clause(Some(&[]));
+        assert!(sql.is_empty());
+        assert!(params.is_empty());
+    }
+    #[test]
+    fn scope_clause_multiple_or_joined_with_params() {
+        let prefixes = vec!["/r/daily".to_string(), "/r/docs".to_string()];
+        let (sql, params) = scope_clause(Some(&prefixes));
+        assert!(sql.starts_with(" AND ("));
+        assert_eq!(sql.matches("d.file_path = ?").count(), 2);
+        assert_eq!(sql.matches(" OR ").count(), 3); // 1 between branches per cond (2) + 1 joining conds
+        assert_eq!(
+            params,
+            vec!["/r/daily", "/r/daily/%", "/r/docs", "/r/docs/%"]
+        );
     }
 }

@@ -53,7 +53,7 @@ pub fn search(
     };
     let limit = top_k * 3;
 
-    let candidates = retrieve::retrieve(conn, &qp, limit, require_vector)?;
+    let candidates = retrieve::retrieve(conn, &qp, limit, require_vector, path_prefixes)?;
 
     // The all-empty candidate case is handled inside rank() (its union guard),
     // which returns an empty SearchOutput — no need to peek at the sets here.
@@ -392,6 +392,35 @@ mod tests {
         let paths = vec![projects];
         let SearchOutput { results, .. } =
             search(&conn, "MTG", 5, None, false, Some(&paths)).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn empty_scope_returns_no_results_not_error() {
+        // A scope matching nothing must return Ok(empty), never an SQL error —
+        // guards the vector retriever's `rowid IN (SELECT ...)` subquery against
+        // the invalid `rowid in ()` that a materialized empty id list would emit.
+        use crate::indexer;
+        use std::io::Write;
+
+        let conn = db::get_memory_connection().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let md = "---\nstatus: current\n---\n\n# MTG\n\nMTG content here.\n";
+        let path = dir.path().join("daily/notes/mtg.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(md.as_bytes())
+            .unwrap();
+        indexer::index_file(&conn, &path, dir.path()).unwrap();
+
+        let nope = dir
+            .path()
+            .join("does-not-exist")
+            .to_string_lossy()
+            .to_string();
+        let out = search(&conn, "MTG", 5, None, false, Some(&[nope]));
+        let SearchOutput { results, .. } = out.expect("empty scope must not error");
         assert!(results.is_empty());
     }
 
