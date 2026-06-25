@@ -485,120 +485,7 @@ pub fn set_verdict(
     })
 }
 
-/// Mark candidates as accepted.
-pub fn mark_accepted(conn: &Connection, surfaces: &[&str]) -> anyhow::Result<()> {
-    for surface in surfaces {
-        conn.execute(
-            "UPDATE dictionary_candidates SET status = 'accepted' WHERE surface = ?",
-            [surface],
-        )?;
-    }
-    Ok(())
-}
-
-/// Mark a candidate as rejected (will be skipped in future collection).
-pub fn mark_rejected(conn: &Connection, surface: &str) -> anyhow::Result<()> {
-    conn.execute(
-        "UPDATE dictionary_candidates SET status = 'rejected' WHERE surface = ?",
-        [surface],
-    )?;
-    Ok(())
-}
-
-// ─── Reject list (reject_words.txt) ─────────────────────────
-
-/// Load the reject list from a text file.
-/// Lines starting with `#` and blank lines are ignored.
-/// All words are lowercased for case-insensitive comparison.
-pub fn load_reject_words(path: &Path) -> anyhow::Result<HashSet<String>> {
-    let mut words = HashSet::new();
-    if !path.exists() {
-        return Ok(words);
-    }
-    for line in std::fs::read_to_string(path)?.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        words.insert(trimmed.to_lowercase());
-    }
-    Ok(words)
-}
-
-/// Sync reject_words.txt → DB: mark matching pending candidates as 'rejected'.
-/// Returns the list of surfaces that were newly rejected.
-pub fn apply_reject_list(
-    conn: &Connection,
-    reject_words: &HashSet<String>,
-) -> anyhow::Result<Vec<String>> {
-    if !db::has_candidates_table(conn) {
-        return Ok(Vec::new());
-    }
-    let pending: Vec<String> = conn
-        .prepare("SELECT surface FROM dictionary_candidates WHERE status = 'pending'")?
-        .query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-    let tx = conn.unchecked_transaction()?;
-    let mut newly_rejected = Vec::new();
-    for surface in &pending {
-        if reject_words.contains(&surface.to_lowercase()) {
-            tx.execute(
-                "UPDATE dictionary_candidates SET status = 'rejected' WHERE surface = ?",
-                [surface],
-            )?;
-            newly_rejected.push(surface.clone());
-        }
-    }
-    tx.commit()?;
-    Ok(newly_rejected)
-}
-
-/// Get all candidates with status = 'rejected', ordered by surface.
-pub fn get_rejected_candidates(conn: &Connection) -> Vec<Candidate> {
-    if !db::has_candidates_table(conn) {
-        return Vec::new();
-    }
-    conn.prepare(
-        "SELECT surface, frequency, pos, source, first_seen, last_seen, status
-         FROM dictionary_candidates
-         WHERE status = 'rejected'
-         ORDER BY surface ASC",
-    )
-    .and_then(|mut stmt| {
-        let rows = stmt.query_map([], |row| {
-            Ok(Candidate {
-                surface: row.get(0)?,
-                frequency: row.get(1)?,
-                pos: row.get(2)?,
-                source: row.get(3)?,
-                first_seen: row.get(4)?,
-                last_seen: row.get(5)?,
-                status: row.get(6)?,
-            })
-        })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
-    })
-    .unwrap_or_default()
-}
-
-/// Get pending candidates whose surface appears in the reject list.
-pub fn get_pending_in_reject_list(
-    conn: &Connection,
-    reject_words: &HashSet<String>,
-) -> Vec<Candidate> {
-    get_threshold_candidates(conn, 0)
-        .into_iter()
-        .filter(|c| reject_words.contains(&c.surface.to_lowercase()))
-        .collect()
-}
-
 // ─── CSV formatting ──────────────────────────────────────────
-
-/// Format a CSV row in janome simpledic format: surface,{USER_DICT_POS},surface
-pub fn format_simpledic_row(surface: &str) -> String {
-    format_simpledic_row_with_reading(surface, surface)
-}
 
 /// Format a simpledic row with an explicit reading: surface,{USER_DICT_POS},reading
 pub fn format_simpledic_row_with_reading(surface: &str, reading: &str) -> String {
@@ -691,65 +578,12 @@ pub fn regenerate_user_dict(conn: &Connection, csv_path: &Path) -> anyhow::Resul
     Ok(rows.len())
 }
 
-/// Export threshold candidates to a CSV file (appending).
-/// Returns the list of newly written candidates.
-/// Output format is simpledic (3 fields: surface, pos, reading).
-pub fn export_candidates_to_csv(
-    conn: &Connection,
-    csv_path: &Path,
-    threshold: i64,
-) -> anyhow::Result<Vec<Candidate>> {
-    let candidates = get_threshold_candidates(conn, threshold);
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Load existing surfaces from the actual file (fresh read, not OnceLock cache)
-    let existing = load_existing_surfaces(csv_path)?;
-
-    // Partition: candidates already in CSV vs genuinely new
-    let (already_in_csv, new_candidates): (Vec<Candidate>, Vec<Candidate>) = candidates
-        .into_iter()
-        .partition(|c| existing.contains(&c.surface.to_lowercase()));
-
-    // Mark CSV-existing candidates as accepted so they stop appearing in doctor
-    if !already_in_csv.is_empty() {
-        let surfaces: Vec<&str> = already_in_csv.iter().map(|c| c.surface.as_str()).collect();
-        mark_accepted(conn, &surfaces)?;
-    }
-
-    if new_candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Ensure parent directory exists
-    if let Some(parent) = csv_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(csv_path)?;
-
-    for c in &new_candidates {
-        let row = format_simpledic_row(&c.surface);
-        writeln!(file, "{row}")?;
-    }
-
-    // Mark as accepted in DB
-    let surfaces: Vec<&str> = new_candidates.iter().map(|c| c.surface.as_str()).collect();
-    mark_accepted(conn, &surfaces)?;
-
-    Ok(new_candidates)
-}
-
 /// Export the DB's rejected set to `reject_words.txt`, overwriting the file.
 /// One surface per line, sorted. Returns the number of words written. An empty
-/// rejected set truncates the file. Round-trips with [`load_reject_words`].
-/// Mirrors [`regenerate_user_dict`]'s durability: per-row DB errors propagate
-/// and the write goes through a sibling temp file + atomic rename.
+/// rejected set truncates the file. Round-trips with
+/// [`import_reject_words_from_file`]. Mirrors [`regenerate_user_dict`]'s
+/// durability: per-row DB errors propagate and the write goes through a sibling
+/// temp file + atomic rename.
 pub fn export_reject_words_to_file(conn: &Connection, path: &Path) -> anyhow::Result<usize> {
     let surfaces: Vec<String> = conn
         .prepare(
@@ -789,8 +623,7 @@ pub struct ImportOutcome {
 /// Import `reject_words.txt` into the DB, marking each listed word `rejected`
 /// via [`set_verdict`]. Insert-only: words absent from the file keep their
 /// verdict (use `dict rm`/`reject` to remove). Lines starting with `#` and blank
-/// lines are skipped; case is preserved verbatim (unlike [`load_reject_words`],
-/// which lowercases for comparison). A missing file is a no-op.
+/// lines are skipped; case is preserved verbatim. A missing file is a no-op.
 pub fn import_reject_words_from_file(
     conn: &Connection,
     path: &Path,
@@ -1493,60 +1326,6 @@ mod tests {
         assert_eq!(summary.rejected_count, 1);
     }
 
-    // ─── mark_accepted / mark_rejected tests ─────────────────
-
-    #[test]
-    fn test_mark_accepted() {
-        let conn = setup();
-        let now = "2026-01-01T00:00:00Z";
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('word1', 5, 'ascii', 'document', ?, ?, 'pending')",
-            [now, now],
-        ).unwrap();
-
-        mark_accepted(&conn, &["word1"]).unwrap();
-
-        let status: String = conn
-            .query_row(
-                "SELECT status FROM dictionary_candidates WHERE surface = 'word1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "accepted");
-
-        let candidates = get_threshold_candidates(&conn, 1);
-        assert!(candidates.is_empty());
-    }
-
-    #[test]
-    fn test_mark_rejected() {
-        let conn = setup();
-        let now = "2026-01-01T00:00:00Z";
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('bad_word', 5, 'ascii', 'document', ?, ?, 'pending')",
-            [now, now],
-        ).unwrap();
-
-        mark_rejected(&conn, "bad_word").unwrap();
-
-        let status: String = conn
-            .query_row(
-                "SELECT status FROM dictionary_candidates WHERE surface = 'bad_word'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "rejected");
-    }
-
-    // ─── CSV format tests ────────────────────────────────────
-
-    #[test]
-    fn test_format_simpledic_row() {
-        assert_eq!(format_simpledic_row("candle"), "candle,名詞,candle");
-    }
-
     // ─── load_existing_surfaces tests ────────────────────────
 
     #[test]
@@ -1576,139 +1355,6 @@ mod tests {
         let surfaces = load_existing_surfaces(&csv_path).unwrap();
         assert_eq!(surfaces.len(), 1);
         assert!(surfaces.contains("candle"));
-    }
-
-    // ─── export_candidates_to_csv tests ──────────────────────
-
-    #[test]
-    fn test_export_candidates_to_csv_creates_file() {
-        let conn = setup();
-        let dir = tempfile::TempDir::new().unwrap();
-        let csv_path = dir.path().join("user_dict.csv");
-
-        let now = "2026-01-01T00:00:00Z";
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
-            [now, now],
-        ).unwrap();
-
-        let exported = export_candidates_to_csv(&conn, &csv_path, 5).unwrap();
-        assert_eq!(exported.len(), 1);
-        assert_eq!(exported[0].surface, "candle");
-        assert!(csv_path.exists());
-
-        let content = std::fs::read_to_string(&csv_path).unwrap();
-        assert!(content.contains("candle,名詞,candle"));
-
-        let status: String = conn
-            .query_row(
-                "SELECT status FROM dictionary_candidates WHERE surface = 'candle'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "accepted");
-    }
-
-    #[test]
-    fn test_export_candidates_to_csv_idempotent() {
-        let conn = setup();
-        let dir = tempfile::TempDir::new().unwrap();
-        let csv_path = dir.path().join("user_dict.csv");
-
-        let now = "2026-01-01T00:00:00Z";
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
-            [now, now],
-        ).unwrap();
-
-        let exported1 = export_candidates_to_csv(&conn, &csv_path, 5).unwrap();
-        assert_eq!(exported1.len(), 1);
-
-        conn.execute(
-            "UPDATE dictionary_candidates SET status = 'pending' WHERE surface = 'candle'",
-            [],
-        )
-        .unwrap();
-
-        let exported2 = export_candidates_to_csv(&conn, &csv_path, 5).unwrap();
-        assert!(exported2.is_empty(), "should not write duplicates");
-    }
-
-    #[test]
-    fn test_export_already_in_csv_marks_accepted() {
-        let conn = setup();
-        let dir = tempfile::TempDir::new().unwrap();
-        let csv_path = dir.path().join("user_dict.csv");
-
-        // Write candidate to CSV manually
-        std::fs::write(&csv_path, "candle,名詞,candle\n").unwrap();
-
-        // Insert same candidate into DB with status = 'pending'
-        let now = "2026-01-01T00:00:00Z";
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
-            [now, now],
-        ).unwrap();
-
-        let exported = export_candidates_to_csv(&conn, &csv_path, 5).unwrap();
-
-        // No new rows appended
-        assert!(
-            exported.is_empty(),
-            "already_in_csv candidates should not be re-exported"
-        );
-
-        // DB status changed to 'accepted'
-        let status: String = conn
-            .query_row(
-                "SELECT status FROM dictionary_candidates WHERE surface = 'candle'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "accepted");
-
-        // CSV unchanged (no duplicate rows)
-        let content = std::fs::read_to_string(&csv_path).unwrap();
-        let line_count = content.lines().count();
-        assert_eq!(line_count, 1, "CSV should not have new rows appended");
-    }
-
-    #[test]
-    fn test_export_candidates_preserves_existing_rows() {
-        let conn = setup();
-        let dir = tempfile::TempDir::new().unwrap();
-        let csv_path = dir.path().join("user_dict.csv");
-
-        // Write an existing entry
-        std::fs::write(&csv_path, "existing_word,名詞,existing_word\n").unwrap();
-
-        let now = "2026-01-01T00:00:00Z";
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('new_word', 10, 'ascii', 'document', ?, ?, 'pending')",
-            [now, now],
-        ).unwrap();
-
-        export_candidates_to_csv(&conn, &csv_path, 5).unwrap();
-
-        let content = std::fs::read_to_string(&csv_path).unwrap();
-        assert!(
-            content.contains("existing_word"),
-            "existing rows should be preserved"
-        );
-        assert!(content.contains("new_word"), "new rows should be appended");
-    }
-
-    #[test]
-    fn test_export_candidates_empty() {
-        let conn = setup();
-        let dir = tempfile::TempDir::new().unwrap();
-        let csv_path = dir.path().join("user_dict.csv");
-
-        let exported = export_candidates_to_csv(&conn, &csv_path, 5).unwrap();
-        assert!(exported.is_empty());
-        assert!(!csv_path.exists());
     }
 
     // ─── helper function tests ───────────────────────────────
@@ -1745,165 +1391,6 @@ mod tests {
             })
             .unwrap();
         assert!(count > 0, "should collect candidates from query");
-    }
-
-    // ─── reject list tests ──────────────────────────────────────
-
-    #[test]
-    fn test_load_reject_words_missing_file() {
-        let result = load_reject_words(Path::new("/nonexistent/reject.txt")).unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_load_reject_words_skips_comments_and_blanks() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("reject.txt");
-        std::fs::write(&path, "# comment\n\nfoo\n  bar  \n# another\nbaz\n").unwrap();
-        let words = load_reject_words(&path).unwrap();
-        assert_eq!(words.len(), 3);
-        assert!(words.contains("foo"));
-        assert!(words.contains("bar"));
-        assert!(words.contains("baz"));
-    }
-
-    #[test]
-    fn test_load_reject_words_lowercases() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("reject.txt");
-        std::fs::write(&path, "Hello\nWORLD\n").unwrap();
-        let words = load_reject_words(&path).unwrap();
-        assert!(words.contains("hello"));
-        assert!(words.contains("world"));
-        assert!(!words.contains("Hello"));
-    }
-
-    #[test]
-    fn test_apply_reject_list_marks_pending() {
-        let conn = setup();
-        let now = "2026-01-01T00:00:00Z";
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('foo', 5, 'ascii', 'document', ?, ?, 'pending')",
-            [now, now],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('bar', 3, 'ascii', 'document', ?, ?, 'pending')",
-            [now, now],
-        ).unwrap();
-
-        let reject_words: HashSet<String> = ["foo".to_string()].into();
-        let rejected = apply_reject_list(&conn, &reject_words).unwrap();
-
-        assert_eq!(rejected, vec!["foo"]);
-        let status: String = conn
-            .query_row(
-                "SELECT status FROM dictionary_candidates WHERE surface = 'foo'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "rejected");
-        // bar should remain pending
-        let status: String = conn
-            .query_row(
-                "SELECT status FROM dictionary_candidates WHERE surface = 'bar'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "pending");
-    }
-
-    #[test]
-    fn test_apply_reject_list_ignores_non_pending() {
-        let conn = setup();
-        let now = "2026-01-01T00:00:00Z";
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('accepted_word', 5, 'ascii', 'document', ?, ?, 'accepted')",
-            [now, now],
-        ).unwrap();
-
-        let reject_words: HashSet<String> = ["accepted_word".to_string()].into();
-        let rejected = apply_reject_list(&conn, &reject_words).unwrap();
-        assert!(rejected.is_empty());
-    }
-
-    #[test]
-    fn test_get_rejected_candidates() {
-        let conn = setup();
-        let now = "2026-01-01T00:00:00Z";
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('aaa', 5, 'ascii', 'document', ?, ?, 'rejected')",
-            [now, now],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('bbb', 3, 'ascii', 'document', ?, ?, 'pending')",
-            [now, now],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('ccc', 2, 'ascii', 'document', ?, ?, 'rejected')",
-            [now, now],
-        ).unwrap();
-
-        let rejected = get_rejected_candidates(&conn);
-        assert_eq!(rejected.len(), 2);
-        assert_eq!(rejected[0].surface, "aaa");
-        assert_eq!(rejected[1].surface, "ccc");
-    }
-
-    #[test]
-    fn test_get_pending_in_reject_list() {
-        let conn = setup();
-        let now = "2026-01-01T00:00:00Z";
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('keep', 10, 'ascii', 'document', ?, ?, 'pending')",
-            [now, now],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('drop', 5, 'ascii', 'document', ?, ?, 'pending')",
-            [now, now],
-        ).unwrap();
-
-        let reject_words: HashSet<String> = ["drop".to_string()].into();
-        let candidates = get_pending_in_reject_list(&conn, &reject_words);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].surface, "drop");
-    }
-
-    // ─── regenerate_user_dict reading-emission test ──────────────
-
-    #[test]
-    fn test_regenerate_user_dict_emits_stored_readings() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("user_dict.simpledic");
-        // accepted with a distinct reading, accepted without (NULL reading),
-        // plus rejected/pending noise that must not be written.
-        set_verdict(
-            &conn,
-            "ハンドロード",
-            Verdict::Accepted,
-            Some("はんどろーど"),
-        )
-        .unwrap();
-        set_verdict(&conn, "クラウド", Verdict::Accepted, None).unwrap();
-        set_verdict(&conn, "noise", Verdict::Rejected, None).unwrap();
-        seed(&conn, "foo", "pending");
-
-        let written = regenerate_user_dict(&conn, &path).unwrap();
-
-        assert_eq!(written, 2, "only accepted surfaces are written");
-        let body = std::fs::read_to_string(&path).unwrap();
-        let rows: Vec<&str> = body.lines().collect();
-        // Sorted by surface; the stored reading is emitted, falling back to the
-        // surface when NULL.
-        assert_eq!(
-            rows,
-            vec![
-                format!("クラウド,{},クラウド", USER_DICT_POS),
-                format!("ハンドロード,{},はんどろーど", USER_DICT_POS),
-            ]
-        );
     }
 
     // ─── export_reject_words_to_file tests ───────────────────────
@@ -2002,7 +1489,7 @@ mod tests {
 
         import_reject_words_from_file(&conn, &path).unwrap();
 
-        // Case is preserved verbatim (unlike `load_reject_words`, which lowercases).
+        // Case is preserved verbatim (the surface is stored as written).
         assert_eq!(status_of(&conn, "FooBar").as_deref(), Some("rejected"));
         assert_eq!(status_of(&conn, "foobar"), None);
     }
