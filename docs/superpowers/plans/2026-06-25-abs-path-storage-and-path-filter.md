@@ -11,6 +11,7 @@
 ## Global Constraints
 
 - ADR authority: **ADR-0017** (`decisions/0017-absolute-source-file-and-path-filter.md`). Storage = lexical absolute, symlinks NOT resolved. `--path` = CWD-anchored directory-boundary match. Display: text = CWD-relative, JSON = absolute.
+- Case handling: `file_path` is stored with its **real case** (display + identity must not break on case-sensitive filesystems — never lowercase the stored path). `--path` matching is **case-insensitive (ASCII)**, applied consistently: the LIKE branch is case-insensitive by SQLite default, and the equality branch uses `COLLATE NOCASE`. Both branches must be case-insensitive in EVERY scope query (final JOIN, FTS, vector subquery, entity) — a mismatch is the scope-leak Codex flagged.
 - License: MIT. No new dependencies — implement the `.`/`..` fold ourselves (`std::path::absolute` does NOT fold `..`).
 - TDD required: Red → Green → Refactor. Unit tests in `#[cfg(test)] mod tests`. DB tests use `:memory:`.
 - Coverage ≥ 90% on touched modules (`cargo llvm-cov --fail-under-lines 90`). clippy `-D warnings`, `cargo fmt --check` clean.
@@ -32,7 +33,7 @@
   - `pub fn absolutize(input: &Path, base: &Path) -> PathBuf` — if `input` is relative, join onto `base`; then fold `.`/`..` lexically (no syscalls, no symlink resolution). Trailing slash collapses naturally.
   - `pub fn normalize_filter_path(arg: &str, cwd: &Path) -> anyhow::Result<PathBuf>` — `--path` normalization: error on empty; else `absolutize(Path::new(arg), cwd)`.
   - `pub fn is_within(candidate: &Path, dir: &Path) -> bool` — true if `candidate == dir` or `candidate` is under `dir` at a component boundary.
-  - `pub fn boundary_like(dir: &Path) -> (String, String)` — returns `(eq_value, like_pattern)` where `eq_value` is the dir as a string and `like_pattern` is `"<escaped>/%"` with LIKE metachars (`\ % _`) escaped for `ESCAPE '\'`. Callers build `d.file_path = ?1 OR d.file_path LIKE ?2 ESCAPE '\'`.
+  - `pub fn boundary_like(dir: &Path) -> (String, String)` — returns `(eq_value, like_pattern)` where `eq_value` is the dir as a string and `like_pattern` is `"<escaped>/%"` with LIKE metachars (`\ % _`) escaped for `ESCAPE '\'`. Callers build `d.file_path = ?1 COLLATE NOCASE OR d.file_path LIKE ?2 ESCAPE '\'`. The `COLLATE NOCASE` on the equality branch makes it case-insensitive to match LIKE's default ASCII case-insensitivity, so both branches are consistent (see "Case handling" in Global Constraints).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -294,26 +295,58 @@ fn check_path_schema_accepts_current_version() {
     let conn = get_memory_connection().unwrap(); // init bumps user_version
     assert!(check_path_schema(&conn).is_ok());
 }
+#[test]
+fn init_does_not_bless_existing_relative_db() {
+    // A pre-absolute DB (tables present, user_version 0, relative file_path rows).
+    // Re-running init must NOT stamp it current — check_path_schema must still reject.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tsm.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO documents (file_path, source_type, file_hash, indexed_at) \
+             VALUES ('daily/x.md', 'note', 'h', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        // user_version left at 0 (pre-migration).
+    }
+    init_db(&path).unwrap(); // idempotent re-init over an existing DB
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert!(
+        check_path_schema(&conn).is_err(),
+        "init must not bless a populated pre-absolute DB"
+    );
+}
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib db::tests::check_path_schema 2>&1 | tail -15`
-Expected: FAIL — `cannot find function check_path_schema`.
+Run: `cargo test --lib db::tests::check_path_schema db::tests::init_does_not_bless 2>&1 | tail -15`
+Expected: FAIL — `cannot find function check_path_schema` (and the regression test fails until fresh-only stamping is in place).
 
 - [ ] **Step 3: Implement**
 
-In `src/db.rs`, add a schema-version constant and bump it in `init_db` after `conn.execute_batch(SCHEMA_SQL)`:
+In `src/db.rs`, add a schema-version constant:
 
 ```rust
 /// DB layout version. Bumped to 1 when file_path became absolute (ADR-0017).
 pub const PATH_SCHEMA_VERSION: i64 = 1;
 ```
 
-In `init_db`, after schema creation, add:
+In `init_db`, stamp `user_version` **only when the schema is freshly created** — never when re-opening an existing DB. `init_db` is idempotent (`CREATE TABLE IF NOT EXISTS`), so an unconditional bump would mark a pre-absolute DB (relative `file_path` rows untouched) as current and let `check_path_schema` wrongly accept it. Detect freshness by the absence of the `documents` table *before* creating the schema (`table_exists` already exists in this module):
 
 ```rust
-    conn.pragma_update(None, "user_version", PATH_SCHEMA_VERSION)?;
+    let fresh = !table_exists(&conn, "documents");
+    conn.execute_batch(SCHEMA_SQL)?;
+    create_vec_table(&conn);
+    if fresh {
+        // Only a brand-new DB (or a post-rebuild recreate, which deletes the
+        // file first) gets stamped. An existing pre-absolute DB keeps its old
+        // user_version and is rejected by check_path_schema below.
+        conn.pragma_update(None, "user_version", PATH_SCHEMA_VERSION)?;
+    }
 ```
 
 Add the guard:
@@ -336,10 +369,10 @@ pub fn check_path_schema(conn: &Connection) -> anyhow::Result<()> {
 
 Call `check_path_schema` from the daemon startup, right after the post-lock `is_initialized` re-check in `src/bin/tsmd/daemon_mode.rs` (search for `is_initialized`), propagating the error so `cmd_start` surfaces it.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib db::tests::check_path_schema 2>&1 | tail -15`
-Expected: PASS.
+Run: `cargo test --lib db::tests::check_path_schema db::tests::init_does_not_bless 2>&1 | tail -15`
+Expected: PASS — including `init_does_not_bless_existing_relative_db`.
 
 - [ ] **Step 5: Commit**
 
@@ -506,7 +539,7 @@ with a boundary match built from the shared helper:
             let mut conditions = Vec::new();
             for p in prefixes {
                 let (eq, like) = crate::paths::boundary_like(std::path::Path::new(p));
-                conditions.push("(d.file_path = ? OR d.file_path LIKE ? ESCAPE '\\')".to_string());
+                conditions.push("(d.file_path = ? COLLATE NOCASE OR d.file_path LIKE ? ESCAPE '\\')".to_string());
                 extra_params.push(Box::new(eq));
                 extra_params.push(Box::new(like));
             }
@@ -581,7 +614,9 @@ Add a helper in `src/searcher/retrieve.rs` that builds an in-scope SQL fragment 
 
 ```rust
 /// Build `(sql_fragment, params)` restricting to in-scope file_paths, e.g.
-/// `" AND (d.file_path = ? OR d.file_path LIKE ? ESCAPE '\\')"`. Empty when no filter.
+/// `" AND (d.file_path = ? COLLATE NOCASE OR d.file_path LIKE ? ESCAPE '\\')"`.
+/// Empty when no filter. Both branches are case-insensitive (ASCII) and identical
+/// to the final-JOIN clause, so retrieval and JOIN scope agree exactly.
 fn scope_clause(path_prefixes: Option<&[String]>) -> (String, Vec<String>) {
     match path_prefixes {
         Some(ps) if !ps.is_empty() => {
@@ -589,7 +624,7 @@ fn scope_clause(path_prefixes: Option<&[String]>) -> (String, Vec<String>) {
             let mut params = Vec::new();
             for p in ps {
                 let (eq, like) = crate::paths::boundary_like(std::path::Path::new(p));
-                conds.push("(d.file_path = ? OR d.file_path LIKE ? ESCAPE '\\')".to_string());
+                conds.push("(d.file_path = ? COLLATE NOCASE OR d.file_path LIKE ? ESCAPE '\\')".to_string());
                 params.push(eq);
                 params.push(like);
             }
@@ -722,15 +757,24 @@ git commit -m "feat(entity): scope entity + 2nd-hop retrieval by --path (ADR-001
 
 ---
 
-### Task 8: Fold content_dir resolution + weight matching into `paths.rs` (absolute base)
+### Task 8: content_dir weight matching against absolute file_path
+
+**Scope note (Codex review):** This task does **not** enable absolute/`..`
+content_dirs. That capability (ADR-0009 §3/§4 deferred "task 4") would require
+watcher changes — `watcher_mode` strips every event path against `project_root`
+and silently drops events outside it, so an outside content_dir would index on a
+full pass but never live-update (stale results). Enabling it is out of scope here
+and tracked separately. content_dirs stay relative-only (the existing
+`config.rs:443` rejection is kept); we only make the weight/half_life matching
+work now that `file_path` is absolute.
 
 **Files:**
-- Modify: `src/config.rs` (content_dir resolution ~432-475: allow absolute/`..`, resolve to absolute via `paths::absolutize`; `directory_weight`/`half_life_days` matching: use `paths::is_within`, longest-match by absolute path length). Fold `project_root_from` (config.rs:852-861) to delegate to `paths::absolutize`.
+- Modify: `src/config.rs` (`directory_weight`/`half_life_days` matching ~1143-1213: resolve each content_dir to absolute against `project_root` via `paths::absolutize`, then match with `paths::is_within`; longest-match preserved). Fold `project_root_from` (config.rs:852-861) to delegate to `paths::absolutize`.
 - Test: `src/config.rs` tests.
 
 **Interfaces:**
 - Consumes: `paths::absolutize`, `paths::is_within`.
-- Produces: `ContentDir.path` is an absolute path string (project_root-resolved). Weight matching uses boundary semantics.
+- Produces: weight/half_life matching compares an absolute `file_path` against each content_dir resolved to absolute, with directory-boundary semantics.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -738,23 +782,20 @@ git commit -m "feat(entity): scope entity + 2nd-hop retrieval by --path (ADR-001
 // in src/config.rs tests
 #[test]
 fn directory_weight_uses_boundary_not_prefix() {
-    // content_dirs: [{ path "/r/daily", weight 2.0 }], default 1.0
-    // weight("/r/daily/x.md") == 2.0 ; weight("/r/daily-report/y.md") == default
-}
-#[test]
-fn content_dir_absolute_path_accepted() {
-    // a content_dirs entry with an absolute path resolves (no longer rejected)
+    // project_root "/r"; content_dirs: [{ path "daily", weight 2.0 }], default 1.0.
+    // file_path is absolute (matching surface).
+    // weight("/r/daily/x.md") == 2.0 ; weight("/r/daily-report/y.md") == default 1.0
 }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --lib config::tests::directory_weight_uses_boundary config::tests::content_dir_absolute 2>&1 | tail -15`
-Expected: FAIL — absolute entries are rejected (config.rs:443) and matching is `starts_with` on relative strings.
+Run: `cargo test --lib config::tests::directory_weight_uses_boundary 2>&1 | tail -15`
+Expected: FAIL — matching is `starts_with` on relative content_dir strings vs an absolute `file_path`, so nothing matches (or matches by substring).
 
 - [ ] **Step 3: Implement**
 
-In `src/config.rs` content_dir resolution, remove the absolute-rejection `bail`/skip (config.rs:443) and resolve each entry with `paths::absolutize(Path::new(&entry.path), &project_root)`, storing the absolute string. Keep the longest-match ordering (`sort_by_key` on path length still works on absolute strings). In `directory_weight` / `half_life_days`, replace `file_path.starts_with(dir.path)` with `crate::paths::is_within(Path::new(file_path), Path::new(&dir.path))`. Simplify `project_root_from` to call `paths::absolutize(path, &cwd).parent()`.
+In `src/config.rs` `directory_weight` / `half_life_days`, resolve each content_dir entry to absolute once (`let dir_abs = crate::paths::absolutize(Path::new(&dir.path), project_root);`) and replace `file_path.starts_with(dir.path)` with `crate::paths::is_within(Path::new(file_path), &dir_abs)`. Keep the longest-match ordering. Leave the `config.rs:443` absolute-rejection in place (content_dirs remain relative-only — see Scope note). Simplify `project_root_from` to call `paths::absolutize(path, &cwd).parent()`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
