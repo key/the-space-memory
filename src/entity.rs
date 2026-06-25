@@ -800,7 +800,7 @@ mod tests {
         // Two docs under different dirs share a tag entity; scoping to one dir
         // must return only that doc's chunk (ADR-0017 Gap 4).
         let conn = db::get_memory_connection().unwrap();
-        let mut chunk_of = |path: &str| -> i64 {
+        let chunk_of = |path: &str| -> i64 {
             conn.execute(
                 "INSERT INTO documents (file_path, source_type, title, file_hash, indexed_at) \
                  VALUES (?, 'note', 'T', 'h', '2026-01-01')",
