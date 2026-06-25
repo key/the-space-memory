@@ -16,7 +16,7 @@
 - Coverage ≥ 90% on touched modules (`cargo llvm-cov --fail-under-lines 90`). clippy `-D warnings`, `cargo fmt --check` clean.
 - `cargo` is on PATH directly (`~/.cargo/bin/cargo`). Do NOT use `mise exec` (its tool-install step fails on attestation in this env).
 - This is a **breaking DB change**: `file_path` meaning changes → `rebuild` required. A pre-migration (relative) DB must be detected and rejected with a clear message, never silently mis-queried.
-- Verified fact (spike): sqlite-vec 0.1.9 accepts `WHERE embedding MATCH ? AND rowid in (...)` and returns only the constrained rowids — vector push-down is native, not best-effort.
+- Verified fact (spike): sqlite-vec 0.1.9 accepts a KNN constraint of the form `WHERE embedding MATCH ? AND rowid IN (SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.file_path LIKE ? ESCAPE '\')` with bound params — it filters to in-scope rowids and returns zero rows for an empty scope. Vector push-down is native, not best-effort. Use the **subquery form**, never a Rust-materialized `rowid in ({list})` (invalid `rowid in ()` for empty scopes; unbounded list/SQL for broad scopes).
 
 ---
 
@@ -538,10 +538,10 @@ git commit -m "feat(search): directory-boundary --path match at final JOIN (ADR-
 - Test: `src/searcher/mod.rs` tests (narrow-scope budget guard).
 
 **Interfaces:**
-- Consumes: `paths::boundary_like`. Verified: sqlite-vec 0.1.9 supports `rowid in (...)`.
+- Consumes: `paths::boundary_like`. Verified by spike on sqlite-vec 0.1.9: the **`rowid IN (SELECT ... WHERE d.file_path LIKE ? ESCAPE '\')` subquery form with bound params** runs, filters to in-scope rowids, and returns zero rows for an empty scope. Use this form — NOT a Rust-materialized `rowid in ({list})`, which yields invalid `rowid in ()` for empty scopes and an unbounded ID list / SQL string for broad scopes.
 - Produces: `retrieve(conn, plan, limit, require_vector, path_prefixes: Option<&[String]>)`.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 ```rust
 // in src/searcher/mod.rs tests
@@ -552,12 +552,28 @@ fn narrow_scope_fills_budget_from_each_source() {
     // Assert: the in-scope docs are returned (not crowded out by out-of-scope
     //         candidates that the final JOIN would have dropped).
 }
+
+#[test]
+fn empty_scope_returns_no_results_not_error() {
+    // Arrange: index in-scope + out-of-scope docs.
+    // Act: search with path_prefixes = ["/r/does-not-exist"].
+    // Assert: Ok with zero results — NOT an SQL error (guards against the
+    //         `rowid in ()` failure mode in the vector retriever).
+}
+
+#[test]
+fn broad_scope_does_not_materialize_ids() {
+    // Arrange: index many in-scope docs (e.g. 50) under /r/.
+    // Act: search with path_prefixes = ["/r"], top_k = 5.
+    // Assert: returns up to top_k results without error (the subquery form
+    //         must not build a giant rowid IN list; broad scope is cheap).
+}
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib searcher::mod::tests::narrow_scope_fills_budget 2>&1 | tail -15`
-Expected: FAIL — scope-blind retrieval crowds out in-scope candidates.
+Run: `cargo test --lib searcher::mod::tests::narrow_scope_fills_budget searcher::mod::tests::empty_scope searcher::mod::tests::broad_scope 2>&1 | tail -15`
+Expected: FAIL — scope-blind retrieval crowds out in-scope candidates (and, with a naive `rowid in ({list})` implementation, the empty-scope test errors).
 
 - [ ] **Step 3: Implement**
 
@@ -604,32 +620,34 @@ FTS5 — join `chunks` + `documents` and apply the scope clause (`fts_results_ra
     let rows = stmt.query_map(binds.as_slice(), |row| row.get::<_, i64>(0))?;
 ```
 
-Vector — pre-compute in-scope chunk ids and constrain the KNN with `rowid in (...)` (verified on 0.1.9). When no filter, keep the current unconstrained query:
+Vector — constrain the KNN with a **`rowid IN (SELECT ...)` subquery using bound parameters**. Do NOT materialize chunk ids in Rust and string-interpolate them into `rowid in (...)`: an empty scope produces invalid `rowid in ()` SQL, and a broad scope builds a huge ID list and SQL string. The subquery form avoids both — an empty scope is a valid query returning zero rows, and no IDs cross into Rust.
+
+Verified by spike on sqlite-vec 0.1.9: `WHERE embedding MATCH ?1 AND rowid IN (SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.file_path LIKE ?2 ESCAPE '\')` runs, filters correctly (in-scope → only in-scope rowids), and returns `[]` for an empty scope (no `rowid in ()`).
 
 ```rust
-    let scoped_ids: Option<Vec<i64>> = match path_prefixes {
-        Some(ps) if !ps.is_empty() => {
-            let (scope_sql, scope_params) = scope_clause(path_prefixes);
-            let sql = format!(
-                "SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id \
-                 WHERE 1=1{scope_sql}"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let binds: Vec<&dyn rusqlite::ToSql> = scope_params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
-            let ids = stmt.query_map(binds.as_slice(), |r| r.get::<_, i64>(0))?
-                .collect::<Result<Vec<i64>, _>>()?;
-            Some(ids)
-        }
-        _ => None,
+    // scope_clause(..) yields the same boundary fragment (over `d.file_path`)
+    // and bound params used by the FTS path above.
+    let (scope_sql, scope_params) = scope_clause(path_prefixes);
+    let sql = if scope_sql.is_empty() {
+        "SELECT rowid, distance FROM chunks_vec \
+         WHERE embedding MATCH ? ORDER BY distance LIMIT ?".to_string()
+    } else {
+        format!(
+            "SELECT rowid, distance FROM chunks_vec \
+             WHERE embedding MATCH ? \
+               AND rowid IN (SELECT c.id FROM chunks c \
+                             JOIN documents d ON d.id = c.document_id \
+                             WHERE 1=1{scope_sql}) \
+             ORDER BY distance LIMIT ?"
+        )
     };
-
-    let sql = match &scoped_ids {
-        Some(ids) => {
-            let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-            format!("SELECT rowid, distance FROM chunks_vec WHERE embedding MATCH ? AND rowid in ({list}) ORDER BY distance LIMIT ?")
-        }
-        None => "SELECT rowid, distance FROM chunks_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?".to_string(),
-    };
+    let mut stmt = conn.prepare(&sql)?;
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&query_vec_json];
+    for p in &scope_params { binds.push(p); }
+    binds.push(&(limit as i64));
+    let rows = stmt.query_map(binds.as_slice(), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+    })?;
 ```
 
 Thread `path_prefixes` through `retrieve(...)` and from `searcher/mod.rs`:
