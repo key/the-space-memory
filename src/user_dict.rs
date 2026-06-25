@@ -629,6 +629,21 @@ pub fn resolve_reading(surface: &str, yomi: Option<&str>) -> (String, bool) {
     }
 }
 
+/// Validate a surface supplied to `dict add` / `dict reject`.
+///
+/// The simpledic format is comma-delimited with one entry per line, so a surface
+/// may not contain a comma or a newline (either would corrupt the file). Empty
+/// or whitespace-only surfaces are rejected too.
+pub fn validate_surface(surface: &str) -> anyhow::Result<()> {
+    if surface.trim().is_empty() {
+        anyhow::bail!("surface must not be empty or whitespace-only");
+    }
+    if surface.contains(',') || surface.contains('\n') || surface.contains('\r') {
+        anyhow::bail!("surface must not contain a comma or newline (simpledic format constraint)");
+    }
+    Ok(())
+}
+
 /// Regenerate `user_dict.simpledic` from the DB's accepted terms (full rewrite).
 ///
 /// The shared primitive every verdict change relies on: ADR-0014 specifies that
@@ -937,6 +952,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_resolve_reading_mixed_kanji_kana_warns() {
+        // One kanji among kana must still warn (exercises the `.any()` path).
+        let (reading, warned) = resolve_reading("消えた記憶", None);
+        assert_eq!(reading, "消えた記憶");
+        assert!(warned, "a single kanji among kana characters must warn");
+    }
+
+    // ─── validate_surface tests ──────────────────────────────
+
+    #[test]
+    fn test_validate_surface_accepts_normal() {
+        assert!(validate_surface("ハンドロード").is_ok());
+        assert!(validate_surface("candle").is_ok());
+    }
+
+    #[test]
+    fn test_validate_surface_rejects_empty_and_whitespace() {
+        assert!(validate_surface("").is_err());
+        assert!(validate_surface("   ").is_err());
+    }
+
+    #[test]
+    fn test_validate_surface_rejects_comma() {
+        // A comma would create extra simpledic fields.
+        assert!(validate_surface("foo,bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_surface_rejects_newline() {
+        // A newline would split into two simpledic rows.
+        assert!(validate_surface("foo\nbar").is_err());
+        assert!(validate_surface("foo\rbar").is_err());
+    }
+
     // ─── regenerate_user_dict tests ──────────────────────────
 
     #[test]
@@ -987,6 +1037,22 @@ mod tests {
         assert_eq!(count, 0);
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.is_empty(), "no accepted terms => empty dict file");
+    }
+
+    #[test]
+    fn test_regenerate_user_dict_output_is_sorted() {
+        let conn = setup();
+        seed(&conn, "zebra", "accepted");
+        seed(&conn, "apple", "accepted");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("user_dict.simpledic");
+
+        regenerate_user_dict(&conn, &path).unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines[0].starts_with("apple,"), "rows sorted by surface ASC");
+        assert!(lines[1].starts_with("zebra,"));
     }
 
     // ─── is_valid_candidate tests ────────────────────────────

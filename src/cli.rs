@@ -1514,6 +1514,7 @@ fn apply_verdict_change(
 
 /// `tsm dict add <surface> [<yomi>]` — accept a term (ADR-0014 §1, §4).
 pub fn cmd_dict_add(surface: &str, yomi: Option<&str>) -> anyhow::Result<()> {
+    user_dict::validate_surface(surface)?;
     let conn = db::get_connection(&config::db_path())?;
     let (reading, warned) = user_dict::resolve_reading(surface, yomi);
     if warned {
@@ -1659,7 +1660,12 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
             eprintln!("DB does not exist yet.");
         }
         eprintln!("\nThis will delete the DB and rebuild from scratch.");
-        eprintln!("Note: reject list (dictionary_candidates) will be lost.");
+        eprintln!("Note: dictionary verdicts (dictionary_candidates) will be lost.");
+        eprintln!(
+            "      The accepted set and reject list are gone until restored from \
+             reject_words.txt (`tsm dict reject --apply`) / `tsm dict import` (once available); \
+             a `dict add`/`rm` before then regenerates user_dict.simpledic from the empty DB."
+        );
         eprintln!("Run with --apply to proceed.");
         return Ok(());
     }
