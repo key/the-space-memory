@@ -318,6 +318,112 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
     Ok(true)
 }
 
+/// A session document plus its chunks, captured from the DB so a destructive
+/// rebuild can carry it forward. Sessions are keyed `session:<stem>` and are
+/// never re-discovered by the file walker (the extension allowlist is `["md"]`),
+/// so without this they would be lost on `tsm rebuild --apply`.
+pub(crate) struct CapturedSession {
+    file_path: String,
+    title: Option<String>,
+    status: Option<String>,
+    created: Option<String>,
+    updated: Option<String>,
+    tags: Option<String>,
+    file_hash: String,
+    chunks: Vec<ChunkInput>,
+}
+
+/// Read every `session:*` document and its chunks from `conn`.
+///
+/// Called before a destructive rebuild deletes the DB. The chunk content is
+/// authoritative in the DB, so carry-forward needs neither the original JSONL
+/// (which may have been rotated out of `~/.claude/projects`) nor a schema change.
+pub(crate) fn capture_sessions(conn: &Connection) -> anyhow::Result<Vec<CapturedSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_path, title, status, created, updated, tags, file_hash
+         FROM documents WHERE file_path LIKE 'session:%' ORDER BY file_path",
+    )?;
+    // (doc_id, partial CapturedSession with chunks filled in below).
+    let partials = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, captured_session_from_row(row)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut sessions = Vec::with_capacity(partials.len());
+    for (doc_id, mut session) in partials {
+        session.chunks = read_session_chunks(conn, doc_id)?;
+        sessions.push(session);
+    }
+    Ok(sessions)
+}
+
+/// Map a `documents` row (sans chunks) into a `CapturedSession`.
+fn captured_session_from_row(row: &rusqlite::Row) -> rusqlite::Result<CapturedSession> {
+    Ok(CapturedSession {
+        file_path: row.get(1)?,
+        title: row.get(2)?,
+        status: row.get(3)?,
+        created: row.get(4)?,
+        updated: row.get(5)?,
+        tags: row.get(6)?,
+        file_hash: row.get(7)?,
+        chunks: Vec::new(),
+    })
+}
+
+/// Read the chunks of one document as `ChunkInput`s, ordered by chunk index.
+fn read_session_chunks(conn: &Connection, doc_id: i64) -> anyhow::Result<Vec<ChunkInput>> {
+    let mut stmt = conn.prepare(
+        "SELECT chunk_index, section_path, content, content_hash
+         FROM chunks WHERE document_id = ? ORDER BY chunk_index",
+    )?;
+    let chunks = stmt
+        .query_map([doc_id], |row| {
+            Ok(ChunkInput {
+                chunk_index: row.get::<_, i64>(0)? as usize,
+                section_path: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                content: row.get::<_, String>(2)?,
+                content_hash: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(chunks)
+}
+
+/// Re-persist captured sessions into a freshly-initialized DB. Mirrors the
+/// persist path of `index_session` (document row + `diff_chunks` for chunks and
+/// FTS) without touching the JSONL. Vectors are intentionally left to the
+/// post-rebuild backfill, which embeds every chunk lacking a vector. Returns the
+/// number of session documents restored.
+pub(crate) fn restore_sessions(
+    conn: &Connection,
+    sessions: &[CapturedSession],
+) -> anyhow::Result<usize> {
+    let now = chrono::Utc::now().to_rfc3339();
+    for session in sessions {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
+             VALUES (?, 'session', ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                session.file_path,
+                session.title,
+                session.status,
+                session.created,
+                session.updated,
+                session.tags,
+                session.file_hash,
+                &now,
+            ],
+        )?;
+        let doc_id = tx.last_insert_rowid();
+        persist::diff_chunks(&tx, doc_id, &session.chunks)?;
+        tx.commit()?;
+    }
+    Ok(sessions.len())
+}
+
 /// Extract human messages from session JSONL and learn synonym pairs.
 fn learn_from_session_jsonl(conn: &Connection, jsonl_path: &Path) {
     use std::io::BufRead;
@@ -517,6 +623,121 @@ mod tests {
             .query_row("SELECT source_type FROM documents", [], |r| r.get(0))
             .unwrap();
         assert_eq!(source_type, "session");
+    }
+
+    /// Regression test for the rebuild data-loss bug: session documents are a
+    /// non-filesystem kind (`session:<stem>`) ingested only via `index_session`
+    /// and never re-walked by `cmd_rebuild` (extension allowlist is `["md"]`),
+    /// so a destructive rebuild used to drop them permanently. Carry-forward
+    /// captures them from the old DB before deletion and re-persists them into
+    /// the fresh DB without needing the original JSONL (which may be rotated).
+    #[test]
+    fn test_sessions_survive_rebuild_via_carry_forward() {
+        // Arrange: old DB with one ingested session.
+        let (old_conn, dir) = setup();
+        let jsonl = r#"{"message":{"role":"user","content":"テスト質問のテキストです。"}}
+{"message":{"role":"assistant","content":"テスト回答のテキストです。"}}"#;
+        let path = dir.path().join("abc123.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        assert!(index_session(&old_conn, &path).unwrap());
+
+        let old_chunks: i64 = old_conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks c JOIN documents d ON c.document_id = d.id \
+                 WHERE d.file_path = 'session:abc123'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(old_chunks >= 1, "session should have chunks before rebuild");
+
+        let captured = capture_sessions(&old_conn).unwrap();
+        assert_eq!(captured.len(), 1, "one session should be captured");
+
+        // Act: a fresh DB stands in for rebuild's delete + reinit. Without
+        // carry-forward the session is gone; restore_sessions brings it back.
+        let new_conn = db::get_memory_connection().unwrap();
+        let before: i64 = new_conn
+            .query_row(
+                "SELECT COUNT(*) FROM documents WHERE file_path LIKE 'session:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, 0,
+            "fresh DB starts with no sessions (the data loss)"
+        );
+
+        let restored = restore_sessions(&new_conn, &captured).unwrap();
+        assert_eq!(restored, 1);
+
+        // Assert: document, chunks, and FTS rows all re-created in the new DB.
+        let (doc_count, source_type): (i64, String) = new_conn
+            .query_row(
+                "SELECT COUNT(*), MAX(source_type) FROM documents WHERE file_path = 'session:abc123'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(doc_count, 1, "session document survives rebuild");
+        assert_eq!(source_type, "session");
+
+        let new_chunks: i64 = new_conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks c JOIN documents d ON c.document_id = d.id \
+                 WHERE d.file_path = 'session:abc123'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_chunks, old_chunks, "all session chunks carried forward");
+
+        let fts_count: i64 = new_conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            fts_count, new_chunks,
+            "FTS rows re-created for session chunks"
+        );
+    }
+
+    #[test]
+    fn test_capture_sessions_excludes_md_and_handles_empty() {
+        let (conn, dir) = setup();
+
+        // A markdown document must not be captured as a session.
+        let md = write_md(dir.path(), "daily/notes/test.md", "# Title\n\nBody text.\n");
+        index_file(&conn, &md, dir.path()).unwrap();
+
+        let captured = capture_sessions(&conn).unwrap();
+        assert!(captured.is_empty(), "md documents are not sessions");
+
+        // Restoring an empty capture is a no-op that restores nothing.
+        let fresh = db::get_memory_connection().unwrap();
+        assert_eq!(restore_sessions(&fresh, &captured).unwrap(), 0);
+        let docs: i64 = fresh
+            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(docs, 0);
+    }
+
+    #[test]
+    fn test_capture_sessions_captures_only_sessions_when_mixed() {
+        let (conn, dir) = setup();
+        let md = write_md(dir.path(), "daily/notes/test.md", "# Title\n\nBody text.\n");
+        index_file(&conn, &md, dir.path()).unwrap();
+
+        let jsonl = r#"{"message":{"role":"user","content":"混在テストの質問文です。"}}
+{"message":{"role":"assistant","content":"混在テストの回答文です。"}}"#;
+        let path = dir.path().join("mixed.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        index_session(&conn, &path).unwrap();
+
+        let captured = capture_sessions(&conn).unwrap();
+        assert_eq!(captured.len(), 1, "only the session is captured");
+        assert_eq!(captured[0].file_path, "session:mixed");
+        assert!(!captured[0].chunks.is_empty());
     }
 
     #[test]
