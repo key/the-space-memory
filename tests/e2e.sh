@@ -310,6 +310,19 @@ run search_json "メロス" --path "$TSM_PROJECT_DIR/notes"
 assert_json "path: absolute --path includes hashire-melos" \
     'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
+# In-scope, parent traversal: a `../` round-trip back into the project resolves
+# lexically to `<project>/notes`. CWD is TSM_PROJECT_DIR, so `../<base>/notes`
+# folds to the same in-scope directory. Verifies `..` is resolved (ADR-0017).
+PROJECT_BASE="$(basename "$TSM_PROJECT_DIR")"
+run search_json "メロス" --path "../$PROJECT_BASE/notes"
+assert_json "path: parent-traversal --path ../<base>/notes includes hashire-melos" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# Out-of-scope parent path: `../<base>/note` (boundary) must NOT match notes/.
+run search_json "メロス" --path "../$PROJECT_BASE/note"
+assert_json "path: parent-traversal --path ../<base>/note excludes notes/ (boundary)" \
+    'all(.results[]; (.source_file | contains("hashire-melos")) | not)' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
 # Case-insensitive (ADR-0017, deliberate owner-accepted tradeoff): an upper-case
 # `NOTES` still matches the lower-case `notes/` directory. This pins the chosen
 # forgiving behavior so a future change to case-sensitive matching is caught.
