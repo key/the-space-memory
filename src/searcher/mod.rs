@@ -357,15 +357,16 @@ mod tests {
         indexer::index_file(&conn, &daily_path, dir.path()).unwrap();
         indexer::index_file(&conn, &project_path, dir.path()).unwrap();
 
-        // Filter to daily/ only
-        let paths = vec!["daily/".to_string()];
+        // Filter to <dir>/daily only (absolute, ADR-0017)
+        let daily = dir.path().join("daily").to_string_lossy().to_string();
+        let paths = vec![daily.clone()];
         let SearchOutput { results, .. } =
             search(&conn, "MTG", 5, None, false, Some(&paths)).unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert!(
-                r.source_file.starts_with("daily/"),
-                "Expected daily/ prefix, got: {}",
+                r.source_file.starts_with(&format!("{daily}/")),
+                "Expected {daily}/ prefix, got: {}",
                 r.source_file
             );
         }
@@ -386,8 +387,9 @@ mod tests {
         f.write_all(md.as_bytes()).unwrap();
         indexer::index_file(&conn, &path, dir.path()).unwrap();
 
-        // Filter to projects/ — should exclude daily/
-        let paths = vec!["projects/".to_string()];
+        // Filter to <dir>/projects — should exclude daily/
+        let projects = dir.path().join("projects").to_string_lossy().to_string();
+        let paths = vec![projects];
         let SearchOutput { results, .. } =
             search(&conn, "MTG", 5, None, false, Some(&paths)).unwrap();
         assert!(results.is_empty());
@@ -415,14 +417,17 @@ mod tests {
             indexer::index_file(&conn, &full, dir.path()).unwrap();
         }
 
-        // Filter to daily/ and docs/ (OR)
-        let paths = vec!["daily/".to_string(), "docs/".to_string()];
+        // Filter to <dir>/daily and <dir>/docs (OR, absolute)
+        let daily = dir.path().join("daily").to_string_lossy().to_string();
+        let docs = dir.path().join("docs").to_string_lossy().to_string();
+        let paths = vec![daily.clone(), docs.clone()];
         let SearchOutput { results, .. } =
             search(&conn, "MTG", 10, None, false, Some(&paths)).unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert!(
-                r.source_file.starts_with("daily/") || r.source_file.starts_with("docs/"),
+                r.source_file.starts_with(&format!("{daily}/"))
+                    || r.source_file.starts_with(&format!("{docs}/")),
                 "Unexpected path: {}",
                 r.source_file
             );
@@ -471,13 +476,14 @@ mod tests {
             indexer::index_file(&conn, &full, dir.path()).unwrap();
         }
 
-        // Filter to a specific file
-        let paths = vec!["docs/api.md".to_string()];
+        // Filter to a specific file (absolute) — matched via the equality branch.
+        let api = dir.path().join("docs/api.md").to_string_lossy().to_string();
+        let paths = vec![api.clone()];
         let SearchOutput { results, .. } =
             search(&conn, "Authentication", 10, None, false, Some(&paths)).unwrap();
         assert!(!results.is_empty());
         for r in &results {
-            assert_eq!(r.source_file, "docs/api.md");
+            assert_eq!(r.source_file, api);
         }
     }
 
@@ -504,14 +510,15 @@ mod tests {
         }
 
         // _ in path must be literal, not a wildcard
-        let paths = vec!["daily_notes/".to_string()];
+        let dn = dir.path().join("daily_notes").to_string_lossy().to_string();
+        let paths = vec![dn.clone()];
         let SearchOutput { results, .. } =
             search(&conn, "MTG", 10, None, false, Some(&paths)).unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert!(
-                r.source_file.starts_with("daily_notes/"),
-                "Expected daily_notes/ prefix, got: {}",
+                r.source_file.starts_with(&format!("{dn}/")),
+                "Expected {dn}/ prefix, got: {}",
                 r.source_file
             );
         }
@@ -542,18 +549,22 @@ mod tests {
             indexer::index_file(&conn, &full, dir.path()).unwrap();
         }
 
-        // Combine path filter + time filter
-        let paths = vec!["daily/".to_string()];
+        // Combine path filter + time filter (absolute path, ADR-0017)
+        let daily = dir.path().join("daily").to_string_lossy().to_string();
+        let paths = vec![daily.clone()];
         let filter = TimeFilter {
             after: Some("2025-01-01".to_string()),
             before: None,
         };
         let SearchOutput { results, .. } =
             search(&conn, "MTG", 10, Some(&filter), false, Some(&paths)).unwrap();
+        // daily/recent.md (today) is in scope + recent; daily/old.md is filtered
+        // by time; projects/recent.md is out of path scope.
+        assert!(!results.is_empty());
         for r in &results {
             assert!(
-                r.source_file.starts_with("daily/"),
-                "Expected daily/ prefix, got: {}",
+                r.source_file.starts_with(&format!("{daily}/")),
+                "Expected {daily}/ prefix, got: {}",
                 r.source_file
             );
         }

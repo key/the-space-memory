@@ -362,17 +362,10 @@ fn main() -> anyhow::Result<()> {
                     .map(|f| f.to_string())
                     .unwrap_or_else(|| config::search_fallback().to_string()),
             );
-            for p in &paths {
-                if p.is_empty() {
-                    anyhow::bail!("--path cannot be empty");
-                }
-                if std::path::Path::new(p).is_absolute() {
-                    anyhow::bail!(
-                        "--path must be a relative path (e.g. 'daily/'), got absolute: {p}"
-                    );
-                }
-            }
-            let paths = if paths.is_empty() { None } else { Some(paths) };
+            // ADR-0017: --path accepts absolute or CWD-relative; normalized to
+            // deduped absolute paths anchored at the caller's CWD.
+            let cwd = std::env::current_dir()?;
+            let paths = cli::normalize_path_filters(&paths, &cwd)?;
             let req = DaemonRequest::Search {
                 query,
                 top_k,
@@ -392,12 +385,18 @@ fn main() -> anyhow::Result<()> {
             let req = if files_from_stdin {
                 let project_root = config::project_root();
                 let paths = cli::read_paths_from_stdin(&project_root);
-                let rel_paths: Vec<String> = paths
+                // Send absolute paths (ADR-0017). The daemon's project_root.join
+                // passes absolute paths through unchanged, and index_file stores
+                // the absolutized path, so the wire value stays stable.
+                let abs_paths: Vec<String> = paths
                     .iter()
-                    .filter_map(|p| p.strip_prefix(&project_root).ok())
-                    .map(|p| p.to_string_lossy().to_string())
+                    .map(|p| {
+                        the_space_memory::paths::absolutize(p, &project_root)
+                            .to_string_lossy()
+                            .to_string()
+                    })
                     .collect();
-                DaemonRequest::Index { files: rel_paths }
+                DaemonRequest::Index { files: abs_paths }
             } else {
                 DaemonRequest::Index { files: vec![] }
             };

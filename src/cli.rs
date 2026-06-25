@@ -279,6 +279,25 @@ pub fn read_paths_from_stdin(project_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Normalize `--path` args to deduped, CWD-anchored absolute paths (ADR-0017).
+/// Accepts absolute or relative input; empty string is the only error.
+pub fn normalize_path_filters(args: &[String], cwd: &Path) -> anyhow::Result<Option<Vec<String>>> {
+    if args.is_empty() {
+        return Ok(None);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for a in args {
+        let p = crate::paths::normalize_filter_path(a, cwd)?
+            .to_string_lossy()
+            .to_string();
+        if seen.insert(p.clone()) {
+            out.push(p);
+        }
+    }
+    Ok(Some(out))
+}
+
 pub struct SearchOptions<'a> {
     pub query: &'a str,
     pub top_k: usize,
@@ -1767,6 +1786,37 @@ pub fn cmd_rebuild_fts() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_path_filters_abs_and_rel_and_dedup() {
+        let cwd = std::path::Path::new("/root/repoA");
+        let got = normalize_path_filters(
+            &[
+                "daily".into(),
+                "/root/repoA/daily".into(),
+                "../repoB".into(),
+            ],
+            cwd,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            got,
+            vec!["/root/repoA/daily".to_string(), "/root/repoB".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_path_filters_empty_arg_errors() {
+        assert!(normalize_path_filters(&["".into()], std::path::Path::new("/c")).is_err());
+    }
+
+    #[test]
+    fn normalize_path_filters_none_when_no_args() {
+        assert!(normalize_path_filters(&[], std::path::Path::new("/c"))
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn test_build_section_reports_version_and_date() {

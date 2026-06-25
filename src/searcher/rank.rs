@@ -61,18 +61,18 @@ fn build_filter_clauses(
         format!(" AND {}", time_clauses.join(" AND "))
     };
 
+    // Directory-boundary match (ADR-0017): `--path /r/daily` matches `/r/daily`
+    // itself and `/r/daily/...`, but not `/r/daily-report/...`. Both branches are
+    // case-insensitive (ASCII) — LIKE by default, equality via COLLATE NOCASE.
     let path_sql = match path_prefixes {
         Some(prefixes) if !prefixes.is_empty() => {
-            let conditions: Vec<String> = prefixes
-                .iter()
-                .map(|_| "d.file_path LIKE ? ESCAPE '\\'".to_string())
-                .collect();
+            let mut conditions = Vec::new();
             for p in prefixes {
-                let escaped = p
-                    .replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_");
-                extra_params.push(Box::new(format!("{}%", escaped)));
+                let (eq, like) = crate::paths::boundary_like(std::path::Path::new(p));
+                conditions
+                    .push("(d.file_path = ? COLLATE NOCASE OR d.file_path LIKE ? ESCAPE '\\')");
+                extra_params.push(Box::new(eq));
+                extra_params.push(Box::new(like));
             }
             format!(" AND ({})", conditions.join(" OR "))
         }

@@ -87,13 +87,19 @@ pub fn index_file(
     file_path: &Path,
     project_root: &Path,
 ) -> anyhow::Result<bool> {
-    let rel_path = file_path
+    // file_path is stored as a lexical absolute path (ADR-0017). The directory
+    // label (used for source_type + chunking) is still derived from the
+    // project_root-relative path so source-type classification is unaffected.
+    let stored_path = crate::paths::absolutize(file_path, project_root)
+        .to_string_lossy()
+        .to_string();
+    let rel_for_label = file_path
         .strip_prefix(project_root)
         .unwrap_or(file_path)
         .to_string_lossy()
         .to_string();
 
-    let directory = directory_from_rel_path(&rel_path);
+    let directory = directory_from_rel_path(&rel_for_label);
     let filename = file_path
         .file_stem()
         .unwrap_or_default()
@@ -106,7 +112,7 @@ pub fn index_file(
     let existing: Option<(i64, String)> = conn
         .query_row(
             "SELECT id, file_hash FROM documents WHERE file_path = ?",
-            [&rel_path],
+            [&stored_path],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .ok();
@@ -117,11 +123,11 @@ pub fn index_file(
         }
     }
 
-    let prepared = prepare::prepare(file_path, &rel_path, &directory, &filename)?;
+    let prepared = prepare::prepare(file_path, &stored_path, &directory, &filename)?;
 
     let diff = persist::persist(
         conn,
-        &rel_path,
+        &stored_path,
         &current_hash,
         existing.map(|(id, _)| id),
         &prepared,
@@ -180,15 +186,14 @@ pub fn index_all_with_progress(
         }
 
         if !fp.exists() {
-            let rel_path = fp
-                .strip_prefix(project_root)
-                .unwrap_or(fp)
+            // Match the absolute key written by index_file (ADR-0017).
+            let stored_path = crate::paths::absolutize(fp, project_root)
                 .to_string_lossy()
                 .to_string();
             let existing: Option<i64> = conn
                 .query_row(
                     "SELECT id FROM documents WHERE file_path = ?",
-                    [&rel_path],
+                    [&stored_path],
                     |row| row.get(0),
                 )
                 .ok();
@@ -411,6 +416,20 @@ mod tests {
         let mut f = std::fs::File::create(&full).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         full
+    }
+
+    #[test]
+    fn index_file_stores_absolute_path() {
+        let conn = crate::db::get_memory_connection().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("note.md");
+        std::fs::write(&f, "# Title\n\nbody").unwrap();
+        index_file(&conn, &f, dir.path()).unwrap();
+        let stored: String = conn
+            .query_row("SELECT file_path FROM documents LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, f.to_string_lossy());
+        assert!(std::path::Path::new(&stored).is_absolute());
     }
 
     #[test]
