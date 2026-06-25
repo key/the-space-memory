@@ -65,23 +65,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum DictCommands {
-    /// Show dictionary update candidates (dry run) / apply to add words
+    /// Show frequent, un-judged dictionary candidate words (read-only)
     Update {
         /// Minimum frequency threshold
         #[arg(long, default_value = "5")]
         threshold: i64,
-        /// Add words to dict and rebuild FTS
-        #[arg(long)]
-        apply: bool,
     },
-    /// Manage reject list (reject_words.txt)
+    /// Reject a word: mark it rejected so it is never added to the dictionary
     Reject {
-        /// Sync reject_words.txt to DB
-        #[arg(long)]
-        apply: bool,
-        /// Show all rejected words in DB
-        #[arg(long, conflicts_with = "apply")]
-        all: bool,
+        /// The word to reject
+        word: String,
     },
     /// Accept a word into the user dictionary (one word; optional reading)
     Add {
@@ -95,6 +88,10 @@ enum DictCommands {
         /// Word to reset
         word: String,
     },
+    /// Export DB verdicts to user_dict.simpledic / reject_words.txt
+    Export,
+    /// Import verdicts from user_dict.simpledic / reject_words.txt into the DB
+    Import,
 }
 
 #[derive(Subcommand)]
@@ -318,11 +315,17 @@ fn main() -> anyhow::Result<()> {
             cli::cmd_rebuild(apply)?;
         }
         Commands::Dict { command } => match command {
-            DictCommands::Update { threshold, apply } => {
-                cli::cmd_dict_update(threshold, apply)?;
+            DictCommands::Update { threshold } => {
+                cli::cmd_dict_update(threshold)?;
             }
-            DictCommands::Reject { apply, all } => {
-                cli::cmd_dict_reject(apply, all)?;
+            DictCommands::Reject { word } => {
+                cli::cmd_dict_reject(&word)?;
+            }
+            DictCommands::Export => {
+                cli::cmd_dict_export()?;
+            }
+            DictCommands::Import => {
+                cli::cmd_dict_import()?;
             }
             DictCommands::Add { surface, yomi } => {
                 cli::cmd_dict_add(&surface, yomi.as_deref())?;
