@@ -83,6 +83,18 @@ enum DictCommands {
         #[arg(long, conflicts_with = "apply")]
         all: bool,
     },
+    /// Accept a word into the user dictionary (one word; optional reading)
+    Add {
+        /// Surface form to add (e.g. a compound lindera mis-splits)
+        surface: String,
+        /// Reading (yomi). Omit for all-kana surfaces; a kanji surface warns
+        yomi: Option<String>,
+    },
+    /// Reset a word to pending, removing it from the dict or reject list
+    Rm {
+        /// Word to reset
+        word: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -311,6 +323,12 @@ fn main() -> anyhow::Result<()> {
             }
             DictCommands::Reject { apply, all } => {
                 cli::cmd_dict_reject(apply, all)?;
+            }
+            DictCommands::Add { surface, yomi } => {
+                cli::cmd_dict_add(&surface, yomi.as_deref())?;
+            }
+            DictCommands::Rm { word } => {
+                cli::cmd_dict_rm(&word)?;
             }
         },
         Commands::Synonym { command } => match command {

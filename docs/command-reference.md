@@ -27,6 +27,8 @@ Complete reference for all `tsm` CLI subcommands.
 - [Dictionary Management](#dictionary-management)
   - [tsm dict update](#tsm-dict-update)
   - [tsm dict reject](#tsm-dict-reject)
+  - [tsm dict add](#tsm-dict-add)
+  - [tsm dict rm](#tsm-dict-rm)
 - [Synonym Management](#synonym-management)
   - [tsm synonym add](#tsm-synonym-add)
   - [tsm synonym rm](#tsm-synonym-rm)
@@ -672,6 +674,60 @@ tsm dict reject --apply
 
 # Show all rejected words
 tsm dict reject --all
+```
+
+---
+
+### tsm dict add
+
+Accept one word into the user dictionary.
+
+```text
+tsm dict add <surface> [<yomi>]
+```
+
+Adds a single term as **accepted**, removing it from the reject list if present.
+Use this for compounds lindera mis-splits (e.g. `ハンドロード` → `ハンド` + `ロード`),
+which never surface as frequency candidates and so cannot be added via
+`dict update`. The accepted set is the authority in the database; the change
+regenerates `user_dict.simpledic` and triggers an FTS re-index so the tokenizer
+picks it up (via the daemon if running, otherwise a direct rebuild).
+
+The optional reading (`yomi`) is stored but not yet used for matching (search is
+surface-based today). Omit it for an all-kana surface, where the surface is its
+own reading. A surface containing kanji with no reading is accepted with a
+warning, storing the surface as a substitute.
+
+**Examples:**
+
+```bash
+# Add a mis-split compound (all-kana: reading defaults to the surface)
+tsm dict add ハンドロード
+
+# Add with an explicit reading
+tsm dict add 宇宙記憶 うちゅうきおく
+```
+
+---
+
+### tsm dict rm
+
+Reset one word to pending.
+
+```text
+tsm dict rm <word>
+```
+
+Removes the word from whichever side it is on — the user dictionary (accepted)
+or the reject list — returning it to **pending**. If the word was accepted, the
+change regenerates `user_dict.simpledic` and triggers an FTS re-index. Resetting
+a word that was never registered is an error (there is nothing to reset).
+
+**Examples:**
+
+```bash
+# Stop treating a word as a dictionary term
+tsm dict rm ハンドロード
 ```
 
 ---

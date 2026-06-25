@@ -1464,8 +1464,13 @@ pub fn cmd_dict_update(threshold: i64, apply: bool) -> anyhow::Result<()> {
 
     drop(conn);
 
-    // Rebuild FTS: if daemon is running, send reindex via IPC (daemon resets
-    // its own segmenter). Otherwise, reset locally and rebuild directly.
+    reindex_fts_after_dict_change()
+}
+
+/// Rebuild the FTS index so the tokenizer picks up a user-dictionary change.
+/// If the daemon is running, send a reindex over IPC (the daemon resets its own
+/// segmenter); otherwise reset the local segmenter and rebuild directly.
+fn reindex_fts_after_dict_change() -> anyhow::Result<()> {
     let daemon_socket = config::daemon_socket_path();
     let reindex_req = crate::daemon_protocol::DaemonRequest::Reindex {
         kind: crate::daemon_protocol::ReindexKind::Fts,
@@ -1483,6 +1488,59 @@ pub fn cmd_dict_update(threshold: i64, apply: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Apply a verdict change to the user dictionary: when the accepted set changed,
+/// regenerate `user_dict.simpledic` from the DB and rebuild FTS (ADR-0014).
+/// Takes `conn` by value so it is dropped before the local FTS rebuild opens its
+/// own writer. A change that does not touch the accepted set is a no-op.
+fn apply_verdict_change(
+    conn: rusqlite::Connection,
+    t: &user_dict::Transition,
+) -> anyhow::Result<()> {
+    if !t.affected_dict {
+        return Ok(());
+    }
+    let csv_path = config::user_dict_path();
+    let n = user_dict::regenerate_user_dict(&conn, &csv_path)?;
+    println!(
+        "Regenerated {} ({n} accepted term{}).",
+        csv_path.display(),
+        if n == 1 { "" } else { "s" }
+    );
+    drop(conn);
+    reindex_fts_after_dict_change()
+}
+
+/// `tsm dict add <surface> [<yomi>]` — accept a term (ADR-0014 §1, §4).
+pub fn cmd_dict_add(surface: &str, yomi: Option<&str>) -> anyhow::Result<()> {
+    user_dict::validate_surface(surface)?;
+    let conn = db::get_connection(&config::db_path())?;
+    let (reading, warned) = user_dict::resolve_reading(surface, yomi);
+    if warned {
+        eprintln!(
+            "warning: no reading for '{surface}'; storing the surface as a substitute. \
+             Provide one with `tsm dict add {surface} <yomi>`."
+        );
+    }
+    let t = user_dict::set_verdict(&conn, surface, user_dict::Verdict::Accepted, Some(&reading))?;
+    match t.from {
+        Some(user_dict::Verdict::Accepted) => println!("'{surface}' is already accepted."),
+        _ => println!("Accepted '{surface}'."),
+    }
+    apply_verdict_change(conn, &t)
+}
+
+/// `tsm dict rm <word>` — reset a term to pending (ADR-0014 §1).
+/// Errors when the term was never registered (nothing to reset).
+pub fn cmd_dict_rm(word: &str) -> anyhow::Result<()> {
+    let conn = db::get_connection(&config::db_path())?;
+    let t = user_dict::set_verdict(&conn, word, user_dict::Verdict::Pending, None)?;
+    match t.from {
+        Some(user_dict::Verdict::Pending) => println!("'{word}' is already pending."),
+        _ => println!("Reset '{word}' to pending."),
+    }
+    apply_verdict_change(conn, &t)
 }
 
 pub fn cmd_dict_reject(apply: bool, all: bool) -> anyhow::Result<()> {
@@ -1602,7 +1660,12 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
             eprintln!("DB does not exist yet.");
         }
         eprintln!("\nThis will delete the DB and rebuild from scratch.");
-        eprintln!("Note: reject list (dictionary_candidates) will be lost.");
+        eprintln!("Note: dictionary verdicts (dictionary_candidates) will be lost.");
+        eprintln!(
+            "      The accepted set and reject list are gone until restored from \
+             reject_words.txt (`tsm dict reject --apply`) / `tsm dict import` (once available); \
+             a `dict add`/`rm` before then regenerates user_dict.simpledic from the empty DB."
+        );
         eprintln!("Run with --apply to proceed.");
         return Ok(());
     }
