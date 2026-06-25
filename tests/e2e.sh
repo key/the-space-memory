@@ -294,14 +294,27 @@ assert_contains "options: text format shows source file" "hashire-melos" "$CAPTU
 echo ""
 log "=== Path scoping (--path) ==="
 
-# In-scope: CWD-relative directory includes the note under notes/
+# In-scope, CWD-relative: a bare relative path is resolved against the CWD
+# (TSM_PROJECT_DIR) before matching — `notes` → `<project>/notes`.
 run search_json "メロス" --path notes
-assert_json "path: --path notes includes hashire-melos" \
+assert_json "path: relative --path notes includes hashire-melos" \
     'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
-# In-scope: absolute directory also works
+# In-scope, CWD-relative with explicit `./` prefix resolves the same way.
+run search_json "メロス" --path ./notes
+assert_json "path: relative --path ./notes includes hashire-melos" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# In-scope: absolute directory also works (same hit as the relative form).
 run search_json "メロス" --path "$TSM_PROJECT_DIR/notes"
 assert_json "path: absolute --path includes hashire-melos" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# Case-insensitive (ADR-0017, deliberate owner-accepted tradeoff): an upper-case
+# `NOTES` still matches the lower-case `notes/` directory. This pins the chosen
+# forgiving behavior so a future change to case-sensitive matching is caught.
+run search_json "メロス" --path NOTES
+assert_json "path: --path is case-insensitive (NOTES matches notes/)" \
     'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # Boundary: `note` must NOT match the `notes/` directory (no substring leak)
