@@ -11,6 +11,7 @@
 ## Global Constraints
 
 - ADR authority: **ADR-0017** (`decisions/0017-absolute-source-file-and-path-filter.md`). Storage = lexical absolute, symlinks NOT resolved. `--path` = CWD-anchored directory-boundary match. Display: text = CWD-relative, JSON = absolute.
+- Platform: **Unix-only**. tsm's IPC is UNIX domain sockets (`daemon.sock` / `embedder.sock`) and its watcher uses inotify/FSEvents — it does not run on Windows, and the release matrix is linux/macOS only. `/` is the sole path separator throughout (stored paths, `--path`, the `/%` boundary pattern). Windows path semantics (drive prefixes, UNC, `\` separators) are explicitly out of scope (consistent with #160's out-of-scope list). `absolutize` tests use Unix roots by design.
 - Case handling: `file_path` is stored with its **real case** (display + identity must not break on case-sensitive filesystems — never lowercase the stored path). `--path` matching is **case-insensitive (ASCII)**, applied consistently: the LIKE branch is case-insensitive by SQLite default, and the equality branch uses `COLLATE NOCASE`. Both branches must be case-insensitive in EVERY scope query (final JOIN, FTS, vector subquery, entity) — a mismatch is the scope-leak Codex flagged.
 - License: MIT. No new dependencies — implement the `.`/`..` fold ourselves (`std::path::absolute` does NOT fold `..`).
 - TDD required: Red → Green → Refactor. Unit tests in `#[cfg(test)] mod tests`. DB tests use `:memory:`.
@@ -269,95 +270,82 @@ git commit -m "feat(indexer): store file_path as absolute (ADR-0017)"
 
 ---
 
-### Task 3: Rebuild-required migration guard
+### Task 3: Rebuild-required migration guard (content-based)
 
 **Files:**
-- Modify: `src/db.rs` (add a `user_version` PRAGMA check on connect; bump on init).
+- Modify: `src/db.rs` (add `check_path_schema`).
+- Modify: `src/bin/tsmd/daemon_mode.rs` (call the guard at startup).
 - Test: `src/db.rs` tests.
 
 **Interfaces:**
-- Produces: `pub fn check_path_schema(conn: &Connection) -> anyhow::Result<()>` — returns `Err` with a "run `tsm rebuild`" message when the DB predates absolute storage. Called from the daemon startup path (where `is_initialized` is checked).
+- Produces: `pub fn check_path_schema(conn: &Connection) -> anyhow::Result<()>` — `Err` with a "run `tsm rebuild`" message **iff** `documents` contains at least one **relative** `file_path` (a pre-absolute row). Called from the daemon startup path (where `is_initialized` is checked).
 
-> **Verified**: `PRAGMA user_version` is currently unused anywhere in `src/` — free to use as the path-schema marker. It is independent of the existing additive column migrations (`ensure_content_hash_column`, `ensure_metadata_column`), which run on connect and stay as-is; those upgrade old DBs in place but never touch `user_version`, so a pre-absolute DB still reads `0` and is correctly rejected.
+**Why content-based, not a `user_version` marker:** the guard checks the actual
+data, so it self-heals and never blocks harmless states. An empty initialized DB
+(schema present, `tsm init` run but never indexed) and a fully-migrated
+(all-absolute) DB both pass; only a DB still holding relative rows is rejected.
+A version marker would reject the empty DB too, and `init_db`'s idempotency makes
+stamping fragile (re-running `init` over an old populated DB would wrongly bless
+it). On a Unix-only target an absolute path always begins with `/`, so
+"relative" = `file_path NOT LIKE '/%'`.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 ```rust
 // in src/db.rs #[cfg(test)] mod tests
 #[test]
-fn check_path_schema_rejects_old_version() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch("PRAGMA user_version = 0;").unwrap();
-    assert!(check_path_schema(&conn).is_err());
-}
-#[test]
-fn check_path_schema_accepts_current_version() {
-    let conn = get_memory_connection().unwrap(); // init bumps user_version
+fn check_path_schema_ok_for_empty_db() {
+    let conn = get_memory_connection().unwrap(); // schema, no rows
     assert!(check_path_schema(&conn).is_ok());
 }
 #[test]
-fn init_does_not_bless_existing_relative_db() {
-    // A pre-absolute DB (tables present, user_version 0, relative file_path rows).
-    // Re-running init must NOT stamp it current — check_path_schema must still reject.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("tsm.db");
-    {
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch(SCHEMA_SQL).unwrap();
-        conn.execute(
-            "INSERT INTO documents (file_path, source_type, file_hash, indexed_at) \
-             VALUES ('daily/x.md', 'note', 'h', '2026-01-01')",
-            [],
-        )
-        .unwrap();
-        // user_version left at 0 (pre-migration).
-    }
-    init_db(&path).unwrap(); // idempotent re-init over an existing DB
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    assert!(
-        check_path_schema(&conn).is_err(),
-        "init must not bless a populated pre-absolute DB"
-    );
+fn check_path_schema_ok_for_absolute_rows() {
+    let conn = get_memory_connection().unwrap();
+    conn.execute(
+        "INSERT INTO documents (file_path, source_type, file_hash, indexed_at) \
+         VALUES ('/r/daily/x.md', 'note', 'h', '2026-01-01')",
+        [],
+    )
+    .unwrap();
+    assert!(check_path_schema(&conn).is_ok());
+}
+#[test]
+fn check_path_schema_rejects_relative_rows() {
+    let conn = get_memory_connection().unwrap();
+    conn.execute(
+        "INSERT INTO documents (file_path, source_type, file_hash, indexed_at) \
+         VALUES ('daily/x.md', 'note', 'h', '2026-01-01')",
+        [],
+    )
+    .unwrap();
+    assert!(check_path_schema(&conn).is_err());
 }
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib db::tests::check_path_schema db::tests::init_does_not_bless 2>&1 | tail -15`
-Expected: FAIL — `cannot find function check_path_schema` (and the regression test fails until fresh-only stamping is in place).
+Run: `cargo test --lib db::tests::check_path_schema 2>&1 | tail -15`
+Expected: FAIL — `cannot find function check_path_schema`.
 
 - [ ] **Step 3: Implement**
 
-In `src/db.rs`, add a schema-version constant:
-
-```rust
-/// DB layout version. Bumped to 1 when file_path became absolute (ADR-0017).
-pub const PATH_SCHEMA_VERSION: i64 = 1;
-```
-
-In `init_db`, stamp `user_version` **only when the schema is freshly created** — never when re-opening an existing DB. `init_db` is idempotent (`CREATE TABLE IF NOT EXISTS`), so an unconditional bump would mark a pre-absolute DB (relative `file_path` rows untouched) as current and let `check_path_schema` wrongly accept it. Detect freshness by the absence of the `documents` table *before* creating the schema (`table_exists` already exists in this module):
-
-```rust
-    let fresh = !table_exists(&conn, "documents");
-    conn.execute_batch(SCHEMA_SQL)?;
-    create_vec_table(&conn);
-    if fresh {
-        // Only a brand-new DB (or a post-rebuild recreate, which deletes the
-        // file first) gets stamped. An existing pre-absolute DB keeps its old
-        // user_version and is rejected by check_path_schema below.
-        conn.pragma_update(None, "user_version", PATH_SCHEMA_VERSION)?;
-    }
-```
-
-Add the guard:
+In `src/db.rs`, add the content-based guard (no schema version marker, no
+`init_db` change):
 
 ```rust
 /// Reject a DB created before absolute-path storage. The `file_path` column
-/// changed meaning (relative → absolute, ADR-0017), so an old DB would
-/// silently mis-match every `--path`. Fail fast and tell the user to rebuild.
+/// changed meaning (relative → absolute, ADR-0017); a stored relative path
+/// would silently mis-match every `--path`. The check is data-driven: it fails
+/// iff a relative `file_path` row exists, so empty and fully-migrated DBs pass
+/// and the check self-heals after a rebuild. Unix-only: absolute paths start
+/// with `/`, so relative = NOT LIKE '/%'.
 pub fn check_path_schema(conn: &Connection) -> anyhow::Result<()> {
-    let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if v < PATH_SCHEMA_VERSION {
+    let has_relative: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM documents WHERE file_path NOT LIKE '/%')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_relative {
         anyhow::bail!(
             "This index predates absolute-path storage and must be rebuilt. \
              Run `tsm rebuild --apply`."
@@ -371,14 +359,14 @@ Call `check_path_schema` from the daemon startup, right after the post-lock `is_
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib db::tests::check_path_schema db::tests::init_does_not_bless 2>&1 | tail -15`
-Expected: PASS — including `init_does_not_bless_existing_relative_db`.
+Run: `cargo test --lib db::tests::check_path_schema 2>&1 | tail -15`
+Expected: PASS — empty + absolute pass, relative rejected.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/db.rs src/bin/tsmd/daemon_mode.rs
-git commit -m "feat(db): reject pre-absolute-path index, require rebuild (ADR-0017)"
+git commit -m "feat(db): reject pre-absolute-path index (relative rows), require rebuild (ADR-0017)"
 ```
 
 ---
