@@ -975,7 +975,7 @@ mod tests {
         assert!(stats1.last_id > 0);
 
         // Second batch: from last_id
-        let (stats2, has_more2) =
+        let (stats2, _has_more2) =
             backfill_next_batch(&conn, &mock_encode, 2, stats1.last_id).unwrap();
         assert!(stats2.filled > 0);
         assert!(stats2.last_id > stats1.last_id);

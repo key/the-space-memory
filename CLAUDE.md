@@ -22,8 +22,8 @@ cargo llvm-cov \
   '(embedder|main|cli|tsmd|tsm_watcher|status|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' \
   --fail-under-lines 90
 
-# Lint
-cargo clippy -- -D warnings
+# Lint (--all-targets also lints test/bench code)
+cargo clippy --all-targets -- -D warnings
 
 # Format
 cargo fmt --check
@@ -300,7 +300,7 @@ containing `bin/{tsm,tsmd}` plus `LICENSE`, `README.md`, and `tsm.toml.example`.
 A change is merge-ready when **all** of the following hold:
 
 - [ ] `cargo test` passes (all existing + new tests)
-- [ ] `cargo clippy -- -D warnings` clean
+- [ ] `cargo clippy --all-targets -- -D warnings` clean (lints test/bench code too)
 - [ ] `cargo fmt --check` clean
 - [ ] Coverage ≥ 90% (on covered modules)
 - [ ] New pub functions have unit tests
@@ -338,12 +338,15 @@ A change is merge-ready when **all** of the following hold:
 - **User dictionary POS is `名詞`** — simpledic format: `surface,名詞,reading`.
   Uses standard POS so existing noun filters work without special handling.
   `#` comment lines are stripped before passing to lindera
-- **`rebuild --apply` resets reject list** — DB is deleted and recreated,
-  so `dictionary_candidates` table (including rejected status) is lost.
-  Run `tsm dict reject --apply` after rebuild to re-sync from `reject_words.txt`
-- **`dict update --apply` uses daemon when available** — if daemon running,
-  sends `reindex fts` via IPC (daemon resets its own segmenter).
-  If daemon stopped, resets segmenter locally and rebuilds FTS directly
+- **`rebuild --apply` resets dictionary verdicts** — DB is deleted and recreated,
+  so the `dictionary_candidates` table (accepted + rejected verdicts) is lost.
+  Run `tsm dict import` after rebuild to restore from `user_dict.simpledic` /
+  `reject_words.txt` (ADR-0014: DB is the authority, files are the portable record)
+- **Dict verdict changes reindex via `reindex_fts_after_dict_change`** — `dict add`
+  / `reject` / `rm` / `import` regenerate `user_dict.simpledic` when the accepted
+  set changes, then reindex FTS: if the daemon is running, send `reindex fts` via
+  IPC (it resets its own segmenter); if stopped, reset the segmenter locally and
+  rebuild FTS directly
 - **Segmenter is cached** — `tokenizer::get_segmenter()` caches the Segmenter
   (including user dict). Call `reset_segmenter()` after writing new simpledic
   if rebuilding FTS in the same process

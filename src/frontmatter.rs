@@ -174,7 +174,7 @@ mod tests {
             Some("2026-03-24")
         );
         // sequences are preserved
-        assert!(map.get("tags").is_some());
+        assert!(map.contains_key("tags"));
     }
 
     #[test]

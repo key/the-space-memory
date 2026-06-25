@@ -1447,7 +1447,11 @@ fn estimate_eta(started_at: &str, processed: usize, total: usize) -> String {
     }
 }
 
-pub fn cmd_dict_update(threshold: i64, apply: bool) -> anyhow::Result<()> {
+/// `tsm dict update` — show frequent, un-judged candidate words (ADR-0014).
+/// A read-only discovery view: it lists words seen often enough to be worth a
+/// verdict. Acceptance/rejection is per word via `dict add` / `dict reject`;
+/// bulk loading is `dict import`. This command only reads.
+pub fn cmd_dict_update(threshold: i64) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
 
@@ -1463,29 +1467,11 @@ pub fn cmd_dict_update(threshold: i64, apply: bool) -> anyhow::Result<()> {
         print_candidate(c);
     }
     eprintln!(
-        "\n{} word(s) will be added to user dictionary.",
+        "\n{} candidate(s). Accept with `tsm dict add <word> [reading]` \
+         or reject with `tsm dict reject <word>`.",
         candidates.len()
     );
-
-    if !apply {
-        println!("Dry run. Pass --apply to add words and rebuild FTS.");
-        return Ok(());
-    }
-
-    // Export to CSV
-    let csv_path = config::user_dict_path();
-    let exported = user_dict::export_candidates_to_csv(&conn, &csv_path, threshold)?;
-    let count = exported.len();
-    println!("Wrote {count} word(s) to {}", csv_path.display());
-
-    if count == 0 {
-        println!("All candidates were already in the dict file. Nothing to do.");
-        return Ok(());
-    }
-
-    drop(conn);
-
-    reindex_fts_after_dict_change()
+    Ok(())
 }
 
 /// Rebuild the FTS index so the tokenizer picks up a user-dictionary change.
@@ -1564,54 +1550,95 @@ pub fn cmd_dict_rm(word: &str) -> anyhow::Result<()> {
     apply_verdict_change(conn, &t)
 }
 
-pub fn cmd_dict_reject(apply: bool, all: bool) -> anyhow::Result<()> {
-    let db_path = config::db_path();
-    let conn = db::get_connection(&db_path)?;
+/// `tsm dict reject <word>` — move a word to the `rejected` verdict (ADR-0014).
+/// Inserts a manual row when the word was never seen (preemptive reject). When
+/// the word was accepted, the accepted set shrinks, so `apply_verdict_change`
+/// regenerates `user_dict.simpledic` and reloads the tokenizer.
+pub fn cmd_dict_reject(word: &str) -> anyhow::Result<()> {
+    user_dict::validate_surface(word)?;
+    let conn = db::get_connection(&config::db_path())?;
+    let t = user_dict::set_verdict(&conn, word, user_dict::Verdict::Rejected, None)?;
+    match t.from {
+        None => println!("Rejected '{word}' (new entry)."),
+        Some(user_dict::Verdict::Rejected) => println!("'{word}' is already rejected."),
+        Some(user_dict::Verdict::Accepted) => {
+            println!("Rejected '{word}' (was accepted; dictionary regenerated).")
+        }
+        Some(user_dict::Verdict::Pending) => println!("Rejected '{word}'."),
+    }
+    apply_verdict_change(conn, &t)
+}
+
+/// `tsm dict export` — write the DB's verdicts to disk (ADR-0014 §2): the
+/// accepted set to `user_dict.simpledic` and the rejected set to
+/// `reject_words.txt`. The DB is the authority; this materializes a portable,
+/// git-trackable snapshot. No reindex — the running tokenizer already reflects
+/// the DB. Diagnostics go to stderr so stdout stays a clean status line.
+pub fn cmd_dict_export() -> anyhow::Result<()> {
+    let conn = db::get_connection(&config::db_path())?;
+
+    let dict_path = config::user_dict_path();
+    let accepted = user_dict::regenerate_user_dict(&conn, &dict_path)?;
+    eprintln!(
+        "Wrote {accepted} accepted word(s) to {}",
+        dict_path.display()
+    );
+
     let reject_path = config::reject_words_path();
+    let rejected = user_dict::export_reject_words_to_file(&conn, &reject_path)?;
+    eprintln!(
+        "Wrote {rejected} rejected word(s) to {}",
+        reject_path.display()
+    );
 
-    if all {
-        let rejected = user_dict::get_rejected_candidates(&conn);
-        if rejected.is_empty() {
-            println!("No rejected candidates.");
-            return Ok(());
-        }
-        eprintln!("=== Rejected Candidates ({} total) ===\n", rejected.len());
-        for c in &rejected {
-            print_candidate(c);
-        }
-        return Ok(());
-    }
+    println!("Exported {accepted} accepted, {rejected} rejected word(s).");
+    Ok(())
+}
 
-    let reject_words = user_dict::load_reject_words(&reject_path)?;
+/// `tsm dict import` — load verdicts from disk into the DB (ADR-0014 §2).
+/// Insert-only: accepted words from `user_dict.simpledic` and rejected words
+/// from `reject_words.txt` are upserted; verdicts absent from the files are left
+/// untouched (use `dict rm`/`reject` to remove). This recovers the DB after a
+/// rebuild and reflects hand-edits or another machine's files. When the imported
+/// verdicts changed the accepted set (a new accepted word, or a reject demoting a
+/// previously-accepted one), `user_dict.simpledic` is regenerated from the final
+/// DB state and the tokenizer reloaded — once. Counts go to stderr.
+pub fn cmd_dict_import() -> anyhow::Result<()> {
+    let conn = db::get_connection(&config::db_path())?;
 
-    if reject_words.is_empty() {
-        println!(
-            "reject_words.txt is empty or not found at {}",
-            reject_path.display()
+    let dict_path = config::user_dict_path();
+    let acc = user_dict::import_user_dict_from_file(&conn, &dict_path)?;
+    eprintln!(
+        "Imported {} accepted word(s) from {}",
+        acc.imported,
+        dict_path.display()
+    );
+
+    let reject_path = config::reject_words_path();
+    let rej = user_dict::import_reject_words_from_file(&conn, &reject_path)?;
+    eprintln!(
+        "Imported {} rejected word(s) from {}",
+        rej.imported,
+        reject_path.display()
+    );
+
+    println!(
+        "Imported {} accepted, {} rejected word(s).",
+        acc.imported, rej.imported
+    );
+
+    // Regenerate from the final DB state (not the input files) so an overlap
+    // between the two files, or a reject that demoted an accepted word, leaves
+    // simpledic consistent with the DB before the tokenizer reloads.
+    if acc.dict_affected + rej.dict_affected > 0 {
+        let n = user_dict::regenerate_user_dict(&conn, &dict_path)?;
+        eprintln!(
+            "Regenerated {} ({n} accepted term(s)).",
+            dict_path.display()
         );
-        return Ok(());
+        drop(conn);
+        reindex_fts_after_dict_change()?;
     }
-
-    let candidates = user_dict::get_pending_in_reject_list(&conn, &reject_words);
-
-    if candidates.is_empty() {
-        println!("No pending candidates match reject_words.txt.");
-        return Ok(());
-    }
-
-    eprintln!("=== Candidates to Reject ===\n");
-    for c in &candidates {
-        print_candidate(c);
-    }
-    eprintln!("\n{} word(s) will be marked rejected.", candidates.len());
-
-    if !apply {
-        println!("Dry run. Pass --apply to reject these words.");
-        return Ok(());
-    }
-
-    let newly_rejected = user_dict::apply_reject_list(&conn, &reject_words)?;
-    println!("Rejected {} word(s).", newly_rejected.len());
     Ok(())
 }
 

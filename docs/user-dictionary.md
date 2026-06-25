@@ -14,16 +14,19 @@ lindera の内蔵辞書（IPAdic）は一般的な日本語をカバーするが
 
 以下の設計方針をとっている。
 
-- **収集は自動、適用は明示的** ---
-  インデックス・検索・セッション取り込み時に未知語を自動収集するが、
-  辞書への追加は `tsm dict update` コマンドで人間が確認してから行う
-- **reject で品質を担保** ---
-  候補テーブルに溜まった不要語（ストップワード等）は `rejected` にマークすることで、
-  以後カウントされなくなる。`reject_words.txt` で一括管理できる
-- **辞書変更は FTS 再構築とセット** ---
-  FTS5 トークナイザーが辞書を読むため、
-  辞書を変更したら FTS インデックスを再構築する必要がある。
-  `tsm dict update --apply` は自動で FTS 再構築を行う
+- **収集は自動、判定は明示的（1語ずつ）** ---
+  インデックス・検索・セッション取り込み時に未知語を自動収集する。
+  辞書への追加は `tsm dict add <surface> [yomi]`、除外は `tsm dict reject <word>`、
+  判定の取り消しは `tsm dict rm <word>` で、人間が 1 語ずつ確認して行う
+  （ADR-0014 の判定状態機械: `accepted` / `rejected` / `pending` は相互排他）
+- **DB を権威とし、ファイルは export/import で往復** ---
+  判定状態は DB（`dictionary_candidates`）を正とし、`tsm dict export` で
+  `user_dict.simpledic` / `reject_words.txt` へ書き出し、`tsm dict import` で
+  取り込む。git 管理・別マシンからの取得・`rebuild` 後の復旧に使う
+- **判定変更は FTS 再構築とセット** ---
+  FTS5 トークナイザーが辞書を読むため、accepted 集合が変わる判定変更
+  （`add` / `reject` / `rm` / `import`）は `user_dict.simpledic` を再生成し、
+  FTS インデックスを再構築する（コマンドが自動で行う）
 
 ## ファイル構成
 
@@ -56,8 +59,9 @@ LoRa,名詞,LoRa
 
 ### reject_words.txt
 
-辞書に登録したくない単語のリスト。`tsm dict reject --apply` でDBに反映する。
-`rebuild --apply` でDB がリセットされても、このファイルから再適用できる。
+辞書に登録したくない単語のリスト。`tsm dict export` が DB の rejected 集合を
+このファイルへ書き出し、`tsm dict import` が取り込む。
+`rebuild --apply` でDB がリセットされても、このファイルから復旧できる。
 
 ```text
 # English stop words
@@ -72,7 +76,7 @@ process
 ```
 
 - 1行1単語、`#` でコメント、空行は無視
-- `tsm dict reject --apply` で pending 候補を `rejected` にマーク
+- `tsm dict import` が各単語を `rejected` として DB に取り込む（表層形のケースは保持）
 
 ### dictionary_candidates テーブル（tsm.db 内）
 
@@ -80,19 +84,20 @@ process
 
 | カラム | 型 | 説明 |
 |---|---|---|
-| surface | TEXT (PK) | 単語の表層形（小文字正規化済み） |
-| frequency | INTEGER | 出現回数 |
-| pos | TEXT | 品詞推定（`proper_noun` / `katakana` / `ascii`） |
-| source | TEXT | 収集元（`document` / `query` / `session`） |
+| surface | TEXT (PK) | 単語の表層形（自動収集は小文字化、手動追加はケース保持） |
+| frequency | INTEGER | 出現回数（手動追加は 0） |
+| pos | TEXT | 品詞推定（`proper_noun` / `katakana` / `ascii` / `manual`） |
+| source | TEXT | 収集元（`document` / `query` / `session` / `manual`） |
+| reading | TEXT | 読み（`dict add` の任意引数。格納のみ・検索未使用、#115 で活用予定） |
 | first_seen | TEXT | 初出日時（RFC3339） |
 | last_seen | TEXT | 最終出現日時（RFC3339） |
 | status | TEXT | `pending` / `accepted` / `rejected` |
 
 ステータスの意味:
 
-- **pending** --- 候補として蓄積中。出現するたびに frequency が加算される
-- **accepted** --- `tsm dict update --apply` で辞書ファイルに追加済み
-- **rejected** --- 不要と判断された語。frequency の加算がスキップされる
+- **pending** --- 候補として蓄積中、または明示判定の不在。出現するたびに frequency が加算される
+- **accepted** --- `tsm dict add` で辞書に採用された語。`user_dict.simpledic` に出力される
+- **rejected** --- `tsm dict reject` で除外された語。frequency の加算がスキップされる
 
 ## 辞書操作ガイド
 
@@ -102,21 +107,19 @@ process
 # 1. インデックスして候補を蓄積
 tsm index
 
-# 2. 候補の確認（ドライラン）
+# 2. 候補の確認（読み取り専用）
 tsm dict update
 
-# 3. reject_words.txt を作成してストップワードを除外
-vi .tsm/reject_words.txt
+# 3. 候補を 1 語ずつ判定する
+tsm dict add ハンドロード はんどろーど   # 採用（読みは任意）
+tsm dict reject the                      # 除外（ストップワード等）
 
-# 4. リジェクトを適用
-tsm dict reject --apply
-
-# 5. 残った候補を確認して辞書に追加
-tsm dict update          # ドライラン — 候補を確認
-tsm stop                 # デーモン停止が必要
-tsm dict update --apply  # 辞書追加 + FTS 再構築
-tsm start
+# 4. DB の判定を git 管理ファイルへ書き出す
+tsm dict export
 ```
+
+`add` / `reject` は accepted 集合が変わると `user_dict.simpledic` を再生成し、
+FTS を自動で再構築する（デーモン稼働中は IPC、停止中は直接再構築）。
 
 ### 定期メンテナンス
 
@@ -126,25 +129,26 @@ tsm start
 # 1. 候補を確認
 tsm dict update
 
-# 2. 不要な語があれば reject_words.txt に追記して適用
-echo "newstopword" >> .tsm/reject_words.txt
-tsm dict reject --apply
+# 2. 1 語ずつ判定（誤判定は dict rm で pending に戻す）
+tsm dict reject newstopword
+tsm dict add 新しい複合語 あたらしいふくごうご
 
-# 3. 辞書に追加
-tsm stop
-tsm dict update --apply
-tsm start
+# 3. 判定をファイルへ反映してコミット
+tsm dict export
 ```
 
-### rebuild 後のリジェクト再適用
+### rebuild 後の判定復旧
 
 `tsm rebuild --apply` は DB を削除・再作成するため、
-`dictionary_candidates` テーブルの rejected ステータスが失われる。
-`reject_words.txt` から再適用する:
+`dictionary_candidates` テーブルの accepted / rejected 判定が失われる。
+git 管理された `user_dict.simpledic` / `reject_words.txt` から復旧する:
 
 ```bash
-tsm dict reject --apply
+tsm dict import
 ```
+
+`import` は insert-only で、ファイルにある語を upsert する（ファイルに無い語の
+判定は変更しない。削除は `tsm dict rm` / `tsm dict reject` で明示的に行う）。
 
 ### 現在の状態を確認する
 
@@ -155,8 +159,8 @@ tsm doctor
 # 辞書の単語数
 wc -l .tsm/user_dict.simpledic
 
-# リジェクト済み単語の一覧
-tsm dict reject --all
+# リジェクト済み単語の一覧（export してファイルを見る）
+tsm dict export && cat .tsm/reject_words.txt
 ```
 
 ## 候補収集の仕組み
@@ -204,5 +208,5 @@ FTS5 インデックスは品詞を理解しない。`wakachi()` が全トーク
 |---|---|
 | `src/user_dict.rs` | 候補収集（`collect_from_text`）、辞書エクスポート、accept/reject 操作、`USER_DICT_POS` 定数 |
 | `src/tokenizer.rs` | lindera の初期化。`user_dict.simpledic` を `load_user_dictionary_from_csv()` で読み込み、`Segmenter` に適用 |
-| `src/cli.rs` | `tsm dict update` / `tsm dict reject` コマンドの実装 |
+| `src/cli.rs` | `tsm dict update` / `add` / `reject` / `rm` / `export` / `import` コマンドの実装 |
 | `src/db.rs` | `dictionary_candidates` テーブルのスキーマ定義 |

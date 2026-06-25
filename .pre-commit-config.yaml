@@ -81,8 +81,8 @@ repos:
         stages: [pre-push]
 
       - id: cargo-clippy
-        name: cargo clippy -D warnings
-        entry: scripts/hook-run.sh cargo clippy -- -D warnings
+        name: cargo clippy --all-targets -D warnings
+        entry: scripts/hook-run.sh cargo clippy --all-targets -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
