@@ -16,7 +16,7 @@
 | [0006](./0006-cli-option-design.md) | CLI オプション設計の判断基準 | Accepted | 2026-04-28 |
 | [0007](./0007-pipeline-stages.md) | tsm の処理を Index / Search の 2 パイプラインに分解 | Accepted | 2026-05-07 / 2026-06-23 |
 | [0008](./0008-setup-init-separation.md) | tsm setup と tsm init の責務分離 | Accepted（一部 → 0009） | 2026-05-08 |
-| [0009](./0009-workspace-and-content-model.md) | プロジェクトとコンテンツ参照モデル | Proposed | 2026-05-19 |
+| [0009](./0009-workspace-and-content-model.md) | プロジェクトとコンテンツ参照モデル | Accepted（§4 → 0017） | 2026-05-19 / 2026-06-25 |
 | [0010](./0010-per-project-daemon.md) | tsmd の per-project identity と socket 競合解決 | Accepted | 2026-05-19 / 2026-06-22 |
 | [0011](./0011-uninitialized-db-failfast-and-readonly-doctor.md) | 未初期化 DB での fail-fast と doctor の read-only 化 | Accepted | 2026-06-22 |
 | [0012](./0012-output-channel-model.md) | 出力チャネルモデル（ユーザー出力 / ログ / エラーの分離） | Accepted | 2026-06-22 |
@@ -24,6 +24,7 @@
 | [0014](./0014-search-vocabulary-model.md) | 検索語彙リソースの管理モデル（判定 / synonym 軸分離 / 読み） | Accepted | 2026-06-23 |
 | [0015](./0015-read-write-connection-split.md) | DB 接続の読み書き分離（reader pool）と書き込み公平化（yield to pending writes） | Accepted | 2026-06-23 |
 | [0016](./0016-cognitive-complexity-gate.md) | 認知的複雑度ゲート（clippy グローバル閾値 + 属性免除） | Accepted | 2026-06-24 |
+| [0017](./0017-absolute-source-file-and-path-filter.md) | source_file の絶対パス保存と --path フィルタの意味論 | Accepted | 2026-06-25 |
 
 新規 ADR 追加時は上記表にも 1 行追加すること。
 
