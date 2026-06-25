@@ -27,6 +27,8 @@ Complete reference for all `tsm` CLI subcommands.
 - [Dictionary Management](#dictionary-management)
   - [tsm dict update](#tsm-dict-update)
   - [tsm dict reject](#tsm-dict-reject)
+  - [tsm dict export](#tsm-dict-export)
+  - [tsm dict import](#tsm-dict-import)
   - [tsm dict add](#tsm-dict-add)
   - [tsm dict rm](#tsm-dict-rm)
 - [Synonym Management](#synonym-management)
@@ -603,26 +605,22 @@ tsm import-wordnet ~/downloads/wnjpn.db
 
 ### tsm dict update
 
-Show or apply user dictionary candidates.
+Show frequent, un-judged dictionary candidate words (read-only, ADR-0014).
 
 ```text
-tsm dict update [--threshold N] [--apply]
+tsm dict update [--threshold N]
 ```
 
-Without `--apply`: dry run — shows candidate words that appear frequently
-enough to be added to the user dictionary.
-
-With `--apply`: writes the dictionary file and triggers FTS re-index. If the
-daemon is running, the FTS re-index is sent via IPC (no need to stop). If the
-daemon is stopped, FTS is rebuilt directly. No git operations are performed —
-if you want the dictionary under version control, commit the file yourself.
+Lists words seen often enough to be worth a verdict but not yet judged. This is
+a **discovery view only** — it does not modify the dictionary. Accept or reject
+each candidate per word with `tsm dict add` / [tsm dict reject](#tsm-dict-reject);
+load many at once with [tsm dict import](#tsm-dict-import).
 
 **Flags:**
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--threshold` | integer | `5` | Minimum frequency for a word to be a candidate |
-| `--apply` | | | Write CSV and trigger FTS re-index |
 
 **Examples:**
 
@@ -632,48 +630,85 @@ tsm dict update
 
 # Show candidates with higher threshold
 tsm dict update --threshold 10
-
-# Apply changes (works with or without daemon)
-tsm dict update --apply
 ```
 
 ---
 
 ### tsm dict reject
 
-Manage the dictionary reject list.
+Reject a word so it is never added to the user dictionary (ADR-0014).
 
 ```text
-tsm dict reject [--apply] [--all]
+tsm dict reject <word>
 ```
 
-The reject list (`reject_words.txt`) prevents specific words from being added
-to the user dictionary.
+Moves `<word>` to the `rejected` verdict in the database (the authority). A word
+has exactly one verdict — `accepted`, `rejected`, or `pending` — so rejecting a
+word automatically clears any prior accepted state. Rejecting a word that was
+never seen inserts a preemptive `rejected` row.
 
-Without flags: shows words currently in `reject_words.txt` that are pending
-sync.
-
-`--apply`: syncs `reject_words.txt` to the database.
-
-`--all`: shows all rejected words stored in the database.
-
-`--apply` and `--all` are mutually exclusive.
-
-**Flags:**
-
-| Flag | Description |
-|---|---|
-| `--apply` | Sync `reject_words.txt` to the database |
-| `--all` | Show all rejected words in the database |
+When the word was previously `accepted`, the accepted set shrinks, so
+`user_dict.simpledic` is regenerated from the database and the tokenizer is
+reloaded (FTS re-index via the daemon if running, else a direct rebuild).
 
 **Examples:**
 
 ```bash
-# Sync reject list to DB
-tsm dict reject --apply
+# Reject a mis-tokenized fragment
+tsm dict reject クラ
+```
 
-# Show all rejected words
-tsm dict reject --all
+---
+
+### tsm dict export
+
+Write the database's verdicts to disk (ADR-0014 §2).
+
+```text
+tsm dict export
+```
+
+The database is the authority for dictionary verdicts; `export` materializes a
+portable, git-trackable snapshot. It writes the accepted set to
+`user_dict.simpledic` and the rejected set to `reject_words.txt`, overwriting
+both files. No FTS re-index is triggered — the running tokenizer already
+reflects the database. A status line goes to stdout; per-file counts go to
+stderr so the stdout stream stays clean.
+
+**Examples:**
+
+```bash
+# Snapshot the current verdicts to the git-tracked files
+tsm dict export
+```
+
+---
+
+### tsm dict import
+
+Load verdicts from disk into the database (ADR-0014 §2).
+
+```text
+tsm dict import
+```
+
+Reads `user_dict.simpledic` (accepted words, with readings) and
+`reject_words.txt` (rejected words) and applies each verdict to the database.
+This recovers verdicts after a `rebuild` (which empties the database) and pulls
+in hand-edits or another machine's files.
+
+Import is **insert-only**: words present in the files are upserted; verdicts for
+words *absent* from the files are left untouched. Removal is explicit — use
+[tsm dict reject](#tsm-dict-reject) or `tsm dict rm`. When accepted words are
+imported, the tokenizer is reloaded (FTS re-index via the daemon if running,
+else a direct rebuild). Counts go to stderr; a status line goes to stdout.
+
+**Examples:**
+
+```bash
+# Restore verdicts after a rebuild
+tsm rebuild --apply
+tsm dict import
 ```
 
 ---
