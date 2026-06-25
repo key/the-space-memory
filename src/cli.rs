@@ -1,6 +1,8 @@
 use std::io::{BufRead, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
+
 use crate::config;
 use crate::db;
 use crate::embedder;
@@ -1681,7 +1683,8 @@ fn spawn_background_backfill() {
     }
 }
 
-/// Print what `tsm rebuild --apply` would do, without mutating anything.
+/// Print what `tsm rebuild --apply` would do, without deleting or rebuilding
+/// the DB. (Opening the DB may still apply idempotent schema migrations.)
 fn rebuild_dry_run(db_path: &Path) -> anyhow::Result<()> {
     if db_path.exists() {
         if let Ok(meta) = std::fs::metadata(db_path) {
@@ -1703,8 +1706,8 @@ fn rebuild_dry_run(db_path: &Path) -> anyhow::Result<()> {
     }
     eprintln!("\nThis will delete the DB and rebuild from scratch.");
     eprintln!(
-        "Note: ingested session documents (session:*) are carried forward (re-indexed from \
-         their existing chunks), not lost."
+        "Note: ingested session documents (session:*) and their chunks are carried \
+         forward (re-indexed from the existing chunks in the DB)."
     );
     eprintln!("Note: dictionary verdicts (dictionary_candidates) will be lost.");
     eprintln!(
@@ -1746,12 +1749,13 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
         println!("Embedder: running");
     }
 
-    // Carry forward ingested session documents (session:<stem>). They enter the
-    // index only via `index_session` and are never re-discovered by the file
-    // walker (extension allowlist is `["md"]`), so a destructive rebuild would
-    // drop them permanently. Capture from the old DB before deletion; their
-    // chunk content is authoritative in the DB, so the original JSONL (which may
-    // have been rotated out of `~/.claude/projects`) is not needed.
+    // Carry forward ingested session documents (session:<stem>). They are a
+    // non-filesystem document kind ingested only via `index_session`; the file
+    // walker only yields real paths under project_root and so never reproduces a
+    // `session:` document, so a destructive rebuild would drop them permanently.
+    // Capture from the old DB before deletion; their chunk content is
+    // authoritative in the DB, so the original JSONL (which may have been rotated
+    // out of `~/.claude/projects`) is not needed.
     let carried_sessions = capture_sessions_for_rebuild(&db_path)?;
 
     // Backup
@@ -1763,12 +1767,24 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
         println!("Deleted: {}", db_path.display());
     }
 
+    // From here the old DB is gone. If any step fails, point the user at the
+    // backup so a half-built DB is not mistaken for a clean failure.
+    let recover_hint = || {
+        let backup = db_path.with_extension("db.bak");
+        format!(
+            "rebuild failed after the old DB was deleted; restore the backup with \
+             `cp {} {}`",
+            backup.display(),
+            db_path.display()
+        )
+    };
+
     // Init
-    db::init_db(&db_path)?;
+    db::init_db(&db_path).with_context(recover_hint)?;
     println!("DB initialized");
 
     // Full index (synchronous, with progress)
-    let conn = db::get_connection(&db_path)?;
+    let conn = db::get_connection(&db_path).with_context(recover_hint)?;
     let walker = indexer::ContentWalker::from_env_with_project_root(&project_root);
     let file_paths = walker.collect_files();
     let total = file_paths.len();
@@ -1784,7 +1800,8 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
         &project_root,
         &walker,
         Some(&progress),
-    )?;
+    )
+    .with_context(recover_hint)?;
     println!(
         "Done: Indexed: {}, Skipped: {}, Removed: {}",
         stats.indexed, stats.skipped, stats.removed
@@ -1793,20 +1810,20 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
     // Re-persist carried-forward sessions into the fresh DB before the vector
     // counts and backfill below, so session chunks are included in the backfill.
     if !carried_sessions.is_empty() {
-        let restored = indexer::restore_sessions(&conn, &carried_sessions)?;
+        let restored =
+            indexer::restore_sessions(&conn, &carried_sessions).with_context(recover_hint)?;
         println!("Restored {restored} session document(s)");
     }
 
-    report_vectors_and_backfill(conn, &socket);
+    report_vectors_and_backfill(conn, &socket)?;
     Ok(())
 }
 
 /// Report vector coverage after a rebuild and start async backfill when chunks
 /// still lack vectors. Consumes `conn`, dropping it before any backfill spawns.
-fn report_vectors_and_backfill(conn: rusqlite::Connection, socket: &Path) {
-    let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0);
-    let chunks = count("SELECT COUNT(*) FROM chunks");
-    let vecs = count("SELECT COUNT(*) FROM chunks_vec");
+fn report_vectors_and_backfill(conn: rusqlite::Connection, socket: &Path) -> anyhow::Result<()> {
+    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+    let vecs: i64 = conn.query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))?;
     drop(conn);
 
     if vecs >= chunks {
@@ -1823,6 +1840,7 @@ fn report_vectors_and_backfill(conn: rusqlite::Connection, socket: &Path) {
     } else if chunks > 0 {
         log::warn!("Vectors: {vecs} / {chunks} — embedder not running, skipping backfill");
     }
+    Ok(())
 }
 
 pub fn cmd_rebuild_fts() -> anyhow::Result<()> {

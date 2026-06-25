@@ -319,9 +319,11 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
 }
 
 /// A session document plus its chunks, captured from the DB so a destructive
-/// rebuild can carry it forward. Sessions are keyed `session:<stem>` and are
-/// never re-discovered by the file walker (the extension allowlist is `["md"]`),
-/// so without this they would be lost on `tsm rebuild --apply`.
+/// rebuild can carry it forward. Sessions are keyed `session:<stem>` — a
+/// non-filesystem document kind ingested only via `index_session`. The file
+/// walker only ever yields real paths under `project_root`, so it can never
+/// reproduce a `session:` document regardless of the extension allowlist;
+/// without this carry-forward they would be lost on `tsm rebuild --apply`.
 pub(crate) struct CapturedSession {
     file_path: String,
     title: Option<String>,
@@ -396,13 +398,19 @@ fn read_session_chunks(conn: &Connection, doc_id: i64) -> anyhow::Result<Vec<Chu
 /// FTS) without touching the JSONL. Vectors are intentionally left to the
 /// post-rebuild backfill, which embeds every chunk lacking a vector. Returns the
 /// number of session documents restored.
+///
+/// All sessions are restored in a single transaction: a failure on any session
+/// rolls back the whole batch rather than leaving the DB partially populated.
+/// This matters because the rebuild has already deleted the old DB by this
+/// point — an all-or-nothing restore keeps the failure recoverable from the
+/// backup instead of silently dropping a subset of sessions.
 pub(crate) fn restore_sessions(
     conn: &Connection,
     sessions: &[CapturedSession],
 ) -> anyhow::Result<usize> {
     let now = chrono::Utc::now().to_rfc3339();
+    let tx = conn.unchecked_transaction()?;
     for session in sessions {
-        let tx = conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
              VALUES (?, 'session', ?, ?, ?, ?, ?, ?, ?)",
@@ -419,8 +427,8 @@ pub(crate) fn restore_sessions(
         )?;
         let doc_id = tx.last_insert_rowid();
         persist::diff_chunks(&tx, doc_id, &session.chunks)?;
-        tx.commit()?;
     }
+    tx.commit()?;
     Ok(sessions.len())
 }
 
@@ -626,30 +634,62 @@ mod tests {
     }
 
     /// Regression test for the rebuild data-loss bug: session documents are a
-    /// non-filesystem kind (`session:<stem>`) ingested only via `index_session`
-    /// and never re-walked by `cmd_rebuild` (extension allowlist is `["md"]`),
-    /// so a destructive rebuild used to drop them permanently. Carry-forward
-    /// captures them from the old DB before deletion and re-persists them into
-    /// the fresh DB without needing the original JSONL (which may be rotated).
+    /// non-filesystem kind (`session:<stem>`) ingested only via `index_session`.
+    /// `cmd_rebuild` re-indexes via the file walker, which only yields real
+    /// filesystem paths and so never reproduces a `session:` document, so a
+    /// destructive rebuild used to drop them permanently. Carry-forward captures
+    /// them from the old DB before deletion and re-persists them into the fresh
+    /// DB without needing the original JSONL (which may be rotated).
+    /// Read a session document's scalar fields, used to assert that carry-forward
+    /// preserves every column by value (catching a positional `row.get` swap).
+    fn session_doc_fields(
+        conn: &Connection,
+        file_path: &str,
+    ) -> (String, String, String, String, String) {
+        conn.query_row(
+            "SELECT title, status, created, updated, file_hash FROM documents WHERE file_path = ?",
+            [file_path],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap()
+    }
+
+    /// Read a session's chunk contents ordered by chunk_index.
+    fn session_chunk_contents(conn: &Connection, file_path: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.content FROM chunks c JOIN documents d ON c.document_id = d.id \
+                 WHERE d.file_path = ? ORDER BY c.chunk_index",
+            )
+            .unwrap();
+        stmt.query_map([file_path], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
     #[test]
     fn test_sessions_survive_rebuild_via_carry_forward() {
-        // Arrange: old DB with one ingested session.
+        // Arrange: old DB with one session whose two Q&A pairs carry distinct
+        // timestamps, so created != updated and there are two ordered chunks —
+        // this lets the assertions catch a field transposition or chunk
+        // mis-alignment that a single-chunk, no-timestamp fixture would hide.
         let (old_conn, dir) = setup();
-        let jsonl = r#"{"message":{"role":"user","content":"テスト質問のテキストです。"}}
-{"message":{"role":"assistant","content":"テスト回答のテキストです。"}}"#;
+        let jsonl = r#"{"timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"最初の質問のテキスト。"}}
+{"timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"最初の回答のテキスト。"}}
+{"timestamp":"2026-02-02T00:00:00Z","message":{"role":"user","content":"次の質問のテキスト。"}}
+{"timestamp":"2026-02-02T00:00:01Z","message":{"role":"assistant","content":"次の回答のテキスト。"}}"#;
         let path = dir.path().join("abc123.jsonl");
         std::fs::write(&path, jsonl).unwrap();
         assert!(index_session(&old_conn, &path).unwrap());
 
-        let old_chunks: i64 = old_conn
-            .query_row(
-                "SELECT COUNT(*) FROM chunks c JOIN documents d ON c.document_id = d.id \
-                 WHERE d.file_path = 'session:abc123'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(old_chunks >= 1, "session should have chunks before rebuild");
+        let old_fields = session_doc_fields(&old_conn, "session:abc123");
+        let old_contents = session_chunk_contents(&old_conn, "session:abc123");
+        assert_eq!(old_contents.len(), 2, "two Q&A pairs yield two chunks");
+        assert_ne!(
+            old_fields.2, old_fields.3,
+            "fixture must have created != updated to detect a field swap"
+        );
 
         let captured = capture_sessions(&old_conn).unwrap();
         assert_eq!(captured.len(), 1, "one session should be captured");
@@ -672,34 +712,70 @@ mod tests {
         let restored = restore_sessions(&new_conn, &captured).unwrap();
         assert_eq!(restored, 1);
 
-        // Assert: document, chunks, and FTS rows all re-created in the new DB.
-        let (doc_count, source_type): (i64, String) = new_conn
+        // Assert: the document survives with every field preserved by value...
+        let source_type: String = new_conn
             .query_row(
-                "SELECT COUNT(*), MAX(source_type) FROM documents WHERE file_path = 'session:abc123'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(doc_count, 1, "session document survives rebuild");
-        assert_eq!(source_type, "session");
-
-        let new_chunks: i64 = new_conn
-            .query_row(
-                "SELECT COUNT(*) FROM chunks c JOIN documents d ON c.document_id = d.id \
-                 WHERE d.file_path = 'session:abc123'",
+                "SELECT source_type FROM documents WHERE file_path = 'session:abc123'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(new_chunks, old_chunks, "all session chunks carried forward");
+        assert_eq!(source_type, "session");
+        assert_eq!(
+            session_doc_fields(&new_conn, "session:abc123"),
+            old_fields,
+            "title/status/created/updated/file_hash all preserved (no column swap)"
+        );
 
+        // ...its chunks survive in order with content aligned to their index...
+        assert_eq!(
+            session_chunk_contents(&new_conn, "session:abc123"),
+            old_contents,
+            "chunk contents carried forward in chunk_index order"
+        );
+
+        // ...and the FTS index is repopulated for those chunks.
         let fts_count: i64 = new_conn
             .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(
-            fts_count, new_chunks,
-            "FTS rows re-created for session chunks"
-        );
+        assert_eq!(fts_count, 2, "FTS rows re-created for both session chunks");
+    }
+
+    #[test]
+    fn test_restore_sessions_multiple_keeps_chunks_per_document() {
+        // Two distinct sessions must both restore, each owning only its chunks.
+        let (old_conn, dir) = setup();
+        for (stem, q) in [
+            ("alpha", "アルファセッションの質問テキストです。"),
+            ("beta", "ベータセッションの質問テキストです。"),
+        ] {
+            let jsonl = format!(
+                r#"{{"message":{{"role":"user","content":"{q}"}}}}
+{{"message":{{"role":"assistant","content":"対応する回答のテキストです。"}}}}"#
+            );
+            let path = dir.path().join(format!("{stem}.jsonl"));
+            std::fs::write(&path, &jsonl).unwrap();
+            index_session(&old_conn, &path).unwrap();
+        }
+
+        let captured = capture_sessions(&old_conn).unwrap();
+        assert_eq!(captured.len(), 2, "both sessions captured");
+
+        let new_conn = db::get_memory_connection().unwrap();
+        assert_eq!(restore_sessions(&new_conn, &captured).unwrap(), 2);
+
+        // Each restored session owns exactly its own chunk (no cross-attribution).
+        for stem in ["alpha", "beta"] {
+            let n: i64 = new_conn
+                .query_row(
+                    "SELECT COUNT(*) FROM chunks c JOIN documents d ON c.document_id = d.id \
+                     WHERE d.file_path = ?",
+                    [format!("session:{stem}")],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "session:{stem} keeps exactly its own chunk");
+        }
     }
 
     #[test]
