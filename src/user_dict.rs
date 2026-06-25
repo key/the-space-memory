@@ -427,8 +427,24 @@ pub fn set_verdict(
     reading: Option<&str>,
 ) -> Result<Transition, SetVerdictError> {
     let tx = conn.unchecked_transaction()?;
+    let t = set_verdict_in(&tx, surface, to, reading)?;
+    tx.commit()?;
+    Ok(t)
+}
 
-    let current: Option<String> = tx
+/// Transaction-agnostic core of [`set_verdict`]: performs the SELECT + upsert on
+/// the given connection/transaction **without** opening or committing its own
+/// transaction. Callers that mutate several terms atomically (the reconcile +
+/// verdict change in `dict add`/`reject`/`rm`, the bulk import loop) drive it
+/// inside one outer transaction so a mid-sequence failure rolls everything back.
+/// Semantics are identical to [`set_verdict`].
+pub(crate) fn set_verdict_in(
+    conn: &Connection,
+    surface: &str,
+    to: Verdict,
+    reading: Option<&str>,
+) -> Result<Transition, SetVerdictError> {
+    let current: Option<String> = conn
         .query_row(
             "SELECT status FROM dictionary_candidates WHERE surface = ?1",
             [surface],
@@ -458,7 +474,7 @@ pub fn set_verdict(
     // brand-new insert is tagged manual. `COALESCE` keeps an existing reading
     // when `reading` is None, and overwrites it when a value is supplied.
     let now = chrono::Utc::now().to_rfc3339();
-    tx.execute(
+    conn.execute(
         "INSERT INTO dictionary_candidates
             (surface, frequency, pos, source, first_seen, last_seen, status, reading)
          VALUES (?1, 0, ?2, 'manual', ?3, ?3, ?4, ?5)
@@ -473,8 +489,6 @@ pub fn set_verdict(
             reading
         ],
     )?;
-
-    tx.commit()?;
 
     let affected_dict = (from == Some(Verdict::Accepted)) ^ (to == Verdict::Accepted);
     Ok(Transition {
@@ -544,7 +558,7 @@ pub fn validate_surface(surface: &str) -> anyhow::Result<()> {
 /// one `surface,POS,reading` row, the reading falling back to the surface when
 /// none is stored (simpledic requires the field). Returns the number of rows
 /// written; an empty accepted set truncates the file.
-pub fn regenerate_user_dict(conn: &Connection, csv_path: &Path) -> anyhow::Result<usize> {
+pub fn regenerate_user_dict(conn: &Connection, csv_path: &Path) -> anyhow::Result<RegenOutcome> {
     // Propagate per-row errors rather than silently dropping a term.
     let rows: Vec<(String, Option<String>)> = conn
         .prepare(
@@ -554,28 +568,47 @@ pub fn regenerate_user_dict(conn: &Connection, csv_path: &Path) -> anyhow::Resul
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    let mut content = String::new();
+    for (surface, reading) in &rows {
+        let reading = reading.as_deref().unwrap_or(surface);
+        content.push_str(&format_simpledic_row_with_reading(surface, reading));
+        content.push('\n');
+    }
+
+    // Compare against the current file so callers can skip an FTS reindex when
+    // nothing changed — and so a retry after a failed reindex still detects the
+    // on-disk/DB divergence and re-materializes (no dirty-marker needed).
+    let changed = match std::fs::read_to_string(csv_path) {
+        Ok(existing) => existing != content,
+        Err(_) => true, // missing/unreadable file → treat as changed
+    };
+
     if let Some(parent) = csv_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-
     // Write to a sibling temp file then atomically rename, so a crash or write
     // failure mid-rewrite never leaves lindera reading a truncated/partial dict.
     let tmp_path = csv_path.with_extension("simpledic.tmp");
     {
         use std::io::Write;
         let mut tmp = std::fs::File::create(&tmp_path)?;
-        for (surface, reading) in &rows {
-            let reading = reading.as_deref().unwrap_or(surface);
-            writeln!(
-                tmp,
-                "{}",
-                format_simpledic_row_with_reading(surface, reading)
-            )?;
-        }
+        tmp.write_all(content.as_bytes())?;
         tmp.sync_all()?;
     }
     std::fs::rename(&tmp_path, csv_path)?;
-    Ok(rows.len())
+    Ok(RegenOutcome {
+        written: rows.len(),
+        changed,
+    })
+}
+
+/// Result of [`regenerate_user_dict`]: how many accepted terms were written, and
+/// whether the file content actually changed (so the caller reindexes FTS only
+/// when needed, and a post-failure retry still re-materializes on divergence).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RegenOutcome {
+    pub written: usize,
+    pub changed: bool,
 }
 
 /// Export the DB's rejected set to `reject_words.txt`, overwriting the file.
@@ -609,6 +642,72 @@ pub fn export_reject_words_to_file(conn: &Connection, path: &Path) -> anyhow::Re
     Ok(surfaces.len())
 }
 
+/// Parse one `user_dict.simpledic` line into `(surface, reading)`.
+///
+/// Blank lines and `#` comments return `Ok(None)` (tolerated). A non-blank,
+/// non-comment line whose first column (the surface) is empty returns `Err`:
+/// silently skipping it would let the next full rewrite delete a real term, so
+/// we **fail closed** instead. `reading == surface` normalizes to `None`
+/// (`regenerate_user_dict` re-emits the surface for a NULL reading, so they
+/// round-trip identically; ADR-0014 §4).
+fn parse_simpledic_line(line: &str) -> anyhow::Result<Option<(String, Option<String>)>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return Ok(None);
+    }
+    let mut cols = trimmed.split(',');
+    let surface = cols.next().map(str::trim).unwrap_or("");
+    if surface.is_empty() {
+        anyhow::bail!("missing surface (first column is empty)");
+    }
+    let reading = cols
+        .next() // pos column (ignored)
+        .and(cols.next())
+        .map(str::trim)
+        .filter(|r| !r.is_empty() && *r != surface)
+        .map(str::to_string);
+    Ok(Some((surface.to_string(), reading)))
+}
+
+/// Read `user_dict.simpledic` into `(surface, reading)` rows, failing closed on
+/// any malformed line (reported with its 1-based line number and path) so a
+/// hand-edit typo never gets silently dropped by a later rewrite. Missing file
+/// → empty vec.
+fn read_simpledic_surfaces(path: &Path) -> anyhow::Result<Vec<(String, Option<String>)>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(path)?;
+    let mut out = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        match parse_simpledic_line(line) {
+            Ok(Some(row)) => out.push(row),
+            Ok(None) => {}
+            Err(e) => anyhow::bail!("{}:{}: {e}", path.display(), i + 1),
+        }
+    }
+    Ok(out)
+}
+
+/// Read `reject_words.txt` surfaces (one per line; `#` comments and blanks
+/// tolerated), case preserved. A non-blank, non-comment line is taken verbatim
+/// as a surface. Missing file → empty vec.
+fn read_reject_surfaces(path: &Path) -> anyhow::Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(path)?;
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let surface = line.trim();
+        if surface.is_empty() || surface.starts_with('#') {
+            continue;
+        }
+        out.push(surface.to_string());
+    }
+    Ok(out)
+}
+
 /// Outcome of importing one verdict file: how many rows were applied, and how
 /// many of those changed the accepted set. The caller regenerates the dictionary
 /// and reindexes once when `dict_affected > 0` (a rejected import can demote a
@@ -628,16 +727,9 @@ pub fn import_reject_words_from_file(
     conn: &Connection,
     path: &Path,
 ) -> anyhow::Result<ImportOutcome> {
-    if !path.exists() {
-        return Ok(ImportOutcome::default());
-    }
     let mut outcome = ImportOutcome::default();
-    for line in std::fs::read_to_string(path)?.lines() {
-        let surface = line.trim();
-        if surface.is_empty() || surface.starts_with('#') {
-            continue;
-        }
-        let t = set_verdict(conn, surface, Verdict::Rejected, None)?;
+    for surface in read_reject_surfaces(path)? {
+        let t = set_verdict_in(conn, &surface, Verdict::Rejected, None)?;
         outcome.imported += 1;
         if t.affected_dict {
             outcome.dict_affected += 1;
@@ -652,37 +744,133 @@ pub fn import_reject_words_from_file(
 /// reading column is stored when present and non-empty. Lines starting with `#`
 /// and blank lines are skipped. A missing file is a no-op.
 pub fn import_user_dict_from_file(conn: &Connection, path: &Path) -> anyhow::Result<ImportOutcome> {
-    if !path.exists() {
-        return Ok(ImportOutcome::default());
-    }
     let mut outcome = ImportOutcome::default();
-    for line in std::fs::read_to_string(path)?.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut cols = line.split(',');
-        let Some(surface) = cols.next().map(str::trim).filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        let _pos = cols.next();
-        // A reading equal to the surface carries no information: `regenerate_user_dict`
-        // writes `surface` into the reading column whenever the stored reading is
-        // NULL (simpledic requires the field), so `reading == surface` round-trips
-        // back to "no distinct reading". Treating it as None keeps the round-trip
-        // idempotent and avoids persisting a surface-as-reading (data debt for
-        // kanji terms — see ADR-0014 §4).
-        let reading = cols
-            .next()
-            .map(str::trim)
-            .filter(|r| !r.is_empty() && *r != surface);
-        let t = set_verdict(conn, surface, Verdict::Accepted, reading)?;
+    for (surface, reading) in read_simpledic_surfaces(path)? {
+        let t = set_verdict_in(conn, &surface, Verdict::Accepted, reading.as_deref())?;
         outcome.imported += 1;
         if t.affected_dict {
             outcome.dict_affected += 1;
         }
     }
     Ok(outcome)
+}
+
+/// Current DB verdict for `surface`, or `None` if it has no candidate row.
+fn db_status(conn: &Connection, surface: &str) -> anyhow::Result<Option<Verdict>> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT status FROM dictionary_candidates WHERE surface = ?1",
+            [surface],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match raw {
+        None => Ok(None),
+        Some(s) => Verdict::from_status(&s)
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("invalid status '{s}' for '{surface}' in DB")),
+    }
+}
+
+/// How many on-disk terms the reconcile pulled into the DB.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileOutcome {
+    pub accepted_healed: usize,
+    pub rejected_healed: usize,
+}
+
+impl ReconcileOutcome {
+    pub fn is_empty(&self) -> bool {
+        self.accepted_healed == 0 && self.rejected_healed == 0
+    }
+}
+
+/// Reconcile the on-disk verdict files INTO the DB before a verdict mutation, so
+/// the subsequent `regenerate_user_dict` rewrite preserves terms present in
+/// `user_dict.simpledic` / `reject_words.txt` but absent from (or only `pending`
+/// in) the DB — the data-loss path of #281 (empty DB after `rebuild`) and #288
+/// (hand-edited file). The DB becomes a faithful image of disk before any
+/// rewrite, making the DB-as-authority model self-healing.
+///
+/// Insert-or-promote, never override an opposing verdict:
+/// - simpledic surface: absent → insert `accepted`; `pending` → promote to
+///   `accepted` (presence in the dict file is an accept); `accepted` → no-op.
+/// - reject surface: absent → insert `rejected`; `pending` → promote to
+///   `rejected`; `rejected` → no-op.
+///
+/// **Fails closed with no writes** on any contradiction — a surface in both
+/// files, a simpledic surface already `rejected` in the DB, or a reject surface
+/// already `accepted` in the DB — so an ambiguous state never silently demotes a
+/// term. All parsing + conflict detection happens before the first write, and
+/// the caller drives this inside one transaction, so an abort leaves the DB
+/// completely unchanged. A malformed simpledic line also fails closed (see
+/// [`read_simpledic_surfaces`]).
+pub fn reconcile_files_into_db(
+    conn: &Connection,
+    simpledic_path: &Path,
+    reject_path: &Path,
+) -> anyhow::Result<ReconcileOutcome> {
+    let accepted = read_simpledic_surfaces(simpledic_path)?;
+    let rejected = read_reject_surfaces(reject_path)?;
+
+    // Detect every conflict before the first write so an abort is a clean no-op.
+    detect_file_conflicts(conn, &accepted, &rejected)?;
+
+    // Apply: insert/promote only (overrides already ruled out by the check above).
+    let mut outcome = ReconcileOutcome::default();
+    for (surface, reading) in &accepted {
+        if db_status(conn, surface)? != Some(Verdict::Accepted) {
+            set_verdict_in(conn, surface, Verdict::Accepted, reading.as_deref())?;
+            outcome.accepted_healed += 1;
+        }
+    }
+    for surface in &rejected {
+        if db_status(conn, surface)? != Some(Verdict::Rejected) {
+            set_verdict_in(conn, surface, Verdict::Rejected, None)?;
+            outcome.rejected_healed += 1;
+        }
+    }
+    Ok(outcome)
+}
+
+/// Read-only check for [`reconcile_files_into_db`]: errors (listing every
+/// offending term) if a surface is in both files, accepted on disk but rejected
+/// in the DB, or rejected on disk but accepted in the DB. Runs before any write
+/// so the caller's transaction stays a no-op on abort.
+fn detect_file_conflicts(
+    conn: &Connection,
+    accepted: &[(String, Option<String>)],
+    rejected: &[String],
+) -> anyhow::Result<()> {
+    let reject_set: HashSet<&str> = rejected.iter().map(String::as_str).collect();
+    let mut conflicts: Vec<String> = Vec::new();
+    for (surface, _) in accepted {
+        if reject_set.contains(surface.as_str()) {
+            conflicts.push(format!(
+                "'{surface}' is in both user_dict.simpledic and reject_words.txt"
+            ));
+        } else if db_status(conn, surface)? == Some(Verdict::Rejected) {
+            conflicts.push(format!(
+                "'{surface}' is accepted in user_dict.simpledic but rejected in the database"
+            ));
+        }
+    }
+    for surface in rejected {
+        if db_status(conn, surface)? == Some(Verdict::Accepted) {
+            conflicts.push(format!(
+                "'{surface}' is in reject_words.txt but accepted in the database"
+            ));
+        }
+    }
+    if !conflicts.is_empty() {
+        anyhow::bail!(
+            "dictionary file conflict — no changes were made. Resolve, then retry:\n  - {}\n\
+             Edit user_dict.simpledic / reject_words.txt so each term appears in only one, \
+             or run `tsm dict export` to rewrite both from the database.",
+            conflicts.join("\n  - ")
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -952,7 +1140,7 @@ mod tests {
 
         let count = regenerate_user_dict(&conn, &path).unwrap();
 
-        assert_eq!(count, 2);
+        assert_eq!(count.written, 2);
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("accepted_a,"));
         assert!(body.contains("accepted_b,"));
@@ -985,7 +1173,7 @@ mod tests {
 
         let count = regenerate_user_dict(&conn, &path).unwrap();
 
-        assert_eq!(count, 0);
+        assert_eq!(count.written, 0);
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.is_empty(), "no accepted terms => empty dict file");
     }
@@ -1026,7 +1214,7 @@ mod tests {
 
         let written = regenerate_user_dict(&conn, &path).unwrap();
 
-        assert_eq!(written, 2, "only accepted surfaces are written");
+        assert_eq!(written.written, 2, "only accepted surfaces are written");
         let body = std::fs::read_to_string(&path).unwrap();
         let rows: Vec<&str> = body.lines().collect();
         // Sorted by surface; the stored reading is emitted, falling back to the
@@ -1613,5 +1801,248 @@ mod tests {
         assert_eq!(reading_of(&conn2, "甲").as_deref(), Some("こう"));
         assert_eq!(status_of(&conn2, "乙").as_deref(), Some("accepted"));
         assert_eq!(reading_of(&conn2, "乙"), None);
+    }
+
+    // ─── parse_simpledic_line tests ──────────────────────────────
+
+    #[test]
+    fn test_parse_simpledic_line_blank_and_comment() {
+        assert_eq!(parse_simpledic_line("").unwrap(), None);
+        assert_eq!(parse_simpledic_line("   ").unwrap(), None);
+        assert_eq!(parse_simpledic_line("# a comment").unwrap(), None);
+    }
+
+    #[test]
+    fn test_parse_simpledic_line_surface_only() {
+        assert_eq!(
+            parse_simpledic_line("クラウド").unwrap(),
+            Some(("クラウド".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn test_parse_simpledic_line_with_distinct_reading() {
+        assert_eq!(
+            parse_simpledic_line("ハンドロード,名詞,はんどろーど").unwrap(),
+            Some(("ハンドロード".to_string(), Some("はんどろーど".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_parse_simpledic_line_reading_equal_surface_is_none() {
+        assert_eq!(
+            parse_simpledic_line("クラウド,名詞,クラウド").unwrap(),
+            Some(("クラウド".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn test_parse_simpledic_line_empty_surface_fails_closed() {
+        // A non-comment line with no surface must error, not silently skip:
+        // skipping it would let the next full rewrite delete a real term.
+        assert!(parse_simpledic_line(",名詞,reading").is_err());
+    }
+
+    #[test]
+    fn test_read_simpledic_surfaces_reports_line_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user_dict.simpledic");
+        std::fs::write(&path, "good\n# c\n,bad\n").unwrap();
+        let err = read_simpledic_surfaces(&path).unwrap_err().to_string();
+        assert!(err.contains(":3:"), "error names the offending line: {err}");
+    }
+
+    // ─── reconcile_files_into_db tests ───────────────────────────
+
+    fn write_files(
+        dir: &std::path::Path,
+        simpledic: &str,
+        reject: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let sp = dir.join("user_dict.simpledic");
+        let rp = dir.join("reject_words.txt");
+        std::fs::write(&sp, simpledic).unwrap();
+        std::fs::write(&rp, reject).unwrap();
+        (sp, rp)
+    }
+
+    #[test]
+    fn test_reconcile_inserts_file_only_accepted() {
+        // #281/#288 core: a simpledic term absent from the DB is pulled in as accepted.
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let (sp, rp) = write_files(dir.path(), "マイ用語,名詞,マイヨウゴ\n", "");
+
+        let out = reconcile_files_into_db(&conn, &sp, &rp).unwrap();
+
+        assert_eq!(out.accepted_healed, 1);
+        assert_eq!(status_of(&conn, "マイ用語").as_deref(), Some("accepted"));
+        assert_eq!(reading_of(&conn, "マイ用語").as_deref(), Some("マイヨウゴ"));
+    }
+
+    #[test]
+    fn test_reconcile_promotes_pending_to_accepted() {
+        // codex finding: a harvested `pending` candidate also present in simpledic
+        // must be promoted, else regenerate (accepted-only) still drops it.
+        let conn = setup();
+        seed(&conn, "クラウド", "pending");
+        let dir = tempfile::tempdir().unwrap();
+        let (sp, rp) = write_files(dir.path(), "クラウド\n", "");
+
+        let out = reconcile_files_into_db(&conn, &sp, &rp).unwrap();
+
+        assert_eq!(out.accepted_healed, 1);
+        assert_eq!(status_of(&conn, "クラウド").as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn test_reconcile_already_accepted_is_noop() {
+        let conn = setup();
+        seed(&conn, "既存", "accepted");
+        let dir = tempfile::tempdir().unwrap();
+        let (sp, rp) = write_files(dir.path(), "既存\n", "");
+
+        let out = reconcile_files_into_db(&conn, &sp, &rp).unwrap();
+
+        assert_eq!(out.accepted_healed, 0, "already accepted needs no heal");
+    }
+
+    #[test]
+    fn test_reconcile_inserts_and_promotes_reject_words() {
+        let conn = setup();
+        seed(&conn, "harvested", "pending");
+        let dir = tempfile::tempdir().unwrap();
+        let (sp, rp) = write_files(dir.path(), "", "novel\nharvested\n");
+
+        let out = reconcile_files_into_db(&conn, &sp, &rp).unwrap();
+
+        assert_eq!(out.rejected_healed, 2);
+        assert_eq!(status_of(&conn, "novel").as_deref(), Some("rejected"));
+        assert_eq!(status_of(&conn, "harvested").as_deref(), Some("rejected"));
+    }
+
+    #[test]
+    fn test_reconcile_conflict_both_files_is_noop_error() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let (sp, rp) = write_files(dir.path(), "dup\n", "dup\n");
+
+        let err = reconcile_files_into_db(&conn, &sp, &rp)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("dup") && err.contains("both"), "{err}");
+        // No-op: the conflict was detected before any write.
+        assert_eq!(
+            status_of(&conn, "dup"),
+            None,
+            "abort leaves the DB unchanged"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_conflict_file_vs_db_rejected_is_noop_error() {
+        let conn = setup();
+        seed(&conn, "x", "rejected");
+        let dir = tempfile::tempdir().unwrap();
+        let (sp, rp) = write_files(dir.path(), "x\n", "");
+
+        let err = reconcile_files_into_db(&conn, &sp, &rp)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("'x'"), "{err}");
+        assert_eq!(
+            status_of(&conn, "x").as_deref(),
+            Some("rejected"),
+            "unchanged"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_conflict_reject_vs_db_accepted_is_noop_error() {
+        let conn = setup();
+        seed(&conn, "y", "accepted");
+        let dir = tempfile::tempdir().unwrap();
+        let (sp, rp) = write_files(dir.path(), "", "y\n");
+
+        let err = reconcile_files_into_db(&conn, &sp, &rp)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("'y'"), "{err}");
+        assert_eq!(
+            status_of(&conn, "y").as_deref(),
+            Some("accepted"),
+            "unchanged"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_malformed_simpledic_is_noop_error() {
+        // A malformed line aborts before any write — no partial heal.
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let (sp, rp) = write_files(dir.path(), "good\n,bad\n", "");
+
+        let err = reconcile_files_into_db(&conn, &sp, &rp)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains(":2:"), "names the bad line: {err}");
+        assert_eq!(
+            status_of(&conn, "good"),
+            None,
+            "abort on a later bad line leaves earlier terms unwritten (no-op)"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_missing_files_is_noop() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let out = reconcile_files_into_db(
+            &conn,
+            &dir.path().join("absent.simpledic"),
+            &dir.path().join("absent.txt"),
+        )
+        .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_reconcile_then_regenerate_preserves_file_only_term() {
+        // End-to-end of the fix: a file-only term + a fresh accept both survive the
+        // post-mutation regenerate (the #288 repro at the user_dict layer).
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let (sp, rp) = write_files(dir.path(), "マイ用語,名詞,マイヨウゴ\n", "");
+
+        reconcile_files_into_db(&conn, &sp, &rp).unwrap();
+        set_verdict_in(&conn, "新語", Verdict::Accepted, Some("シンゴ")).unwrap();
+        regenerate_user_dict(&conn, &sp).unwrap();
+
+        let body = std::fs::read_to_string(&sp).unwrap();
+        assert!(
+            body.contains("マイ用語,名詞,マイヨウゴ"),
+            "file-only term survived: {body}"
+        );
+        assert!(body.contains("新語,名詞,シンゴ"), "new term added: {body}");
+    }
+
+    // ─── regenerate_user_dict change detection ───────────────────
+
+    #[test]
+    fn test_regenerate_reports_changed_then_unchanged() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user_dict.simpledic");
+        seed(&conn, "alpha", "accepted");
+
+        let first = regenerate_user_dict(&conn, &path).unwrap();
+        assert!(first.changed, "writing a fresh file counts as changed");
+
+        let second = regenerate_user_dict(&conn, &path).unwrap();
+        assert!(!second.changed, "re-running with no DB change is unchanged");
     }
 }
