@@ -38,18 +38,8 @@ pub(crate) fn retrieve(
 
     let vec = vec_results_from_embedding(conn, plan.query_vec.as_deref(), limit, path_prefixes)?;
 
-    // Treat an empty vector set as "embedder down" only when FTS *did* find
-    // in-scope candidates: then the embedder should have produced vectors too.
-    // When FTS is also empty the scope/query simply matched nothing (e.g. a
-    // `--path` scope with no in-scope chunks) — that is not an embedder failure
-    // and must not error (ADR-0017).
-    if require_vector && vec.is_empty() && !fts.is_empty() && db::has_vec_table(conn) {
-        anyhow::bail!(
-            "Embedder is not running. Vector search unavailable.\n\
-             Run `tsm restart` to restart, or use `--fallback fts_only` for FTS-only search."
-        );
-    }
-
+    // Entity candidates are computed before the embedder-health check so the
+    // check can tell "scope/query matched nothing" from "embedder down".
     let entity = entity::entity_results_by_ids(
         conn,
         &plan.classification.matched_entity_ids,
@@ -57,6 +47,22 @@ pub(crate) fn retrieve(
         path_prefixes,
     )
     .unwrap_or_default();
+
+    // Treat an empty vector set as "embedder down" only when some non-vector
+    // retriever *did* find in-scope candidates: then the embedder should have
+    // produced vectors too. When FTS and entity are both empty the scope/query
+    // simply matched nothing (e.g. a `--path` scope with no in-scope chunks) —
+    // that is not an embedder failure and must not error (ADR-0017).
+    if require_vector
+        && vec.is_empty()
+        && (!fts.is_empty() || !entity.is_empty())
+        && db::has_vec_table(conn)
+    {
+        anyhow::bail!(
+            "Embedder is not running. Vector search unavailable.\n\
+             Run `tsm restart` to restart, or use `--fallback fts_only` for FTS-only search."
+        );
+    }
 
     Ok(CandidateSets { fts, vec, entity })
 }

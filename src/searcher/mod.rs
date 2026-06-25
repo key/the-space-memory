@@ -429,6 +429,33 @@ mod tests {
     }
 
     #[test]
+    fn entity_only_match_errors_when_embedder_down() {
+        // FTS misses (body lacks the term) but the frontmatter tag matches an
+        // entity. With require_vector=true and no embedder (query_vec None →
+        // empty vec), this must error rather than silently return entity-only
+        // results — otherwise the embedder outage is hidden under fallback=error.
+        use crate::indexer;
+        use std::io::Write;
+
+        let conn = db::get_memory_connection().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let md = "---\nstatus: current\ntags: [rust]\n---\n\n# Topic\n\nUnrelated body content.\n";
+        let full = dir.path().join("notes/x.md");
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::File::create(&full)
+            .unwrap()
+            .write_all(md.as_bytes())
+            .unwrap();
+        indexer::index_file(&conn, &full, dir.path()).unwrap();
+
+        let out = search(&conn, "rust", 5, None, true, None);
+        assert!(
+            out.is_err(),
+            "embedder-down with an entity-only match must surface the outage"
+        );
+    }
+
+    #[test]
     fn test_search_with_multiple_path_filters() {
         use crate::indexer;
         use std::io::Write;
