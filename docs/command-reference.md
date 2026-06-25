@@ -248,7 +248,7 @@ applied as date filters (see [Temporal Query Syntax](#temporal-query-syntax)).
 | `--before` | | date | | Return only documents before this date |
 | `--recent` | | duration | | Return documents from the last N days/weeks/months |
 | `--year` | | integer | | Return documents from a specific year |
-| `--path` | | string | | Filter by path prefix (relative, repeatable — OR logic) |
+| `--path` | | string | | Scope to a directory (absolute or CWD-relative, repeatable — OR logic) |
 | `--fallback` | | `error`\|`fts-only` | `error` | Behavior when embedder is unavailable |
 
 **Date format for `--after` / `--before`:** `YYYY-MM-DD`, `YYYY-MM`, or `YYYY`.
@@ -256,8 +256,15 @@ applied as date filters (see [Temporal Query Syntax](#temporal-query-syntax)).
 **Duration format for `--recent`:** `Nd` (days), `Nw` (weeks), `Nm` (months).
 Example: `30d`, `2w`, `3m`.
 
-**`--path` flag:** Accepts a relative path prefix. Multiple `--path` flags are
-combined with OR logic (any match). Must be a relative path, not absolute.
+**`--path` flag:** Scopes results to a directory. Accepts an **absolute path or
+a path relative to the current working directory** (resolved to an absolute path
+before matching; `.`/`..` are resolved lexically). Matching is at a **directory
+boundary**, so `--path daily` matches `daily/notes/x.md` but not `daily-report/…`;
+a trailing slash is optional (`daily` ≡ `daily/`). Multiple `--path` flags are
+combined with OR logic (any match). A path that resolves outside the indexed
+content, or matches nothing, returns no results (not an error); an empty string
+is rejected. Matching is case-insensitive (ASCII), consistent with SQLite's
+`LIKE`.
 
 **`--fallback` flag:** When `error` (default), search fails if the embedder is
 not running. When `fts-only`, falls back to full-text search only. Note the

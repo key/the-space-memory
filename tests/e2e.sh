@@ -287,6 +287,28 @@ assert_json "options: --include-content adds content field" \
 set +e; CAPTURED_OUTPUT=$(tsm search -q "メロス" -k 1 2>/dev/null); CAPTURED_EXIT=$?; set -e
 assert_contains "options: text format shows source file" "hashire-melos" "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
+# ── Path scoping (--path, ADR-0017) ──────────────────────────────────
+# Stored file_path is absolute; --path accepts CWD-relative or absolute input
+# and matches at a directory boundary. CWD is TSM_PROJECT_DIR.
+
+echo ""
+log "=== Path scoping (--path) ==="
+
+# In-scope: CWD-relative directory includes the note under notes/
+run search_json "メロス" --path notes
+assert_json "path: --path notes includes hashire-melos" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# In-scope: absolute directory also works
+run search_json "メロス" --path "$TSM_PROJECT_DIR/notes"
+assert_json "path: absolute --path includes hashire-melos" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# Boundary: `note` must NOT match the `notes/` directory (no substring leak)
+run search_json "メロス" --path note
+assert_json "path: --path note excludes notes/ (boundary)" \
+    'all(.results[]; (.source_file | contains("hashire-melos")) | not)' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
 # ── Entity search (tag boost) ────────────────────────────────────────
 
 echo ""

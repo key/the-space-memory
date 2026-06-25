@@ -80,6 +80,9 @@ tsm index
 
 # 7. 検索
 tsm search -q "クエリ" -k 5
+
+# ディレクトリで絞り込む（絶対パスまたはカレントディレクトリ相対）
+tsm search -q "クエリ" --path notes/
 ```
 
 `tsm setup` は `HF_HUB_CACHE` を自動設定する。Hugging Face のモデルキャッシュを

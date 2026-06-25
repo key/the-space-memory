@@ -383,48 +383,69 @@ pub fn entity_results_by_ids(
     }
 
     // 2nd hop: chunks related via co-occurring entities (lower priority)
-    let related_ids = find_related_entity_ids(conn, entity_ids, 5);
-    if !related_ids.is_empty() {
-        let ph2 = related_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql2 = format!(
-            "SELECT ce.chunk_id, COUNT(*) as match_count
-             FROM chunk_entities ce
-             WHERE ce.entity_id IN ({ph2})
-               AND ce.chunk_id NOT IN (SELECT chunk_id FROM chunk_entities WHERE entity_id IN ({placeholders})){scope_in}
-             GROUP BY ce.chunk_id
-             ORDER BY match_count DESC
-             LIMIT ?",
-        );
-
-        let mut params2: Vec<Box<dyn rusqlite::types::ToSql>> = related_ids
-            .iter()
-            .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
-            .collect();
-        for id in entity_ids {
-            params2.push(Box::new(*id));
-        }
-        for s in &scope_params {
-            params2.push(Box::new(s.clone()));
-        }
-        params2.push(Box::new(limit as i64));
-        let refs2: Vec<&dyn rusqlite::types::ToSql> = params2.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt2 = conn.prepare(&sql2)?;
-        let rows2 = stmt2.query_map(refs2.as_slice(), |row| row.get::<_, i64>(0))?;
-
-        let base_rank = result.len();
-        for (i, row) in rows2.enumerate() {
-            if let Ok(chunk_id) = row {
-                result.entry(chunk_id).or_insert(base_rank + i);
-            }
-        }
+    let base_rank = result.len();
+    let hop2 = second_hop_chunk_ids(
+        conn,
+        entity_ids,
+        &placeholders,
+        &scope_in,
+        &scope_params,
+        limit,
+    )?;
+    for (i, chunk_id) in hop2.into_iter().enumerate() {
+        result.entry(chunk_id).or_insert(base_rank + i);
     }
 
     Ok(result)
+}
+
+/// 2nd-hop expansion: chunks reachable via entities co-occurring with
+/// `entity_ids`, excluding chunks already matched directly. `scope_in` /
+/// `scope_params` carry the in-scope `--path` restriction (ADR-0017 Gap 4).
+/// Returns chunk ids in rank order (empty when no related entities).
+fn second_hop_chunk_ids(
+    conn: &Connection,
+    entity_ids: &[i64],
+    placeholders: &str,
+    scope_in: &str,
+    scope_params: &[String],
+    limit: usize,
+) -> anyhow::Result<Vec<i64>> {
+    let related_ids = find_related_entity_ids(conn, entity_ids, 5);
+    if related_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ph2 = related_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql2 = format!(
+        "SELECT ce.chunk_id, COUNT(*) as match_count
+         FROM chunk_entities ce
+         WHERE ce.entity_id IN ({ph2})
+           AND ce.chunk_id NOT IN (SELECT chunk_id FROM chunk_entities WHERE entity_id IN ({placeholders})){scope_in}
+         GROUP BY ce.chunk_id
+         ORDER BY match_count DESC
+         LIMIT ?",
+    );
+
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = related_ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
+    for id in entity_ids {
+        params.push(Box::new(*id));
+    }
+    for s in scope_params {
+        params.push(Box::new(s.clone()));
+    }
+    params.push(Box::new(limit as i64));
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let mut stmt = conn.prepare(&sql2)?;
+    let rows = stmt.query_map(refs.as_slice(), |row| row.get::<_, i64>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 /// Find entity IDs that co-occur with the given entities (1 hop via entity_edges).
