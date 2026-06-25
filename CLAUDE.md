@@ -22,8 +22,8 @@ cargo llvm-cov \
   '(embedder|main|cli|tsmd|tsm_watcher|status|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' \
   --fail-under-lines 90
 
-# Lint
-cargo clippy -- -D warnings
+# Lint (--all-targets also lints test/bench code)
+cargo clippy --all-targets -- -D warnings
 
 # Format
 cargo fmt --check
@@ -300,7 +300,7 @@ containing `bin/{tsm,tsmd}` plus `LICENSE`, `README.md`, and `tsm.toml.example`.
 A change is merge-ready when **all** of the following hold:
 
 - [ ] `cargo test` passes (all existing + new tests)
-- [ ] `cargo clippy -- -D warnings` clean
+- [ ] `cargo clippy --all-targets -- -D warnings` clean (lints test/bench code too)
 - [ ] `cargo fmt --check` clean
 - [ ] Coverage ≥ 90% (on covered modules)
 - [ ] New pub functions have unit tests

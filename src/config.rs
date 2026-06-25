@@ -1699,7 +1699,7 @@ embedder_idle_timeout_secs = 1200
         )
         .unwrap();
 
-        let (cfg, root) = load_config_from(&[config_path.clone()]);
+        let (cfg, root) = load_config_from(std::slice::from_ref(&config_path));
         assert_eq!(cfg.state_dir, Some(PathBuf::from("/custom/data")));
         assert_eq!(cfg.embedder_idle_timeout_secs, Some(1200));
         assert!(cfg.daemon_socket_path.is_none());

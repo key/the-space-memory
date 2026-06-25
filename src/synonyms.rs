@@ -910,9 +910,8 @@ mod tests {
         )
         .unwrap();
         let mut word_id = 1i64;
-        let mut synset_id = 1;
-        for (a, b) in pairs {
-            let sid = format!("syn{synset_id:04}");
+        for (idx, (a, b)) in pairs.iter().enumerate() {
+            let sid = format!("syn{:04}", idx + 1);
             wn.execute(
                 "INSERT INTO synset (synset) VALUES (?)",
                 rusqlite::params![sid],
@@ -940,7 +939,6 @@ mod tests {
             )
             .unwrap();
             word_id += 1;
-            synset_id += 1;
         }
         file
     }
