@@ -2164,7 +2164,7 @@ mod tests {
         let conn = db::get_connection(&db_path).unwrap();
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
             rusqlite::params![now, now],
         ).unwrap();
         drop(conn);

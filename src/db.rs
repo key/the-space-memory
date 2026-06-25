@@ -92,7 +92,8 @@ CREATE TABLE IF NOT EXISTS dictionary_candidates (
     first_seen  TEXT NOT NULL,
     last_seen   TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(status IN ('pending', 'rejected', 'accepted'))
+                    CHECK(status IN ('pending', 'rejected', 'accepted')),
+    reading     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_dict_candidates_status_freq
@@ -253,6 +254,27 @@ fn ensure_metadata_column(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Add the `dictionary_candidates.reading` column to pre-existing DBs (no-op if present).
+///
+/// No-op when the `dictionary_candidates` table is absent: a freshly initialized DB
+/// already has the column via `SCHEMA_SQL`, and an uninitialized DB has no table to
+/// migrate. Existing rows keep a NULL reading until set by an explicit `dict add`.
+fn ensure_reading_column(conn: &Connection) -> anyhow::Result<()> {
+    if !table_exists(conn, "dictionary_candidates") {
+        return Ok(());
+    }
+    let exists: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('dictionary_candidates') WHERE name = 'reading'")?
+        .exists([])?;
+    if !exists {
+        conn.execute(
+            "ALTER TABLE dictionary_candidates ADD COLUMN reading TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Get a connection to the database at the given path.
 pub fn get_connection(db_path: &Path) -> anyhow::Result<Connection> {
     ensure_vec_extension();
@@ -260,6 +282,7 @@ pub fn get_connection(db_path: &Path) -> anyhow::Result<Connection> {
     apply_pragmas(&conn)?;
     ensure_chunk_hash_column(&conn)?;
     ensure_metadata_column(&conn)?;
+    ensure_reading_column(&conn)?;
     Ok(conn)
 }
 
@@ -276,6 +299,7 @@ pub fn get_read_connection(db_path: &Path) -> anyhow::Result<Connection> {
     apply_pragmas(&conn)?;
     ensure_chunk_hash_column(&conn)?;
     ensure_metadata_column(&conn)?;
+    ensure_reading_column(&conn)?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
 }
@@ -602,6 +626,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(got.as_deref(), Some("{\"status\":\"current\"}"));
+    }
+
+    #[test]
+    fn test_memory_db_has_reading_column() {
+        let conn = get_memory_connection().unwrap();
+        let has: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('dictionary_candidates') WHERE name='reading'",
+            )
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has, "fresh schema must include the reading column");
+    }
+
+    #[test]
+    fn test_ensure_reading_column_adds_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Pre-migration schema: dictionary_candidates without `reading`.
+        conn.execute_batch(
+            "CREATE TABLE dictionary_candidates (
+                surface TEXT PRIMARY KEY,
+                frequency INTEGER NOT NULL DEFAULT 1,
+                pos TEXT NOT NULL,
+                source TEXT NOT NULL,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending');
+             INSERT INTO dictionary_candidates
+                VALUES ('w', 1, 'ascii', 'doc', 't', 't', 'pending');",
+        )
+        .unwrap();
+
+        ensure_reading_column(&conn).unwrap();
+        // Second call is a no-op (idempotent).
+        ensure_reading_column(&conn).unwrap();
+
+        let has: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('dictionary_candidates') WHERE name='reading'",
+            )
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has);
+
+        // Pre-existing rows carry a NULL reading.
+        let reading: Option<String> = conn
+            .query_row(
+                "SELECT reading FROM dictionary_candidates WHERE surface='w'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(reading.is_none());
+    }
+
+    #[test]
+    fn test_ensure_reading_column_noop_without_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        // No dictionary_candidates table at all → no-op, no error.
+        ensure_reading_column(&conn).unwrap();
     }
 
     #[test]

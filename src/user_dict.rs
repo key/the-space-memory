@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::config;
 use crate::db;
@@ -20,6 +20,8 @@ pub enum CandidatePos {
     ProperNoun,
     Katakana,
     Ascii,
+    /// Term inserted by an explicit `dict add` / `dict reject`, not auto-harvested.
+    Manual,
 }
 
 impl CandidatePos {
@@ -28,7 +30,85 @@ impl CandidatePos {
             Self::ProperNoun => "proper_noun",
             Self::Katakana => "katakana",
             Self::Ascii => "ascii",
+            Self::Manual => "manual",
         }
+    }
+}
+
+/// A term's dictionary verdict. Maps 1:1 to `dictionary_candidates.status`
+/// CHECK values, so the type structurally excludes invalid statuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Pending,
+    Rejected,
+    Accepted,
+}
+
+impl Verdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Rejected => "rejected",
+            Self::Accepted => "accepted",
+        }
+    }
+
+    /// Parse a `dictionary_candidates.status` value. Returns `None` for any
+    /// string outside the CHECK constraint's domain.
+    fn from_status(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "rejected" => Some(Self::Rejected),
+            "accepted" => Some(Self::Accepted),
+            _ => None,
+        }
+    }
+}
+
+/// Outcome of a `set_verdict` transition. `from` is `None` when the term did
+/// not exist and was inserted. `affected_dict` is true iff the accepted set
+/// gained or lost the term, i.e. the caller must regenerate `user_dict.simpledic`
+/// and reload the tokenizer (`restart`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transition {
+    pub surface: String,
+    pub from: Option<Verdict>,
+    pub to: Verdict,
+    pub affected_dict: bool,
+}
+
+/// Error from `set_verdict`.
+#[derive(Debug)]
+pub enum SetVerdictError {
+    /// A transition to `Pending` (i.e. `dict rm`) targeted a surface that has
+    /// no candidate row. `Pending` is the absence of an explicit verdict, so
+    /// there is nothing to reset.
+    NotFound(String),
+    /// Underlying database error.
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for SetVerdictError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(s) => write!(f, "term '{s}' is not a dictionary candidate"),
+            Self::Db(e) => write!(f, "database error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SetVerdictError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Db(e) => Some(e),
+            Self::NotFound(_) => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for SetVerdictError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Db(e)
     }
 }
 
@@ -325,6 +405,86 @@ pub fn candidate_summary(conn: &Connection) -> CandidateSummary {
 
 // ─── Status updates ──────────────────────────────────────────
 
+/// Transition a single term to `to`, enforcing the accepted XOR rejected XOR
+/// pending invariant via the single `status` column.
+///
+/// The term is upserted: a surface with no candidate row is inserted (manual
+/// terms that never surfaced as auto-candidates, e.g. mis-split compounds),
+/// **except** a transition to `Pending` (`dict rm`), which returns
+/// [`SetVerdictError::NotFound`] — `Pending` is the absence of a verdict, so a
+/// nonexistent term has nothing to reset.
+///
+/// `reading` is only meaningful when accepting; it is stored verbatim (the
+/// caller normalizes per ADR-0014). A non-NULL `reading` overwrites; `None`
+/// preserves any existing reading (`COALESCE`).
+///
+/// The SELECT and the write run in one transaction so the returned
+/// [`Transition`] always matches the committed DB state.
+pub fn set_verdict(
+    conn: &Connection,
+    surface: &str,
+    to: Verdict,
+    reading: Option<&str>,
+) -> Result<Transition, SetVerdictError> {
+    let tx = conn.unchecked_transaction()?;
+
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT status FROM dictionary_candidates WHERE surface = ?1",
+            [surface],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    let from = match current.as_deref() {
+        None => None,
+        Some(s) => Some(Verdict::from_status(s).ok_or_else(|| {
+            SetVerdictError::Db(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unexpected status '{s}' for '{surface}'").into(),
+            ))
+        })?),
+    };
+
+    // `Pending` is the absence of an explicit verdict, so a `dict rm` on a term
+    // that was never registered has nothing to reset.
+    if from.is_none() && to == Verdict::Pending {
+        return Err(SetVerdictError::NotFound(surface.to_string()));
+    }
+
+    // One upsert covers both insert (new manual term) and update (existing row).
+    // On an existing row, `pos`/`source`/`frequency` are left untouched: only a
+    // brand-new insert is tagged manual. `COALESCE` keeps an existing reading
+    // when `reading` is None, and overwrites it when a value is supplied.
+    let now = chrono::Utc::now().to_rfc3339();
+    tx.execute(
+        "INSERT INTO dictionary_candidates
+            (surface, frequency, pos, source, first_seen, last_seen, status, reading)
+         VALUES (?1, 0, ?2, 'manual', ?3, ?3, ?4, ?5)
+         ON CONFLICT(surface) DO UPDATE SET
+             status  = excluded.status,
+             reading = COALESCE(excluded.reading, dictionary_candidates.reading)",
+        rusqlite::params![
+            surface,
+            CandidatePos::Manual.as_str(),
+            now,
+            to.as_str(),
+            reading
+        ],
+    )?;
+
+    tx.commit()?;
+
+    let affected_dict = (from == Some(Verdict::Accepted)) ^ (to == Verdict::Accepted);
+    Ok(Transition {
+        surface: surface.to_string(),
+        from,
+        to,
+        affected_dict,
+    })
+}
+
 /// Mark candidates as accepted.
 pub fn mark_accepted(conn: &Connection, surfaces: &[&str]) -> anyhow::Result<()> {
     for surface in surfaces {
@@ -506,6 +666,166 @@ mod tests {
         assert_eq!(CandidatePos::ProperNoun.as_str(), "proper_noun");
         assert_eq!(CandidatePos::Katakana.as_str(), "katakana");
         assert_eq!(CandidatePos::Ascii.as_str(), "ascii");
+        assert_eq!(CandidatePos::Manual.as_str(), "manual");
+    }
+
+    // ─── Verdict tests ───────────────────────────────────────
+
+    #[test]
+    fn test_verdict_as_str() {
+        assert_eq!(Verdict::Pending.as_str(), "pending");
+        assert_eq!(Verdict::Rejected.as_str(), "rejected");
+        assert_eq!(Verdict::Accepted.as_str(), "accepted");
+    }
+
+    // ─── set_verdict tests ───────────────────────────────────
+
+    fn seed(conn: &Connection, surface: &str, status: &str) {
+        conn.execute(
+            "INSERT INTO dictionary_candidates
+                (surface, frequency, pos, source, first_seen, last_seen, status)
+             VALUES (?1, 5, 'ascii', 'document', '2026-01-01', '2026-01-01', ?2)",
+            rusqlite::params![surface, status],
+        )
+        .unwrap();
+    }
+
+    fn status_of(conn: &Connection, surface: &str) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT status FROM dictionary_candidates WHERE surface = ?1",
+            [surface],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn reading_of(conn: &Connection, surface: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT reading FROM dictionary_candidates WHERE surface = ?1",
+            [surface],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_set_verdict_pending_to_accepted() {
+        let conn = setup();
+        seed(&conn, "candle", "pending");
+        let t = set_verdict(&conn, "candle", Verdict::Accepted, None).unwrap();
+        assert_eq!(t.from, Some(Verdict::Pending));
+        assert_eq!(t.to, Verdict::Accepted);
+        assert!(t.affected_dict, "entering accepted touches the dict");
+        assert_eq!(status_of(&conn, "candle").as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn test_set_verdict_pending_to_rejected_not_affected() {
+        let conn = setup();
+        seed(&conn, "bad", "pending");
+        let t = set_verdict(&conn, "bad", Verdict::Rejected, None).unwrap();
+        assert_eq!(t.from, Some(Verdict::Pending));
+        assert!(
+            !t.affected_dict,
+            "pending->rejected does not touch the dict"
+        );
+        assert_eq!(status_of(&conn, "bad").as_deref(), Some("rejected"));
+    }
+
+    #[test]
+    fn test_set_verdict_accepted_to_pending() {
+        let conn = setup();
+        seed(&conn, "word", "accepted");
+        let t = set_verdict(&conn, "word", Verdict::Pending, None).unwrap();
+        assert_eq!(t.from, Some(Verdict::Accepted));
+        assert!(t.affected_dict, "leaving accepted touches the dict");
+        assert_eq!(status_of(&conn, "word").as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn test_set_verdict_rejected_to_pending_not_affected() {
+        let conn = setup();
+        seed(&conn, "word", "rejected");
+        let t = set_verdict(&conn, "word", Verdict::Pending, None).unwrap();
+        assert!(
+            !t.affected_dict,
+            "rejected<->pending never touches the dict"
+        );
+    }
+
+    #[test]
+    fn test_set_verdict_insert_on_unregistered_add() {
+        let conn = setup();
+        let t = set_verdict(
+            &conn,
+            "ハンドロード",
+            Verdict::Accepted,
+            Some("はんどろーど"),
+        )
+        .unwrap();
+        assert_eq!(t.from, None, "new term was inserted");
+        assert!(t.affected_dict);
+        let (freq, pos, source): (i64, String, String) = conn
+            .query_row(
+                "SELECT frequency, pos, source FROM dictionary_candidates WHERE surface = ?1",
+                ["ハンドロード"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(freq, 0);
+        assert_eq!(pos, "manual");
+        assert_eq!(source, "manual");
+        assert_eq!(
+            reading_of(&conn, "ハンドロード").as_deref(),
+            Some("はんどろーど")
+        );
+    }
+
+    #[test]
+    fn test_set_verdict_insert_on_unregistered_reject() {
+        let conn = setup();
+        let t = set_verdict(&conn, "noise", Verdict::Rejected, None).unwrap();
+        assert_eq!(t.from, None);
+        assert!(!t.affected_dict);
+        assert_eq!(status_of(&conn, "noise").as_deref(), Some("rejected"));
+        assert_eq!(reading_of(&conn, "noise"), None);
+    }
+
+    #[test]
+    fn test_set_verdict_rm_unregistered_errors() {
+        let conn = setup();
+        let err = set_verdict(&conn, "ghost", Verdict::Pending, None).unwrap_err();
+        assert!(matches!(err, SetVerdictError::NotFound(ref s) if s == "ghost"));
+    }
+
+    #[test]
+    fn test_set_verdict_idempotent_same_verdict() {
+        let conn = setup();
+        seed(&conn, "word", "accepted");
+        let t = set_verdict(&conn, "word", Verdict::Accepted, None).unwrap();
+        assert_eq!(t.from, Some(Verdict::Accepted));
+        assert_eq!(t.to, Verdict::Accepted);
+        assert!(!t.affected_dict, "no net change to the accepted set");
+        assert_eq!(status_of(&conn, "word").as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn test_set_verdict_reading_overwrites_with_non_null() {
+        let conn = setup();
+        set_verdict(&conn, "term", Verdict::Accepted, Some("yomi1")).unwrap();
+        set_verdict(&conn, "term", Verdict::Accepted, Some("yomi2")).unwrap();
+        assert_eq!(reading_of(&conn, "term").as_deref(), Some("yomi2"));
+    }
+
+    #[test]
+    fn test_set_verdict_reading_preserved_when_none() {
+        let conn = setup();
+        set_verdict(&conn, "term", Verdict::Accepted, Some("yomi")).unwrap();
+        // A later transition without a reading must not clobber it.
+        set_verdict(&conn, "term", Verdict::Rejected, None).unwrap();
+        assert_eq!(reading_of(&conn, "term").as_deref(), Some("yomi"));
     }
 
     // ─── is_valid_candidate tests ────────────────────────────
@@ -777,15 +1097,15 @@ mod tests {
         let conn = setup();
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('high', 10, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('high', 10, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('low', 2, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('low', 2, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('rejected', 10, 'ascii', 'document', ?, ?, 'rejected')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('rejected', 10, 'ascii', 'document', ?, ?, 'rejected')",
             [now, now],
         ).unwrap();
 
@@ -810,15 +1130,15 @@ mod tests {
         let conn = setup();
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('a_word', 10, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('a_word', 10, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('b_word', 2, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('b_word', 2, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('c_word', 5, 'ascii', 'document', ?, ?, 'rejected')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('c_word', 5, 'ascii', 'document', ?, ?, 'rejected')",
             [now, now],
         ).unwrap();
 
@@ -835,7 +1155,7 @@ mod tests {
         let conn = setup();
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('word1', 5, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('word1', 5, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
 
@@ -859,7 +1179,7 @@ mod tests {
         let conn = setup();
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('bad_word', 5, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('bad_word', 5, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
 
@@ -923,7 +1243,7 @@ mod tests {
 
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
 
@@ -953,7 +1273,7 @@ mod tests {
 
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
 
@@ -982,7 +1302,7 @@ mod tests {
         // Insert same candidate into DB with status = 'pending'
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
 
@@ -1021,7 +1341,7 @@ mod tests {
 
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('new_word', 10, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('new_word', 10, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
 
@@ -1118,11 +1438,11 @@ mod tests {
         let conn = setup();
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('foo', 5, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('foo', 5, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('bar', 3, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('bar', 3, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
 
@@ -1154,7 +1474,7 @@ mod tests {
         let conn = setup();
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('accepted_word', 5, 'ascii', 'document', ?, ?, 'accepted')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('accepted_word', 5, 'ascii', 'document', ?, ?, 'accepted')",
             [now, now],
         ).unwrap();
 
@@ -1168,15 +1488,15 @@ mod tests {
         let conn = setup();
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('aaa', 5, 'ascii', 'document', ?, ?, 'rejected')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('aaa', 5, 'ascii', 'document', ?, ?, 'rejected')",
             [now, now],
         ).unwrap();
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('bbb', 3, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('bbb', 3, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('ccc', 2, 'ascii', 'document', ?, ?, 'rejected')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('ccc', 2, 'ascii', 'document', ?, ?, 'rejected')",
             [now, now],
         ).unwrap();
 
@@ -1191,11 +1511,11 @@ mod tests {
         let conn = setup();
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('keep', 10, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('keep', 10, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('drop', 5, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('drop', 5, 'ascii', 'document', ?, ?, 'pending')",
             [now, now],
         ).unwrap();
 
