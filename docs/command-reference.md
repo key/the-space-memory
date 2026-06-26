@@ -167,33 +167,42 @@ tsm restart
 
 ### tsm setup
 
-Download external resources (embedding model + WordNet DB). System-wide;
-no workspace DB writes. Run once per machine; re-run only when the
-upstream resources change.
+Populate the machine-wide cache (`$cache_dir`) with external resources
+(embedding model + WordNet DB). System-wide; no workspace `.tsm/` writes.
+Run once per machine; re-run only when the upstream resources change
+(ADR-0008).
 
 ```text
-tsm setup
+tsm setup [--link-mode <symlink|copy>]
 ```
 
 Pure resource-fetch layer:
 
 1. Downloads `cl-nagoya/ruri-v3-30m` model files (`config.json`,
-   `tokenizer.json`, `model.safetensors`) from HuggingFace Hub
-   and copies them to `.tsm/models/ruri-v3-30m/`.
-2. Downloads Japanese WordNet (`wnjpn.db.gz`) from GitHub and
-   decompresses it to `.tsm/wnjpn.db`.
+   `tokenizer.json`, `model.safetensors`) from HuggingFace Hub and
+   materializes `$cache_dir/models/ruri-v3-30m` per `--link-mode`.
+2. Downloads Japanese WordNet (`wnjpn.db.gz`) from GitHub into
+   `$cache_dir/sources/wnjpn-<version>.db` and materializes
+   `$cache_dir/wnjpn.db` per `--link-mode`.
+3. Writes `$cache_dir/manifest.json` recording each entry's mode,
+   target, size, and fetch time (read by `tsm doctor`).
 
-Importing WordNet synonyms into the workspace DB is `tsm init`'s job.
-After running `tsm setup` for the first time, run `tsm init` (or re-run
-it) so the freshly downloaded WordNet DB gets imported.
+Wiring the cache into a workspace `.tsm/` and importing WordNet synonyms
+into the workspace DB are `tsm init`'s job. After running `tsm setup` for
+the first time, run `tsm init` in your workspace to finish.
 
-**Flags:** none
+**Flags:**
+
+| Flag | Description |
+|---|---|
+| `--link-mode <symlink\|copy>` | How cache entries reference upstream sources. `symlink` (default) points at the upstream (no duplication); `copy` physically duplicates it. Defaults to `[setup].link_mode` from `tsm.toml`, else `symlink`. |
 
 **Example:**
 
 ```bash
-tsm setup
-tsm init        # imports WordNet synonyms into the workspace DB
+tsm setup                     # symlink mode (default)
+tsm setup --link-mode copy    # physically copy resources into the cache
+tsm init                      # wire the cache into the workspace + import WordNet
 ```
 
 ---
