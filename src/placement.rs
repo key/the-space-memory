@@ -103,11 +103,28 @@ pub fn remove_path(p: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Recursion ceiling for the symlink-following walkers below. Inputs (HF cache
+/// snapshots, tsm-owned `sources/`) are shallow and acyclic, so this is a
+/// backstop: because both walkers follow symlinks, a directory symlink that
+/// points at an ancestor would otherwise recurse until the stack overflows.
+/// Exceeding the bound is reported as an error rather than aborting the process.
+const MAX_RECURSION_DEPTH: usize = 64;
+
 /// Recursively copy directory `src` into `dst`, creating `dst` and any parents.
 /// Symlinks are dereferenced: file symlinks become physical files and directory
 /// symlinks become physical directories, so a `copy` of a symlink-based tree
 /// (e.g. a HuggingFace snapshot whose files link to blobs) is self-contained.
 pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    copy_dir_all_inner(src, dst, 0)
+}
+
+fn copy_dir_all_inner(src: &Path, dst: &Path, depth: usize) -> Result<()> {
+    if depth > MAX_RECURSION_DEPTH {
+        anyhow::bail!(
+            "directory nesting exceeds {MAX_RECURSION_DEPTH} levels at {} (possible symlink cycle)",
+            src.display()
+        );
+    }
     std::fs::create_dir_all(dst).with_context(|| format!("creating dir {}", dst.display()))?;
     for entry in std::fs::read_dir(src).with_context(|| format!("reading dir {}", src.display()))? {
         let entry = entry?;
@@ -116,7 +133,7 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         // Follow symlinks so blob-linked snapshot files materialize as bytes.
         let meta = std::fs::metadata(&from).with_context(|| format!("stat {}", from.display()))?;
         if meta.is_dir() {
-            copy_dir_all(&from, &to)?;
+            copy_dir_all_inner(&from, &to, depth + 1)?;
         } else {
             std::fs::copy(&from, &to)
                 .with_context(|| format!("copying {} -> {}", from.display(), to.display()))?;
@@ -130,6 +147,16 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 /// single size rule shared by `tsm setup` (writing the manifest) and
 /// `tsm doctor` (verifying it), so the two never disagree (ADR-0008).
 pub fn tree_size(path: &Path) -> Result<u64> {
+    tree_size_inner(path, 0)
+}
+
+fn tree_size_inner(path: &Path, depth: usize) -> Result<u64> {
+    if depth > MAX_RECURSION_DEPTH {
+        anyhow::bail!(
+            "directory nesting exceeds {MAX_RECURSION_DEPTH} levels at {} (possible symlink cycle)",
+            path.display()
+        );
+    }
     let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     if !meta.is_dir() {
         return Ok(meta.len());
@@ -138,7 +165,7 @@ pub fn tree_size(path: &Path) -> Result<u64> {
     for entry in
         std::fs::read_dir(path).with_context(|| format!("reading dir {}", path.display()))?
     {
-        total += tree_size(&entry?.path())?;
+        total += tree_size_inner(&entry?.path(), depth + 1)?;
     }
     Ok(total)
 }
@@ -392,6 +419,31 @@ mod tests {
         assert!(
             leftover.symlink_metadata().is_err(),
             "partial temp must be cleaned up on failure"
+        );
+    }
+
+    // N-1: a directory symlink pointing at an ancestor would recurse forever
+    // (both walkers follow symlinks). The depth bound turns that into an error
+    // instead of a stack overflow.
+    #[test]
+    fn walkers_bound_symlink_cycles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file"), "x").unwrap();
+        // dir/loop -> dir  (cycle)
+        symlink(&dir, dir.join("loop")).unwrap();
+
+        // Both walkers must terminate with an error rather than overflow the
+        // stack. The OS symlink-resolution limit (ELOOP) typically trips before
+        // the depth backstop, so assert on the outcome, not the message.
+        assert!(
+            copy_dir_all(&dir, &tmp.path().join("out")).is_err(),
+            "cyclic copy must error, not overflow"
+        );
+        assert!(
+            tree_size(&dir).is_err(),
+            "cyclic tree_size must error, not overflow"
         );
     }
 

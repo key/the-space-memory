@@ -742,7 +742,11 @@ fn write_cache_layout(
         "wnjpn.db".to_string(),
         manifest::ManifestEntry {
             mode,
-            target: sources_path.to_path_buf(),
+            // Cache-relative (ADR-0008 §manifest, S1): the WordNet source is
+            // tsm-owned under `$cache_dir/sources/`. The model target stays
+            // absolute (an external HF snapshot dir). doctor resolves a relative
+            // target against `cache_dir`.
+            target: PathBuf::from(format!("sources/wnjpn-{WORDNET_VERSION}.db")),
             size: placement::tree_size(sources_path)?,
             fetched_at,
             version: Some(WORDNET_VERSION.to_string()),
@@ -2773,7 +2777,10 @@ mod tests {
         assert!(model_entry.version.is_none());
         let wn_entry = &m.resources["wnjpn.db"];
         assert_eq!(wn_entry.mode, config::LinkMode::Symlink);
-        assert_eq!(wn_entry.target, sources);
+        // wnjpn target is cache-relative (S1); the symlink itself points at the
+        // real (absolute) source, verified via read_link above.
+        assert_eq!(wn_entry.target, PathBuf::from("sources/wnjpn-v1.1.db"));
+        assert!(!wn_entry.target.is_absolute());
         assert!(wn_entry.size > 0);
         assert!(wn_entry.source_url.is_some());
         assert_eq!(wn_entry.version.as_deref(), Some("v1.1"));
