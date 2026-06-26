@@ -7,6 +7,8 @@ use crate::config;
 use crate::db;
 use crate::embedder;
 use crate::indexer;
+use crate::manifest;
+use crate::placement;
 use crate::searcher;
 use crate::synonyms;
 use crate::user_dict;
@@ -628,83 +630,143 @@ pub fn cmd_synonym_import(file: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn cmd_setup() -> anyhow::Result<()> {
-    // Download model files from HuggingFace Hub
+/// HuggingFace model id for the embedding model.
+const RURI_MODEL_ID: &str = "cl-nagoya/ruri-v3-30m";
+/// WordNet release version mirrored into the cache as `sources/wnjpn-<ver>.db`.
+const WORDNET_VERSION: &str = "v1.1";
+/// Upstream WordNet archive URL.
+const WORDNET_URL: &str = "https://github.com/bond-lab/wnja/releases/download/v1.1/wnjpn.db.gz";
+
+/// `tsm setup`: populate the machine-wide cache (`$cache_dir`) only.
+///
+/// Fetches the ruri model (HuggingFace Hub) and the Japanese WordNet DB, places
+/// them under `$cache_dir` per `mode`, and writes `manifest.json`. Never touches
+/// a workspace `.tsm/` — wiring the cache into a workspace is `tsm init`'s job
+/// (ADR-0008). `link_mode_override` (the `--link-mode` flag) wins over
+/// `[setup].link_mode` from config when `Some`.
+pub fn cmd_setup(link_mode_override: Option<config::LinkMode>) -> anyhow::Result<()> {
+    let mode = link_mode_override.unwrap_or_else(config::setup_link_mode);
+    let cache_dir = config::cache_dir();
+    std::fs::create_dir_all(&cache_dir)?;
+    std::fs::create_dir_all(config::cache_sources_dir())?;
+
+    let snapshot_dir = fetch_ruri_snapshot()?;
+
+    let sources_path = config::cache_sources_dir().join(format!("wnjpn-{WORDNET_VERSION}.db"));
+    ensure_wordnet_source(&sources_path)?;
+
+    write_cache_layout(&cache_dir, &snapshot_dir, &sources_path, mode)?;
+
+    println!(
+        "Setup complete ({mode} mode) at {}. Run `tsm init` in your workspace to finish.",
+        cache_dir.display()
+    );
+    Ok(())
+}
+
+/// Ensure the ruri model snapshot is present in the HuggingFace cache and return
+/// its snapshot directory. Network-touching; covered by E2E, not unit tests.
+fn fetch_ruri_snapshot() -> anyhow::Result<PathBuf> {
     let api = hf_hub::api::sync::Api::new()?;
     let repo = api.repo(hf_hub::Repo::new(
-        "cl-nagoya/ruri-v3-30m".to_string(),
+        RURI_MODEL_ID.to_string(),
         hf_hub::RepoType::Model,
     ));
-    let config_path = repo.get("config.json")?;
-    let tokenizer_path = repo.get("tokenizer.json")?;
-    let weights_path = repo.get("model.safetensors")?;
-    println!("Model files downloaded:");
-    println!("  config:    {}", config_path.display());
-    println!("  tokenizer: {}", tokenizer_path.display());
-    println!("  weights:   {}", weights_path.display());
-
-    // Copy to models_dir for local access
-    let dest = config::models_dir();
-    std::fs::create_dir_all(&dest)?;
-    let sources = [
-        (&config_path, "config.json"),
-        (&tokenizer_path, "tokenizer.json"),
-        (&weights_path, "model.safetensors"),
-    ];
-    let mut copied: Vec<std::path::PathBuf> = Vec::new();
-    let copy_result = (|| -> anyhow::Result<()> {
-        for (src, name) in &sources {
-            let dst = dest.join(name);
-            std::fs::copy(src, &dst)?;
-            copied.push(dst.clone());
-            println!("  copied: {}", dst.display());
-        }
-        Ok(())
-    })();
-    if let Err(e) = copy_result {
-        log::warn!("Setup failed; cleaning up partial files");
-        for f in &copied {
-            let _ = std::fs::remove_file(f);
-        }
-        return Err(e);
+    // Pull every required file so the snapshot dir is complete, then derive the
+    // snapshot directory from one of them.
+    let mut last: Option<PathBuf> = None;
+    for file in config::MODEL_FILES {
+        last = Some(repo.get(file)?);
     }
-    println!("Model files installed to {}", dest.display());
-
-    // Download Japanese WordNet DB. Importing the synonyms into the
-    // workspace DB is `tsm init`'s job: `tsm setup` is the pure
-    // resource-fetch layer, with no workspace DB writes.
-    setup_wordnet()?;
-
-    println!("Setup complete. Run `tsm init` in your workspace to finish.");
-
-    Ok(())
+    let any_path = last.context("MODEL_FILES is empty")?;
+    let snapshot_dir = any_path
+        .parent()
+        .context("model file has no parent snapshot dir")?
+        .to_path_buf();
+    Ok(snapshot_dir)
 }
 
-fn setup_wordnet() -> anyhow::Result<()> {
-    let wordnet_dest = config::wordnet_db_path();
-    if wordnet_dest.is_file() {
-        println!("WordNet DB already exists at {}", wordnet_dest.display());
-    } else {
-        download_wordnet(&wordnet_dest)?;
+/// Download + decompress the WordNet DB into `sources_path` if it is missing.
+/// Network-touching; covered by E2E. Uses tmp + rename for atomicity.
+fn ensure_wordnet_source(sources_path: &Path) -> anyhow::Result<()> {
+    if sources_path.is_file() {
+        return Ok(());
     }
-    Ok(())
-}
-
-fn download_wordnet(dest: &Path) -> anyhow::Result<()> {
-    const WORDNET_URL: &str = "https://github.com/bond-lab/wnja/releases/download/v1.1/wnjpn.db.gz";
     println!("Downloading WordNet DB from {WORDNET_URL}...");
     let resp = ureq::get(WORDNET_URL).call()?;
     let mut gz_data = Vec::new();
     resp.into_body().as_reader().read_to_end(&mut gz_data)?;
     let mut decoder = flate2::read::GzDecoder::new(&gz_data[..]);
-    let parent = dest.parent().expect("dest has parent");
+    let parent = sources_path
+        .parent()
+        .context("sources_path has no parent")?;
     std::fs::create_dir_all(parent)?;
-    let tmp_path = dest.with_extension("db.tmp");
+    let tmp_path = sources_path.with_extension("db.tmp");
     let mut out = std::fs::File::create(&tmp_path)?;
     std::io::copy(&mut decoder, &mut out)?;
-    std::fs::rename(&tmp_path, dest)?;
-    println!("WordNet DB installed to {}", dest.display());
+    std::fs::rename(&tmp_path, sources_path)?;
     Ok(())
+}
+
+/// Materialize the cache layout (model dir, `wnjpn.db`, `manifest.json`) from
+/// already-fetched sources, per `mode`. Pure filesystem — unit-tested. Idempotent
+/// via `placement::*` (existing entries are replaced).
+fn write_cache_layout(
+    cache_dir: &Path,
+    snapshot_dir: &Path,
+    sources_path: &Path,
+    mode: config::LinkMode,
+) -> anyhow::Result<()> {
+    let fetched_at = now_rfc3339();
+
+    let model_dst = cache_dir.join("models/ruri-v3-30m");
+    placement::place_directory(snapshot_dir, &model_dst, mode)?;
+
+    let wordnet_dst = cache_dir.join("wnjpn.db");
+    placement::place_file(sources_path, &wordnet_dst, mode)?;
+
+    let mut resources = std::collections::BTreeMap::new();
+    resources.insert(
+        "models/ruri-v3-30m".to_string(),
+        manifest::ManifestEntry {
+            mode,
+            target: snapshot_dir.to_path_buf(),
+            size: placement::tree_size(snapshot_dir)?,
+            fetched_at: fetched_at.clone(),
+            version: None,
+            model_id: Some(RURI_MODEL_ID.to_string()),
+            source_url: None,
+        },
+    );
+    resources.insert(
+        "wnjpn.db".to_string(),
+        manifest::ManifestEntry {
+            mode,
+            // Cache-relative (ADR-0008 §manifest, S1): the WordNet source is
+            // tsm-owned under `$cache_dir/sources/`. The model target stays
+            // absolute (an external HF snapshot dir). doctor resolves a relative
+            // target against `cache_dir`.
+            target: PathBuf::from(format!("sources/wnjpn-{WORDNET_VERSION}.db")),
+            size: placement::tree_size(sources_path)?,
+            fetched_at,
+            version: Some(WORDNET_VERSION.to_string()),
+            model_id: None,
+            source_url: Some(WORDNET_URL.to_string()),
+        },
+    );
+
+    manifest::write(
+        &cache_dir.join("manifest.json"),
+        &manifest::Manifest {
+            version: 1,
+            resources,
+        },
+    )?;
+    Ok(())
+}
+
+fn now_rfc3339() -> String {
+    chrono::Local::now().to_rfc3339()
 }
 
 /// Doctor output as a structured result for testability.
@@ -2659,5 +2721,158 @@ mod tests {
         let sc = std::fs::read_to_string(state.join("hooks/score/10-default.lua")).unwrap();
         assert!(ex.contains("function extract"));
         assert!(sc.contains("function score"));
+    }
+
+    // ─── write_cache_layout (tsm setup, pure FS) ─────────────────────
+    //
+    // These exercise the cache-population logic with pre-staged sources so they
+    // need no network (HF Hub / GitHub). The full `cmd_setup` with real
+    // downloads is covered by E2E (`tests/e2e.sh`).
+
+    /// Stage a fake HF snapshot dir (with `MODEL_FILES`) and a fake WordNet
+    /// source file, returning their paths. The snapshot lives outside the cache
+    /// (as the real HF cache does); the source lives under `cache/sources/`.
+    fn stage_fake_sources(cache_dir: &Path, root: &Path) -> (PathBuf, PathBuf) {
+        let snapshot_dir = root.join("hf_snapshot");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        for f in config::MODEL_FILES {
+            std::fs::write(snapshot_dir.join(f), "dummy-model-bytes").unwrap();
+        }
+        let sources_path = cache_dir.join("sources").join("wnjpn-v1.1.db");
+        std::fs::create_dir_all(sources_path.parent().unwrap()).unwrap();
+        std::fs::write(&sources_path, "dummy-wnjpn-db").unwrap();
+        (snapshot_dir, sources_path)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_cache_layout_symlink_creates_full_layout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, tmp.path());
+
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Symlink).unwrap();
+
+        let model = cache_dir.join("models/ruri-v3-30m");
+        let wnjpn = cache_dir.join("wnjpn.db");
+        assert!(model.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(wnjpn.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&model).unwrap(), snapshot);
+        assert_eq!(std::fs::read_link(&wnjpn).unwrap(), sources);
+
+        let m = manifest::read(&cache_dir.join("manifest.json")).unwrap();
+        assert_eq!(m.version, 1);
+        assert_eq!(m.resources.len(), 2);
+        let model_entry = &m.resources["models/ruri-v3-30m"];
+        assert_eq!(model_entry.mode, config::LinkMode::Symlink);
+        assert_eq!(model_entry.target, snapshot);
+        assert!(model_entry.size > 0);
+        assert_eq!(
+            model_entry.model_id.as_deref(),
+            Some("cl-nagoya/ruri-v3-30m")
+        );
+        assert!(model_entry.source_url.is_none());
+        assert!(model_entry.version.is_none());
+        let wn_entry = &m.resources["wnjpn.db"];
+        assert_eq!(wn_entry.mode, config::LinkMode::Symlink);
+        // wnjpn target is cache-relative (S1); the symlink itself points at the
+        // real (absolute) source, verified via read_link above.
+        assert_eq!(wn_entry.target, PathBuf::from("sources/wnjpn-v1.1.db"));
+        assert!(!wn_entry.target.is_absolute());
+        assert!(wn_entry.size > 0);
+        assert!(wn_entry.source_url.is_some());
+        assert_eq!(wn_entry.version.as_deref(), Some("v1.1"));
+        assert!(wn_entry.model_id.is_none());
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_cache_layout_copy_creates_physical_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, tmp.path());
+
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Copy).unwrap();
+
+        let model = cache_dir.join("models/ruri-v3-30m");
+        let wnjpn = cache_dir.join("wnjpn.db");
+        let model_meta = model.symlink_metadata().unwrap();
+        let wnjpn_meta = wnjpn.symlink_metadata().unwrap();
+        assert!(model_meta.file_type().is_dir() && !model_meta.file_type().is_symlink());
+        assert!(wnjpn_meta.file_type().is_file() && !wnjpn_meta.file_type().is_symlink());
+        for f in config::MODEL_FILES {
+            assert!(model.join(f).is_file());
+        }
+        let m = manifest::read(&cache_dir.join("manifest.json")).unwrap();
+        assert_eq!(
+            m.resources["models/ruri-v3-30m"].mode,
+            config::LinkMode::Copy
+        );
+        assert_eq!(m.resources["wnjpn.db"].mode, config::LinkMode::Copy);
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_cache_layout_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, tmp.path());
+
+        // Run twice (and across modes) — must not error and stay valid.
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Symlink).unwrap();
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Copy).unwrap();
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Copy).unwrap();
+
+        let m = manifest::read(&cache_dir.join("manifest.json")).unwrap();
+        assert_eq!(m.resources.len(), 2);
+        // Final mode wins; the copy converged from the earlier symlink.
+        let model = cache_dir.join("models/ruri-v3-30m");
+        assert!(!model.symlink_metadata().unwrap().file_type().is_symlink());
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_cache_layout_does_not_touch_workspace() {
+        let cache_tmp = tempfile::TempDir::new().unwrap();
+        let state_tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", cache_tmp.path());
+        std::env::set_var("TSM_STATE_DIR", state_tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, cache_tmp.path());
+
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Symlink).unwrap();
+
+        // Workspace state paths must be untouched by `setup`.
+        assert!(
+            !config::models_dir().exists(),
+            "setup must not create workspace models dir"
+        );
+        assert!(
+            !config::wordnet_db_path().exists(),
+            "setup must not create workspace wnjpn.db"
+        );
+        // The only thing under state_tmp should be nothing setup created: the
+        // dir stays empty of model/wnjpn artefacts.
+        assert!(!state_tmp.path().join("models").exists());
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
     }
 }

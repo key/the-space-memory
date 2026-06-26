@@ -46,10 +46,12 @@ jobs:
         run: tsm setup
         env:
           HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
-          # `tsm setup` installs the model to `{state_dir}/models/ruri-v3-30m`.
-          # Pin state_dir to an absolute `{workspace}/.tsm` so the install path is
-          # explicit (not dependent on the step's CWD) and matches the TSM_CACHE_DIR
-          # the test step points the embedder at.
+          # `tsm setup` populates the machine-wide cache at `{cache_dir}/models/
+          # ruri-v3-30m` (ADR-0008); it does not touch the workspace `.tsm/`. Pin
+          # TSM_CACHE_DIR to an absolute `{workspace}/.tsm` so the install path is
+          # explicit and matches the TSM_CACHE_DIR the test step points the
+          # embedder at. TSM_STATE_DIR is irrelevant to setup but kept aligned.
+          TSM_CACHE_DIR: ${{ github.workspace }}/.tsm
           TSM_STATE_DIR: ${{ github.workspace }}/.tsm
 
       - name: Run E2E tests

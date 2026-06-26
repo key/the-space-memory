@@ -22,6 +22,24 @@ impl fmt::Display for SearchFallbackArg {
     }
 }
 
+/// CLI surface for `config::LinkMode`. Kept as a thin wrapper so `config`
+/// stays decoupled from clap (mirrors `SearchFallbackArg` / `ReindexKindArg`).
+/// Shared by `setup --link-mode` and `init --link-mode` (ADR-0008).
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LinkModeArg {
+    Symlink,
+    Copy,
+}
+
+impl From<LinkModeArg> for config::LinkMode {
+    fn from(arg: LinkModeArg) -> Self {
+        match arg {
+            LinkModeArg::Symlink => config::LinkMode::Symlink,
+            LinkModeArg::Copy => config::LinkMode::Copy,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ReindexKindArg {
     All,
@@ -180,8 +198,14 @@ enum Commands {
         /// Path to the JSONL file
         session_file: PathBuf,
     },
-    /// Download model files from HuggingFace Hub
-    Setup,
+    /// Download the model + WordNet into the machine-wide cache (`$cache_dir`).
+    /// Run once per machine; does not touch a workspace `.tsm/`.
+    Setup {
+        /// How cache entries reference upstream sources (symlink | copy).
+        /// Defaults to `[setup].link_mode` from tsm.toml, else `symlink`.
+        #[arg(long, value_enum)]
+        link_mode: Option<LinkModeArg>,
+    },
     /// Fill missing vectors for chunks (needs running embedder)
     VectorFill {
         /// Batch size for processing
@@ -264,7 +288,7 @@ fn main() -> anyhow::Result<()> {
     let resolved_root =
         config::resolve_project_root(&cwd, args.project_root.as_deref(), tsm_config.as_deref());
     let project_root = match &args.command {
-        Commands::Init | Commands::Setup => resolved_root.unwrap_or_else(|_| cwd.clone()),
+        Commands::Init | Commands::Setup { .. } => resolved_root.unwrap_or_else(|_| cwd.clone()),
         _ => resolved_root?,
     };
     // Surface a `--project-root` that lost to the CWD's `tsm.toml` or
@@ -304,7 +328,7 @@ fn main() -> anyhow::Result<()> {
             cmd_stop()?;
             cmd_start(false, true)?;
         }
-        Commands::Setup => cli::cmd_setup()?,
+        Commands::Setup { link_mode } => cli::cmd_setup(link_mode.map(Into::into))?,
         Commands::VectorFill { batch_size } => cli::cmd_vector_fill(batch_size)?,
 
         // ── Direct-only with daemon guard ──
