@@ -61,7 +61,7 @@ Initialize the workspace: schema, scaffold files, WordNet import, user
 synonym import. All steps are idempotent and re-runnable.
 
 ```text
-tsm init
+tsm init [--link-mode <symlink|copy>]
 ```
 
 Performs the following per-workspace setup steps. Every file write uses
@@ -76,14 +76,22 @@ overwritten:
    - `.tsm/user_dict.simpledic` — empty (lindera user dictionary)
    - `.tsm/custom_terms.toml` — header comment with format example
    - `.tsm/synonyms.csv` — header comment for user synonym pairs
-3. Imports Japanese WordNet synonyms from `.tsm/wnjpn.db` if present.
+3. Materializes the machine cache's ruri model and WordNet DB into the
+   workspace (`.tsm/models/ruri-v3-30m`, `.tsm/wnjpn.db`) as a symlink or
+   copy per `--link-mode`. Missing cache entries log a warning and are
+   skipped — run `tsm setup` to populate the cache, then re-run `tsm init`.
+4. Imports Japanese WordNet synonyms from `.tsm/wnjpn.db` if present.
    If missing, logs a warning and continues — run `tsm setup` to
    download the file, then re-run `tsm init` to import.
-4. Imports user-defined synonyms from `.tsm/synonyms.csv` (insert-only — unlike
+5. Imports user-defined synonyms from `.tsm/synonyms.csv` (insert-only — unlike
    [tsm synonym import](#tsm-synonym-import) it never deletes, so re-running
    `tsm init` never drops pairs added with `tsm synonym add`).
 
-**Flags:** none
+**Flags:**
+
+| Flag | Description |
+|---|---|
+| `--link-mode <symlink\|copy>` | How workspace resources reference the cache. Overrides `[init].link_mode` from `tsm.toml` (default `symlink`). |
 
 **Example:**
 

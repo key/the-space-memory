@@ -145,7 +145,12 @@ enum SynonymCommands {
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize the database
-    Init,
+    Init {
+        /// How workspace resources reference the machine cache.
+        /// Defaults to `[init].link_mode` from tsm.toml, or `symlink`.
+        #[arg(long, value_enum)]
+        link_mode: Option<LinkModeArg>,
+    },
     /// Start the daemon (tsmd)
     Start {
         /// Skip watcher startup
@@ -288,7 +293,9 @@ fn main() -> anyhow::Result<()> {
     let resolved_root =
         config::resolve_project_root(&cwd, args.project_root.as_deref(), tsm_config.as_deref());
     let project_root = match &args.command {
-        Commands::Init | Commands::Setup { .. } => resolved_root.unwrap_or_else(|_| cwd.clone()),
+        Commands::Init { .. } | Commands::Setup { .. } => {
+            resolved_root.unwrap_or_else(|_| cwd.clone())
+        }
         _ => resolved_root?,
     };
     // Surface a `--project-root` that lost to the CWD's `tsm.toml` or
@@ -321,7 +328,7 @@ fn main() -> anyhow::Result<()> {
     the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Stderr)?;
     match args.command {
         // ── Always direct ──
-        Commands::Init => cli::cmd_init()?,
+        Commands::Init { link_mode } => cli::cmd_init(link_mode.map(config::LinkMode::from))?,
         Commands::Start { no_watcher } => cmd_start(no_watcher, true)?,
         Commands::Stop => cmd_stop()?,
         Commands::Restart => {
