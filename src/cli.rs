@@ -79,21 +79,38 @@ pub struct InitPaths<'a> {
     pub project_root: &'a Path,
     pub state_dir: &'a Path,
     pub user_dict_path: &'a Path,
+    /// Upstream cache directory for the ruri model, materialized into
+    /// `state_dir/models/ruri-v3-30m` via `link_mode`. Passed explicitly so
+    /// tests can point it at a tempdir without the config singleton.
+    pub cache_models_src: &'a Path,
+    /// Upstream cache WordNet DB, materialized into `state_dir/wnjpn.db`.
+    pub cache_wordnet_src: &'a Path,
+    /// How workspace resources reference the cache (`symlink`/`copy`).
+    pub link_mode: config::LinkMode,
 }
 
 /// Convenience wrapper that builds `InitPaths` from the config singleton
 /// and forwards to `cmd_init_with`. Tests bypass this by calling
 /// `cmd_init_with` directly with a tempdir.
-pub fn cmd_init() -> anyhow::Result<()> {
+///
+/// `link_mode_override` comes from the `--link-mode` CLI flag; when absent
+/// the configured `[init].link_mode` (default `symlink`) is used.
+pub fn cmd_init(link_mode_override: Option<config::LinkMode>) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let project_root = config::project_root();
     let state_dir = config::state_dir();
     let user_dict_path = config::user_dict_path();
+    let cache_models_src = config::cache_models_dir();
+    let cache_wordnet_src = config::cache_wordnet_db_path();
+    let link_mode = link_mode_override.unwrap_or_else(config::init_link_mode);
     cmd_init_with(&InitPaths {
         db_path: &db_path,
         project_root: &project_root,
         state_dir: &state_dir,
         user_dict_path: &user_dict_path,
+        cache_models_src: &cache_models_src,
+        cache_wordnet_src: &cache_wordnet_src,
+        link_mode,
     })
 }
 
@@ -131,6 +148,21 @@ pub fn cmd_init_with(paths: &InitPaths<'_>) -> anyhow::Result<()> {
     )?;
     install_default_hooks(paths.state_dir)?;
 
+    // Materialize cache resources into the workspace via the configured
+    // link_mode. Both calls warn-and-continue when the cache is empty (the
+    // pre-`tsm setup` path), and rebuild any existing entry so a re-run with
+    // a different mode flips symlink↔copy.
+    place_directory_or_skip(
+        paths.cache_models_src,
+        &paths.state_dir.join("models/ruri-v3-30m"),
+        paths.link_mode,
+    )?;
+    place_file_or_skip(
+        paths.cache_wordnet_src,
+        &paths.state_dir.join("wnjpn.db"),
+        paths.link_mode,
+    )?;
+
     // WordNet import — graceful skip when the resource is missing so
     // offline `tsm init` and pre-`tsm setup` invocations both succeed.
     let wordnet_db = paths.state_dir.join("wnjpn.db");
@@ -164,6 +196,70 @@ pub fn cmd_init_with(paths: &InitPaths<'_>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Shared guard for the `place_*_or_skip` wrappers. Returns `true` when the
+/// caller should materialize `src` at `dst`, `false` (with a warning) when
+/// placement must be skipped:
+///
+/// - the cache entry is absent — the pre-`tsm setup` path; init still succeeds;
+/// - `src` and `dst` resolve to the same path (e.g. `cache_dir == state_dir`).
+///   Placement removes `dst` before recreating it, so in symlink mode that
+///   would delete the cache and leave a dangling self-symlink. Skipping
+///   leaves the existing resource in place.
+fn should_place_cache_resource(src: &Path, dst: &Path) -> bool {
+    if !src.exists() {
+        log::warn!(
+            "cache resource not found: {} — run `tsm setup` to populate it, then re-run `tsm init`.",
+            src.display()
+        );
+        return false;
+    }
+    if same_entry_location(src, dst) {
+        log::warn!(
+            "cache resource {} is also the workspace destination; skipping placement to avoid destroying it (cache_dir == state_dir).",
+            src.display()
+        );
+        return false;
+    }
+    true
+}
+
+/// Whether `a` and `b` name the same filesystem entry. The parent directory
+/// is canonicalized (resolving symlinked ancestors) but the final component
+/// is NOT dereferenced — so a symlink `b` that points at `a` is correctly
+/// seen as a *distinct* entry (the normal re-init case), while `a == b`
+/// (e.g. `cache_dir == state_dir`) is detected. Returns `false` when either
+/// parent cannot be resolved (e.g. `dst` not created yet), so placement
+/// proceeds normally.
+fn same_entry_location(a: &Path, b: &Path) -> bool {
+    let location = |p: &Path| -> Option<PathBuf> {
+        let parent = p.parent()?.canonicalize().ok()?;
+        Some(parent.join(p.file_name()?))
+    };
+    match (location(a), location(b)) {
+        (Some(la), Some(lb)) => la == lb,
+        _ => false,
+    }
+}
+
+/// Materialize a cache directory into the workspace, or warn-and-continue
+/// when placement must be skipped (see [`should_place_cache_resource`]).
+fn place_directory_or_skip(src: &Path, dst: &Path, mode: config::LinkMode) -> anyhow::Result<()> {
+    if should_place_cache_resource(src, dst) {
+        placement::place_directory(src, dst, mode)
+    } else {
+        Ok(())
+    }
+}
+
+/// File counterpart of [`place_directory_or_skip`].
+fn place_file_or_skip(src: &Path, dst: &Path, mode: config::LinkMode) -> anyhow::Result<()> {
+    if should_place_cache_resource(src, dst) {
+        placement::place_file(src, dst, mode)
+    } else {
+        Ok(())
+    }
 }
 
 /// Write `content` to `path` if no file exists there. Idempotent —
@@ -2189,6 +2285,26 @@ mod tests {
     /// state_dir layout. Returns (project_root, state_dir) for
     /// post-condition assertions.
     fn run_init(dir: &Path) -> (PathBuf, PathBuf) {
+        // No cache sources: placement is skipped (warn-and-continue), so
+        // this exercises the pre-`tsm setup` path used by the scaffold /
+        // WordNet / idempotency tests.
+        let missing_cache = dir.join("no-such-cache");
+        run_init_with_cache(
+            dir,
+            &missing_cache.join("models/ruri-v3-30m"),
+            &missing_cache.join("wnjpn.db"),
+            super::config::LinkMode::Symlink,
+        )
+    }
+
+    /// `run_init` with explicit cache sources and link mode, for the
+    /// symlink/copy/mode-change tests.
+    fn run_init_with_cache(
+        dir: &Path,
+        cache_models_src: &Path,
+        cache_wordnet_src: &Path,
+        link_mode: super::config::LinkMode,
+    ) -> (PathBuf, PathBuf) {
         let state_dir = dir.join(".tsm");
         let db_path = state_dir.join("tsm.db");
         let user_dict_path = state_dir.join("user_dict.simpledic");
@@ -2197,6 +2313,9 @@ mod tests {
             project_root: dir,
             state_dir: &state_dir,
             user_dict_path: &user_dict_path,
+            cache_models_src,
+            cache_wordnet_src,
+            link_mode,
         })
         .unwrap();
         (dir.to_path_buf(), state_dir)
@@ -2348,6 +2467,185 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM synonyms", [], |r| r.get(0))
             .unwrap();
         assert_eq!(synonym_rows, 1, "second init should not duplicate rows");
+    }
+
+    /// Stage a fake machine cache: a `models/ruri-v3-30m/` directory holding
+    /// a placeholder file, and a valid (mock) `wnjpn.db` so the WordNet
+    /// import succeeds. Returns the two upstream source paths.
+    fn stage_fake_cache(cache_dir: &Path) -> (PathBuf, PathBuf) {
+        let models_src = cache_dir.join("models/ruri-v3-30m");
+        std::fs::create_dir_all(&models_src).unwrap();
+        std::fs::write(models_src.join("model.safetensors"), b"weights").unwrap();
+        let wnjpn_src = cache_dir.join("wnjpn.db");
+        create_mock_wordnet_db(&wnjpn_src, &[("alpha", "beta")]);
+        (models_src, wnjpn_src)
+    }
+
+    /// Assert the single WordNet pair staged by `stage_fake_cache` was
+    /// imported. This closes the cache→placed-link→import seam at the unit
+    /// level: the import reads `state_dir/wnjpn.db`, which is only populated
+    /// by the placement step having materialized the cache link/copy.
+    fn assert_wordnet_synonym_imported(state_dir: &Path) {
+        let conn = crate::db::get_connection(&state_dir.join("tsm.db")).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM synonyms WHERE source = 'wordnet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "WordNet synonym should be imported through the placed link"
+        );
+    }
+
+    #[test]
+    fn cmd_init_with_creates_workspace_symlinks_when_mode_is_symlink() {
+        // symlink mode: workspace entries point at the cache by symbolic
+        // link, leaving no duplicate bytes in the workspace.
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = tempfile::TempDir::new().unwrap();
+        let (models_src, wnjpn_src) = stage_fake_cache(cache.path());
+
+        let (_, state_dir) = run_init_with_cache(
+            dir.path(),
+            &models_src,
+            &wnjpn_src,
+            super::config::LinkMode::Symlink,
+        );
+
+        let models_dst = state_dir.join("models/ruri-v3-30m");
+        let wnjpn_dst = state_dir.join("wnjpn.db");
+        assert!(
+            std::fs::symlink_metadata(&models_dst)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "models/ruri-v3-30m should be a symlink"
+        );
+        assert!(
+            std::fs::symlink_metadata(&wnjpn_dst)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "wnjpn.db should be a symlink"
+        );
+        assert_wordnet_synonym_imported(&state_dir);
+    }
+
+    #[test]
+    fn cmd_init_with_creates_workspace_copies_when_mode_is_copy() {
+        // copy mode: workspace entries are physical, self-contained copies
+        // (no symlink), so the workspace survives the cache being removed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = tempfile::TempDir::new().unwrap();
+        let (models_src, wnjpn_src) = stage_fake_cache(cache.path());
+
+        let (_, state_dir) = run_init_with_cache(
+            dir.path(),
+            &models_src,
+            &wnjpn_src,
+            super::config::LinkMode::Copy,
+        );
+
+        let models_dst = state_dir.join("models/ruri-v3-30m");
+        let wnjpn_dst = state_dir.join("wnjpn.db");
+        let models_meta = std::fs::symlink_metadata(&models_dst).unwrap();
+        assert!(
+            !models_meta.file_type().is_symlink() && models_meta.is_dir(),
+            "models/ruri-v3-30m should be a physical directory"
+        );
+        assert!(
+            models_dst.join("model.safetensors").is_file(),
+            "copied model directory should contain its files"
+        );
+        let wnjpn_meta = std::fs::symlink_metadata(&wnjpn_dst).unwrap();
+        assert!(
+            !wnjpn_meta.file_type().is_symlink() && wnjpn_meta.is_file(),
+            "wnjpn.db should be a physical file"
+        );
+        assert_wordnet_synonym_imported(&state_dir);
+    }
+
+    #[test]
+    fn cmd_init_with_replaces_existing_workspace_links_on_mode_change() {
+        // Re-running init with a different mode rebuilds the workspace
+        // entries: symlink first, then copy → the symlink becomes physical.
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = tempfile::TempDir::new().unwrap();
+        let (models_src, wnjpn_src) = stage_fake_cache(cache.path());
+
+        run_init_with_cache(
+            dir.path(),
+            &models_src,
+            &wnjpn_src,
+            super::config::LinkMode::Symlink,
+        );
+        let wnjpn_dst = dir.path().join(".tsm/wnjpn.db");
+        assert!(
+            std::fs::symlink_metadata(&wnjpn_dst)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "first init should produce a symlink"
+        );
+
+        run_init_with_cache(
+            dir.path(),
+            &models_src,
+            &wnjpn_src,
+            super::config::LinkMode::Copy,
+        );
+        let models_dst = dir.path().join(".tsm/models/ruri-v3-30m");
+        assert!(
+            !std::fs::symlink_metadata(&models_dst)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "re-init with copy should replace the model symlink with a directory"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&wnjpn_dst)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "re-init with copy should replace the wnjpn.db symlink with a file"
+        );
+    }
+
+    #[test]
+    fn cmd_init_with_does_not_self_destruct_when_cache_equals_state_dir() {
+        // Degenerate config where the cache source and the workspace
+        // destination resolve to the same path (cache_dir == state_dir).
+        // Placement must NOT remove the source to "replace" it — in symlink
+        // mode that would delete the cache and leave a dangling self-symlink.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_dir = dir.path().join(".tsm");
+        let models = state_dir.join("models/ruri-v3-30m");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("model.safetensors"), b"weights").unwrap();
+        let wnjpn = state_dir.join("wnjpn.db");
+        create_mock_wordnet_db(&wnjpn, &[("alpha", "beta")]);
+
+        // src == dst for both resources.
+        run_init_with_cache(
+            dir.path(),
+            &models,
+            &wnjpn,
+            super::config::LinkMode::Symlink,
+        );
+
+        assert!(
+            models.join("model.safetensors").is_file(),
+            "the cache model must survive when cache_dir == state_dir"
+        );
+        assert!(
+            wnjpn.is_file(),
+            "the cache WordNet DB must survive when cache_dir == state_dir"
+        );
+        // The surviving wnjpn.db is still importable through the same path.
+        assert_wordnet_synonym_imported(&state_dir);
     }
 
     #[test]
