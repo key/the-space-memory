@@ -127,6 +127,20 @@ wait_embedder_ready() {
     return 1
 }
 
+# Sum the file counts across the watcher's "detected N changed file(s)" log
+# lines. The watcher logs to stderr, which the daemon captures into
+# logs/tsmd-stderr.log; we read it directly and compute the sum here so the
+# value lands in the e2e job's stdout (CI does not surface tsmd's own logs).
+# Used by the parallel-ingest race as a loop-absence guard (#149): a healthy
+# burst forwards ≈RACE_COUNT events, while the old index→open→reindex loop
+# forwarded ~1361. awk (not bc) keeps it dependency-free.
+watcher_detected_sum() {
+    local log="$TSM_STATE_DIR/logs/tsmd-stderr.log"
+    [[ -f "$log" ]] || { echo 0; return; }
+    grep -oE 'detected [0-9]+ changed' "$log" 2>/dev/null \
+        | grep -oE '[0-9]+' | awk '{s += $1} END {print s + 0}'
+}
+
 # ── Environment setup ─────────────────────────────────────────────────
 
 export TSM_STATE_DIR
@@ -553,6 +567,15 @@ RACE_DIR="$TSM_PROJECT_DIR/notes"
 # unindexed file is absent from results at any -k, so this never hides a drop.)
 RACE_K=$((RACE_COUNT + 5))
 
+# Loop-absence guard (#149): a healthy burst makes the watcher forward
+# ≈RACE_COUNT file-events (measured: 20/20/20 across runs); the old
+# index→open→reindex loop forwarded ~1361. Snapshot the running total now and
+# diff after the burst so the count isolates this race (earlier watcher tests
+# also log "detected" lines). 100 is well above the healthy ceiling and far
+# below the loop, so it catches a regression without flaking.
+RACE_LOOP_THRESHOLD=100
+DETECTED_BEFORE="$(watcher_detected_sum)"
+
 # Parallel create
 for i in $(seq 1 "$RACE_COUNT"); do
     cat > "$RACE_DIR/race-$i.md" <<HEREDOC &
@@ -600,6 +623,26 @@ if [[ ${#MISSING_CREATE[@]} -eq 0 ]]; then
 else
     fail "race: parallel ingest missed ${#MISSING_CREATE[@]}/$RACE_COUNT files" \
          "not indexed: ${MISSING_CREATE[*]}"
+fi
+
+# Loop-absence guard: the index-completeness check above cannot tell a healthy
+# index from one produced by a still-running index→open→reindex loop (the loop
+# eventually indexes everything too — it just never stops). Assert the watcher
+# forwarded a bounded number of events during the burst. A drift in the
+# "detected N" log wording would make the delta 0, so a 0 delta fails here
+# rather than passing silently.
+DETECTED_AFTER="$(watcher_detected_sum)"
+RACE_FORWARDED=$((DETECTED_AFTER - DETECTED_BEFORE))
+log "race: watcher forwarded $RACE_FORWARDED file-event(s) during the burst" \
+    "(healthy ≈ $RACE_COUNT; the #149 loop forwarded ~1361; threshold $RACE_LOOP_THRESHOLD)"
+if [[ "$RACE_FORWARDED" -le 0 ]]; then
+    fail "race: loop-guard could not read the watcher forward count" \
+         "delta=$RACE_FORWARDED (missing tsmd-stderr.log or changed 'detected N' log format?)"
+elif [[ "$RACE_FORWARDED" -ge "$RACE_LOOP_THRESHOLD" ]]; then
+    fail "race: watcher forwarded $RACE_FORWARDED events (>= $RACE_LOOP_THRESHOLD)" \
+         "index→open→reindex loop appears to have regressed (#149)"
+else
+    pass "race: loop absent — watcher forwarded $RACE_FORWARDED < $RACE_LOOP_THRESHOLD events"
 fi
 
 # Parallel delete — verifies concurrent removals also coalesce correctly.
