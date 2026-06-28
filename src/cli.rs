@@ -978,7 +978,11 @@ fn link_check_item(
 /// the cache (`state_dir/models/ruri-v3-30m`, `state_dir/wnjpn.db`).
 fn workspace_section() -> DoctorSection {
     let state_dir = config::state_dir();
-    let missing_hint = "Run `tsm setup` then `tsm init`.";
+    // Workspace links are an optional override: when absent, the embedder falls
+    // back to the machine-wide cache, so a missing link is informational, not a
+    // fault. Keep the hint gentle and point at `tsm init`.
+    let missing_hint =
+        "Run `tsm init` to link this workspace to the cache (the embedder uses the cache meanwhile).";
     let broken_hint = "Run `tsm init` to recreate the workspace link.";
     DoctorSection {
         name: "Workspace".to_string(),
@@ -1062,18 +1066,24 @@ fn manifest_items(cache_dir: &Path) -> Vec<CheckItem> {
     items
 }
 
-/// Reconcile a single manifest entry against the filesystem: the resolved target
-/// must exist and its recursive size must match the recorded `size`.
+/// Reconcile a single manifest entry against the filesystem. The size check
+/// targets the *placed cache entry* (`cache_dir/<key>`), not the upstream source
+/// the manifest records. This is correct in both link modes and, crucially,
+/// catches a corrupted physical copy: sizing the (intact) source instead would
+/// report "matches manifest" while the actual cache entry is damaged, and would
+/// also false-warn in copy mode once the upstream is garbage-collected (the
+/// self-contained copy is still healthy).
 fn manifest_entry_item(cache_dir: &Path, key: &str, entry: &manifest::ManifestEntry) -> CheckItem {
-    let resolved = manifest::resolve_target(cache_dir, &entry.target);
-    if !resolved.exists() {
+    let placed = cache_dir.join(key);
+    // `exists()` follows symlinks, so a dangling cache link reports as missing.
+    if !placed.exists() {
         return CheckItem {
             status: CheckStatus::Warning,
-            message: format!("{key}: target {} missing", resolved.display()),
+            message: format!("{key}: cache entry {} missing", placed.display()),
             hint: Some("Run `tsm setup` to repopulate the cache.".to_string()),
         };
     }
-    match placement::tree_size(&resolved) {
+    match placement::tree_size(&placed) {
         Ok(actual) if actual == entry.size => CheckItem {
             status: CheckStatus::Ok,
             message: format!("{key}: {} (matches manifest)", human_size(actual)),
@@ -1086,11 +1096,11 @@ fn manifest_entry_item(cache_dir: &Path, key: &str, entry: &manifest::ManifestEn
                 human_size(actual),
                 human_size(entry.size)
             ),
-            hint: Some("Run `tsm setup` to refresh the manifest.".to_string()),
+            hint: Some("Run `tsm setup` to refresh the cache and manifest.".to_string()),
         },
         Err(e) => CheckItem {
             status: CheckStatus::Warning,
-            message: format!("{key}: cannot size {}: {e}", resolved.display()),
+            message: format!("{key}: cannot size {}: {e}", placed.display()),
             hint: Some("Run `tsm setup` to repopulate the cache.".to_string()),
         },
     }
@@ -3128,7 +3138,9 @@ mod tests {
         assert_eq!(it.status, CheckStatus::Warning);
         assert!(it.message.contains("not present"));
         let hint = it.hint.as_deref().unwrap();
-        assert!(hint.contains("tsm setup") && hint.contains("tsm init"));
+        // Graceful: a missing workspace link points at `tsm init` and notes the
+        // embedder still works via the cache (it is an optional override).
+        assert!(hint.contains("tsm init") && hint.contains("cache"));
 
         std::env::remove_var("TSM_STATE_DIR");
         config::reload();
@@ -3209,6 +3221,52 @@ mod tests {
             "expected a size-mismatch warning, got: {:?}",
             section.items
         );
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_cache_section_copy_mode_detects_corrupted_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, tmp.path());
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Copy).unwrap();
+        // Corrupt the PLACED physical copy while the source stays intact. Sizing
+        // the source would falsely report "matches manifest"; sizing the placed
+        // entry must catch the corruption.
+        std::fs::write(
+            cache_dir.join("wnjpn.db"),
+            "corrupted-and-a-different-length",
+        )
+        .unwrap();
+
+        let section = system_cache_section();
+        // The reconciliation line ("wnjpn.db: ..."), not the link line.
+        let it = item(&section, "wnjpn.db: ");
+        assert_eq!(it.status, CheckStatus::Warning);
+        assert!(it.message.contains("manifest records"));
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_cache_section_errors_on_malformed_manifest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::fs::write(config::cache_manifest_path(), "{ not valid json").unwrap();
+
+        let section = system_cache_section();
+        let it = item(&section, "manifest.json");
+        assert_eq!(it.status, CheckStatus::Error);
+        assert!(it.message.contains("invalid"));
 
         std::env::remove_var("TSM_CACHE_DIR");
         config::reload();
