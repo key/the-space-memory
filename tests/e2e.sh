@@ -375,7 +375,12 @@ assert_json "temporal: --after/--before hits seasonal-text" \
 echo ""
 log "=== Vector search ==="
 
-run search_json "学校の先生と生徒"
+# Use a wider window than the default top-5: `tsm init` imports the full
+# Japanese WordNet, and query expansion lets one multi-chunk document fill the
+# first several hybrid-ranked slots, pushing the semantically-matched botchan
+# just past the default cutoff. -k 10 keeps the assertion about semantic recall
+# without depending on the exact rank.
+run search_json "学校の先生と生徒" -k 10
 assert_json "vector: 学校の先生と生徒 → botchan" \
     'any(.results[]; .source_file | contains("botchan"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
