@@ -170,6 +170,34 @@ fn tree_size_inner(path: &Path, depth: usize) -> Result<u64> {
     Ok(total)
 }
 
+/// Liveness of a placed resource, for `tsm doctor` reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkStatus {
+    /// Present and resolvable: a physical file/dir, or a symlink whose target exists.
+    Alive,
+    /// A symlink whose target does not exist (dangling).
+    Broken,
+    /// Nothing at the path.
+    Missing,
+}
+
+/// Classify `path` for doctor reporting: distinguishes a dangling symlink
+/// (`Broken`) from an absent path (`Missing`) and a live entry (`Alive`),
+/// where "live" covers both a physical file/dir and a symlink that resolves.
+pub fn link_status(path: &Path) -> LinkStatus {
+    match std::fs::symlink_metadata(path) {
+        Err(_) => LinkStatus::Missing,
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if path.exists() {
+                LinkStatus::Alive
+            } else {
+                LinkStatus::Broken
+            }
+        }
+        Ok(_) => LinkStatus::Alive,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,5 +496,44 @@ mod tests {
         symlink(blobs.join("blob"), dir.join("link")).unwrap(); // follows → 5
 
         assert_eq!(tree_size(&dir).unwrap(), 2 + 3 + 5);
+    }
+
+    #[test]
+    fn link_status_alive_for_physical_file_and_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        let dir = tmp.path().join("d");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(link_status(&file), LinkStatus::Alive);
+        assert_eq!(link_status(&dir), LinkStatus::Alive);
+    }
+
+    #[test]
+    fn link_status_alive_for_live_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, "x").unwrap();
+        let link = tmp.path().join("link");
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(link_status(&link), LinkStatus::Alive);
+    }
+
+    #[test]
+    fn link_status_broken_for_dangling_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("link");
+        symlink(tmp.path().join("does-not-exist"), &link).unwrap();
+
+        assert_eq!(link_status(&link), LinkStatus::Broken);
+    }
+
+    #[test]
+    fn link_status_missing_for_absent_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        assert_eq!(link_status(&tmp.path().join("nope")), LinkStatus::Missing);
     }
 }
