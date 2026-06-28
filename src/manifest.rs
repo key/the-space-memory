@@ -66,6 +66,18 @@ pub fn write(path: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a manifest entry `target` to a concrete filesystem path:
+/// an absolute target is used as-is (e.g. the model's external HF snapshot dir),
+/// a relative one is joined onto `cache_dir` (e.g. `sources/wnjpn-v1.1.db`).
+/// Relative storage lets the cache be relocated without rewriting the manifest.
+pub fn resolve_target(cache_dir: &Path, target: &Path) -> PathBuf {
+    if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        cache_dir.join(target)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +201,19 @@ mod tests {
         std::fs::write(&path, "{ not valid json").unwrap();
 
         assert!(read(&path).is_err());
+    }
+
+    #[test]
+    fn resolve_target_keeps_absolute_and_joins_relative() {
+        let cache = Path::new("/home/u/.cache/tsm");
+
+        // Relative (wnjpn): joined onto cache_dir.
+        assert_eq!(
+            resolve_target(cache, Path::new("sources/wnjpn-v1.1.db")),
+            PathBuf::from("/home/u/.cache/tsm/sources/wnjpn-v1.1.db")
+        );
+        // Absolute (model snapshot): used as-is.
+        let abs = Path::new("/abs/hf/snapshots/deadbeef");
+        assert_eq!(resolve_target(cache, abs), abs.to_path_buf());
     }
 }

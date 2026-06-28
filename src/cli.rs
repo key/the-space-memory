@@ -9,6 +9,7 @@ use crate::embedder;
 use crate::indexer;
 use crate::manifest;
 use crate::placement;
+use crate::placement::LinkStatus;
 use crate::searcher;
 use crate::synonyms;
 use crate::user_dict;
@@ -889,6 +890,9 @@ pub fn run_doctor(conn: &rusqlite::Connection, db_path: &Path) -> DoctorReport {
     }
 
     doctor_check_with_conn(conn, &mut report, db_section);
+    // Resource layers (workspace links + machine-wide cache) are independent of
+    // the DB, so they always run as their own report sections.
+    append_resource_sections(&mut report);
     // Build metadata first (matches the local `cmd_doctor` path).
     report.sections.insert(0, build_section());
     report
@@ -912,6 +916,11 @@ pub fn doctor_check(db_path: &Path) -> DoctorReport {
                 hint: None,
             });
         }
+        if let Ok(conn) = db::get_connection(db_path) {
+            doctor_check_with_conn(&conn, &mut report, db_section);
+        } else {
+            report.sections.push(db_section);
+        }
     } else {
         db_section.items.push(CheckItem {
             status: CheckStatus::Error,
@@ -919,16 +928,183 @@ pub fn doctor_check(db_path: &Path) -> DoctorReport {
             hint: Some("Run `init`.".to_string()),
         });
         report.sections.push(db_section);
-        return report;
     }
 
-    if let Ok(conn) = db::get_connection(db_path) {
-        doctor_check_with_conn(&conn, &mut report, db_section);
-    } else {
-        report.sections.push(db_section);
-    }
-
+    // Workspace / System cache layers do not depend on the DB and must be
+    // reported even when the DB is absent (e.g. after `tsm setup` but before
+    // `tsm init`); doctor stays read-only and never starts the daemon.
+    append_resource_sections(&mut report);
     report
+}
+
+/// Append the two resource layers — `Workspace` (the workspace's links into the
+/// cache) and `System cache` (the machine-wide cache + manifest) — to a doctor
+/// report. Pure filesystem inspection; never starts the daemon.
+fn append_resource_sections(report: &mut DoctorReport) {
+    report.sections.push(workspace_section());
+    report.sections.push(system_cache_section());
+}
+
+/// Map a resource path's [`LinkStatus`] to a doctor [`CheckItem`]. `target_note`
+/// describes what the entry should point at (e.g. `cache`, `HF cache`); the
+/// hints guide recovery for the broken / missing cases.
+fn link_check_item(
+    label: &str,
+    target_note: &str,
+    path: &Path,
+    broken_hint: &str,
+    missing_hint: &str,
+) -> CheckItem {
+    match placement::link_status(path) {
+        LinkStatus::Alive => CheckItem {
+            status: CheckStatus::Ok,
+            message: format!("{label}  →  {target_note} (link alive)"),
+            hint: None,
+        },
+        LinkStatus::Broken => CheckItem {
+            status: CheckStatus::Error,
+            message: format!("{label}  →  {target_note} (link broken)"),
+            hint: Some(broken_hint.to_string()),
+        },
+        LinkStatus::Missing => CheckItem {
+            status: CheckStatus::Warning,
+            message: format!("{label}: not present"),
+            hint: Some(missing_hint.to_string()),
+        },
+    }
+}
+
+/// Build the `Workspace` doctor section: liveness of the workspace's links into
+/// the cache (`state_dir/models/ruri-v3-30m`, `state_dir/wnjpn.db`).
+fn workspace_section() -> DoctorSection {
+    let state_dir = config::state_dir();
+    let missing_hint = "Run `tsm setup` then `tsm init`.";
+    let broken_hint = "Run `tsm init` to recreate the workspace link.";
+    DoctorSection {
+        name: "Workspace".to_string(),
+        items: vec![
+            link_check_item(
+                "models/ruri-v3-30m",
+                "cache",
+                &state_dir.join("models/ruri-v3-30m"),
+                broken_hint,
+                missing_hint,
+            ),
+            link_check_item(
+                "wnjpn.db",
+                "cache",
+                &state_dir.join("wnjpn.db"),
+                broken_hint,
+                missing_hint,
+            ),
+        ],
+    }
+}
+
+/// Build the `System cache` doctor section: liveness of the machine-wide cache
+/// entries plus manifest validity / size reconciliation.
+fn system_cache_section() -> DoctorSection {
+    let cache_dir = config::cache_dir();
+    let setup_hint = "Run `tsm setup`.";
+    let mut items = vec![
+        link_check_item(
+            "models/ruri-v3-30m",
+            "HF cache",
+            &config::cache_models_dir(),
+            setup_hint,
+            setup_hint,
+        ),
+        link_check_item(
+            "wnjpn.db",
+            "sources",
+            &config::cache_wordnet_db_path(),
+            setup_hint,
+            setup_hint,
+        ),
+    ];
+    items.extend(manifest_items(&cache_dir));
+    DoctorSection {
+        name: "System cache".to_string(),
+        items,
+    }
+}
+
+/// Build the manifest-related [`CheckItem`]s for the System cache section:
+/// graceful "not found" when setup has not run, an error on a malformed file,
+/// else a per-entry existence + size reconciliation.
+fn manifest_items(cache_dir: &Path) -> Vec<CheckItem> {
+    let manifest_path = config::cache_manifest_path();
+    if !manifest_path.exists() {
+        return vec![CheckItem {
+            status: CheckStatus::Warning,
+            message: "manifest.json: not found".to_string(),
+            hint: Some("Run `tsm setup` to build the cache.".to_string()),
+        }];
+    }
+    let manifest = match manifest::read(&manifest_path) {
+        Ok(m) => m,
+        Err(e) => {
+            return vec![CheckItem {
+                status: CheckStatus::Error,
+                message: format!("manifest.json invalid: {e}"),
+                hint: Some("Run `tsm setup` to regenerate the manifest.".to_string()),
+            }];
+        }
+    };
+    let mut items = vec![CheckItem {
+        status: CheckStatus::Ok,
+        message: format!("manifest.json: {} entries", manifest.resources.len()),
+        hint: None,
+    }];
+    for (key, entry) in &manifest.resources {
+        items.push(manifest_entry_item(cache_dir, key, entry));
+    }
+    items
+}
+
+/// Reconcile a single manifest entry against the filesystem: the resolved target
+/// must exist and its recursive size must match the recorded `size`.
+fn manifest_entry_item(cache_dir: &Path, key: &str, entry: &manifest::ManifestEntry) -> CheckItem {
+    let resolved = manifest::resolve_target(cache_dir, &entry.target);
+    if !resolved.exists() {
+        return CheckItem {
+            status: CheckStatus::Warning,
+            message: format!("{key}: target {} missing", resolved.display()),
+            hint: Some("Run `tsm setup` to repopulate the cache.".to_string()),
+        };
+    }
+    match placement::tree_size(&resolved) {
+        Ok(actual) if actual == entry.size => CheckItem {
+            status: CheckStatus::Ok,
+            message: format!("{key}: {} (matches manifest)", human_size(actual)),
+            hint: None,
+        },
+        Ok(actual) => CheckItem {
+            status: CheckStatus::Warning,
+            message: format!(
+                "{key}: {} on disk, manifest records {}",
+                human_size(actual),
+                human_size(entry.size)
+            ),
+            hint: Some("Run `tsm setup` to refresh the manifest.".to_string()),
+        },
+        Err(e) => CheckItem {
+            status: CheckStatus::Warning,
+            message: format!("{key}: cannot size {}: {e}", resolved.display()),
+            hint: Some("Run `tsm setup` to repopulate the cache.".to_string()),
+        },
+    }
+}
+
+/// Human-readable byte size for doctor messages (matches the DB section's MB
+/// style for larger artefacts, exact bytes for small ones).
+fn human_size(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}MB", bytes as f64 / MB)
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 fn doctor_check_with_conn(
@@ -2873,6 +3049,213 @@ mod tests {
 
         std::env::remove_var("TSM_CACHE_DIR");
         std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    // ─── doctor two-layer integrity (Workspace / System cache) ───────
+    //
+    // Section builders read global config (state_dir / cache_dir), so these are
+    // `#[serial]` and pin TSM_STATE_DIR / TSM_CACHE_DIR to tempdirs.
+
+    fn item<'a>(section: &'a DoctorSection, needle: &str) -> &'a CheckItem {
+        section
+            .items
+            .iter()
+            .find(|i| i.message.contains(needle))
+            .unwrap_or_else(|| panic!("no item matching {needle:?} in {:?}", section.items))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_workspace_section_reports_alive_links() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        config::reload();
+        // Stage live symlinks for both workspace resources.
+        let target_dir = tmp.path().join("cache-model");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target_db = tmp.path().join("cache-wnjpn.db");
+        std::fs::write(&target_db, "db").unwrap();
+        std::fs::create_dir_all(tmp.path().join("models")).unwrap();
+        std::os::unix::fs::symlink(&target_dir, tmp.path().join("models/ruri-v3-30m")).unwrap();
+        std::os::unix::fs::symlink(&target_db, tmp.path().join("wnjpn.db")).unwrap();
+
+        let section = workspace_section();
+        assert_eq!(section.name, "Workspace");
+        assert_eq!(item(&section, "models/ruri-v3-30m").status, CheckStatus::Ok);
+        assert!(item(&section, "models/ruri-v3-30m")
+            .message
+            .contains("link alive"));
+        assert_eq!(item(&section, "wnjpn.db").status, CheckStatus::Ok);
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_workspace_section_reports_broken_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        config::reload();
+        // Symlink to a target that does not exist → broken.
+        std::fs::create_dir_all(tmp.path().join("models")).unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("gone"),
+            tmp.path().join("models/ruri-v3-30m"),
+        )
+        .unwrap();
+
+        let section = workspace_section();
+        let it = item(&section, "models/ruri-v3-30m");
+        assert_eq!(it.status, CheckStatus::Error);
+        assert!(it.message.contains("link broken"));
+        assert!(it.hint.as_deref().unwrap().contains("tsm init"));
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_workspace_section_reports_missing_when_no_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        config::reload();
+
+        let section = workspace_section();
+        let it = item(&section, "models/ruri-v3-30m");
+        assert_eq!(it.status, CheckStatus::Warning);
+        assert!(it.message.contains("not present"));
+        let hint = it.hint.as_deref().unwrap();
+        assert!(hint.contains("tsm setup") && hint.contains("tsm init"));
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_cache_section_reports_alive_when_cache_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, tmp.path());
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Symlink).unwrap();
+
+        let section = system_cache_section();
+        assert_eq!(section.name, "System cache");
+        assert_eq!(item(&section, "models/ruri-v3-30m").status, CheckStatus::Ok);
+        assert_eq!(item(&section, "wnjpn.db").status, CheckStatus::Ok);
+        assert_eq!(item(&section, "manifest.json").status, CheckStatus::Ok);
+        assert!(item(&section, "manifest.json")
+            .message
+            .contains("2 entries"));
+        // Per-entry reconciliation reports a size match.
+        assert!(section
+            .items
+            .iter()
+            .any(|i| i.message.contains("matches manifest") && i.status == CheckStatus::Ok));
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_cache_section_reports_broken_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        // A dangling cache wnjpn.db symlink (no manifest, no model).
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone.db"), config::cache_wordnet_db_path())
+            .unwrap();
+
+        let section = system_cache_section();
+        let it = item(&section, "wnjpn.db");
+        assert_eq!(it.status, CheckStatus::Error);
+        assert!(it.message.contains("link broken"));
+        // No manifest yet → graceful "not found", not a crash.
+        let mf = item(&section, "manifest.json");
+        assert_eq!(mf.status, CheckStatus::Warning);
+        assert!(mf.message.contains("not found"));
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_cache_section_warns_on_size_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, tmp.path());
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Symlink).unwrap();
+        // Grow the source after the manifest recorded its size → mismatch.
+        std::fs::write(&sources, "dummy-wnjpn-db-now-much-longer-than-before").unwrap();
+
+        let section = system_cache_section();
+        assert!(
+            section
+                .items
+                .iter()
+                .any(|i| i.status == CheckStatus::Warning
+                    && i.message.contains("wnjpn.db")
+                    && i.message.contains("manifest records")),
+            "expected a size-mismatch warning, got: {:?}",
+            section.items
+        );
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_json_output_includes_workspace_and_cache_sections() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path().join("state"));
+        std::env::set_var("TSM_CACHE_DIR", tmp.path().join("cache"));
+        config::reload();
+
+        let mut report = DoctorReport::default();
+        append_resource_sections(&mut report);
+        let json = report.to_json();
+        assert!(json.contains("Workspace"), "json: {json}");
+        assert!(json.contains("System cache"), "json: {json}");
+
+        std::env::remove_var("TSM_STATE_DIR");
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_text_output_includes_two_sections_with_hints() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path().join("state"));
+        std::env::set_var("TSM_CACHE_DIR", tmp.path().join("cache"));
+        config::reload();
+
+        let mut report = DoctorReport::default();
+        append_resource_sections(&mut report);
+        // Both layers present as distinct sections.
+        let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Workspace"));
+        assert!(names.contains(&"System cache"));
+        // An un-set-up environment yields recovery hints on the issues.
+        let issues = report.issues();
+        assert!(
+            issues.iter().any(|s| s.contains("tsm setup")),
+            "expected recovery hints, got: {issues:?}"
+        );
+
+        std::env::remove_var("TSM_STATE_DIR");
+        std::env::remove_var("TSM_CACHE_DIR");
         config::reload();
     }
 }
