@@ -516,7 +516,13 @@ mod tests {
             .ok();
 
         // We test the individual pieces rather than run() which also inits logger.
-        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<Event, notify::Error>>();
+        // `_rx` is held only to keep the channel open for the watcher's handler;
+        // we do not assert on its timing. Raw notify delivers events immediately
+        // (no debounce buffer), and on Linux registering a recursive watch can
+        // surface a startup event, so asserting channel silence here would be
+        // flaky. Startup-event handling (debounce + kind filter) is exercised by
+        // the debounce/predicate unit tests and the e2e race regression instead.
+        let (tx, _rx) = std::sync::mpsc::channel::<std::result::Result<Event, notify::Error>>();
         let mut watcher: RecommendedWatcher =
             recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
                 let _ = tx.send(res);
@@ -528,9 +534,6 @@ mod tests {
 
         // The main loop condition checks SHUTDOWN
         assert!(SHUTDOWN.load(Ordering::SeqCst));
-
-        // Verify recv_timeout returns Timeout (no events)
-        assert!(rx.recv_timeout(Duration::from_millis(10)).is_err());
 
         SHUTDOWN.store(false, Ordering::SeqCst);
     }
