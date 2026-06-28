@@ -43,14 +43,16 @@ fn yield_to_pending_writes(writes_pending: &Arc<AtomicUsize>) -> bool {
 
 /// The dictionary-candidate harvest query for a request, if it should harvest.
 ///
-/// Only a `Search` harvests; the query is reduced to the same extracted keyword
-/// form the search itself tokenizes (not the raw request string), so candidate
-/// collection matches search-time tokenization.
+/// Only a `Search` harvests. The query is reduced to the same keyword form the
+/// search itself tokenizes: `run_search` strips temporal expressions via
+/// `parse_temporal` before tokenizing, so the harvest strips them too —
+/// otherwise a temporal phrase ("先月" etc.) would leak into candidates.
 pub fn harvest_query_for(req: &the_space_memory::daemon_protocol::DaemonRequest) -> Option<String> {
-    use the_space_memory::daemon_protocol::DaemonRequest;
+    use the_space_memory::{daemon_protocol::DaemonRequest, temporal};
     match req {
         DaemonRequest::Search { query, .. } => {
-            Some(tokenizer::extract_search_keywords(query).join(" "))
+            let stripped = temporal::parse_temporal(query).query;
+            Some(tokenizer::extract_search_keywords(&stripped).join(" "))
         }
         _ => None,
     }
@@ -61,17 +63,23 @@ pub fn harvest_query_for(req: &the_space_memory::daemon_protocol::DaemonRequest)
 /// Routes the best-effort write through the shared writer `Arc<Mutex<Connection>>`
 /// instead of opening a private `db::get_connection` writer, so it serializes
 /// with every other write and is visible to the `writes_pending` fairness yield
-/// (ADR-0015). `lock()` blocks until the writer is free, so a contended write
-/// waits rather than racing at the SQLite level and being lost. The caller runs
-/// this after the search response, so search latency is unaffected.
+/// (ADR-0015). Tokenization runs before the lock; `lock()` then blocks until the
+/// writer is free for the DB upsert only, so a contended write waits rather than
+/// racing at the SQLite level and being lost. The caller runs this after the
+/// search response, so search latency is unaffected.
 pub fn harvest_query_candidates(
     conn: &Arc<Mutex<rusqlite::Connection>>,
     writes_pending: &Arc<AtomicUsize>,
     query: &str,
 ) {
+    // Tokenize + validate outside the writer lock.
+    let candidates = user_dict::extract_query_candidates(query);
+    if candidates.is_empty() {
+        return; // nothing to write — skip the lock entirely
+    }
     let _pending = PendingWriteGuard::new(writes_pending);
     match conn.lock() {
-        Ok(conn) => user_dict::collect_from_query(&conn, query),
+        Ok(conn) => user_dict::upsert_candidates(&conn, &candidates, "query"),
         Err(e) => log::warn!("dict candidate harvest: writer lock poisoned: {e}"),
     }
 }
@@ -79,8 +87,13 @@ pub fn harvest_query_candidates(
 /// Delete stale synonym pairs through the daemon writer (once at startup).
 ///
 /// Routing through the shared writer keeps the daemon the sole writer
-/// (ADR-0015); the pass is independent of the embedder.
-pub fn cleanup_stale_synonyms(conn: &Arc<Mutex<rusqlite::Connection>>) {
+/// (ADR-0015); the `PendingWriteGuard` makes the pass visible to the fairness
+/// yield. The pass is independent of the embedder.
+pub fn cleanup_stale_synonyms(
+    conn: &Arc<Mutex<rusqlite::Connection>>,
+    writes_pending: &Arc<AtomicUsize>,
+) {
+    let _pending = PendingWriteGuard::new(writes_pending);
     match conn.lock() {
         Ok(conn) => synonyms::cleanup_stale(&conn),
         Err(e) => log::warn!("synonym cleanup: writer lock poisoned: {e}"),
@@ -479,11 +492,40 @@ mod tests {
         assert!(harvest_query_for(&DaemonRequest::Status).is_none());
     }
 
+    #[test]
+    fn test_harvest_query_for_strips_temporal_expressions() {
+        use the_space_memory::{temporal, tokenizer};
+
+        // The real search tokenizes the temporal-stripped query
+        // (`run_search` → `parse_temporal`), so the harvest must too: a temporal
+        // phrase like "先月" must not leak into dictionary candidates.
+        let raw = "先月の調査レポート";
+        let harvested = harvest_query_for(&search_req(raw)).expect("Search yields a harvest query");
+
+        let stripped = temporal::parse_temporal(raw).query;
+        assert_eq!(
+            harvested,
+            tokenizer::extract_search_keywords(&stripped).join(" ")
+        );
+        // Guard against regression to raw-query extraction: the temporal token
+        // is actually removed (premise: parse_temporal strips "先月").
+        assert_ne!(
+            harvested,
+            tokenizer::extract_search_keywords(raw).join(" "),
+            "temporal stripping must change the harvested keywords"
+        );
+        assert!(
+            !harvested.contains("先月"),
+            "temporal expression must not appear in harvest keywords: {harvested}"
+        );
+    }
+
     // ─── cleanup_stale_synonyms tests ───────────────────────────────
 
     #[test]
     fn test_cleanup_stale_synonyms_runs_through_writer() {
         let conn = writer_arc();
+        let writes_pending = Arc::new(AtomicUsize::new(0));
         conn.lock()
             .unwrap()
             .execute(
@@ -493,7 +535,7 @@ mod tests {
             )
             .unwrap();
 
-        cleanup_stale_synonyms(&conn);
+        cleanup_stale_synonyms(&conn, &writes_pending);
 
         let remaining: i64 = conn
             .lock()
@@ -507,6 +549,11 @@ mod tests {
         assert_eq!(
             remaining, 0,
             "stale synonym pair should be deleted through the writer"
+        );
+        assert_eq!(
+            writes_pending.load(Ordering::Acquire),
+            0,
+            "pending-write guard must be released after cleanup"
         );
     }
 }

@@ -249,8 +249,9 @@ pub fn run(args: Args) -> Result<()> {
     // independent of the embedder.
     {
         let conn = Arc::clone(&conn);
+        let writes_pending = Arc::clone(&writes_pending);
         std::thread::spawn(move || {
-            backfill::cleanup_stale_synonyms(&conn);
+            backfill::cleanup_stale_synonyms(&conn, &writes_pending);
         });
     }
 
