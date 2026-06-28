@@ -127,6 +127,20 @@ wait_embedder_ready() {
     return 1
 }
 
+# Sum the file counts across the watcher's "detected N changed file(s)" log
+# lines. The watcher logs to stderr, which the daemon captures into
+# logs/tsmd-stderr.log; we read it directly and compute the sum here so the
+# value lands in the e2e job's stdout (CI does not surface tsmd's own logs).
+# Used by the parallel-ingest race as a loop-absence guard (#149): a healthy
+# burst forwards ≈RACE_COUNT events, while the old index→open→reindex loop
+# forwarded ~1361. awk (not bc) keeps it dependency-free.
+watcher_detected_sum() {
+    local log="$TSM_STATE_DIR/logs/tsmd-stderr.log"
+    [[ -f "$log" ]] || { echo 0; return; }
+    grep -oE 'detected [0-9]+ changed' "$log" 2>/dev/null \
+        | grep -oE '[0-9]+' | awk '{s += $1} END {print s + 0}'
+}
+
 # ── Environment setup ─────────────────────────────────────────────────
 
 export TSM_STATE_DIR
@@ -529,23 +543,38 @@ fi
 # ── Parallel ingest race ─────────────────────────────────────────────
 #
 # Verifies that concurrent file creations all land in the index without
-# dedup drops or lost events. Watcher debounces at 2s (watcher_mode.rs:47),
-# so 20 parallel writes should coalesce into one batch.
+# dedup drops or lost events. The watcher debounces changes and coalesces a
+# burst into one index request, so 20 parallel writes should all be indexed.
 # Also checks the reverse direction: concurrent deletions remove all entries.
 #
-# ⚠️ Currently gated behind TSM_E2E_RUN_RACE=1 because the pre-refactor
-# pipeline drops events under parallel load (see issue #149 / ADR-0007).
-# Re-enable by default once the pipeline stage refactor lands.
+# Regression guard for #149: the watcher used to forward notify `Access(Open)`
+# events, so the daemon reading a file to index it re-triggered indexing in an
+# infinite loop that starved most of a parallel burst (only ~5/20 indexed).
+# The watcher now filters to content events; this exercises that fix on Linux.
 
 echo ""
 log "=== 並列投入 race ==="
 
-if [[ "${TSM_E2E_RUN_RACE:-0}" != "1" ]]; then
-    log "SKIP parallel ingest race — tracked in #149, re-enable after pipeline refactor"
-else
-
 RACE_COUNT=20
 RACE_DIR="$TSM_PROJECT_DIR/notes"
+
+# All race files share the tokens "unique"/"marker" plus an identical Japanese
+# phrase, so every `unique-marker-$i` query matches all RACE_COUNT docs. The
+# default top-k (5) would then return only the 5 highest-scoring docs, and the
+# other 15 would look "missing" even when fully indexed — a search-ranking
+# artifact, not an event drop. Request more than RACE_COUNT results so the
+# presence check reflects indexing, not top-k truncation. (A genuinely
+# unindexed file is absent from results at any -k, so this never hides a drop.)
+RACE_K=$((RACE_COUNT + 5))
+
+# Loop-absence guard (#149): a healthy burst makes the watcher forward
+# ≈RACE_COUNT file-events (measured: 20/20/20 across runs); the old
+# index→open→reindex loop forwarded ~1361. Snapshot the running total now and
+# diff after the burst so the count isolates this race (earlier watcher tests
+# also log "detected" lines). 100 is well above the healthy ceiling and far
+# below the loop, so it catches a regression without flaking.
+RACE_LOOP_THRESHOLD=100
+DETECTED_BEFORE="$(watcher_detected_sum)"
 
 # Parallel create
 for i in $(seq 1 "$RACE_COUNT"); do
@@ -576,7 +605,7 @@ MISSING_CREATE=()
 while [[ $RACE_ELAPSED -lt $RACE_TIMEOUT ]]; do
     MISSING_CREATE=()
     for i in $(seq 1 "$RACE_COUNT"); do
-        if ! search_json "unique-marker-$i" 2>/dev/null \
+        if ! search_json "unique-marker-$i" -k "$RACE_K" 2>/dev/null \
              | jq -e "any(.results[]; .source_file | contains(\"race-$i.md\"))" \
                >/dev/null 2>&1; then
             MISSING_CREATE+=("$i")
@@ -596,6 +625,26 @@ else
          "not indexed: ${MISSING_CREATE[*]}"
 fi
 
+# Loop-absence guard: the index-completeness check above cannot tell a healthy
+# index from one produced by a still-running index→open→reindex loop (the loop
+# eventually indexes everything too — it just never stops). Assert the watcher
+# forwarded a bounded number of events during the burst. A drift in the
+# "detected N" log wording would make the delta 0, so a 0 delta fails here
+# rather than passing silently.
+DETECTED_AFTER="$(watcher_detected_sum)"
+RACE_FORWARDED=$((DETECTED_AFTER - DETECTED_BEFORE))
+log "race: watcher forwarded $RACE_FORWARDED file-event(s) during the burst" \
+    "(healthy ≈ $RACE_COUNT; the #149 loop forwarded ~1361; threshold $RACE_LOOP_THRESHOLD)"
+if [[ "$RACE_FORWARDED" -le 0 ]]; then
+    fail "race: loop-guard could not read the watcher forward count" \
+         "delta=$RACE_FORWARDED (missing tsmd-stderr.log or changed 'detected N' log format?)"
+elif [[ "$RACE_FORWARDED" -ge "$RACE_LOOP_THRESHOLD" ]]; then
+    fail "race: watcher forwarded $RACE_FORWARDED events (>= $RACE_LOOP_THRESHOLD)" \
+         "index→open→reindex loop appears to have regressed (#149)"
+else
+    pass "race: loop absent — watcher forwarded $RACE_FORWARDED < $RACE_LOOP_THRESHOLD events"
+fi
+
 # Parallel delete — verifies concurrent removals also coalesce correctly.
 for i in $(seq 1 "$RACE_COUNT"); do
     rm -f "$RACE_DIR/race-$i.md" &
@@ -610,7 +659,7 @@ STILL_PRESENT=()
 while [[ $RACE_ELAPSED -lt $RACE_TIMEOUT ]]; do
     STILL_PRESENT=()
     for i in $(seq 1 "$RACE_COUNT"); do
-        if search_json "unique-marker-$i" 2>/dev/null \
+        if search_json "unique-marker-$i" -k "$RACE_K" 2>/dev/null \
            | jq -e "any(.results[]; .source_file | contains(\"race-$i.md\"))" \
              >/dev/null 2>&1; then
             STILL_PRESENT+=("$i")
@@ -629,8 +678,6 @@ else
     fail "race: parallel delete left ${#STILL_PRESENT[@]}/$RACE_COUNT entries" \
          "still indexed: ${STILL_PRESENT[*]}"
 fi
-
-fi  # end TSM_E2E_RUN_RACE gate
 
 # ── Embedder crash recovery ──────────────────────────────────────────
 #
