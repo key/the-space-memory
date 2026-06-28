@@ -60,12 +60,58 @@ variables. They have no `tsm.toml` equivalent.
 | `XDG_CACHE_HOME` | `$HOME/.cache` | Fallback input for the `TSM_CACHE_DIR` default (XDG Base Directory convention) |
 | `HOME` | _(OS-provided)_ | Fallback input for the `TSM_CACHE_DIR` default when `XDG_CACHE_HOME` is unset |
 
+## Resource Layers and `link_mode`
+
+The embedding model (~147 MB) and WordNet DB (~200 MB) live in two layers[^layers]:
+
+- **System cache** (`cache_dir`, machine-global) — fetched once per machine by
+  `tsm setup` and shared by every workspace. Defaults to
+  `{XDG_CACHE_HOME}/tsm` (else `$HOME/.cache/tsm`).
+- **Workspace** (`.tsm/`, per-workspace) — `tsm init` materializes
+  `.tsm/models/ruri-v3-30m` and `.tsm/wnjpn.db` as references to the system
+  cache, so each workspace stays small.
+
+```text
+$cache_dir/                         <workspace>/.tsm/
+├── models/ruri-v3-30m   ◄─────────  models/ruri-v3-30m   (init link/copy)
+└── wnjpn.db             ◄─────────  wnjpn.db             (init link/copy)
+   ▲  (setup link/copy)
+   └── upstream: HuggingFace cache / sources/wnjpn-<ver>.db
+```
+
+Each layer chooses independently how it materializes its entries, via
+`[setup].link_mode` (cache layer) and `[init].link_mode` (workspace layer):
+
+- `symlink` (default) — reference the upstream entry; no duplicated bytes.
+  A broken link is reported by the embedder at startup and by `tsm doctor`.
+- `copy` — physically duplicate the upstream entry; survives the upstream
+  being removed, at the cost of disk space.
+
+Resolution for each layer is independent: CLI flag (`--link-mode`) >
+`tsm.toml` > default (`symlink`).
+
+| Scenario | `[setup].link_mode` | `[init].link_mode` | Per-workspace duplication |
+|---|---|---|---|
+| Single host | `symlink` | `symlink` | none |
+| Single DevContainer | `symlink` | `symlink` | none |
+| Host ↔ DevContainer (shared workspace) | `symlink` | `copy` | ~347 MB per workspace |
+| Fully self-contained (max portability) | `copy` | `copy` | ~347 MB per cache + per workspace |
+
+Pick `copy` for the workspace layer when the workspace must work without the
+cache — e.g. a workspace shared between a host and a DevContainer whose
+`cache_dir` absolute path differs between the two environments.
+
 ## tsm.toml Full Example
 
 ```toml
 # Root directory for all tsm state files: DB, sockets, PID, logs, user dict.
 # Default: .tsm (relative to working directory)
 state_dir = ".tsm"
+
+# Machine-wide cache for the model and WordNet DB, shared across all
+# workspaces and populated by `tsm setup`.
+# Default: {XDG_CACHE_HOME}/tsm (else $HOME/.cache/tsm)
+# cache_dir = "/custom/cache"
 
 # UNIX socket for the embedder child process.
 # Default: {state_dir}/embedder.sock
@@ -97,6 +143,16 @@ search_fallback = "error"
 # Path to the lindera simpledic user dictionary file.
 # Default: {state_dir}/user_dict.simpledic
 user_dict_path = ".tsm/user_dict.simpledic"
+
+[setup]
+# How `tsm setup` materializes entries inside the cache: "symlink" (default,
+# references the upstream without duplicating bytes) or "copy".
+link_mode = "symlink"
+
+[init]
+# How `tsm init` materializes the workspace's references to the cache
+# (.tsm/models/ruri-v3-30m, .tsm/wnjpn.db): "symlink" (default) or "copy".
+link_mode = "symlink"
 
 [index]
 # Content directories to index, with per-directory scoring parameters.
@@ -250,3 +306,6 @@ Changes take effect differently depending on the field:
 - `embedder_backfill_interval_secs`
 - `index.claude_session.weight` (`session_weight`)
 - `index.claude_session.half_life_days` (`session_half_life_days`)
+
+[^layers]: Design background for the two-layer model:
+    `decisions/0008-setup-init-separation.md`.

@@ -97,6 +97,11 @@ tsm search -q "query" --path notes/
 `tsm setup` sets `HF_HUB_CACHE` automatically; override it to redirect the
 Hugging Face model cache.
 
+`tsm setup` populates a machine-wide cache (`~/.cache/tsm`) once per machine;
+`tsm init` then materializes the model and WordNet DB into the workspace's
+`.tsm/` as a symlink (default) or copy. See
+[Resource Layers and `link_mode`](docs/configuration.md#resource-layers-and-link_mode).
+
 ### What gets indexed
 
 tsm recursively scans the project root (directory containing `tsm.toml`) for `.md` files.
