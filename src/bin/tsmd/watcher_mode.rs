@@ -5,7 +5,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use notify::event::ModifyKind;
+use notify::event::{AccessKind, AccessMode, ModifyKind};
 use notify::{recommended_watcher, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use the_space_memory::config;
@@ -31,12 +31,25 @@ extern "C" fn sighup_handler(_sig: libc::c_int) {
 /// *reading* a watched file to index it emits `Access(Open)` events — as do its
 /// repeated reads of `tsm.toml` / `.tsmignore` during ingest-policy checks.
 /// Forwarding those turned indexing into an infinite index→open→reindex loop
-/// (#149). We therefore drop every `Access(_)` event (open/close/read) and
-/// metadata-only changes (atime/permissions), keeping creation, content writes,
-/// renames, and removals. A denylist — rather than an allowlist — preserves the
-/// coarse `Any` / `Modify(Any)` events some backends (e.g. macOS FSEvents) emit.
+/// (#149). We therefore drop the access events the daemon's reads emit (`Open`,
+/// `Read`, `Close(Read)`) and metadata-only changes (atime/permissions), while
+/// keeping creation, content writes, renames, and removals.
+///
+/// `Access(Close(Write))` (inotify `IN_CLOSE_WRITE`) is the one access event we
+/// keep: it is the canonical "a writer finished and closed the file" signal. The
+/// daemon opens files read-only, so its reads never emit `Close(Write)` — only
+/// `Open` / `Close(Read)` — so keeping it cannot reopen the loop.
+///
+/// This is a denylist (drop specific access/metadata kinds, keep the rest)
+/// rather than an allowlist, so coarse `Any` / `Modify(Any)` events that some
+/// backends (e.g. macOS FSEvents) emit are preserved.
 fn is_index_relevant(kind: &EventKind) -> bool {
-    !(kind.is_access() || matches!(kind, EventKind::Modify(ModifyKind::Metadata(_))))
+    match kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        EventKind::Access(_) => false,
+        EventKind::Modify(ModifyKind::Metadata(_)) => false,
+        _ => true,
+    }
 }
 
 /// Coalesces file-change events by relative path: a path is emitted once it has
@@ -360,15 +373,28 @@ mod tests {
     }
 
     #[test]
-    fn test_access_close_and_read_are_not_index_relevant() {
+    fn test_read_side_access_events_are_not_index_relevant() {
+        // The access events the daemon's read-only indexing emits must be
+        // dropped — these are what drove the #149 loop.
         for kind in [
-            EventKind::Access(AccessKind::Close(AccessMode::Write)),
             EventKind::Access(AccessKind::Close(AccessMode::Read)),
             EventKind::Access(AccessKind::Read),
             EventKind::Access(AccessKind::Any),
         ] {
             assert!(!is_index_relevant(&kind), "{kind:?} must be dropped");
         }
+    }
+
+    #[test]
+    fn test_close_write_is_index_relevant() {
+        // IN_CLOSE_WRITE is the canonical write-completion signal and is only
+        // emitted by writers, never by the daemon's read-only opens — so it is
+        // kept while every other Access(_) is dropped.
+        let kind = EventKind::Access(AccessKind::Close(AccessMode::Write));
+        assert!(
+            is_index_relevant(&kind),
+            "Access(Close(Write)) must be forwarded"
+        );
     }
 
     #[test]
