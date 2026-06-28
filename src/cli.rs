@@ -198,31 +198,68 @@ pub fn cmd_init_with(paths: &InitPaths<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Materialize a cache directory into the workspace, or warn-and-continue
-/// when the cache entry is absent (pre-`tsm setup`). Delegates the actual
-/// symlink/copy to [`placement::place_directory`].
-fn place_directory_or_skip(src: &Path, dst: &Path, mode: config::LinkMode) -> anyhow::Result<()> {
+/// Shared guard for the `place_*_or_skip` wrappers. Returns `true` when the
+/// caller should materialize `src` at `dst`, `false` (with a warning) when
+/// placement must be skipped:
+///
+/// - the cache entry is absent — the pre-`tsm setup` path; init still succeeds;
+/// - `src` and `dst` resolve to the same path (e.g. `cache_dir == state_dir`).
+///   Placement removes `dst` before recreating it, so in symlink mode that
+///   would delete the cache and leave a dangling self-symlink. Skipping
+///   leaves the existing resource in place.
+fn should_place_cache_resource(src: &Path, dst: &Path) -> bool {
     if !src.exists() {
         log::warn!(
             "cache resource not found: {} — run `tsm setup` to populate it, then re-run `tsm init`.",
             src.display()
         );
-        return Ok(());
+        return false;
     }
-    placement::place_directory(src, dst, mode)
+    if same_entry_location(src, dst) {
+        log::warn!(
+            "cache resource {} is also the workspace destination; skipping placement to avoid destroying it (cache_dir == state_dir).",
+            src.display()
+        );
+        return false;
+    }
+    true
 }
 
-/// File counterpart of [`place_directory_or_skip`]. Delegates to
-/// [`placement::place_file`].
-fn place_file_or_skip(src: &Path, dst: &Path, mode: config::LinkMode) -> anyhow::Result<()> {
-    if !src.exists() {
-        log::warn!(
-            "cache resource not found: {} — run `tsm setup` to populate it, then re-run `tsm init`.",
-            src.display()
-        );
-        return Ok(());
+/// Whether `a` and `b` name the same filesystem entry. The parent directory
+/// is canonicalized (resolving symlinked ancestors) but the final component
+/// is NOT dereferenced — so a symlink `b` that points at `a` is correctly
+/// seen as a *distinct* entry (the normal re-init case), while `a == b`
+/// (e.g. `cache_dir == state_dir`) is detected. Returns `false` when either
+/// parent cannot be resolved (e.g. `dst` not created yet), so placement
+/// proceeds normally.
+fn same_entry_location(a: &Path, b: &Path) -> bool {
+    let location = |p: &Path| -> Option<PathBuf> {
+        let parent = p.parent()?.canonicalize().ok()?;
+        Some(parent.join(p.file_name()?))
+    };
+    match (location(a), location(b)) {
+        (Some(la), Some(lb)) => la == lb,
+        _ => false,
     }
-    placement::place_file(src, dst, mode)
+}
+
+/// Materialize a cache directory into the workspace, or warn-and-continue
+/// when placement must be skipped (see [`should_place_cache_resource`]).
+fn place_directory_or_skip(src: &Path, dst: &Path, mode: config::LinkMode) -> anyhow::Result<()> {
+    if should_place_cache_resource(src, dst) {
+        placement::place_directory(src, dst, mode)
+    } else {
+        Ok(())
+    }
+}
+
+/// File counterpart of [`place_directory_or_skip`].
+fn place_file_or_skip(src: &Path, dst: &Path, mode: config::LinkMode) -> anyhow::Result<()> {
+    if should_place_cache_resource(src, dst) {
+        placement::place_file(src, dst, mode)
+    } else {
+        Ok(())
+    }
 }
 
 /// Write `content` to `path` if no file exists there. Idempotent —
@@ -2444,6 +2481,25 @@ mod tests {
         (models_src, wnjpn_src)
     }
 
+    /// Assert the single WordNet pair staged by `stage_fake_cache` was
+    /// imported. This closes the cache→placed-link→import seam at the unit
+    /// level: the import reads `state_dir/wnjpn.db`, which is only populated
+    /// by the placement step having materialized the cache link/copy.
+    fn assert_wordnet_synonym_imported(state_dir: &Path) {
+        let conn = crate::db::get_connection(&state_dir.join("tsm.db")).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM synonyms WHERE source = 'wordnet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "WordNet synonym should be imported through the placed link"
+        );
+    }
+
     #[test]
     fn cmd_init_with_creates_workspace_symlinks_when_mode_is_symlink() {
         // symlink mode: workspace entries point at the cache by symbolic
@@ -2475,6 +2531,7 @@ mod tests {
                 .is_symlink(),
             "wnjpn.db should be a symlink"
         );
+        assert_wordnet_synonym_imported(&state_dir);
     }
 
     #[test]
@@ -2508,6 +2565,7 @@ mod tests {
             !wnjpn_meta.file_type().is_symlink() && wnjpn_meta.is_file(),
             "wnjpn.db should be a physical file"
         );
+        assert_wordnet_synonym_imported(&state_dir);
     }
 
     #[test]
@@ -2554,6 +2612,40 @@ mod tests {
                 .is_symlink(),
             "re-init with copy should replace the wnjpn.db symlink with a file"
         );
+    }
+
+    #[test]
+    fn cmd_init_with_does_not_self_destruct_when_cache_equals_state_dir() {
+        // Degenerate config where the cache source and the workspace
+        // destination resolve to the same path (cache_dir == state_dir).
+        // Placement must NOT remove the source to "replace" it — in symlink
+        // mode that would delete the cache and leave a dangling self-symlink.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_dir = dir.path().join(".tsm");
+        let models = state_dir.join("models/ruri-v3-30m");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("model.safetensors"), b"weights").unwrap();
+        let wnjpn = state_dir.join("wnjpn.db");
+        create_mock_wordnet_db(&wnjpn, &[("alpha", "beta")]);
+
+        // src == dst for both resources.
+        run_init_with_cache(
+            dir.path(),
+            &models,
+            &wnjpn,
+            super::config::LinkMode::Symlink,
+        );
+
+        assert!(
+            models.join("model.safetensors").is_file(),
+            "the cache model must survive when cache_dir == state_dir"
+        );
+        assert!(
+            wnjpn.is_file(),
+            "the cache WordNet DB must survive when cache_dir == state_dir"
+        );
+        // The surviving wnjpn.db is still importable through the same path.
+        assert_wordnet_synonym_imported(&state_dir);
     }
 
     #[test]
