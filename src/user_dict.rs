@@ -134,8 +134,12 @@ pub struct CandidateSummary {
     pub rejected_count: i64,
 }
 
+/// A tokenized dictionary candidate (surface form + part of speech).
+///
+/// Produced by [`extract_query_candidates`] and consumed by
+/// [`upsert_candidates`]; fields stay private (callers forward the value).
 #[derive(Debug)]
-struct RawCandidate {
+pub struct RawCandidate {
     surface: String,
     pos: CandidatePos,
 }
@@ -270,24 +274,30 @@ fn is_valid_candidate(word: &str, existing_words: &HashSet<String>) -> bool {
 
 // ─── Collection ──────────────────────────────────────────────
 
-/// Collect dictionary candidates from text and upsert into DB.
-/// source: "document" | "query" | "session"
-pub fn collect_from_text(conn: &Connection, text: &str, source: &str) {
-    if !db::has_candidates_table(conn) {
-        return;
-    }
+/// Tokenize text into validated dictionary candidates (no DB access).
+///
+/// Splitting extraction from the upsert lets the daemon tokenize a search query
+/// outside the writer lock and acquire the lock only for the DB write.
+pub fn extract_query_candidates(text: &str) -> Vec<RawCandidate> {
     if text.trim().len() < 4 {
+        return Vec::new();
+    }
+    let existing = get_existing_surfaces();
+    extract_raw_candidates(text)
+        .into_iter()
+        .filter(|c| is_valid_candidate(&c.surface, existing))
+        .collect()
+}
+
+/// Upsert pre-extracted candidates into the DB. Requires a writable connection.
+/// source: "document" | "query" | "session"
+pub fn upsert_candidates(conn: &Connection, candidates: &[RawCandidate], source: &str) {
+    if candidates.is_empty() || !db::has_candidates_table(conn) {
         return;
     }
-
-    let existing = get_existing_surfaces();
-    let candidates = extract_raw_candidates(text);
     let now = chrono::Utc::now().to_rfc3339();
 
     for c in candidates {
-        if !is_valid_candidate(&c.surface, existing) {
-            continue;
-        }
         if let Err(e) = conn.execute(
             "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status)
              VALUES (?1, 1, ?2, ?3, ?4, ?4, 'pending')
@@ -305,27 +315,13 @@ pub fn collect_from_text(conn: &Connection, text: &str, source: &str) {
     }
 }
 
-/// Collect candidates from a search query.
-pub fn collect_from_query(conn: &Connection, query: &str) {
-    collect_from_text(conn, query, "query");
-}
-
-/// Spawn query-candidate collection on a fresh writer connection (fire-and-forget).
-///
-/// The daemon serves searches on a `query_only` reader connection, so the harvest
-/// must not run on the serving connection. Returns the join handle; callers on the
-/// hot path drop it (fire-and-forget), tests join it for determinism.
-pub fn spawn_collect_from_query(
-    db_path: std::path::PathBuf,
-    query: String,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || match db::get_connection(&db_path) {
-        Ok(conn) => collect_from_query(&conn, &query),
-        Err(e) => log::warn!(
-            "dict candidate harvest: failed to open writer connection ({}): {e}",
-            db_path.display()
-        ),
-    })
+/// Collect dictionary candidates from text and upsert into DB.
+/// source: "document" | "query" | "session"
+pub fn collect_from_text(conn: &Connection, text: &str, source: &str) {
+    if !db::has_candidates_table(conn) {
+        return;
+    }
+    upsert_candidates(conn, &extract_query_candidates(text), source);
 }
 
 // ─── Querying ────────────────────────────────────────────────
@@ -1545,22 +1541,33 @@ mod tests {
         assert_eq!(count, 0, "short text should be skipped");
     }
 
-    // ─── spawn_collect_from_query tests ──────────────────────
+    // ─── extract_query_candidates / upsert_candidates tests ──────────
 
     #[test]
-    fn test_spawn_collect_from_query_writes_to_own_connection() {
-        // Arrange: create a real file-based DB (WAL requires a real file)
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        crate::db::init_db(&db_path).unwrap();
+    fn test_extract_query_candidates_returns_validated() {
+        let candidates = extract_query_candidates("田中さんが東京に行った");
+        assert!(
+            !candidates.is_empty(),
+            "should extract at least one validated candidate"
+        );
+    }
 
-        // Act: spawn harvest and join deterministically
-        spawn_collect_from_query(db_path.clone(), "candle framework for rust".to_string())
-            .join()
-            .unwrap();
+    #[test]
+    fn test_extract_query_candidates_short_text_empty() {
+        assert!(
+            extract_query_candidates("hi").is_empty(),
+            "text shorter than the threshold yields no candidates"
+        );
+    }
 
-        // Assert: candidates were written via the spawned writer connection
-        let conn = crate::db::get_connection(&db_path).unwrap();
+    #[test]
+    fn test_upsert_candidates_writes_pre_extracted() {
+        let conn = setup();
+        let candidates = extract_query_candidates("田中さんが東京に行った");
+        assert!(!candidates.is_empty(), "precondition: candidates extracted");
+
+        upsert_candidates(&conn, &candidates, "query");
+
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM dictionary_candidates", [], |r| {
                 r.get(0)
@@ -1568,7 +1575,7 @@ mod tests {
             .unwrap();
         assert!(
             count > 0,
-            "spawn_collect_from_query must write candidates; got 0"
+            "upsert should persist the pre-extracted candidates"
         );
     }
 
@@ -1680,21 +1687,6 @@ mod tests {
         assert!(!is_ascii_term("123"));
         assert!(!is_ascii_term(""));
         assert!(!is_ascii_term("日本語"));
-    }
-
-    // ─── collect_from_query test ─────────────────────────────
-
-    #[test]
-    fn test_collect_from_query() {
-        let conn = setup();
-        collect_from_query(&conn, "candle framework for rust");
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM dictionary_candidates", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert!(count > 0, "should collect candidates from query");
     }
 
     // ─── export_reject_words_to_file tests ───────────────────────

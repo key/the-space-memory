@@ -2,7 +2,6 @@ use rusqlite::Connection;
 
 use crate::{
     classifier, config, db, embedder, entity, synonyms, tokenizer::extract_search_keywords,
-    user_dict,
 };
 
 /// Output of the Plan stage: extracted keywords, classification weights,
@@ -21,9 +20,9 @@ pub(crate) struct QueryPlan {
 /// Plan stage: extract keywords, classify the query, expand via entity graph
 /// and synonyms, and embed the query for vector search.
 ///
-/// Side effects (synonym cleanup, dictionary-candidate harvest) are dispatched
-/// to background threads and do not write through `conn`. `conn` is read-only
-/// throughout this function.
+/// `conn` is read-only throughout: the stage performs no writes. Best-effort
+/// dictionary-candidate harvesting is the daemon's responsibility, routed
+/// through the shared writer after the response (see `handle_client`).
 ///
 /// Returns `Ok(None)` if the query contains too few meaningful keywords to
 /// search (the caller should return an empty result set). Returns
@@ -36,14 +35,6 @@ pub(crate) fn plan(conn: &Connection, query: &str) -> anyhow::Result<Option<Quer
     let keywords_query = keywords.join(" ");
 
     let classification = classifier::classify(conn, &keywords_query);
-
-    // Lazy spawn stale synonym cleanup (once per process)
-    synonyms::maybe_spawn_cleanup(config::db_path());
-
-    // Collect query terms as dictionary candidates on a fresh writer connection.
-    // The daemon serves searches on a `query_only` reader conn, so the harvest
-    // must not run on the serving connection (fire-and-forget).
-    let _ = user_dict::spawn_collect_from_query(config::db_path(), keywords_query.clone());
 
     // Expand query: entity graph + synonym dictionary
     let entity_exp = entity::expand_entities_by_ids(
