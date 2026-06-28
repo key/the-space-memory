@@ -544,6 +544,15 @@ log "=== 並列投入 race ==="
 RACE_COUNT=20
 RACE_DIR="$TSM_PROJECT_DIR/notes"
 
+# All race files share the tokens "unique"/"marker" plus an identical Japanese
+# phrase, so every `unique-marker-$i` query matches all RACE_COUNT docs. The
+# default top-k (5) would then return only the 5 highest-scoring docs, and the
+# other 15 would look "missing" even when fully indexed — a search-ranking
+# artifact, not an event drop. Request more than RACE_COUNT results so the
+# presence check reflects indexing, not top-k truncation. (A genuinely
+# unindexed file is absent from results at any -k, so this never hides a drop.)
+RACE_K=$((RACE_COUNT + 5))
+
 # Parallel create
 for i in $(seq 1 "$RACE_COUNT"); do
     cat > "$RACE_DIR/race-$i.md" <<HEREDOC &
@@ -573,7 +582,7 @@ MISSING_CREATE=()
 while [[ $RACE_ELAPSED -lt $RACE_TIMEOUT ]]; do
     MISSING_CREATE=()
     for i in $(seq 1 "$RACE_COUNT"); do
-        if ! search_json "unique-marker-$i" 2>/dev/null \
+        if ! search_json "unique-marker-$i" -k "$RACE_K" 2>/dev/null \
              | jq -e "any(.results[]; .source_file | contains(\"race-$i.md\"))" \
                >/dev/null 2>&1; then
             MISSING_CREATE+=("$i")
@@ -607,7 +616,7 @@ STILL_PRESENT=()
 while [[ $RACE_ELAPSED -lt $RACE_TIMEOUT ]]; do
     STILL_PRESENT=()
     for i in $(seq 1 "$RACE_COUNT"); do
-        if search_json "unique-marker-$i" 2>/dev/null \
+        if search_json "unique-marker-$i" -k "$RACE_K" 2>/dev/null \
            | jq -e "any(.results[]; .source_file | contains(\"race-$i.md\"))" \
              >/dev/null 2>&1; then
             STILL_PRESENT+=("$i")
