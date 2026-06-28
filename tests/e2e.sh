@@ -529,20 +529,17 @@ fi
 # ── Parallel ingest race ─────────────────────────────────────────────
 #
 # Verifies that concurrent file creations all land in the index without
-# dedup drops or lost events. Watcher debounces at 2s (watcher_mode.rs:47),
-# so 20 parallel writes should coalesce into one batch.
+# dedup drops or lost events. The watcher debounces changes and coalesces a
+# burst into one index request, so 20 parallel writes should all be indexed.
 # Also checks the reverse direction: concurrent deletions remove all entries.
 #
-# ⚠️ Currently gated behind TSM_E2E_RUN_RACE=1 because the pre-refactor
-# pipeline drops events under parallel load (see issue #149 / ADR-0007).
-# Re-enable by default once the pipeline stage refactor lands.
+# Regression guard for #149: the watcher used to forward notify `Access(Open)`
+# events, so the daemon reading a file to index it re-triggered indexing in an
+# infinite loop that starved most of a parallel burst (only ~5/20 indexed).
+# The watcher now filters to content events; this exercises that fix on Linux.
 
 echo ""
 log "=== 並列投入 race ==="
-
-if [[ "${TSM_E2E_RUN_RACE:-0}" != "1" ]]; then
-    log "SKIP parallel ingest race — tracked in #149, re-enable after pipeline refactor"
-else
 
 RACE_COUNT=20
 RACE_DIR="$TSM_PROJECT_DIR/notes"
@@ -629,8 +626,6 @@ else
     fail "race: parallel delete left ${#STILL_PRESENT[@]}/$RACE_COUNT entries" \
          "still indexed: ${STILL_PRESENT[*]}"
 fi
-
-fi  # end TSM_E2E_RUN_RACE gate
 
 # ── Embedder crash recovery ──────────────────────────────────────────
 #
