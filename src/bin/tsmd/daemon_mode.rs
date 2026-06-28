@@ -245,6 +245,15 @@ pub fn run(args: Args) -> Result<()> {
     // Reindex-active flag: at most one reindex runs at a time.
     let reindex_active = Arc::new(AtomicBool::new(false));
 
+    // Startup synonym cleanup — one pass through the writer (ADR-0015),
+    // independent of the embedder.
+    {
+        let conn = Arc::clone(&conn);
+        std::thread::spawn(move || {
+            backfill::cleanup_stale_synonyms(&conn);
+        });
+    }
+
     // Startup backfill — waits for embedder socket then runs one pass.
     if !args.no_embedder {
         let conn = Arc::clone(&conn);
@@ -426,6 +435,11 @@ fn handle_client(
         return Ok(());
     }
 
+    // A search harvests its query terms as dictionary candidates. Capture the
+    // harvest query before `req` is consumed; the write itself runs after the
+    // response.
+    let harvest_query = backfill::harvest_query_for(&req);
+
     let resp = if req.is_read_only() {
         let conn = read_pool.checkout();
         daemon::handle_request(&conn, req, project_root, &SHUTDOWN)
@@ -439,5 +453,13 @@ fn handle_client(
         daemon::handle_request(&conn, req, project_root, &SHUTDOWN)
     };
     write_response(stream, &resp)?;
+
+    // Best-effort dict-candidate harvest, routed through the shared writer and
+    // fairness counter (ADR-0015) rather than a private connection. Runs after
+    // the response so it adds nothing to search latency; `lock()` blocks under
+    // contention so the write is never lost.
+    if let Some(query) = harvest_query {
+        backfill::harvest_query_candidates(conn, writes_pending, &query);
+    }
     Ok(())
 }

@@ -92,9 +92,9 @@ impl DaemonRequest {
     /// `query_only` reader connection, so any write would fail `SQLITE_READONLY`.
     /// If a handler classified `true` ever needs to write (including indirect
     /// side effects like dictionary-candidate harvesting), route that write onto
-    /// a writer connection (e.g. a background `db::get_connection` thread, as the
-    /// search path does for `user_dict::spawn_collect_from_query`) rather than
-    /// reclassifying the request as a write.
+    /// the daemon's shared writer after the response (as the search path does via
+    /// `tsmd::backfill::harvest_query_candidates`) rather than reclassifying the
+    /// request as a write.
     pub fn is_read_only(&self) -> bool {
         match self {
             // Genuine reads.

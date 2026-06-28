@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -582,22 +581,6 @@ pub fn cleanup_stale(conn: &Connection) {
     if deleted > 0 {
         log::info!("cleaned up {deleted} stale synonym pairs");
     }
-}
-
-/// Global flag to ensure cleanup runs at most once per process.
-static CLEANUP_SPAWNED: AtomicBool = AtomicBool::new(false);
-
-/// Spawn a background cleanup thread (runs at most once per process).
-pub fn maybe_spawn_cleanup(db_path: std::path::PathBuf) {
-    if CLEANUP_SPAWNED.swap(true, Ordering::SeqCst) {
-        return; // Already spawned
-    }
-
-    std::thread::spawn(move || {
-        if let Ok(conn) = db::get_connection(&db_path) {
-            cleanup_stale(&conn);
-        }
-    });
 }
 
 #[cfg(test)]

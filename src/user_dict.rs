@@ -306,26 +306,12 @@ pub fn collect_from_text(conn: &Connection, text: &str, source: &str) {
 }
 
 /// Collect candidates from a search query.
+///
+/// The daemon routes this through its shared writer after the search response
+/// (see `tsmd::backfill::harvest_query_candidates`); it must run on a writable
+/// connection, never the `query_only` reader pool.
 pub fn collect_from_query(conn: &Connection, query: &str) {
     collect_from_text(conn, query, "query");
-}
-
-/// Spawn query-candidate collection on a fresh writer connection (fire-and-forget).
-///
-/// The daemon serves searches on a `query_only` reader connection, so the harvest
-/// must not run on the serving connection. Returns the join handle; callers on the
-/// hot path drop it (fire-and-forget), tests join it for determinism.
-pub fn spawn_collect_from_query(
-    db_path: std::path::PathBuf,
-    query: String,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || match db::get_connection(&db_path) {
-        Ok(conn) => collect_from_query(&conn, &query),
-        Err(e) => log::warn!(
-            "dict candidate harvest: failed to open writer connection ({}): {e}",
-            db_path.display()
-        ),
-    })
 }
 
 // ─── Querying ────────────────────────────────────────────────
@@ -1543,33 +1529,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0, "short text should be skipped");
-    }
-
-    // ─── spawn_collect_from_query tests ──────────────────────
-
-    #[test]
-    fn test_spawn_collect_from_query_writes_to_own_connection() {
-        // Arrange: create a real file-based DB (WAL requires a real file)
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        crate::db::init_db(&db_path).unwrap();
-
-        // Act: spawn harvest and join deterministically
-        spawn_collect_from_query(db_path.clone(), "candle framework for rust".to_string())
-            .join()
-            .unwrap();
-
-        // Assert: candidates were written via the spawned writer connection
-        let conn = crate::db::get_connection(&db_path).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM dictionary_candidates", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert!(
-            count > 0,
-            "spawn_collect_from_query must write candidates; got 0"
-        );
     }
 
     // ─── get_threshold_candidates tests ──────────────────────
