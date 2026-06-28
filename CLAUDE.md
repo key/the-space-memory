@@ -431,6 +431,17 @@ see ADR-0012.
 4. Internals (How it works) — collection logic, data flow
 5. Implementation reference (Code) — source files and roles
 
+### Referencing ADRs and issues
+
+ADR numbers (`ADR-XXXX`) and issue numbers (`#NNN`) MUST NOT appear in source
+code or type definitions. Explain the rationale directly in prose instead — a
+comment should stand on its own without the reader opening an ADR. In `docs/`
+and other Markdown, do not cite ADRs inline; when a source pointer is genuinely
+useful, use a Markdown footnote (`[^adr-xxxx]`) defined at the end of the file.
+PR titles, commit messages, and PR bodies may still reference ADRs/issues —
+those are traceability, not code/doc content. Existing inline references across
+the repo (including in this file) are being removed gradually.
+
 ## License Compatibility
 
 Verify license compatibility when adding dependencies. This project is **MIT** licensed.
