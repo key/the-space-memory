@@ -57,14 +57,14 @@ These commands run directly (not routed through the daemon).
 
 ### tsm init
 
-Initialize the workspace: schema, scaffold files, WordNet import, user
-synonym import. All steps are idempotent and re-runnable.
+Initialize the workspace: schema, scaffold files, cache links, WordNet import,
+user synonym import. All steps are idempotent and re-runnable.
 
 ```text
 tsm init [--link-mode <symlink|copy>]
 ```
 
-Performs the following per-workspace setup steps. Every file write uses
+Performs the following per-workspace setup steps. Every scaffold write uses
 `OpenOptions::create_new`, so existing user-customized files are never
 overwritten:
 
@@ -76,28 +76,36 @@ overwritten:
    - `.tsm/user_dict.simpledic` — empty (lindera user dictionary)
    - `.tsm/custom_terms.toml` — header comment with format example
    - `.tsm/synonyms.csv` — header comment for user synonym pairs
-3. Materializes the machine cache's ruri model and WordNet DB into the
-   workspace (`.tsm/models/ruri-v3-30m`, `.tsm/wnjpn.db`) as a symlink or
-   copy per `--link-mode`. Missing cache entries log a warning and are
+3. Materializes the workspace's references to the machine-wide cache per
+   `--link-mode`: `.tsm/models/ruri-v3-30m` and `.tsm/wnjpn.db`. `symlink`
+   (default) points at the cache; `copy` duplicates it into `.tsm/` so the
+   workspace is self-contained. Missing cache entries log a warning and are
    skipped — run `tsm setup` to populate the cache, then re-run `tsm init`.
+   Re-running with a different `--link-mode` rebuilds these entries (flipping
+   symlink↔copy) without touching `tsm.db`.
 4. Imports Japanese WordNet synonyms from `.tsm/wnjpn.db` if present.
    If missing, logs a warning and continues — run `tsm setup` to
-   download the file, then re-run `tsm init` to import.
+   populate the cache, then re-run `tsm init` to import.
 5. Imports user-defined synonyms from `.tsm/synonyms.csv` (insert-only — unlike
    [tsm synonym import](#tsm-synonym-import) it never deletes, so re-running
    `tsm init` never drops pairs added with `tsm synonym add`).
+
+To override the cache model or WordNet for one workspace, place files directly
+in `.tsm/models/ruri-v3-30m/` or `.tsm/wnjpn.db`; the embedder prefers the
+workspace copy and falls back to the cache.
 
 **Flags:**
 
 | Flag | Description |
 |---|---|
-| `--link-mode <symlink\|copy>` | How workspace resources reference the cache. Overrides `[init].link_mode` from `tsm.toml` (default `symlink`). |
+| `--link-mode <symlink\|copy>` | How `.tsm/` references the cache. `symlink` (default) links to the cache (no duplication); `copy` duplicates cache contents into `.tsm/` (use for DevContainer / host-shared workspaces that must be self-contained). Defaults to `[init].link_mode` from `tsm.toml`, else `symlink`. |
 
 **Example:**
 
 ```bash
-tsm setup       # one-time: fetch ruri model + WordNet DB
-tsm init        # per-workspace: schema, scaffold, synonym import
+tsm setup                   # one-time per machine: populate the cache
+tsm init                    # per-workspace: schema, scaffold, cache links, import
+tsm init --link-mode copy   # self-contained workspace (copies model + WordNet)
 ```
 
 ---
@@ -465,7 +473,13 @@ tsm doctor [-f json]
 ```
 
 Checks database integrity, embedder availability, vector coverage, and
-dictionary state. Outputs a formatted report with pass/warn/fail indicators.
+dictionary state. It also reports the two resource layers: a **Workspace**
+section (the `.tsm/` links into the cache) and a **System cache** section (the
+machine-wide cache entries plus `manifest.json` validity and size
+reconciliation). These two layers are inspected by reading the filesystem only —
+`doctor` never starts the daemon and never creates files. Each non-OK item
+carries a recovery hint. Outputs a formatted report with pass/warn/fail
+indicators.
 
 **Flags:**
 
@@ -486,6 +500,16 @@ dictionary state. Outputs a formatted report with pass/warn/fail indicators.
 │  Embedder                                           │
 │    ✔ Running (idle timeout: 600s)                   │
 │    ✔ Vectors: 5678 (matches all chunks)             │
+│                                                     │
+│  Workspace                                          │
+│    ✔ models/ruri-v3-30m  →  cache (link alive)      │
+│    ✔ wnjpn.db            →  cache (link alive)      │
+│                                                     │
+│  System cache                                       │
+│    ✔ models/ruri-v3-30m  →  HF cache (link alive)   │
+│    ✔ wnjpn.db            →  sources (link alive)    │
+│    ✔ manifest.json: 2 entries                       │
+│    ✔ wnjpn.db: 203.0MB (matches manifest)           │
 │                                                     │
 │  All good.                                          │
 │                                                     │

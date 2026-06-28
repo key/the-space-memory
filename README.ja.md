@@ -88,6 +88,11 @@ tsm search -q "クエリ" --path notes/
 `tsm setup` は `HF_HUB_CACHE` を自動設定する。Hugging Face のモデルキャッシュを
 別の場所に向けたい場合は明示的に上書きする。
 
+`tsm setup` はマシン共有のキャッシュ（`~/.cache/tsm`）をマシンごとに 1 回だけ
+構築し、`tsm init` がそのモデルと WordNet DB をワークスペースの `.tsm/` に
+symlink（既定）または copy で展開する。詳細は
+[Resource Layers and `link_mode`](docs/configuration.md#resource-layers-and-link_mode) を参照。
+
 ### インデックス対象
 
 tsmはプロジェクトルート（`tsm.toml` があるディレクトリ）配下の `.md` ファイルを再帰的にスキャンする。

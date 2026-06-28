@@ -8,6 +8,12 @@
 # Env: TSM_STATE_DIR
 # state_dir = ".tsm"
 
+# Machine-wide cache directory for the embedding model and WordNet DB,
+# shared across all workspaces and populated once per machine by `tsm setup`.
+# Default: "{XDG_CACHE_HOME}/tsm" (else "$HOME/.cache/tsm")
+# Env: TSM_CACHE_DIR
+# cache_dir = "/custom/cache"
+
 # UNIX socket path for the embedder child process (encode requests).
 # Default: "{state_dir}/embedder.sock"
 # Env: TSM_EMBEDDER_SOCKET
@@ -51,6 +57,27 @@
 # Default: "{state_dir}/user_dict.simpledic"
 # Env: TSM_USER_DICT
 # user_dict_path = ".tsm/user_dict.simpledic"
+
+# ─── Resource placement ───────────────────────────────────────────
+#
+# How the model and WordNet DB are materialized at each layer. "symlink"
+# references the upstream entry without duplicating bytes; "copy" makes a
+# physical, self-contained duplicate. Pick "copy" for the workspace layer
+# when the workspace must survive without the cache (e.g. moving between a
+# host and a DevContainer whose cache path differs).
+
+[setup]
+# Strategy `tsm setup` uses to materialize entries inside the cache.
+# Options: "symlink" | "copy". Default: "symlink".
+# Env: TSM_SETUP_LINK_MODE
+# link_mode = "symlink"
+
+[init]
+# Strategy `tsm init` uses to materialize the workspace's references to the
+# cache (.tsm/models/ruri-v3-30m, .tsm/wnjpn.db).
+# Options: "symlink" | "copy". Default: "symlink".
+# Env: TSM_INIT_LINK_MODE
+# link_mode = "symlink"
 
 # ─── Index settings ───────────────────────────────────────────────
 
