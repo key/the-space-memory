@@ -4,6 +4,8 @@ use std::sync::{OnceLock, RwLock};
 
 use directories::ProjectDirs;
 
+pub use crate::config_accessors::*;
+
 // ─── Internal constants (not user-configurable) ──────────────────
 
 pub const MAX_CHUNK_CHARS: usize = 800;
@@ -19,6 +21,10 @@ pub const BACKFILL_BATCH_SIZE: usize = 8;
 /// Smaller = finer write preemption, larger = better full-reindex
 /// throughput. 200 is the middle ground; tune via config + measurement.
 pub const DEFAULT_REINDEX_FTS_BATCH_SIZE: usize = 200;
+/// Default per-document chunk cap in the search result window (#299).
+/// Caps same-document flooding so below-cliff documents can surface. `0`
+/// disables the cap (plain top-k).
+pub const DEFAULT_MAX_CHUNKS_PER_DOCUMENT: usize = 3;
 pub const MAX_QUERY_EXPANSIONS: usize = 5;
 pub const RECENT_DAYS: i64 = 30;
 pub const DICT_CANDIDATE_FREQ_THRESHOLD: i64 = 5;
@@ -194,6 +200,7 @@ pub(crate) struct ConfigFile {
     embedder_backfill_interval_secs: Option<u64>,
     reader_pool_size: Option<u64>,
     reindex_fts_batch_size: Option<u64>,
+    max_chunks_per_document: Option<u64>,
     search_fallback: Option<SearchFallback>,
     user_dict_path: Option<PathBuf>,
     #[serde(default)]
@@ -257,6 +264,12 @@ pub struct ResolvedConfig {
     /// Default: `DEFAULT_REINDEX_FTS_BATCH_SIZE`. Env: `TSM_REINDEX_FTS_BATCH_SIZE`.
     /// Config: `reindex_fts_batch_size`.
     pub reindex_fts_batch_size: usize,
+
+    /// Max chunks per document in the search result window (#299). Caps
+    /// same-document flooding; `0` disables the cap. Default:
+    /// `DEFAULT_MAX_CHUNKS_PER_DOCUMENT`. Env: `TSM_MAX_CHUNKS_PER_DOCUMENT`.
+    /// Config: `max_chunks_per_document`.
+    pub max_chunks_per_document: usize,
 
     /// Behavior when the embedder is stopped during search.
     /// Default: `Error` (refuse to search without vector search).
@@ -418,6 +431,15 @@ impl ResolvedConfig {
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_REINDEX_FTS_BATCH_SIZE);
 
+        // 0 is a valid value (disables the cap), so no `> 0` filter — only an
+        // absent setting falls back to the default.
+        let max_chunks_per_document = env_parse_u64(
+            "TSM_MAX_CHUNKS_PER_DOCUMENT",
+            file_cfg.max_chunks_per_document,
+        )
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_MAX_CHUNKS_PER_DOCUMENT);
+
         let search_fallback = env_parse_fallback(file_cfg.search_fallback);
 
         let user_dict_path = env_or("TSM_USER_DICT", file_cfg.user_dict_path.as_ref())
@@ -515,6 +537,7 @@ impl ResolvedConfig {
             embedder_backfill_interval_secs,
             reader_pool_size,
             reindex_fts_batch_size,
+            max_chunks_per_document,
             search_fallback,
             user_dict_path,
             setup_link_mode,
@@ -658,7 +681,7 @@ fn injected_candidates(root: &Path, tsm_config: Option<&Path>) -> Vec<PathBuf> {
 static RESOLVED: OnceLock<RwLock<ResolvedConfig>> = OnceLock::new();
 
 /// Get the lazily-loaded resolved config singleton (cloned).
-fn resolved() -> ResolvedConfig {
+pub(crate) fn resolved() -> ResolvedConfig {
     RESOLVED
         .get_or_init(|| RwLock::new(ResolvedConfig::from_env()))
         .read()
@@ -809,6 +832,9 @@ fn load_config_from(candidates: &[PathBuf]) -> (ConfigFile, Option<PathBuf>) {
         merged.reindex_fts_batch_size = merged
             .reindex_fts_batch_size
             .or(file.reindex_fts_batch_size);
+        merged.max_chunks_per_document = merged
+            .max_chunks_per_document
+            .or(file.max_chunks_per_document);
         merged.search_fallback = merged.search_fallback.or(file.search_fallback);
         merged.user_dict_path = merged.user_dict_path.or(file.user_dict_path);
         if merged.index.content_dirs.is_empty() {
@@ -911,129 +937,6 @@ pub fn resolve_project_root(
         "no tsm.toml in the current directory and no --project-root given; \
          run `tsm init` here or pass --project-root <dir>"
     )
-}
-
-// ─── Accessor functions (delegate to ResolvedConfig singleton) ───
-
-pub fn state_dir() -> PathBuf {
-    resolved().state_dir.clone()
-}
-
-pub fn cache_dir() -> PathBuf {
-    resolved().cache_dir.clone()
-}
-
-pub fn embedder_socket_path() -> PathBuf {
-    resolved().embedder_socket_path.clone()
-}
-
-pub fn daemon_socket_path() -> PathBuf {
-    resolved().daemon_socket_path.clone()
-}
-
-pub fn log_dir() -> PathBuf {
-    resolved().log_dir.clone()
-}
-
-pub fn embedder_idle_timeout_secs() -> u64 {
-    resolved().embedder_idle_timeout_secs
-}
-
-pub fn embedder_backfill_interval_secs() -> u64 {
-    resolved().embedder_backfill_interval_secs
-}
-
-pub fn reader_pool_size() -> usize {
-    resolved().reader_pool_size
-}
-
-pub fn reindex_fts_batch_size() -> usize {
-    resolved().reindex_fts_batch_size
-}
-
-pub fn search_fallback() -> SearchFallback {
-    resolved().search_fallback
-}
-
-pub fn content_dirs() -> Vec<ContentDir> {
-    resolved().content_dirs
-}
-
-pub fn session_weight() -> f64 {
-    resolved().session_weight
-}
-
-pub fn session_half_life_days() -> f64 {
-    resolved().session_half_life_days
-}
-
-pub fn respect_gitignore() -> bool {
-    resolved().respect_gitignore
-}
-
-pub fn ignore_file() -> String {
-    resolved().ignore_file.clone()
-}
-
-pub fn index_extensions() -> Vec<String> {
-    resolved().extensions.clone()
-}
-
-pub fn project_root() -> PathBuf {
-    resolved().project_root.clone()
-}
-
-/// Return the legacy `index_root` value captured from the config file, if any.
-///
-/// When `Some`, a config file still uses the removed `index_root` key.
-/// Callers are responsible for handling this condition:
-/// - CLI startup: hard-exit with a migration message.
-/// - Daemon startup: `anyhow::bail!` before socket bind.
-/// - Config reload: push a warning and keep running.
-pub fn legacy_index_root() -> Option<PathBuf> {
-    resolved().rejected_index_root.clone()
-}
-
-// ─── Derived paths ───────────────────────────────────────────────
-
-pub fn db_path() -> PathBuf {
-    state_dir().join("tsm.db")
-}
-
-pub fn user_dict_path() -> PathBuf {
-    resolved().user_dict_path.clone()
-}
-
-pub fn setup_link_mode() -> LinkMode {
-    resolved().setup_link_mode
-}
-
-pub fn init_link_mode() -> LinkMode {
-    resolved().init_link_mode
-}
-
-pub fn custom_terms_path() -> PathBuf {
-    state_dir().join("custom_terms.toml")
-}
-
-pub fn stopwords_path() -> PathBuf {
-    state_dir().join("stopwords.txt")
-}
-
-pub fn reject_words_path() -> PathBuf {
-    state_dir().join("reject_words.txt")
-}
-
-pub fn wordnet_db_path() -> PathBuf {
-    state_dir().join("wnjpn.db")
-}
-
-pub fn user_synonyms_path() -> PathBuf {
-    state_dir().join("synonyms.csv")
-}
-
-pub fn daemon_pid_path() -> PathBuf {
-    state_dir().join("tsmd.pid")
 }
 
 // ─── Local model directory ──────────────────────────────────────
@@ -2793,5 +2696,48 @@ half_life_days = 180
         let cfg = resolved_from_toml("reindex_fts_batch_size = 10\n");
         assert_eq!(cfg.reindex_fts_batch_size, 55);
         std::env::remove_var("TSM_REINDEX_FTS_BATCH_SIZE");
+    }
+
+    // ─── max_chunks_per_document (#299) ──────────────────────────────
+
+    #[test]
+    #[serial]
+    fn test_max_chunks_per_document_default() {
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.max_chunks_per_document, DEFAULT_MAX_CHUNKS_PER_DOCUMENT);
+    }
+
+    #[test]
+    #[serial]
+    fn test_max_chunks_per_document_from_file() {
+        let cfg = resolved_from_toml("max_chunks_per_document = 5\n");
+        assert_eq!(cfg.max_chunks_per_document, 5);
+    }
+
+    #[test]
+    #[serial]
+    fn test_max_chunks_per_document_zero_disables_not_default() {
+        // 0 is a valid value (disables the cap) and must be preserved, unlike
+        // the pool-size knobs where 0 falls back to a default.
+        let cfg = resolved_from_toml("max_chunks_per_document = 0\n");
+        assert_eq!(cfg.max_chunks_per_document, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_max_chunks_per_document_env_override() {
+        std::env::set_var("TSM_MAX_CHUNKS_PER_DOCUMENT", "7");
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.max_chunks_per_document, 7);
+        std::env::remove_var("TSM_MAX_CHUNKS_PER_DOCUMENT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_max_chunks_per_document_env_beats_file() {
+        std::env::set_var("TSM_MAX_CHUNKS_PER_DOCUMENT", "2");
+        let cfg = resolved_from_toml("max_chunks_per_document = 9\n");
+        assert_eq!(cfg.max_chunks_per_document, 2);
+        std::env::remove_var("TSM_MAX_CHUNKS_PER_DOCUMENT");
     }
 }

@@ -72,6 +72,39 @@ fn build_filter_clauses(
     (time_sql, path_sql, extra_params)
 }
 
+/// Greedy per-document diversification of score-sorted results.
+///
+/// Walks the (score-descending) candidate pool and keeps a chunk only while its
+/// document (`source_file`) is still under `cap`, until `k` are selected. This
+/// caps same-document flooding and lets below-cliff documents rise into the
+/// freed slots (#299).
+///
+/// The pool is the **floor**: diversification draws only from the candidates the
+/// retriever already produced and never digs deeper. If fewer than `k` survive
+/// the cap, fewer are returned — weak filler is not injected for diversity's
+/// sake. `cap == 0` disables the cap (plain top-k by score).
+fn diversify_by_document(sorted: Vec<SearchResult>, k: usize, cap: usize) -> Vec<SearchResult> {
+    if cap == 0 {
+        let mut out = sorted;
+        out.truncate(k);
+        return out;
+    }
+
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(k.min(sorted.len()));
+    for r in sorted {
+        if out.len() >= k {
+            break;
+        }
+        let seen = counts.entry(r.source_file.clone()).or_insert(0);
+        if *seen < cap {
+            *seen += 1;
+            out.push(r);
+        }
+    }
+    out
+}
+
 /// Rank stage: metadata-fetch SQL join, RRF fusion, score hooks, threshold
 /// filtering, top-k truncation, and related-doc attachment.
 ///
@@ -201,7 +234,10 @@ pub(crate) fn rank(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let total_hits = results.len();
-    results.truncate(top_k);
+    // Per-document diversity cap (#299): cap same-document flooding and let
+    // below-cliff documents rise into freed slots. Runs on every path
+    // (including the FTS-only fallback) since rank() is always the final stage.
+    results = diversify_by_document(results, top_k, config::max_chunks_per_document());
 
     // Enrich with related documents
     let result_doc_ids: Vec<i64> = results
@@ -269,5 +305,89 @@ mod tests {
     #[test]
     fn test_snippet_single_line() {
         assert_eq!(snippet("単一行テスト"), "単一行テスト");
+    }
+
+    // ─── diversify_by_document tests ────────────────────────────────
+
+    /// Build a minimal score-sorted result keyed by document file + score.
+    fn sr(file: &str, score: f64) -> SearchResult {
+        SearchResult {
+            source_file: file.to_string(),
+            source_type: "note".to_string(),
+            section_path: String::new(),
+            snippet: String::new(),
+            score,
+            status: None,
+            related_docs: Vec::new(),
+        }
+    }
+
+    fn files(results: &[SearchResult]) -> Vec<&str> {
+        results.iter().map(|r| r.source_file.as_str()).collect()
+    }
+
+    #[test]
+    fn test_diversify_caps_flooding_doc_and_pulls_below_cliff() {
+        // docA floods the top with 5 chunks; docB/docC sit just below. With
+        // cap=3, k=5: docA keeps its 3 best, docB+docC rise into the freed slots.
+        let pool = vec![
+            sr("a.md", 0.90),
+            sr("a.md", 0.89),
+            sr("a.md", 0.88),
+            sr("a.md", 0.87),
+            sr("a.md", 0.86),
+            sr("b.md", 0.50),
+            sr("c.md", 0.40),
+        ];
+        let out = diversify_by_document(pool, 5, 3);
+        assert_eq!(out.len(), 5);
+        assert_eq!(files(&out), vec!["a.md", "a.md", "a.md", "b.md", "c.md"]);
+        assert_eq!(out.iter().filter(|r| r.source_file == "a.md").count(), 3);
+    }
+
+    #[test]
+    fn test_diversify_respects_cap_boundary_exactly() {
+        // A document with exactly `cap` chunks keeps all of them; the (cap+1)-th
+        // is dropped even though it outranks another document's chunk.
+        let pool = vec![
+            sr("a.md", 0.9),
+            sr("a.md", 0.8),
+            sr("a.md", 0.7),
+            sr("a.md", 0.6), // 4th A — must be skipped at cap=3
+            sr("b.md", 0.5),
+        ];
+        let out = diversify_by_document(pool, 5, 3);
+        assert_eq!(files(&out), vec!["a.md", "a.md", "a.md", "b.md"]);
+    }
+
+    #[test]
+    fn test_diversify_returns_fewer_than_k_on_pool_starvation() {
+        // The whole pool is one document. Capping leaves < k and the floor
+        // forbids digging past the pool — so return fewer, not weak filler.
+        let pool = vec![
+            sr("a.md", 0.9),
+            sr("a.md", 0.8),
+            sr("a.md", 0.7),
+            sr("a.md", 0.6),
+        ];
+        let out = diversify_by_document(pool, 5, 3);
+        assert_eq!(out.len(), 3, "starved pool yields cap, not k");
+        assert!(out.iter().all(|r| r.source_file == "a.md"));
+    }
+
+    #[test]
+    fn test_diversify_cap_zero_disables_and_returns_plain_top_k() {
+        // cap=0 disables the diversity cap: plain top-k by score order.
+        let pool = vec![
+            sr("a.md", 0.9),
+            sr("a.md", 0.8),
+            sr("a.md", 0.7),
+            sr("a.md", 0.6),
+            sr("a.md", 0.5),
+            sr("b.md", 0.4),
+        ];
+        let out = diversify_by_document(pool, 5, 0);
+        assert_eq!(out.len(), 5);
+        assert!(out.iter().all(|r| r.source_file == "a.md"));
     }
 }

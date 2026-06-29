@@ -2,6 +2,7 @@ pub mod chunker;
 pub mod classifier;
 pub mod cli;
 pub mod config;
+mod config_accessors;
 pub mod daemon;
 pub mod daemon_lock;
 pub mod daemon_protocol;
