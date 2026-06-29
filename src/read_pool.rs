@@ -4,7 +4,7 @@
 //! WAL imposes no contention between reader connections, but a single
 //! `Connection` cannot be shared across threads at once. The pool hands each
 //! concurrent reader its own connection, so `N` connections give `N`-way real
-//! parallel reads. Writes never use this pool (see ADR-0015).
+//! parallel reads. Writes never use this pool.
 
 use std::ops::Deref;
 use std::path::Path;

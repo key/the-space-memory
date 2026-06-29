@@ -328,7 +328,7 @@ pub fn entity_results(
 /// Search for chunks by pre-computed entity IDs (avoids redundant lookup).
 ///
 /// When `path_prefixes` is set, both the direct and 2nd-hop chunk lookups are
-/// restricted to chunks whose document is in-scope (ADR-0017 Gap 4), so the
+/// restricted to chunks whose document is in-scope, so the
 /// entity retriever does not spend its budget on out-of-scope chunks.
 pub fn entity_results_by_ids(
     conn: &Connection,
@@ -401,7 +401,7 @@ pub fn entity_results_by_ids(
 
 /// 2nd-hop expansion: chunks reachable via entities co-occurring with
 /// `entity_ids`, excluding chunks already matched directly. `scope_in` /
-/// `scope_params` carry the in-scope `--path` restriction (ADR-0017 Gap 4).
+/// `scope_params` carry the in-scope `--path` restriction.
 /// Returns chunk ids in rank order (empty when no related entities).
 fn second_hop_chunk_ids(
     conn: &Connection,
@@ -798,7 +798,7 @@ mod tests {
     #[test]
     fn entity_results_respect_path_scope() {
         // Two docs under different dirs share a tag entity; scoping to one dir
-        // must return only that doc's chunk (ADR-0017 Gap 4).
+        // must return only that doc's chunk.
         let conn = db::get_memory_connection().unwrap();
         let chunk_of = |path: &str| -> i64 {
             conn.execute(

@@ -30,8 +30,8 @@ extern "C" fn sighup_handler(_sig: libc::c_int) {
 /// `inotify.rs`) with no config knob to disable it, so the daemon merely
 /// *reading* a watched file to index it emits `Access(Open)` events — as do its
 /// repeated reads of `tsm.toml` / `.tsmignore` during ingest-policy checks.
-/// Forwarding those turned indexing into an infinite index→open→reindex loop
-/// (#149). We therefore drop the access events the daemon's reads emit (`Open`,
+/// Forwarding those turned indexing into an infinite index→open→reindex loop.
+/// We therefore drop the access events the daemon's reads emit (`Open`,
 /// `Read`, `Close(Read)`) and metadata-only changes (atime/permissions), while
 /// keeping creation, content writes, renames, and removals.
 ///
@@ -56,7 +56,7 @@ fn is_index_relevant(kind: &EventKind) -> bool {
 /// stayed quiet for [`DEBOUNCE`]. Replaces notify-debouncer-mini, whose
 /// `DebouncedEvent` collapsed every notify event kind into an opaque "changed"
 /// signal — discarding exactly the kind information needed to filter out the
-/// `Access(Open)` events behind the #149 feedback loop.
+/// `Access(Open)` events that caused the feedback loop.
 struct Debounce {
     /// Relative path → instant of its most recent event.
     pending: HashMap<String, Instant>,
@@ -122,7 +122,7 @@ pub fn run() -> Result<()> {
     }
 
     // Raw notify watcher. The handler filters by event kind *before* the event
-    // reaches our debounce, so `Access(Open)` noise (the #149 loop) never enters
+    // reaches our debounce, so `Access(Open)` noise never enters
     // the pipeline. Surviving events and watch errors are forwarded over the
     // channel; the main loop debounces and dispatches them.
     let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<Event, notify::Error>>();
@@ -131,7 +131,7 @@ pub fn run() -> Result<()> {
             Ok(event) if is_index_relevant(&event.kind) => {
                 let _ = tx.send(Ok(event));
             }
-            Ok(_) => {} // drop Access / metadata-only events (#149)
+            Ok(_) => {} // drop Access / metadata-only events
             Err(e) => {
                 let _ = tx.send(Err(e));
             }
@@ -359,7 +359,7 @@ mod tests {
         RELOAD_REQUESTED.store(false, Ordering::SeqCst);
     }
 
-    // ── Root-cause fix: event-kind filter (#149) ──────────────────────
+    // ── Root-cause fix: event-kind filter ────────────────────────────
     // The daemon's reads of watched files (and of tsm.toml / .tsmignore on
     // every ingest-policy check) surface as `Access(Open)` events under
     // notify's inotify backend. Forwarding them caused an infinite
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn test_access_open_is_not_index_relevant() {
-        // The exact kind observed dominating the #149 feedback loop.
+        // The exact kind observed dominating the feedback loop.
         let kind = EventKind::Access(AccessKind::Open(AccessMode::Any));
         assert!(!is_index_relevant(&kind), "Access(Open) must be dropped");
     }
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn test_read_side_access_events_are_not_index_relevant() {
         // The access events the daemon's read-only indexing emits must be
-        // dropped — these are what drove the #149 loop.
+        // dropped — these are what drove the feedback loop.
         for kind in [
             EventKind::Access(AccessKind::Close(AccessMode::Read)),
             EventKind::Access(AccessKind::Read),

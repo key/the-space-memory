@@ -191,8 +191,8 @@ pub fn is_initialized(conn: &Connection) -> bool {
 /// creating it.
 ///
 /// A missing file reports `Ok(false)` without opening anything, so starting an
-/// uninitialized project never materializes the state directory (ADR-0008 —
-/// `init` is an explicit, separate step). An existing file is opened read-write
+/// uninitialized project never materializes the state directory (`init` is an
+/// explicit, separate step). An existing file is opened read-write
 /// but **without** the `CREATE` flag: this never creates a new DB, yet still
 /// lets SQLite recover a hot WAL left by an unclean shutdown (a read-only open
 /// would fail with `SQLITE_READONLY_RECOVERY` and falsely block startup).
@@ -370,7 +370,7 @@ pub fn has_vec_table(conn: &Connection) -> bool {
 }
 
 /// Reject a DB created before absolute-path storage. The `file_path` column
-/// changed meaning (relative → absolute, ADR-0017); a stored relative path
+/// changed meaning (relative → absolute); a stored relative path
 /// would silently mis-match every `--path`. The check is data-driven: it fails
 /// iff a legacy relative `file_path` row exists, so empty and fully-migrated DBs
 /// pass and the check self-heals after a rebuild.

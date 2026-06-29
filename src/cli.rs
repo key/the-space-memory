@@ -380,7 +380,7 @@ pub fn read_paths_from_stdin(project_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Normalize `--path` args to deduped, CWD-anchored absolute paths (ADR-0017).
+/// Normalize `--path` args to deduped, CWD-anchored absolute paths.
 /// Accepts absolute or relative input; empty string is the only error.
 pub fn normalize_path_filters(args: &[String], cwd: &Path) -> anyhow::Result<Option<Vec<String>>> {
     if args.is_empty() {
@@ -468,7 +468,7 @@ pub fn cmd_search(opts: SearchOptions) -> anyhow::Result<()> {
 }
 
 fn print_text(results: &[searcher::SearchResult], total_hits: usize) {
-    // Text output is relative to the caller's CWD (ADR-0017).
+    // Text output is relative to the caller's CWD.
     let cwd = std::env::current_dir().unwrap_or_default();
     print!("{}", searcher::format_text(results, total_hits, &cwd));
 }
@@ -685,7 +685,7 @@ pub fn cmd_synonym_export(file: Option<&Path>) -> anyhow::Result<()> {
         }
         None => {
             // stdout destination: CSV is the user output, so the diagnostic
-            // count goes to stderr to keep the stream pipeable (ADR-0012).
+            // count goes to stderr to keep the stream pipeable.
             let stdout = std::io::stdout();
             let mut w = stdout.lock();
             let count = synonyms::export_user_synonyms(&conn, &mut w)?;
@@ -738,8 +738,8 @@ const WORDNET_URL: &str = "https://github.com/bond-lab/wnja/releases/download/v1
 ///
 /// Fetches the ruri model (HuggingFace Hub) and the Japanese WordNet DB, places
 /// them under `$cache_dir` per `mode`, and writes `manifest.json`. Never touches
-/// a workspace `.tsm/` — wiring the cache into a workspace is `tsm init`'s job
-/// (ADR-0008). `link_mode_override` (the `--link-mode` flag) wins over
+/// a workspace `.tsm/` — wiring the cache into a workspace is `tsm init`'s job.
+/// `link_mode_override` (the `--link-mode` flag) wins over
 /// `[setup].link_mode` from config when `Some`.
 pub fn cmd_setup(link_mode_override: Option<config::LinkMode>) -> anyhow::Result<()> {
     let mode = link_mode_override.unwrap_or_else(config::setup_link_mode);
@@ -839,7 +839,7 @@ fn write_cache_layout(
         "wnjpn.db".to_string(),
         manifest::ManifestEntry {
             mode,
-            // Cache-relative (ADR-0008 §manifest, S1): the WordNet source is
+            // Cache-relative: the WordNet source is
             // tsm-owned under `$cache_dir/sources/`. The model target stays
             // absolute (an external HF snapshot dir). doctor resolves a relative
             // target against `cache_dir`.
@@ -1793,7 +1793,7 @@ fn estimate_eta(started_at: &str, processed: usize, total: usize) -> String {
     }
 }
 
-/// `tsm dict update` — show frequent, un-judged candidate words (ADR-0014).
+/// `tsm dict update` — show frequent, un-judged candidate words.
 /// A read-only discovery view: it lists words seen often enough to be worth a
 /// verdict. Acceptance/rejection is per word via `dict add` / `dict reject`;
 /// bulk loading is `dict import`. This command only reads.
@@ -1881,7 +1881,7 @@ fn reindex_fts_after_dict_change() -> anyhow::Result<()> {
 }
 
 /// Reconcile the on-disk verdict files into the DB and apply the user's verdict
-/// change in ONE transaction (ADR-0014; fixes #281/#288). The reconcile pulls
+/// change in ONE transaction. The reconcile pulls
 /// terms present in `user_dict.simpledic` / `reject_words.txt` but absent from
 /// (or only `pending` in) the DB into it BEFORE the change, so the subsequent
 /// `user_dict.simpledic` rewrite cannot silently drop them. Any file conflict or
@@ -1945,7 +1945,7 @@ fn materialize_dict(conn: rusqlite::Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `tsm dict add <surface> [<yomi>]` — accept a term (ADR-0014 §1, §4).
+/// `tsm dict add <surface> [<yomi>]` — accept a term.
 pub fn cmd_dict_add(surface: &str, yomi: Option<&str>) -> anyhow::Result<()> {
     user_dict::validate_surface(surface)?;
     let conn = db::get_connection(&config::db_path())?;
@@ -1966,7 +1966,7 @@ pub fn cmd_dict_add(surface: &str, yomi: Option<&str>) -> anyhow::Result<()> {
     materialize_dict(conn)
 }
 
-/// `tsm dict rm <word>` — reset a term to pending (ADR-0014 §1).
+/// `tsm dict rm <word>` — reset a term to pending.
 /// Errors when the term was never registered (nothing to reset).
 pub fn cmd_dict_rm(word: &str) -> anyhow::Result<()> {
     let conn = db::get_connection(&config::db_path())?;
@@ -1979,7 +1979,7 @@ pub fn cmd_dict_rm(word: &str) -> anyhow::Result<()> {
     materialize_dict(conn)
 }
 
-/// `tsm dict reject <word>` — move a word to the `rejected` verdict (ADR-0014).
+/// `tsm dict reject <word>` — move a word to the `rejected` verdict.
 /// Inserts a manual row when the word was never seen (preemptive reject). When
 /// the word was accepted, the accepted set shrinks, so `user_dict.simpledic` is
 /// regenerated and the tokenizer reloaded.
@@ -1999,7 +1999,7 @@ pub fn cmd_dict_reject(word: &str) -> anyhow::Result<()> {
     materialize_dict(conn)
 }
 
-/// `tsm dict export` — write the DB's verdicts to disk (ADR-0014 §2): the
+/// `tsm dict export` — write the DB's verdicts to disk: the
 /// accepted set to `user_dict.simpledic` and the rejected set to
 /// `reject_words.txt`. The DB is the authority; this materializes a portable,
 /// git-trackable snapshot. No reindex — the running tokenizer already reflects
@@ -2025,7 +2025,7 @@ pub fn cmd_dict_export() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `tsm dict import` — load verdicts from disk into the DB (ADR-0014 §2).
+/// `tsm dict import` — load verdicts from disk into the DB.
 /// Insert-only: accepted words from `user_dict.simpledic` and rejected words
 /// from `reject_words.txt` are upserted; verdicts absent from the files are left
 /// untouched (use `dict rm`/`reject` to remove). This recovers the DB after a
@@ -2043,7 +2043,7 @@ pub fn cmd_dict_import() -> anyhow::Result<()> {
     user_dict::assert_no_cross_file_conflict(&dict_path, &reject_path)?;
 
     // One transaction for the whole import: a mid-file failure rolls back rather
-    // than leaving a partial set of verdicts committed (#287).
+    // than leaving a partial set of verdicts committed.
     let (acc, rej) = {
         let tx = conn.unchecked_transaction()?;
         let acc = user_dict::import_user_dict_from_file(&tx, &dict_path)?;
