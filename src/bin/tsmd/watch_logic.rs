@@ -3,7 +3,7 @@
 //! (the notify event loop and watch registration glue) so this logic is covered
 //! by the coverage gate while the I/O shell stays excluded.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -115,6 +115,29 @@ pub(crate) fn watch_targets(
                 ok
             })
             .collect()
+    }
+}
+
+/// The watch-set transition computed by [`diff_watch_set`]: which directories to
+/// unwatch, which to newly watch, and which are already watched and kept.
+pub(crate) struct WatchDiff {
+    /// In `current` but no longer `desired` — unwatch these.
+    pub(crate) to_unwatch: Vec<PathBuf>,
+    /// In `desired` but not yet in `current` — watch these.
+    pub(crate) to_watch: Vec<PathBuf>,
+    /// In both `current` and `desired` — already watched, keep as-is.
+    pub(crate) kept: HashSet<PathBuf>,
+}
+
+/// Pure set diff between the currently-watched directories and the desired set:
+/// splits them into unwatch / watch / kept. The caller applies the watch and
+/// unwatch I/O (which can fail per directory), so this stays free of the notify
+/// `Watcher` and is unit-testable on its own.
+pub(crate) fn diff_watch_set(current: &HashSet<PathBuf>, desired: &HashSet<PathBuf>) -> WatchDiff {
+    WatchDiff {
+        to_unwatch: current.difference(desired).cloned().collect(),
+        to_watch: desired.difference(current).cloned().collect(),
+        kept: current.intersection(desired).cloned().collect(),
     }
 }
 
@@ -294,5 +317,58 @@ mod tests {
         let targets = watch_targets(dir.path(), &dirs);
 
         assert_eq!(targets, vec![dir.path().join("exists")]);
+    }
+
+    // ── Watch-set diff ─────────────────────────────────────────────────
+
+    fn set(paths: &[&str]) -> HashSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    fn sorted(mut v: Vec<PathBuf>) -> Vec<PathBuf> {
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn test_diff_watch_set_all_new() {
+        // Empty current → everything desired is to_watch; nothing kept/unwatched.
+        let diff = diff_watch_set(&set(&[]), &set(&["/a", "/b"]));
+        assert_eq!(
+            sorted(diff.to_watch),
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
+        assert!(diff.to_unwatch.is_empty());
+        assert!(diff.kept.is_empty());
+    }
+
+    #[test]
+    fn test_diff_watch_set_unchanged_keeps_all() {
+        // current == desired → nothing to watch/unwatch; all kept.
+        let diff = diff_watch_set(&set(&["/a", "/b"]), &set(&["/a", "/b"]));
+        assert!(diff.to_watch.is_empty());
+        assert!(diff.to_unwatch.is_empty());
+        assert_eq!(diff.kept, set(&["/a", "/b"]));
+    }
+
+    #[test]
+    fn test_diff_watch_set_partial_overlap() {
+        // /a kept, /b removed (unwatch), /c added (watch).
+        let diff = diff_watch_set(&set(&["/a", "/b"]), &set(&["/a", "/c"]));
+        assert_eq!(sorted(diff.to_watch), vec![PathBuf::from("/c")]);
+        assert_eq!(sorted(diff.to_unwatch), vec![PathBuf::from("/b")]);
+        assert_eq!(diff.kept, set(&["/a"]));
+    }
+
+    #[test]
+    fn test_diff_watch_set_all_removed() {
+        // Empty desired → everything current is to_unwatch; nothing kept.
+        let diff = diff_watch_set(&set(&["/a", "/b"]), &set(&[]));
+        assert!(diff.to_watch.is_empty());
+        assert_eq!(
+            sorted(diff.to_unwatch),
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
+        assert!(diff.kept.is_empty());
     }
 }
