@@ -9,7 +9,7 @@ This document specifies the stages, their responsibilities and I/O, the
 invariants that hold across them, and where each plugin kind hooks in. For
 the cross-process data flow (which process owns each step), see
 [Data Flow](data-flow.md). For the rationale and alternatives behind this
-decomposition, see [ADR-0007](../decisions/0007-pipeline-stages.md).
+decomposition, see the pipeline-stages decision record.[^adr-0007]
 
 ## Why stages
 
@@ -119,11 +119,12 @@ API specification, not here.
 
 ## Related
 
-- [ADR-0007](../decisions/0007-pipeline-stages.md) — rationale and
-  alternatives for the two-pipeline decomposition
-- [ADR-0001](../decisions/0001-process-roles-and-responsibilities.md) —
-  process roles and responsibilities
-- [ADR-0005](../decisions/0005-embedder-binary-consolidation.md) — embedder
-  binary consolidation (origin of the Embed serial contract)
+- Rationale and alternatives for the two-pipeline decomposition.[^adr-0007]
+- Process roles and responsibilities.[^adr-0001]
+- Embedder binary consolidation — origin of the Embed serial contract.[^adr-0005]
 - [Data Flow](data-flow.md) — cross-process data flow that these logical
   stages run within
+
+[^adr-0007]: [ADR-0007: Pipeline stages](../decisions/0007-pipeline-stages.md)
+[^adr-0001]: [ADR-0001: Process roles and responsibilities](../decisions/0001-process-roles-and-responsibilities.md)
+[^adr-0005]: [ADR-0005: Embedder binary consolidation](../decisions/0005-embedder-binary-consolidation.md)

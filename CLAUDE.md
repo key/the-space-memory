@@ -61,20 +61,20 @@ src/
 ├── cli.rs              — CLI command implementations
 ├── config.rs           — Configuration (TSM_* env vars, config file, scoring params)
 ├── db.rs               — SQLite (rusqlite) DB init & connection management
-├── indexer/             — Index pipeline (Prepare/Persist/Embed stages, ADR-0007)
+├── indexer/             — Index pipeline (Prepare/Persist/Embed stages)
 │   ├── mod.rs           — Orchestration: index_file (prepare→persist→embed), index_all*, index_session
 │   ├── prepare.rs       — Prepare stage: file → PreparedFile (parse/chunk/metadata, no DB)
 │   ├── persist.rs       — Persist stage: one transaction (documents/chunks/FTS5/entity/links), diff, rebuild_fts
 │   ├── embed.rs         — Embed stage: async vector inference + writes (backfill)
 │   └── walker.rs        — File discovery + ingest policy
-├── searcher/            — Search pipeline (Plan/Retrieve/Rank/Format stages, ADR-0007)
+├── searcher/            — Search pipeline (Plan/Retrieve/Rank/Format stages)
 │   ├── mod.rs           — Orchestration: search() (plan→retrieve→rank); SearchResult, SearchOutput
 │   ├── plan.rs          — Plan stage: keyword extraction, classify, expansion, query embedding → QueryPlan
 │   ├── retrieve.rs      — Retrieve stage: FTS5 + vector + entity candidate sets → CandidateSets
 │   ├── rank.rs          — Rank stage: metadata fetch (time/path filter), RRF fusion, score hook, sort
 │   └── format.rs        — Format stage: text / JSON output rendering
 ├── embedder.rs          — candle + ruri-v3-30m inference (pure library)
-├── lua_hooks.rs         — Embedded Lua runtime for extract/score hooks (ADR-0013)
+├── lua_hooks.rs         — Embedded Lua runtime for extract/score hooks
 ├── hooks/extract/       — Embedded default extract hook (10-md_frontmatter.lua)
 ├── hooks/score/         — Embedded default score hook (10-default.lua)
 ├── chunker.rs           — Markdown → H2/H3/paragraph chunking
@@ -341,7 +341,7 @@ A change is merge-ready when **all** of the following hold:
 - **`rebuild --apply` resets dictionary verdicts** — DB is deleted and recreated,
   so the `dictionary_candidates` table (accepted + rejected verdicts) is lost.
   Run `tsm dict import` after rebuild to restore from `user_dict.simpledic` /
-  `reject_words.txt` (ADR-0014: DB is the authority, files are the portable record)
+  `reject_words.txt` (DB is the authority, files are the portable record)
 - **Dict verdict changes reindex via `reindex_fts_after_dict_change`** — `dict add`
   / `reject` / `rm` / `import` regenerate `user_dict.simpledic` when the accepted
   set changes, then reindex FTS: if the daemon is running, send `reindex fts` via
@@ -358,8 +358,8 @@ A change is merge-ready when **all** of the following hold:
   creates it, yet still recovers a hot WAL), and propagates genuine open failures
   (permissions, corruption) as `Err` rather than misreporting "not initialized".
   Starting in an unconfigured directory exits with "Run `tsm init` first" and
-  leaves no stray `.tsm` behind (ADR-0008: init is explicit, never
-  auto-created). The daemon re-checks `is_initialized` once more after taking the
+  leaves no stray `.tsm` behind (init is explicit, never auto-created). The
+  daemon re-checks `is_initialized` once more after taking the
   startup lock to close the probe→open race. `cmd_start` also surfaces the
   spawned daemon's captured stderr via `try_wait`, so a daemon that dies after
   spawn fails immediately instead of blocking on the 30s socket-wait timeout
@@ -409,11 +409,11 @@ ADR number from `main`, not your branch (renumbering may be in flight).
 |---|---|
 | `decisions/` | ADR (decision records and rationale) |
 
-For changes involving process architecture, IPC, or failure behavior,
-see ADR-0001. For uninitialized-DB fail-fast, daemon auto-start boundaries,
-and read-only `doctor`, see ADR-0011. For the output-channel model
-(user output → stdout, logs/errors → stderr/file, log-file consolidation),
-see ADR-0012.
+Several behaviors have dedicated records in `decisions/`: process roles, IPC,
+and failure behavior; uninitialized-DB fail-fast, daemon auto-start boundaries,
+and read-only `doctor`; and the output-channel model (user output → stdout,
+logs/errors → stderr/file, log-file consolidation). Review the relevant record
+before changing that behavior.
 
 ## Language Policy
 

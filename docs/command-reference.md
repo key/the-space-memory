@@ -47,7 +47,7 @@ These flags apply to every subcommand.
 
 | Flag | Description |
 |---|---|
-| `--project-root <DIR>` | Directory holding `tsm.toml`, treated as the project root. Used when the current directory has no `tsm.toml`; `content_dirs` paths resolve against it (the `state_dir`, default `.tsm/`, stays relative to the working directory). When neither resolves a root, commands fail (except `tsm init` / `tsm setup`, which fall back to the current directory). See ADR-0009 §2. |
+| `--project-root <DIR>` | Directory holding `tsm.toml`, treated as the project root. Used when the current directory has no `tsm.toml`; `content_dirs` paths resolve against it (the `state_dir`, default `.tsm/`, stays relative to the working directory). When neither resolves a root, commands fail (except `tsm init` / `tsm setup`, which fall back to the current directory). |
 
 ---
 
@@ -185,8 +185,7 @@ tsm restart
 
 Populate the machine-wide cache (`$cache_dir`) with external resources
 (embedding model + WordNet DB). System-wide; no workspace `.tsm/` writes.
-Run once per machine; re-run only when the upstream resources change
-(ADR-0008).
+Run once per machine; re-run only when the upstream resources change.
 
 ```text
 tsm setup [--link-mode <symlink|copy>]
@@ -653,7 +652,7 @@ tsm import-wordnet ~/downloads/wnjpn.db
 
 ### tsm dict update
 
-Show frequent, un-judged dictionary candidate words (read-only, ADR-0014).
+Show frequent, un-judged dictionary candidate words (read-only).
 
 ```text
 tsm dict update [--threshold N]
@@ -684,7 +683,7 @@ tsm dict update --threshold 10
 
 ### tsm dict reject
 
-Reject a word so it is never added to the user dictionary (ADR-0014).
+Reject a word so it is never added to the user dictionary.
 
 ```text
 tsm dict reject <word>
@@ -712,7 +711,7 @@ tsm dict reject クラ
 
 ### tsm dict export
 
-Write the database's verdicts to disk (ADR-0014 §2).
+Write the database's verdicts to disk.
 
 ```text
 tsm dict export
@@ -736,7 +735,7 @@ tsm dict export
 
 ### tsm dict import
 
-Load verdicts from disk into the database (ADR-0014 §2).
+Load verdicts from disk into the database.
 
 ```text
 tsm dict import
@@ -791,7 +790,7 @@ warning, storing the surface as a substitute.
 Before applying the change, `add` / `reject` / `rm` reconcile the on-disk files
 (`user_dict.simpledic`, `reject_words.txt`) into the database, so terms you
 hand-edited into a file — or that survived a `rebuild` in the file but not the
-database — are preserved rather than dropped by the regenerate (ADR-0014). If a
+database — are preserved rather than dropped by the regenerate. If a
 file is internally inconsistent (the same term in both files, or a term whose
 file verdict contradicts the database), the command **aborts with no changes**
 and names the offending term; resolve the files (or run `tsm dict export` to

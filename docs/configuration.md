@@ -11,7 +11,7 @@ env var  >  tsm.toml  >  built-in default
 ## Config File Search Order
 
 The `tsm` CLI resolves the **project root** in this order (first match wins),
-then loads `<project_root>/tsm.toml` from it (ADR-0009 §2):
+then loads `<project_root>/tsm.toml` from it:
 
 1. `$TSM_CONFIG` — its parent directory becomes the project root, and that file
    is the config
