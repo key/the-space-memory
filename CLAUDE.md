@@ -37,6 +37,7 @@ taplo check <file>.toml
 # Code metrics
 lizard src/ --language rust -Tcyclomatic_complexity=15 -w  # CCN warnings
 npx jscpd                                                  # Duplicate detection
+cargo test --test file_line_limits                         # per-file line-count gate (ADR-0018)
 
 # Git hooks (prek). Run once after cloning. Hooks live in the shared .git, so
 # they apply across all worktrees; a branch without .pre-commit-config.yaml is
@@ -309,6 +310,23 @@ containing `bin/{tsm,tsmd}` plus `LICENSE`, `README.md`, and `tsm.toml.example`.
 
 - Serena MCP via Docker (`ghcr.io/oraios/serena:latest`). Config in `.mcp.json`
 
+## Per-file line-count gate (ADR-0018)
+
+`tests/file_line_limits.rs` (CI job `file-lines`, also under `cargo test`) caps
+each `src/**/*.rs` file's **code** lines — physical lines excluding the trailing
+`#[cfg(test)] mod tests` block — at `max(800, baseline)`. The baseline lives in
+`tests/file-line-baseline.txt` (`path count`, only files over 800) and is a
+frozen ratchet: the gate fails if a file grows past its limit, if a baseline
+entry is stale (`<= 800`, or larger than the file's current count), or if any
+baseline value is raised/added relative to `origin/main` (invariant 3 — checked
+via `git show origin/main:tests/file-line-baseline.txt`; skipped when that ref or
+file is absent, i.e. locally or on the introducing PR).
+
+To **lower a baseline** after splitting/shrinking a file: re-measure and edit
+`tests/file-line-baseline.txt` down to the new count (the gate's failure message
+prints the exact number), or delete the line once the file is at/under 800.
+Baselines may only shrink; a new file over 800 must be split, not baselined.
+
 ## Definition of Done
 
 A change is merge-ready when **all** of the following hold:
@@ -320,6 +338,7 @@ A change is merge-ready when **all** of the following hold:
 - [ ] New pub functions have unit tests
 - [ ] `npx jscpd` duplication ≤ 5%
 - [ ] `lizard src/ --language rust -Tcyclomatic_complexity=15 -w` no new warnings
+- [ ] Per-file line-count gate green (`cargo test --test file_line_limits`; ADR-0018)
 - [ ] `bash tests/e2e.sh` passes (if search, index, or IPC changed)
 - [ ] CLAUDE.md updated if architecture or commands changed
 - [ ] README.md / README.ja.md updated in sync (if user-facing change)
