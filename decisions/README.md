@@ -25,6 +25,7 @@
 | [0015](./0015-read-write-connection-split.md) | DB 接続の読み書き分離（reader pool）と書き込み公平化（yield to pending writes） | Accepted | 2026-06-23 |
 | [0016](./0016-cognitive-complexity-gate.md) | 認知的複雑度ゲート（clippy グローバル閾値 + 属性免除） | Accepted | 2026-06-24 |
 | [0017](./0017-absolute-source-file-and-path-filter.md) | source_file の絶対パス保存と --path フィルタの意味論 | Accepted | 2026-06-25 |
+| [0018](./0018-per-file-line-count-gate.md) | ファイルあたりコード行数ゲート（閾値 800 + 凍結ベースラインのラチェット） | Proposed | 2026-06-29 |
 
 新規 ADR 追加時は上記表にも 1 行追加すること。
 
