@@ -19,7 +19,7 @@ cargo test --lib frontmatter
 cargo llvm-cov --html
 cargo llvm-cov \
   --ignore-filename-regex \
-  '(embedder|main|cli|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' \
+  '(ruri_model|main|cli|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' \
   --fail-under-lines 90
 
 # Lint (--all-targets also lints test/bench code)
@@ -74,7 +74,8 @@ src/
 │   ├── retrieve.rs      — Retrieve stage: FTS5 + vector + entity candidate sets → CandidateSets
 │   ├── rank.rs          — Rank stage: metadata fetch (time/path filter), RRF fusion, score hook, sort
 │   └── format.rs        — Format stage: text / JSON output rendering
-├── embedder.rs          — candle + ruri-v3-30m inference (pure library)
+├── embedder.rs          — Encode pipeline behind the `EmbeddingModel` trait; gate-covered via a mock model
+├── ruri_model.rs        — Real ruri-v3-30m loader + ModernBert forward (model-coupled shell; gate-excluded)
 ├── lua_hooks.rs         — Embedded Lua runtime for extract/score hooks
 ├── hooks/extract/       — Embedded default extract hook (10-md_frontmatter.lua)
 ├── hooks/score/         — Embedded default score hook (10-default.lua)

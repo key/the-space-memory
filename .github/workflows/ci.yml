@@ -50,7 +50,7 @@ jobs:
         run: >-
           cargo llvm-cov
           --ignore-filename-regex
-          '(embedder|main|cli|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs'
+          '(ruri_model|main|cli|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs'
           --fail-under-lines 90
 
   file-lines:
