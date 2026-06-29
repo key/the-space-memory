@@ -19,7 +19,7 @@ cargo test --lib frontmatter
 cargo llvm-cov --html
 cargo llvm-cov \
   --ignore-filename-regex \
-  '(embedder|main|cli|tsmd|tsm_watcher|status|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' \
+  '(embedder|main|cli|status|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' \
   --fail-under-lines 90
 
 # Lint (--all-targets also lints test/bench code)
