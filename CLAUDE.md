@@ -97,7 +97,8 @@ src/
     ├── main.rs          — tsmd entry point, mode dispatch (--embedder / --fs-watcher)
     ├── daemon_mode.rs   — Daemon mode (accept loop, client handling)
     ├── embedder_mode.rs — Embedder child process (socket server, model inference)
-    ├── watcher_mode.rs  — FS watcher child process (file change → Index IPC)
+    ├── watcher_mode.rs  — FS watcher child process: notify event loop + watch registration (I/O shell)
+    ├── watch_logic.rs   — Pure fs-watcher logic (event relevance, debounce, watch targets); gate-covered
     ├── child.rs         — Child process management (spawn, reap, stop)
     └── backfill.rs      — Vector backfill orchestration
 ```
