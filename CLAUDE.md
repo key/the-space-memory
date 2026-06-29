@@ -176,7 +176,10 @@ src/
 - **90%+ coverage** — Enforced via `cargo llvm-cov --fail-under-lines 90` in CI.
   `--fail-under-lines` is a single GLOBAL aggregate over the included set (not a
   per-file floor), so a file must reach ≈90% itself before leaving the
-  `--ignore-filename-regex`, or it dilutes the total.
+  `--ignore-filename-regex`, or it dilutes the total. `llvm-cov` counts a file's
+  in-file `#[cfg(test)] mod tests` lines as covered, so a test-heavy file's % is
+  inflated — when un-excluding a file, read the tests to confirm the *production*
+  branches are covered, not just that the number crossed 90.
 - **Coverage exclusions & rationale** — the regex (see the commands above) covers
   the entry points (`*main.rs`), the daemon/embedder/watcher I/O loops
   (`daemon_mode`, `embedder_mode`, `watcher_mode`, `child`, `backfill`), `cli`,
@@ -346,6 +349,10 @@ A change is merge-ready when **all** of the following hold:
 
 ## Gotchas
 
+- **e2e red on a HuggingFace HTTP 429** (model-download rate limit during `tsm
+  setup`) is an infra flake, not a code bug — re-run the `e2e` job. A non-search
+  change (status, coverage regex, docs) cannot affect e2e behavior, so a red e2e
+  there is almost always this.
 - **Lua hooks dir layout** — `.tsm/hooks/{extract,score}/NN-name.lua` (sorted by file name, `.lua` only).
   Empty or absent dir → embedded defaults. Disable a hook by renaming away the `.lua` extension.
 - **Editing a hook requires `tsm restart`** — daemon validates and loads all hooks at startup
