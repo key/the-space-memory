@@ -10,7 +10,7 @@ use notify::{recommended_watcher, Event, RecommendedWatcher, RecursiveMode, Watc
 use the_space_memory::config;
 use the_space_memory::daemon_protocol::{self, DaemonRequest};
 
-use crate::watch_logic::{is_index_relevant, watch_targets, Debounce};
+use crate::watch_logic::{diff_watch_set, is_index_relevant, watch_targets, Debounce};
 use crate::SHUTDOWN;
 
 /// Flag set by SIGHUP to trigger watch target reload.
@@ -193,18 +193,19 @@ fn update_watches(
 ) {
     let dirs = config::content_dirs();
     let desired: HashSet<PathBuf> = watch_targets(project_root, &dirs).into_iter().collect();
+    let diff = diff_watch_set(current, &desired);
 
     // Unwatch removed dirs
-    for dir in current.difference(&desired) {
+    for dir in &diff.to_unwatch {
         log::info!("unwatching {}", dir.display());
         if let Err(e) = watcher.unwatch(dir) {
             log::warn!("failed to unwatch {}: {e}", dir.display());
         }
     }
 
-    // Watch new dirs (only include successfully watched dirs)
-    let mut actually_watched: HashSet<PathBuf> = current.intersection(&desired).cloned().collect();
-    for dir in desired.difference(current) {
+    // Watch new dirs (keep the unchanged set, add only successfully watched ones)
+    let mut actually_watched = diff.kept;
+    for dir in &diff.to_watch {
         log::info!("watching {}", dir.display());
         if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
             log::warn!("cannot watch {}: {e}", dir.display());
