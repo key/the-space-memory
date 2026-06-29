@@ -1,5 +1,5 @@
 //! Embedded Lua runtime for user-editable metadata `extract` and scoring
-//! `score` hooks (ADR-0013).
+//! `score` hooks.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn test_run_extract_non_standard_frontmatter_key_readable() {
-        // ADR-0013: a non-standard key (priority) must reach the extract hook.
+        // A non-standard key (priority) must reach the extract hook.
         // Also verify that sequences (tags) arrive as an array table.
         let s = sources_from(
             r#"function extract(c)

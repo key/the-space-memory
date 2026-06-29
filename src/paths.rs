@@ -1,7 +1,7 @@
 //! Shared path resolution: lexical absolutization (no symlink resolution),
 //! `--path` filter normalization, and directory-boundary matching.
 //! All functions are pure (no filesystem syscalls) so they unit-test cleanly
-//! and behave identically across CLI and daemon. See ADR-0017.
+//! and behave identically across CLI and daemon.
 //!
 //! Unix-only: `/` is the sole path separator (tsm uses UNIX domain sockets and
 //! does not run on Windows). Tests use Unix roots by design.
@@ -9,7 +9,7 @@
 use std::path::{Component, Path, PathBuf};
 
 /// Lexically absolutize `input` against `base`, folding `.`/`..` without
-/// touching the filesystem (symlinks are NOT resolved — ADR-0017 option A).
+/// touching the filesystem (symlinks are NOT resolved).
 /// `std::path::absolute` deliberately does not fold `..`; we do, accepting the
 /// documented symlink caveat.
 pub fn absolutize(input: &Path, base: &Path) -> PathBuf {
@@ -76,7 +76,7 @@ pub fn boundary_like(dir: &Path) -> (String, String) {
 /// Build a path-scope SQL fragment + bind params over an aliased `d.file_path`
 /// (callers must alias the `documents` table as `d`). Returns `("", [])` when
 /// there is no filter. Each `--path` prefix becomes a case-insensitive
-/// directory-boundary clause; multiple prefixes are OR-joined (ADR-0017). The
+/// directory-boundary clause; multiple prefixes are OR-joined. The
 /// fragment is appended to an existing WHERE, e.g. `... WHERE 1=1{frag}`.
 pub fn scope_clause(path_prefixes: Option<&[String]>) -> (String, Vec<String>) {
     match path_prefixes {

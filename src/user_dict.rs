@@ -411,7 +411,7 @@ pub fn candidate_summary(conn: &Connection) -> CandidateSummary {
 /// nonexistent term has nothing to reset.
 ///
 /// `reading` is only meaningful when accepting; it is stored verbatim (the
-/// caller normalizes per ADR-0014). A non-NULL `reading` overwrites; `None`
+/// caller normalizes). A non-NULL `reading` overwrites; `None`
 /// preserves any existing reading (`COALESCE`).
 ///
 /// The SELECT and the write run in one transaction so the returned
@@ -517,7 +517,7 @@ fn surface_has_kanji(s: &str) -> bool {
     })
 }
 
-/// Resolve the reading stored by `dict add` per ADR-0014 §4.
+/// Resolve the reading stored by `dict add`.
 ///
 /// An explicit `yomi` is used verbatim. When omitted, the surface stands in as
 /// its own reading; the returned bool is `true` when the surface contains kanji,
@@ -548,8 +548,8 @@ pub fn validate_surface(surface: &str) -> anyhow::Result<()> {
 
 /// Regenerate `user_dict.simpledic` from the DB's accepted terms (full rewrite).
 ///
-/// The shared primitive every verdict change relies on: ADR-0014 specifies that
-/// a verdict change regenerates simpledic and reloads the tokenizer. `export`
+/// The shared primitive every verdict change relies on: a verdict change
+/// regenerates simpledic and reloads the tokenizer. `export`
 /// reuses it for the simpledic half of its round-trip. Each accepted term becomes
 /// one `surface,POS,reading` row, the reading falling back to the surface when
 /// none is stored (simpledic requires the field). Returns the number of rows
@@ -647,7 +647,7 @@ pub fn export_reject_words_to_file(conn: &Connection, path: &Path) -> anyhow::Re
 /// silently skipping it would let the next full rewrite delete a real term, so
 /// we **fail closed** instead. `reading == surface` normalizes to `None`
 /// (`regenerate_user_dict` re-emits the surface for a NULL reading, so they
-/// round-trip identically; ADR-0014 §4).
+/// round-trip identically).
 fn parse_simpledic_line(line: &str) -> anyhow::Result<Option<(String, Option<String>)>> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -801,8 +801,8 @@ impl ReconcileOutcome {
 /// Reconcile the on-disk verdict files INTO the DB before a verdict mutation, so
 /// the subsequent `regenerate_user_dict` rewrite preserves terms present in
 /// `user_dict.simpledic` / `reject_words.txt` but absent from (or only `pending`
-/// in) the DB — the data-loss path of #281 (empty DB after `rebuild`) and #288
-/// (hand-edited file). The DB becomes a faithful image of disk before any
+/// in) the DB — the data-loss path of an empty DB after `rebuild`, or a
+/// hand-edited file. The DB becomes a faithful image of disk before any
 /// rewrite, making the DB-as-authority model self-healing.
 ///
 /// Insert-or-promote, never override an opposing verdict:
@@ -1125,7 +1125,7 @@ mod tests {
         assert_eq!(reading_of(&conn, "term").as_deref(), Some("yomi"));
     }
 
-    // ─── resolve_reading tests (ADR-0014 §4) ─────────────────
+    // ─── resolve_reading tests ────────────────────────────────
 
     #[test]
     fn test_resolve_reading_explicit_yomi_used() {
@@ -1163,10 +1163,7 @@ mod tests {
         // U+20BB7 (𠮷) is a CJK Extension B ideograph outside the BMP.
         let (reading, warned) = resolve_reading("𠮷", None);
         assert_eq!(reading, "𠮷");
-        assert!(
-            warned,
-            "supplementary-plane kanji must also warn (ADR-0014 §4)"
-        );
+        assert!(warned, "supplementary-plane kanji must also warn");
     }
 
     #[test]
@@ -1942,7 +1939,7 @@ mod tests {
 
     #[test]
     fn test_reconcile_inserts_file_only_accepted() {
-        // #281/#288 core: a simpledic term absent from the DB is pulled in as accepted.
+        // Core: a simpledic term absent from the DB is pulled in as accepted.
         let conn = setup();
         let dir = tempfile::tempdir().unwrap();
         let (sp, rp) = write_files(dir.path(), "マイ用語,名詞,マイヨウゴ\n", "");
@@ -2087,7 +2084,8 @@ mod tests {
     #[test]
     fn test_reconcile_then_regenerate_preserves_file_only_term() {
         // End-to-end of the fix: a file-only term + a fresh accept both survive the
-        // post-mutation regenerate (the #288 repro at the user_dict layer).
+        // post-mutation regenerate (the file-only-term data-loss repro at the
+        // user_dict layer).
         let conn = setup();
         let dir = tempfile::tempdir().unwrap();
         let (sp, rp) = write_files(dir.path(), "マイ用語,名詞,マイヨウゴ\n", "");

@@ -3,7 +3,7 @@
 //! Records, per cached resource (keyed by its path relative to `cache_dir`),
 //! how it was placed (`mode`), where it points (`target`), its `size`, and when
 //! it was fetched. `tsm doctor` reads this to verify each entry's existence,
-//! link liveness, and size against the on-disk artefact (ADR-0008).
+//! link liveness, and size against the on-disk artefact.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

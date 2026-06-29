@@ -24,7 +24,7 @@ impl fmt::Display for SearchFallbackArg {
 
 /// CLI surface for `config::LinkMode`. Kept as a thin wrapper so `config`
 /// stays decoupled from clap (mirrors `SearchFallbackArg` / `ReindexKindArg`).
-/// Shared by `setup --link-mode` and `init --link-mode` (ADR-0008).
+/// Shared by `setup --link-mode` and `init --link-mode`.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum LinkModeArg {
     Symlink,
@@ -71,7 +71,7 @@ const LONG_VERSION: &str = match option_env!("TSM_VERSION_LONG") {
     about = "The Space Memory — knowledge search engine"
 )]
 struct Cli {
-    /// Project root: the directory holding `tsm.toml` (ADR-0009 §2).
+    /// Project root: the directory holding `tsm.toml`.
     /// Used when the current directory has no `tsm.toml`. Without either,
     /// commands fail (except `tsm init`, which scaffolds in the CWD).
     #[arg(long, global = true, value_name = "DIR")]
@@ -273,7 +273,7 @@ fn main() -> anyhow::Result<()> {
     config::ensure_model_cache_env();
     let args = Cli::parse();
 
-    // ADR-0009 §2: resolve the project root (the dir holding `tsm.toml`) from
+    // Resolve the project root (the dir holding `tsm.toml`) from
     // the CWD, `--project-root`, or `$TSM_CONFIG`, and inject it before any
     // config access. `init` and `setup` are project-independent (they run
     // before a project exists — scaffolding and model-cache download), so they
@@ -311,13 +311,13 @@ fn main() -> anyhow::Result<()> {
     }
     config::set_project_root(project_root);
 
-    // ADR-0009 §3: reject a config that still has the removed `index_root` key.
+    // Reject a config that still has the removed `index_root` key.
     // This is the only place a hard exit is permitted for this condition; the
     // daemon uses `anyhow::bail!` and reload uses a warning (mirrors the
-    // uninitialized-DB startup behaviour in ADR-0011).
+    // uninitialized-DB startup behaviour).
     if let Some(path) = config::legacy_index_root() {
         eprintln!(
-            "error: `index_root = \"{}\"` in tsm.toml is no longer supported (ADR-0009 §3).\n\
+            "error: `index_root = \"{}\"` in tsm.toml is no longer supported.\n\
              Replace it with `[[index.content_dirs]]` entries with paths relative to the \
              project root.\nAborting.",
             path.display()
@@ -396,7 +396,7 @@ fn main() -> anyhow::Result<()> {
                     .map(|f| f.to_string())
                     .unwrap_or_else(|| config::search_fallback().to_string()),
             );
-            // ADR-0017: --path accepts absolute or CWD-relative; normalized to
+            // --path accepts absolute or CWD-relative; normalized to
             // deduped absolute paths anchored at the caller's CWD.
             let cwd = std::env::current_dir()?;
             let paths = cli::normalize_path_filters(&paths, &cwd)?;
@@ -419,7 +419,7 @@ fn main() -> anyhow::Result<()> {
             let req = if files_from_stdin {
                 let project_root = config::project_root();
                 let paths = cli::read_paths_from_stdin(&project_root);
-                // Send absolute paths (ADR-0017). The daemon's project_root.join
+                // Send absolute paths. The daemon's project_root.join
                 // passes absolute paths through unchanged, and index_file stores
                 // the absolutized path, so the wire value stays stable.
                 let abs_paths: Vec<String> = paths
@@ -553,7 +553,7 @@ fn render_search(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
             let results: Vec<the_space_memory::searcher::SearchResult> =
                 serde_json::from_value(payload["results"].clone())
                     .map_err(|e| anyhow::anyhow!("Failed to parse search results: {e}"))?;
-            // Text output is relative to the caller's CWD (ADR-0017).
+            // Text output is relative to the caller's CWD.
             let cwd = std::env::current_dir().unwrap_or_default();
             print!(
                 "{}",
@@ -676,7 +676,7 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
 
     // Fail fast on an uninitialized DB BEFORE creating the stderr log file (which
     // would materialize the state directory) or spawning tsmd. `init` is an
-    // explicit, separate step (ADR-0008); starting in an unconfigured directory
+    // explicit, separate step; starting in an unconfigured directory
     // must not leave a stray `.tsm` behind. The probe never creates the DB; a
     // genuine open failure propagates instead of being misreported as "not
     // initialized".
@@ -722,8 +722,8 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
     // directory or the two would bind/connect different files. `config::
     // project_root()` can diverge from CWD via escape hatches (e.g. $TSM_CONFIG
     // pointing elsewhere), which would break that agreement. In the normal case
-    // (a `tsm.toml` in CWD) `canonical(CWD)` equals the ADR-0009 §2 project root.
-    // Once ADR-0009 makes `state_dir` derive from `project_root`, this converges
+    // (a `tsm.toml` in CWD) `canonical(CWD)` equals the project root (the dir
+    // holding `tsm.toml`). Once `state_dir` derives from `project_root`, this converges
     // on `config::project_root()`.
     let project_root = std::fs::canonicalize(std::env::current_dir()?)?;
 

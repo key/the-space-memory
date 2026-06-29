@@ -1,5 +1,5 @@
 //! Low-level filesystem placement helpers shared by `tsm setup` (cache
-//! population) and `tsm init` (workspace scaffolding) — ADR-0008.
+//! population) and `tsm init` (workspace scaffolding).
 //!
 //! Each `place_*` call is idempotent and converges `dst` to `mode`: a missing
 //! parent is created, and an existing destination (symlink, file, or directory)
@@ -145,7 +145,7 @@ fn copy_dir_all_inner(src: &Path, dst: &Path, depth: usize) -> Result<()> {
 /// Total size in bytes of `path`: its own length if a file, else the recursive
 /// sum of all regular files beneath it. Symlinks are followed. This is the
 /// single size rule shared by `tsm setup` (writing the manifest) and
-/// `tsm doctor` (verifying it), so the two never disagree (ADR-0008).
+/// `tsm doctor` (verifying it), so the two never disagree.
 pub fn tree_size(path: &Path) -> Result<u64> {
     tree_size_inner(path, 0)
 }

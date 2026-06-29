@@ -16,7 +16,7 @@ pub const SNIPPET_MAX_CHARS: usize = 200;
 pub const MIN_SESSION_MESSAGE_LEN: usize = 10;
 pub const BACKFILL_BATCH_SIZE: usize = 8;
 /// Default FTS reindex batch size when `reindex_fts_batch_size` is unset.
-/// Smaller = finer write preemption (ADR-0015), larger = better full-reindex
+/// Smaller = finer write preemption, larger = better full-reindex
 /// throughput. 200 is the middle ground; tune via config + measurement.
 pub const DEFAULT_REINDEX_FTS_BATCH_SIZE: usize = 200;
 pub const MAX_QUERY_EXPANSIONS: usize = 5;
@@ -80,7 +80,7 @@ impl std::str::FromStr for SearchFallback {
 /// File placement strategy when materializing cached resources.
 ///
 /// `Symlink` (default) references the upstream entry by symbolic link;
-/// `Copy` physically duplicates it. See ADR-0008 「リンク戦略」.
+/// `Copy` physically duplicates it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LinkMode {
@@ -155,14 +155,14 @@ pub(crate) struct ClaudeSessionConfig {
     pub half_life_days: Option<f64>,
 }
 
-/// The `[setup]` section of tsm.toml. See ADR-0008.
+/// The `[setup]` section of tsm.toml.
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct SetupConfig {
     pub link_mode: Option<LinkMode>,
 }
 
-/// The `[init]` section of tsm.toml. See ADR-0008.
+/// The `[init]` section of tsm.toml.
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct InitConfig {
@@ -221,7 +221,6 @@ pub struct ResolvedConfig {
     /// `manifest.json`). Shared across all workspaces on the host.
     /// Default: `$XDG_CACHE_HOME/tsm/` (or `$HOME/.cache/tsm/` if XDG unset).
     /// Env: `TSM_CACHE_DIR`. Config: `cache_dir`.
-    /// See ADR-0008.
     pub cache_dir: PathBuf,
 
     /// UNIX socket path for the embedder child process (encode requests).
@@ -251,10 +250,10 @@ pub struct ResolvedConfig {
 
     /// Number of read-only connections in the daemon's reader pool.
     /// Default: CPU core count. Env: `TSM_READER_POOL_SIZE`. Config: `reader_pool_size`.
-    /// Caps concurrent reads (see ADR-0015).
+    /// Caps concurrent reads.
     pub reader_pool_size: usize,
 
-    /// FTS reindex batch size; smaller = finer preemption, more fsync (ADR-0015).
+    /// FTS reindex batch size; smaller = finer preemption, more fsync.
     /// Default: `DEFAULT_REINDEX_FTS_BATCH_SIZE`. Env: `TSM_REINDEX_FTS_BATCH_SIZE`.
     /// Config: `reindex_fts_batch_size`.
     pub reindex_fts_batch_size: usize,
@@ -272,13 +271,11 @@ pub struct ResolvedConfig {
     /// Strategy `tsm setup` uses when materializing entries inside `cache_dir`
     /// (HuggingFace cache → cache, sources → cache).
     /// Default: `Symlink`. Env: `TSM_SETUP_LINK_MODE`. Config: `[setup].link_mode`.
-    /// See ADR-0008.
     pub setup_link_mode: LinkMode,
 
     /// Strategy `tsm init` uses when materializing entries inside `state_dir`
     /// (cache → `.tsm/`).
     /// Default: `Symlink`. Env: `TSM_INIT_LINK_MODE`. Config: `[init].link_mode`.
-    /// See ADR-0008.
     pub init_link_mode: LinkMode,
 
     /// Content directories with scoring weights and half-life.
@@ -306,7 +303,7 @@ pub struct ResolvedConfig {
     pub extensions: Vec<String>,
 
     /// Set when a loaded config file still carries a legacy `index_root` key
-    /// (removed in ADR-0009 §3). The value is captured here instead of
+    /// (removed). The value is captured here instead of
     /// calling `process::exit` so each caller can decide how to handle it:
     /// - CLI startup (`tsm` main): hard-exit with a migration message.
     /// - Daemon startup (`tsmd`): `anyhow::bail!` before socket bind.
@@ -339,14 +336,14 @@ pub struct ResolvedConfig {
 impl ResolvedConfig {
     /// Resolve all config values from environment variables, config files, and defaults.
     ///
-    /// Two resolution paths (ADR-0009 §2):
+    /// Two resolution paths:
     /// - **Injected** (the `tsm` CLI calls `set_project_root()` in `main`):
     ///   the project root is explicit, so the config file is loaded only from
     ///   `<root>/tsm.toml` (or `$TSM_CONFIG`). No XDG fallback.
     /// - **Un-injected** (`tsmd`, tests): legacy discovery via
     ///   `config_file_candidates()` incl. the XDG config dir, with
     ///   `cwd_fallback()` for the project root. Preserved so `tsmd` keeps
-    ///   working unchanged until ADR-0010 wires its own `--project-root`.
+    ///   working unchanged until it gains its own `--project-root` injection.
     pub fn from_env() -> Self {
         if let Some(root) = injected_root() {
             let tsm_config = std::env::var_os("TSM_CONFIG").map(PathBuf::from);
@@ -357,7 +354,7 @@ impl ResolvedConfig {
         Self::from_config_file(&file_cfg, project_root)
     }
 
-    /// Resolve config for an explicitly injected project root (ADR-0009 §2):
+    /// Resolve config for an explicitly injected project root:
     /// load `tsm.toml` from `<root>` (or `$TSM_CONFIG`) only — no XDG fallback.
     /// Pure over its inputs (no process-global read), so the injected path is
     /// unit-testable without touching the `PROJECT_ROOT` singleton.
@@ -568,8 +565,7 @@ fn env_or(var: &str, file_val: Option<&PathBuf>) -> Option<PathBuf> {
 ///   2. `$HOME` is set (and non-empty) → `$HOME/.cache/tsm`
 ///   3. Last-resort relative fallback `.cache/tsm` (CWD-relative).
 ///
-/// macOS uses the same XDG-style path on purpose; see ADR-0008 Rationale
-/// "なぜ XDG_CACHE_HOME を採るか（macOS でも）". `dirs::cache_dir()` would
+/// macOS uses the same XDG-style path on purpose: `dirs::cache_dir()` would
 /// return `~/Library/Caches/tsm` on macOS, which is not the desired layout.
 fn default_cache_dir() -> PathBuf {
     fn non_empty_pathbuf(var: &str) -> Option<PathBuf> {
@@ -601,7 +597,7 @@ fn env_parse_fallback(file_val: Option<SearchFallback>) -> SearchFallback {
 
 /// Resolve a `LinkMode` from an env var, falling back to a config file value
 /// and finally `LinkMode::default()`. Used for both
-/// `[setup].link_mode` and `[init].link_mode` (ADR-0008).
+/// `[setup].link_mode` and `[init].link_mode`.
 fn env_parse_link_mode(var: &str, file_val: Option<LinkMode>) -> LinkMode {
     if let Ok(val) = std::env::var(var) {
         match val.parse::<LinkMode>() {
@@ -630,7 +626,7 @@ fn env_parse_u64(var: &str, file_val: Option<u64>) -> Option<u64> {
     file_val
 }
 
-/// Explicitly resolved project root (ADR-0009 §2), injected once by the
+/// Explicitly resolved project root, injected once by the
 /// binary's `main` after CLI parsing, before any config access. When set,
 /// `from_env()` uses it and skips legacy XDG/CWD discovery.
 static PROJECT_ROOT: OnceLock<PathBuf> = OnceLock::new();
@@ -647,8 +643,8 @@ fn injected_root() -> Option<PathBuf> {
     PROJECT_ROOT.get().cloned()
 }
 
-/// Config-file candidates for an explicitly injected project root
-/// (ADR-0009 §2): `$TSM_CONFIG` (if set) then `<root>/tsm.toml`. No XDG —
+/// Config-file candidates for an explicitly injected project root:
+/// `$TSM_CONFIG` (if set) then `<root>/tsm.toml`. No XDG —
 /// an injected root is authoritative, so silent fallbacks are dropped.
 fn injected_candidates(root: &Path, tsm_config: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
@@ -731,7 +727,7 @@ pub fn reload() -> Vec<String> {
     }
     if let Some(ref p) = new_cfg.rejected_index_root {
         warnings.push(format!(
-            "`index_root = \"{}\"` in tsm.toml is no longer supported (ADR-0009 §3); \
+            "`index_root = \"{}\"` in tsm.toml is no longer supported; \
              replace it with `[[index.content_dirs]]` entries. \
              The key is ignored; run `tsm restart` after fixing the config.",
             p.display()
@@ -875,7 +871,7 @@ fn config_file_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-/// Resolve the project root per ADR-0009 §2. The project root is the directory
+/// Resolve the project root. The project root is the directory
 /// that holds `tsm.toml`. Precedence (no walk-up, no silent fallback):
 ///   1. `TSM_CONFIG` escape hatch (§6) → parent directory of that file
 ///   2. `<cwd>/tsm.toml` exists → `cwd`
@@ -989,7 +985,7 @@ pub fn project_root() -> PathBuf {
 
 /// Return the legacy `index_root` value captured from the config file, if any.
 ///
-/// When `Some`, a config file still uses the removed `index_root` key (ADR-0009 §3).
+/// When `Some`, a config file still uses the removed `index_root` key.
 /// Callers are responsible for handling this condition:
 /// - CLI startup: hard-exit with a migration message.
 /// - Daemon startup: `anyhow::bail!` before socket bind.
@@ -1074,7 +1070,7 @@ pub fn hooks_score_dir() -> PathBuf {
     state_dir().join("hooks/score")
 }
 
-// ─── Machine-wide cache helpers (ADR-0008) ─────────────────────
+// ─── Machine-wide cache helpers ────────────────────────────────
 
 /// Cache directory for the ruri-v3-30m model: `{cache_dir}/models/ruri-v3-30m/`.
 pub fn cache_models_dir() -> PathBuf {
@@ -1158,7 +1154,7 @@ pub fn half_life_days(file_path: &str, source_type: &str) -> f64 {
 }
 
 /// Validate a configured half-life in days. `0.0` is a valid sentinel that
-/// disables time decay (ADR-0009): the searcher treats it as timeless and
+/// disables time decay: the searcher treats it as timeless and
 /// applies no decay. Negative, infinite, and NaN values are invalid and fall
 /// back to `default`.
 fn sanitize_half_life(value: f64, default: f64) -> f64 {
@@ -1772,7 +1768,7 @@ embedder_idle_timeout_secs = 1200
         let mut warnings = Vec::new();
         if let Some(ref p) = new_cfg.rejected_index_root {
             warnings.push(format!(
-                "`index_root = \"{}\"` in tsm.toml is no longer supported (ADR-0009 §3); \
+                "`index_root = \"{}\"` in tsm.toml is no longer supported; \
                  replace it with `[[index.content_dirs]]` entries. \
                  The key is ignored; run `tsm restart` after fixing the config.",
                 p.display()
@@ -1787,10 +1783,6 @@ embedder_idle_timeout_secs = 1200
         assert!(
             w.contains("index_root"),
             "warning must mention index_root: {w}"
-        );
-        assert!(
-            w.contains("ADR-0009"),
-            "warning must reference ADR-0009: {w}"
         );
         assert!(
             w.contains("content_dirs"),
@@ -1832,7 +1824,7 @@ embedder_idle_timeout_secs = 999
         assert!(root.is_none(), "no config loaded → no project_root");
     }
 
-    // ── resolve_project_root (ADR-0009 §2) ──────────────────────────────
+    // ── resolve_project_root ─────────────────────────────────────────────
     // Pure resolution: precedence is TSM_CONFIG → CWD-direct tsm.toml →
     // --project-root → error. No walk-up, no silent fallback.
 
@@ -2356,7 +2348,7 @@ path = "daily/notes"
 half_life_days = 0.0
 "#,
         );
-        // 0 is the sentinel for "time decay disabled" (ADR-0009); kept as-is.
+        // 0 is the sentinel for "time decay disabled"; kept as-is.
         assert_eq!(cfg.content_dirs[0].half_life_days, 0.0);
     }
 
@@ -2380,7 +2372,7 @@ half_life_days = -5.0
 half_life_days = 0.0
 "#,
         );
-        // 0 is the sentinel for "time decay disabled" (ADR-0009); kept as-is.
+        // 0 is the sentinel for "time decay disabled"; kept as-is.
         assert_eq!(cfg.session_half_life_days, 0.0);
     }
 
@@ -2404,7 +2396,7 @@ path = "company/knowledge"
 weight = 1.5
 "#,
         );
-        // Mirror directory_weight's production matching (ADR-0017): file_path is
+        // Mirror directory_weight's production matching: file_path is
         // absolute, content_dir resolved to absolute against project_root, matched
         // at a directory boundary.
         let weight_of = |file_path: &std::path::Path| {

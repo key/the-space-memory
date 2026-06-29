@@ -15,8 +15,7 @@ use crate::ipc::{read_message, write_message};
 /// Bench-only instrumentation. Compiled out unless `bench-counters` feature is enabled.
 ///
 /// Counts client-side `embed_via_socket_at` calls. Used by bench harness to verify
-/// the regression invariant "embedder is not called more often than expected"
-/// (ADR-0007 metric #4).
+/// the regression invariant "embedder is not called more often than expected".
 #[cfg(feature = "bench-counters")]
 pub mod counters {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,7 +47,7 @@ pub struct Embedder {
 impl Embedder {
     /// Load the ruri-v3-30m model.
     ///
-    /// Resolution order (ADR-0008):
+    /// Resolution order:
     /// 1. `{state_dir}/models/ruri-v3-30m/` — workspace override
     ///    (lets users drop a fine-tuned model into a single workspace)
     /// 2. `{cache_dir}/models/ruri-v3-30m/` — machine-wide cache
