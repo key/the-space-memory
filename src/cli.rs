@@ -327,7 +327,7 @@ fn install_default_hooks(state_dir: &Path) -> anyhow::Result<()> {
 ///
 /// The policy is the non-bypassable correctness gate applied by the
 /// indexer — no caller-side pre-filter is required (or permitted, per
-/// design: duplicated filter logic was a bug-magnet, see #134).
+/// design: duplicated filter logic was a bug-magnet).
 pub fn run_index(
     conn: &rusqlite::Connection,
     file_paths: &[PathBuf],
@@ -1835,7 +1835,7 @@ enum ReindexPlan {
 /// Classify a daemon reindex response. Only a missing daemon (`None`) warrants a
 /// local rebuild; an IPC error (`Some(Err)`) or an explicit rejection
 /// (`Some(Ok)` with `ok == false`) is surfaced so the caller does not quietly
-/// run a competing local rebuild against the daemon-owned DB (#286/#282).
+/// run a competing local rebuild against the daemon-owned DB.
 fn classify_reindex(
     resp: Option<anyhow::Result<crate::daemon_protocol::DaemonResponse>>,
 ) -> ReindexPlan {
@@ -1920,8 +1920,8 @@ fn report_reconcile(r: &user_dict::ReconcileOutcome) {
 /// from the on-disk/DB divergence — no dirty marker needed. A regenerate failure
 /// is surfaced (the DB is already committed); the next mutation retries. (A
 /// reindex that fails *after* a successful regenerate is surfaced as an error but
-/// not auto-retried here, since the file then matches the DB — see #286/#282 for
-/// reindex-error handling.) Takes `conn` by value so it is dropped before any
+/// not auto-retried here, since the file then matches the DB.) Takes `conn` by
+/// value so it is dropped before any
 /// local FTS rebuild opens its own writer.
 fn materialize_dict(conn: rusqlite::Connection) -> anyhow::Result<()> {
     let csv_path = config::user_dict_path();

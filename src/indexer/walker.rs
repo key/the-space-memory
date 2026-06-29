@@ -114,8 +114,8 @@ impl ContentWalker {
     /// extension allowlist — is exposed via the `IngestPolicy::accepts`
     /// impl. Bypassing that composition (e.g. calling only `is_ignored`)
     /// would let a path skip the extension allowlist — the historical
-    /// drift fixed in #134 / #135. Production callers must go through
-    /// `accepts()`.
+    /// drift this combined gate exists to prevent. Production callers must go
+    /// through `accepts()`.
     pub(crate) fn is_ignored(&self, path: &Path) -> bool {
         let Ok(rel) = path.strip_prefix(&self.project_root) else {
             return true;
@@ -529,12 +529,12 @@ mod tests {
         assert!(walker.is_ignored(Path::new("/etc/passwd")));
     }
 
-    // ─── No synthetic fallback (post-#136 item 7) ──────────────────────
+    // ─── No synthetic fallback ─────────────────────────────────────────
 
     #[test]
     #[serial_test::serial]
     fn hidden_dirs_are_indexed_when_no_tsmignore() {
-        // Inverted from the pre-#136-item-7 behavior: when `.tsmignore` is
+        // Inverted from the earlier behavior: when `.tsmignore` is
         // absent, no exclusion patterns are loaded. Hidden directories like
         // `.obsidian` are now traversed. Users opt back in to the historical
         // exclusion by running `tsm init`, which writes a default `.tsmignore`

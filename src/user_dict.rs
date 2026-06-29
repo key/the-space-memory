@@ -801,8 +801,8 @@ impl ReconcileOutcome {
 /// Reconcile the on-disk verdict files INTO the DB before a verdict mutation, so
 /// the subsequent `regenerate_user_dict` rewrite preserves terms present in
 /// `user_dict.simpledic` / `reject_words.txt` but absent from (or only `pending`
-/// in) the DB — the data-loss path of #281 (empty DB after `rebuild`) and #288
-/// (hand-edited file). The DB becomes a faithful image of disk before any
+/// in) the DB — the data-loss path of an empty DB after `rebuild`, or a
+/// hand-edited file. The DB becomes a faithful image of disk before any
 /// rewrite, making the DB-as-authority model self-healing.
 ///
 /// Insert-or-promote, never override an opposing verdict:
@@ -1939,7 +1939,7 @@ mod tests {
 
     #[test]
     fn test_reconcile_inserts_file_only_accepted() {
-        // #281/#288 core: a simpledic term absent from the DB is pulled in as accepted.
+        // Core: a simpledic term absent from the DB is pulled in as accepted.
         let conn = setup();
         let dir = tempfile::tempdir().unwrap();
         let (sp, rp) = write_files(dir.path(), "マイ用語,名詞,マイヨウゴ\n", "");
@@ -2084,7 +2084,8 @@ mod tests {
     #[test]
     fn test_reconcile_then_regenerate_preserves_file_only_term() {
         // End-to-end of the fix: a file-only term + a fresh accept both survive the
-        // post-mutation regenerate (the #288 repro at the user_dict layer).
+        // post-mutation regenerate (the file-only-term data-loss repro at the
+        // user_dict layer).
         let conn = setup();
         let dir = tempfile::tempdir().unwrap();
         let (sp, rp) = write_files(dir.path(), "マイ用語,名詞,マイヨウゴ\n", "");
