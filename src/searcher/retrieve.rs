@@ -152,8 +152,8 @@ fn fts_results_raw(
 ///
 /// Returns an empty map when the embedding is `None` (embedder unavailable)
 /// or the vec table does not exist. When `path_prefixes` is set, the KNN is
-/// constrained to in-scope chunks via a bound `rowid IN (SELECT ...)` subquery
-/// — never a materialized id list (an empty scope would make
+/// constrained to in-scope chunks via a bound `rowid IN (SELECT ...)` subquery,
+/// never a materialized id list (an empty scope would make
 /// `rowid in ()` invalid, and a broad scope would explode the query).
 fn vec_results_from_embedding(
     conn: &Connection,
