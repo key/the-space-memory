@@ -1,4 +1,5 @@
 mod backfill;
+mod backfill_logic;
 mod child;
 mod daemon_mode;
 mod embedder_mode;

@@ -100,7 +100,8 @@ src/
     ├── watcher_mode.rs  — FS watcher child process: notify event loop + watch registration (I/O shell)
     ├── watch_logic.rs   — Pure fs-watcher logic (event relevance, debounce, watch targets); gate-covered
     ├── child.rs         — Child process management (spawn, reap, stop)
-    └── backfill.rs      — Vector backfill orchestration
+    ├── backfill.rs      — Backfill/reindex passes (embedder-socket + status I/O shell)
+    └── backfill_logic.rs — Pure backfill logic (write guard, yield, harvest, synonym cleanup); gate-covered
 ```
 
 - **FTS5**: lindera tokenization + unicode61 tokenizer
