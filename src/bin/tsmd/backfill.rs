@@ -62,8 +62,8 @@ pub fn harvest_query_for(req: &the_space_memory::daemon_protocol::DaemonRequest)
 ///
 /// Routes the best-effort write through the shared writer `Arc<Mutex<Connection>>`
 /// instead of opening a private `db::get_connection` writer, so it serializes
-/// with every other write and is visible to the `writes_pending` fairness yield
-/// (ADR-0015). Tokenization runs before the lock; `lock()` then blocks until the
+/// with every other write and is visible to the `writes_pending` fairness yield.
+/// Tokenization runs before the lock; `lock()` then blocks until the
 /// writer is free for the DB upsert only, so a contended write waits rather than
 /// racing at the SQLite level and being lost. The caller runs this after the
 /// search response, so search latency is unaffected.
@@ -86,8 +86,8 @@ pub fn harvest_query_candidates(
 
 /// Delete stale synonym pairs through the daemon writer (once at startup).
 ///
-/// Routing through the shared writer keeps the daemon the sole writer
-/// (ADR-0015); the `PendingWriteGuard` makes the pass visible to the fairness
+/// Routing through the shared writer keeps the daemon the sole writer;
+/// the `PendingWriteGuard` makes the pass visible to the fairness
 /// yield. The pass is independent of the embedder.
 pub fn cleanup_stale_synonyms(
     conn: &Arc<Mutex<rusqlite::Connection>>,

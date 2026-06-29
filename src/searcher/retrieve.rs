@@ -52,7 +52,7 @@ pub(crate) fn retrieve(
     // retriever *did* find in-scope candidates: then the embedder should have
     // produced vectors too. When FTS and entity are both empty the scope/query
     // simply matched nothing (e.g. a `--path` scope with no in-scope chunks) —
-    // that is not an embedder failure and must not error (ADR-0017).
+    // that is not an embedder failure and must not error.
     if require_vector
         && vec.is_empty()
         && (!fts.is_empty() || !entity.is_empty())
@@ -96,7 +96,7 @@ fn fts_results(
 /// Run FTS5 search using a pre-built query string (e.g. expanded with synonyms).
 ///
 /// When `path_prefixes` is set, the candidates are restricted in-scope at
-/// retrieval time (ADR-0017 Gap 3) by joining `chunks`/`documents` and applying
+/// retrieval time by joining `chunks`/`documents` and applying
 /// the directory-boundary clause, so the `limit` budget is spent on in-scope rows.
 fn fts_results_raw(
     conn: &Connection,
@@ -153,7 +153,7 @@ fn fts_results_raw(
 /// Returns an empty map when the embedding is `None` (embedder unavailable)
 /// or the vec table does not exist. When `path_prefixes` is set, the KNN is
 /// constrained to in-scope chunks via a bound `rowid IN (SELECT ...)` subquery
-/// (ADR-0017 Gap 3) — never a materialized id list (an empty scope would make
+/// — never a materialized id list (an empty scope would make
 /// `rowid in ()` invalid, and a broad scope would explode the query).
 fn vec_results_from_embedding(
     conn: &Connection,

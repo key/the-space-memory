@@ -87,7 +87,7 @@ pub fn index_file(
     file_path: &Path,
     project_root: &Path,
 ) -> anyhow::Result<bool> {
-    // file_path is stored as a lexical absolute path (ADR-0017). The directory
+    // file_path is stored as a lexical absolute path. The directory
     // label (used for source_type + chunking) is still derived from the
     // project_root-relative path so source-type classification is unaffected.
     let stored_path = crate::paths::absolutize(file_path, project_root)
@@ -124,8 +124,8 @@ pub fn index_file(
     }
 
     // Hook API contract: extract hooks see the project-relative path as
-    // `ctx.path` (unchanged by ADR-0017). Only DB persistence uses the absolute
-    // `stored_path` (file identity). Keep these two separate.
+    // `ctx.path`, unchanged by absolute-path storage. Only DB persistence uses
+    // the absolute `stored_path` (file identity). Keep these two separate.
     let prepared = prepare::prepare(file_path, &rel_for_label, &directory, &filename)?;
 
     let diff = persist::persist(
@@ -189,7 +189,7 @@ pub fn index_all_with_progress(
         }
 
         if !fp.exists() {
-            // Match the absolute key written by index_file (ADR-0017).
+            // Match the absolute key written by index_file.
             let stored_path = crate::paths::absolutize(fp, project_root)
                 .to_string_lossy()
                 .to_string();

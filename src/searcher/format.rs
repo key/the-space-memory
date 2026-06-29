@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::SearchResult;
 
-/// Render a stored (absolute, ADR-0017) path for human output: relative to
+/// Render a stored (absolute) path for human output: relative to
 /// `cwd` when it sits under it, else the absolute path unchanged.
 fn display_path(file_path: &str, cwd: &Path) -> String {
     Path::new(file_path)
@@ -13,7 +13,7 @@ fn display_path(file_path: &str, cwd: &Path) -> String {
 
 /// Render search results as human-readable text.
 ///
-/// Paths are shown relative to `cwd` (ADR-0017: storage is absolute, text output
+/// Paths are shown relative to `cwd` (storage is absolute; text output
 /// is CWD-relative for readability). Returns a formatted multi-line string
 /// suitable for terminal output. When `results` is empty, returns "No results found.".
 pub fn format_text(results: &[SearchResult], total_hits: usize, cwd: &Path) -> String {

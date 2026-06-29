@@ -61,7 +61,7 @@ fn build_filter_clauses(
         format!(" AND {}", time_clauses.join(" AND "))
     };
 
-    // Directory-boundary path scope (ADR-0017). Built by the shared, pure,
+    // Directory-boundary path scope. Built by the shared, pure,
     // unit-tested `paths::scope_clause` so the final JOIN, retrieval, and entity
     // queries all use one source of truth (no divergence between filters).
     let (path_sql, path_params) = crate::paths::scope_clause(path_prefixes);

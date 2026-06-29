@@ -24,7 +24,7 @@ pub fn run(args: Args) -> Result<()> {
 
     // Fail fast on an uninitialized DB BEFORE the logger's `create_dir_all` or
     // the lock/socket operations touch the state directory. `init` is an
-    // explicit, separate step (ADR-0008); the daemon must never auto-create its
+    // explicit, separate step; the daemon must never auto-create its
     // schema, nor leave a stray `.tsm` when started in an unconfigured
     // directory. The probe never creates the DB file; a genuine open failure
     // (permissions, corruption) propagates here instead of being misreported.
@@ -80,18 +80,18 @@ pub fn run(args: Args) -> Result<()> {
         return Err(db::uninitialized_error(&db_path));
     }
 
-    // ADR-0017: reject an index that predates absolute-path storage (a relative
+    // Reject an index that predates absolute-path storage (a relative
     // file_path row would silently mis-match every --path). Same fail-fast path
     // as the guards above — surfaced to the user via `tsm start`.
     db::check_path_schema(&conn)?;
 
-    // ADR-0009 §3: reject a config that still carries the removed `index_root`
+    // Reject a config that still carries the removed `index_root`
     // key.  `anyhow::bail!` here keeps the accept loop clean — no socket is
     // bound, no children are spawned, and `tsm start` surfaces the stderr via
     // `wait_for_daemon_ready` (same path as the uninitialized-DB guard above).
     if let Some(path) = config::legacy_index_root() {
         anyhow::bail!(
-            "`index_root = \"{}\"` in tsm.toml is no longer supported (ADR-0009 §3). \
+            "`index_root = \"{}\"` in tsm.toml is no longer supported. \
              Replace it with `[[index.content_dirs]]` entries with paths relative to \
              the project root.",
             path.display()
@@ -101,7 +101,7 @@ pub fn run(args: Args) -> Result<()> {
     let conn = Arc::new(Mutex::new(conn));
 
     // Read-only connection pool: serves Status/Doctor/Search/Ping concurrently
-    // with the writer (WAL snapshots). See ADR-0015.
+    // with the writer (WAL snapshots).
     let read_pool = Arc::new(
         the_space_memory::read_pool::ReadPool::new(&db_path, config::reader_pool_size())
             .context("Failed to open reader pool")?,
@@ -153,8 +153,8 @@ pub fn run(args: Args) -> Result<()> {
         );
     }
 
-    // Load + validate Lua hooks before serving. Fail-fast on a broken hook
-    // (ADR-0011 philosophy: refuse to start in a broken state).
+    // Load + validate Lua hooks before serving. Fail-fast on a broken hook —
+    // refuse to start in a broken state.
     the_space_memory::lua_hooks::init_hooks()
         .map_err(|e| anyhow::anyhow!("hook load failed: {e}"))?;
 
@@ -245,7 +245,7 @@ pub fn run(args: Args) -> Result<()> {
     // Reindex-active flag: at most one reindex runs at a time.
     let reindex_active = Arc::new(AtomicBool::new(false));
 
-    // Startup synonym cleanup — one pass through the writer (ADR-0015),
+    // Startup synonym cleanup — one pass through the writer,
     // independent of the embedder.
     {
         let conn = Arc::clone(&conn);
@@ -456,7 +456,7 @@ fn handle_client(
     write_response(stream, &resp)?;
 
     // Best-effort dict-candidate harvest, routed through the shared writer and
-    // fairness counter (ADR-0015) rather than a private connection. Runs after
+    // fairness counter rather than a private connection. Runs after
     // the response so it adds nothing to search latency; `lock()` blocks under
     // contention so the write is never lost.
     if let Some(query) = harvest_query {

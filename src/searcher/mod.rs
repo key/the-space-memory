@@ -357,7 +357,7 @@ mod tests {
         indexer::index_file(&conn, &daily_path, dir.path()).unwrap();
         indexer::index_file(&conn, &project_path, dir.path()).unwrap();
 
-        // Filter to <dir>/daily only (absolute, ADR-0017)
+        // Filter to <dir>/daily only (absolute)
         let daily = dir.path().join("daily").to_string_lossy().to_string();
         let paths = vec![daily.clone()];
         let SearchOutput { results, .. } =
@@ -609,7 +609,7 @@ mod tests {
             indexer::index_file(&conn, &full, dir.path()).unwrap();
         }
 
-        // Combine path filter + time filter (absolute path, ADR-0017)
+        // Combine path filter + time filter (absolute path)
         let daily = dir.path().join("daily").to_string_lossy().to_string();
         let paths = vec![daily.clone()];
         let filter = TimeFilter {
@@ -807,7 +807,7 @@ mod tests {
         }
     }
 
-    /// ADR-0015 guard: search() must succeed on a query_only connection.
+    /// Guard: search() must succeed on a query_only connection.
     /// A revert of searcher/plan.rs:46 that writes through the serving conn
     /// would cause SQLITE_READONLY here.
     #[test]
