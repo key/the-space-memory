@@ -43,6 +43,7 @@ which additionally consults the user config directory:
 | `TSM_EMBEDDER_IDLE_TIMEOUT` | u64 (seconds) | `600` | `embedder_idle_timeout_secs` | Idle timeout before embedder auto-shutdown (0 = never). Note: tsmd spawns embedder with `--no-idle-timeout`; this only affects standalone runs |
 | `TSM_EMBEDDER_BACKFILL_INTERVAL` | u64 (seconds) | `300` | `embedder_backfill_interval_secs` | Seconds between periodic vector backfill checks (0 = disable) |
 | `TSM_SEARCH_FALLBACK` | enum | `"error"` | `search_fallback` | Behavior when embedder is down: `error` or `fts_only` |
+| `TSM_MAX_CHUNKS_PER_DOCUMENT` | usize | `3` | `max_chunks_per_document` | Per-document chunk cap in the search result window (caps same-document flooding; `0` disables) |
 | `TSM_USER_DICT` | path | `{state_dir}/user_dict.simpledic` | `user_dict_path` | Path to the lindera user dictionary |
 | `TSM_SETUP_LINK_MODE` | enum | `symlink` | `[setup].link_mode` | How `tsm setup` materializes cached resources: `symlink` or `copy` |
 | `TSM_INIT_LINK_MODE` | enum | `symlink` | `[init].link_mode` | How `tsm init` links workspace resources to the cache: `symlink` or `copy` |
@@ -139,6 +140,11 @@ embedder_backfill_interval_secs = 300
 # "fts_only" — fall back to FTS5-only with a warning
 # Default: "error"
 search_fallback = "error"
+
+# Max chunks per document in the search result window. Caps same-document
+# flooding so distinct documents below the score cliff can surface. 0 disables.
+# Default: 3
+max_chunks_per_document = 3
 
 # Path to the lindera simpledic user dictionary file.
 # Default: {state_dir}/user_dict.simpledic
@@ -302,6 +308,7 @@ Changes take effect differently depending on the field:
 
 - `index.content_dirs`
 - `search_fallback`
+- `max_chunks_per_document`
 - `embedder_idle_timeout_secs`
 - `embedder_backfill_interval_secs`
 - `index.claude_session.weight` (`session_weight`)
