@@ -15,7 +15,7 @@ use the_space_memory::db;
 use the_space_memory::ipc::accept_blocking;
 use the_space_memory::status;
 
-use crate::{backfill, child, Args, SHUTDOWN};
+use crate::{backfill, backfill_logic, child, Args, SHUTDOWN};
 
 pub fn run(args: Args) -> Result<()> {
     config::ensure_model_cache_env();
@@ -251,7 +251,7 @@ pub fn run(args: Args) -> Result<()> {
         let conn = Arc::clone(&conn);
         let writes_pending = Arc::clone(&writes_pending);
         std::thread::spawn(move || {
-            backfill::cleanup_stale_synonyms(&conn, &writes_pending);
+            backfill_logic::cleanup_stale_synonyms(&conn, &writes_pending);
         });
     }
 
@@ -439,7 +439,7 @@ fn handle_client(
     // A search harvests its query terms as dictionary candidates. Capture the
     // harvest query before `req` is consumed; the write itself runs after the
     // response.
-    let harvest_query = backfill::harvest_query_for(&req);
+    let harvest_query = backfill_logic::harvest_query_for(&req);
 
     let resp = if req.is_read_only() {
         let conn = read_pool.checkout();
@@ -447,7 +447,7 @@ fn handle_client(
     } else {
         // Mark a write pending BEFORE locking so reindex/backfill yields the
         // writer to us within one batch (mirror of the retired search yield).
-        let _pending = backfill::PendingWriteGuard::new(writes_pending);
+        let _pending = backfill_logic::PendingWriteGuard::new(writes_pending);
         let conn = conn
             .lock()
             .map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
@@ -460,7 +460,7 @@ fn handle_client(
     // the response so it adds nothing to search latency; `lock()` blocks under
     // contention so the write is never lost.
     if let Some(query) = harvest_query {
-        backfill::harvest_query_candidates(conn, writes_pending, &query);
+        backfill_logic::harvest_query_candidates(conn, writes_pending, &query);
     }
     Ok(())
 }

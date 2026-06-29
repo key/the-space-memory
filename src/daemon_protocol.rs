@@ -93,7 +93,7 @@ impl DaemonRequest {
     /// If a handler classified `true` ever needs to write (including indirect
     /// side effects like dictionary-candidate harvesting), route that write onto
     /// the daemon's shared writer after the response (as the search path does via
-    /// `tsmd::backfill::harvest_query_candidates`) rather than reclassifying the
+    /// `tsmd::backfill_logic::harvest_query_candidates`) rather than reclassifying the
     /// request as a write.
     pub fn is_read_only(&self) -> bool {
         match self {
