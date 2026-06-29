@@ -18,7 +18,7 @@ lindera の内蔵辞書（IPAdic）は一般的な日本語をカバーするが
   インデックス・検索・セッション取り込み時に未知語を自動収集する。
   辞書への追加は `tsm dict add <surface> [yomi]`、除外は `tsm dict reject <word>`、
   判定の取り消しは `tsm dict rm <word>` で、人間が 1 語ずつ確認して行う
-  （ADR-0014 の判定状態機械: `accepted` / `rejected` / `pending` は相互排他）
+  （判定状態機械: `accepted` / `rejected` / `pending` は相互排他）
 - **DB を権威とし、ファイルは export/import で往復** ---
   判定状態は DB（`dictionary_candidates`）を正とし、`tsm dict export` で
   `user_dict.simpledic` / `reject_words.txt` へ書き出し、`tsm dict import` で
