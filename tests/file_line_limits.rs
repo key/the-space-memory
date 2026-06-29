@@ -33,11 +33,17 @@ const BASELINE_REL: &str = "tests/file-line-baseline.txt";
 /// test_utils;` — stay counted as code; only the trailing test module is
 /// stripped. A file with no such trailing module counts in full.
 ///
-/// Fails closed against a silent undercount: if a trailing test module is found
-/// but the file does not end with its closing `}`, code has leaked past it, so
-/// we error rather than strip too much. The module *interior* is never scanned —
-/// raw-string fixtures legitimately contain column-0 text — so the EOF brace is
-/// the boundary guard.
+/// Boundary guard, with a documented limit. The module *interior* is never
+/// scanned: test fixtures legitimately contain raw strings (`r#"…"#`) with
+/// column-0 content, which a brace-depth scan would misread. Instead we require
+/// the file to end at the test module's column-0 `}`; if anything else trails it
+/// (prose, comments, an unbalanced line) we error rather than strip too much.
+///
+/// This is NOT a complete guard: because we do not lex, a full production item
+/// placed *after* the trailing `mod tests` that itself ends in a column-0 `}`
+/// would pass and be excluded from the count. The gate therefore assumes the
+/// repo convention that the inline test module is the file's last item. A
+/// lexer-based detector that makes the boundary exact is tracked as a follow-up.
 fn code_line_count(content: &str) -> Result<usize, String> {
     let lines: Vec<&str> = content.lines().collect();
 
@@ -183,18 +189,50 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The base branch's baseline file content, or `None` when it cannot be read
-/// (the introducing PR — no file on `origin/main` yet — or a local/shallow
-/// checkout without the ref). Invariant 3 is skipped in that case.
-fn base_baseline(root: &Path) -> Option<String> {
-    let out = Command::new("git")
+/// State of the base branch's baseline, used to drive invariant 3.
+enum BaseBaseline {
+    /// `origin/main` has the baseline file — enforce invariant 3 against it.
+    Content(String),
+    /// `origin/main` resolves but carries no baseline file yet. This is the
+    /// bootstrap window: only the introducing PR (and the commits before this
+    /// gate first lands on `main`) hit it. Invariant 3 arms automatically once
+    /// the baseline exists on `main`.
+    BootstrapAbsent,
+    /// `origin/main` could not be resolved at all (shallow/local checkout, or a
+    /// CI job that failed to fetch it). Invariant 3 cannot be checked.
+    RefUnavailable,
+}
+
+fn base_baseline(root: &Path) -> BaseBaseline {
+    let ref_ok = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "origin/main"])
+        .current_dir(root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ref_ok {
+        return BaseBaseline::RefUnavailable;
+    }
+    // `origin/main` exists; a failed `git show` here means the baseline file is
+    // simply not in that tree yet (bootstrap), not a missing ref.
+    match Command::new("git")
         .args(["show", &format!("origin/main:{BASELINE_REL}")])
         .current_dir(root)
         .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    {
+        Ok(o) if o.status.success() => {
+            BaseBaseline::Content(String::from_utf8_lossy(&o.stdout).into_owned())
+        }
+        _ => BaseBaseline::BootstrapAbsent,
+    }
+}
+
+/// Whether invariant 3 must run fail-closed: the dedicated `file-lines` CI job
+/// sets this, having fetched `origin/main`. There, an unresolvable base is a
+/// setup failure and errors rather than silently skipping. Other contexts (the
+/// general `test` job, local `cargo test`) leave invariant 3 to that job.
+fn invariant3_is_strict() -> bool {
+    std::env::var_os("TSM_FILE_LINE_GATE_STRICT").is_some()
 }
 
 #[test]
@@ -225,13 +263,26 @@ fn enforce_per_file_line_limits() {
     let baseline = parse_baseline(include_str!("file-line-baseline.txt"));
     violations.extend(growth_and_tightness_violations(&current, &baseline));
 
+    // Invariant 3 (immutability) needs the base branch. It is authoritative only
+    // in the strict `file-lines` job; elsewhere it is skipped (that job covers
+    // it). In strict mode an unresolvable base is fail-closed, not fail-open.
+    let strict = invariant3_is_strict();
     match base_baseline(root) {
-        Some(base) => {
+        BaseBaseline::Content(base) => {
             violations.extend(immutability_violations(&baseline, &parse_baseline(&base)));
         }
-        None => eprintln!(
-            "[file-lines] origin/main baseline unavailable (bootstrap or local/shallow \
-             checkout); skipping invariant 3 (immutability)"
+        BaseBaseline::BootstrapAbsent => eprintln!(
+            "[file-lines] no baseline on origin/main yet (bootstrap); invariant 3 \
+             (immutability) arms once this lands on main"
+        ),
+        BaseBaseline::RefUnavailable if strict => violations.push(
+            "invariant 3 (immutability) could not run: origin/main is unavailable in the \
+             strict file-lines job — it must fetch the base branch before running"
+                .to_string(),
+        ),
+        BaseBaseline::RefUnavailable => eprintln!(
+            "[file-lines] origin/main unavailable (local/shallow checkout); invariant 3 \
+             (immutability) is enforced by the strict file-lines CI job"
         ),
     }
 

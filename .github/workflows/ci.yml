@@ -71,6 +71,10 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
 
       - name: Per-file line-count gate (ADR-0018)
+        # Strict mode: this job fetched origin/main, so an unresolvable base is a
+        # setup failure and fails closed (invariant 3 is authoritative here).
+        env:
+          TSM_FILE_LINE_GATE_STRICT: "1"
         run: cargo test --test file_line_limits -- --nocapture
 
   arm64-check:
