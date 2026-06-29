@@ -18,6 +18,7 @@ pub mod manifest;
 pub mod paths;
 pub mod placement;
 pub mod read_pool;
+pub mod ruri_model;
 pub mod searcher;
 pub mod session_chunker;
 pub mod status;

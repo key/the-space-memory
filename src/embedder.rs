@@ -1,13 +1,10 @@
-use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor, D};
-use candle_nn::VarBuilder;
-use candle_transformers::models::modernbert::{Config, ModernBert};
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
+use tokenizers::Tokenizer;
 
 use crate::config;
 use crate::ipc::{read_message, write_message};
@@ -37,143 +34,43 @@ pub mod counters {
     }
 }
 
-/// The embedder engine: loads model and produces embeddings.
+/// Abstraction over the model's forward pass so the encode pipeline can be
+/// unit-tested against a mock. The real ruri/ModernBert wrapper lives behind
+/// this trait in `ruri_model.rs` (kept out of the coverage gate).
+pub trait EmbeddingModel {
+    /// Run the transformer forward pass: `(input_ids, attention_mask)` →
+    /// hidden states shaped `(batch, seq_len, hidden)`.
+    fn forward(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor>;
+}
+
+/// The embedder engine: holds a model + tokenizer and produces embeddings.
+///
+/// The model is type-erased behind [`EmbeddingModel`] so the encode pipeline is
+/// testable with a mock; construction from real files lives in `ruri_model.rs`.
 pub struct Embedder {
-    model: ModernBert,
+    model: Box<dyn EmbeddingModel>,
     tokenizer: Tokenizer,
     device: Device,
 }
 
 impl Embedder {
-    /// Load the ruri-v3-30m model.
-    ///
-    /// Resolution order:
-    /// 1. `{state_dir}/models/ruri-v3-30m/` — workspace override
-    ///    (lets users drop a fine-tuned model into a single workspace)
-    /// 2. `{cache_dir}/models/ruri-v3-30m/` — machine-wide cache
-    ///    populated by `tsm setup`
-    /// 3. Neither populated → fail with an actionable error message
-    pub fn load(device: &Device) -> Result<Self> {
-        if let Some(dir) = config::models_dir_complete() {
-            log::info!("Loading model from workspace override: {}", dir.display());
-            return Self::load_from_dir(&dir, device);
-        }
-
-        if let Some(dir) = config::cache_models_dir_complete() {
-            log::info!("Loading model from cache: {}", dir.display());
-            return Self::load_from_dir(&dir, device);
-        }
-
-        anyhow::bail!(
-            "ruri-v3-30m model not found. Run `tsm setup` to populate the cache, \
-             or place the model files at {} (workspace override).",
-            config::models_dir().display()
-        );
-    }
-
-    /// Helper: load all three required files from a single directory.
-    fn load_from_dir(dir: &Path, device: &Device) -> Result<Self> {
-        Self::load_from_paths(
-            &dir.join("config.json"),
-            &dir.join("tokenizer.json"),
-            &dir.join("model.safetensors"),
-            device,
-        )
-    }
-
-    /// Load model from explicit file paths.
-    pub fn load_from_paths(
-        config_path: &Path,
-        tokenizer_path: &Path,
-        weights_path: &Path,
-        device: &Device,
-    ) -> Result<Self> {
-        let config_str = std::fs::read_to_string(config_path)?;
-        let config: Config = serde_json::from_str(&config_str)?;
-        let pad_token_id = config.pad_token_id;
-
-        let mut tokenizer =
-            Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        tokenizer.with_padding(Some(PaddingParams {
-            strategy: PaddingStrategy::BatchLongest,
-            pad_id: pad_token_id,
-            pad_token: "[PAD]".to_string(),
-            ..Default::default()
-        }));
-
-        let tensors = load_tensors_with_prefix(weights_path, device)?;
-        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
-        let model = ModernBert::load(vb, &config)?;
-
-        Ok(Self {
+    /// Assemble an embedder from its parts. Used by the loader (`ruri_model.rs`)
+    /// and by tests; the struct fields stay private.
+    pub(crate) fn from_parts(
+        model: Box<dyn EmbeddingModel>,
+        tokenizer: Tokenizer,
+        device: Device,
+    ) -> Self {
+        Self {
             model,
             tokenizer,
-            device: device.clone(),
-        })
+            device,
+        }
     }
 
     /// Encode texts into embedding vectors.
     pub fn encode(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Truncate texts to avoid OOM/crash on very long inputs.
-        // ruri-v3-30m supports up to 8192 tokens; we limit input chars
-        // conservatively (Japanese averages ~1.5 chars/token).
-        const MAX_CHARS: usize = 8192;
-        let truncated: Vec<String> = texts
-            .iter()
-            .map(|t| {
-                if t.len() > MAX_CHARS {
-                    let mut end = MAX_CHARS;
-                    while end > 0 && !t.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    t[..end].to_string()
-                } else {
-                    t.clone()
-                }
-            })
-            .collect();
-
-        let encodings = self
-            .tokenizer
-            .encode_batch(truncated, true)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let input_ids: Vec<Vec<u32>> = encodings.iter().map(|e| e.get_ids().to_vec()).collect();
-        let attention_masks: Vec<Vec<u32>> = encodings
-            .iter()
-            .map(|e| e.get_attention_mask().to_vec())
-            .collect();
-
-        let batch_size = input_ids.len();
-        let seq_len = input_ids[0].len();
-
-        let input_ids_flat: Vec<u32> = input_ids.into_iter().flatten().collect();
-        let mask_flat: Vec<u32> = attention_masks.into_iter().flatten().collect();
-
-        let input_ids_tensor =
-            Tensor::from_vec(input_ids_flat, (batch_size, seq_len), &self.device)?
-                .to_dtype(DType::U32)?;
-        let attention_mask_tensor =
-            Tensor::from_vec(mask_flat, (batch_size, seq_len), &self.device)?
-                .to_dtype(DType::U32)?;
-
-        let output = self
-            .model
-            .forward(&input_ids_tensor, &attention_mask_tensor)?;
-        let embeddings = mean_pooling(&output, &attention_mask_tensor)?;
-
-        // Convert to Vec<Vec<f32>>
-        let mut result = Vec::with_capacity(batch_size);
-        for i in 0..batch_size {
-            let row = embeddings.get(i)?;
-            let values: Vec<f32> = row.to_vec1()?;
-            result.push(values);
-        }
-        Ok(result)
+        encode_impl(self.model.as_ref(), &self.tokenizer, &self.device, texts)
     }
 
     /// Get the embedding dimension.
@@ -182,16 +79,75 @@ impl Embedder {
     }
 }
 
-/// Load safetensors with "model." prefix added to tensor names.
-/// Uses mmap to leverage OS page cache for faster repeated loads.
-fn load_tensors_with_prefix(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
-    let mmaped = unsafe { candle_core::safetensors::MmapedSafetensors::new(path)? };
-    let mut renamed = HashMap::new();
-    for (name, _view) in mmaped.tensors() {
-        let tensor = mmaped.load(&name, device)?;
-        renamed.insert(format!("model.{name}"), tensor);
+/// Cap each text so very long inputs cannot OOM/crash the model.
+/// ruri-v3-30m supports up to 8192 tokens; we limit input chars conservatively
+/// (Japanese averages ~1.5 chars/token), truncating on a UTF-8 char boundary.
+fn truncate_texts(texts: &[String]) -> Vec<String> {
+    const MAX_CHARS: usize = 8192;
+    texts
+        .iter()
+        .map(|t| {
+            if t.len() > MAX_CHARS {
+                let mut end = MAX_CHARS;
+                while end > 0 && !t.is_char_boundary(end) {
+                    end -= 1;
+                }
+                t[..end].to_string()
+            } else {
+                t.clone()
+            }
+        })
+        .collect()
+}
+
+/// Tokenize, run the model forward pass, and mean-pool into embedding vectors.
+///
+/// Parameterized over [`EmbeddingModel`] so it runs against a mock model and a
+/// code-built tokenizer without any model files.
+fn encode_impl(
+    model: &dyn EmbeddingModel,
+    tokenizer: &Tokenizer,
+    device: &Device,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(renamed)
+
+    let truncated = truncate_texts(texts);
+
+    let encodings = tokenizer
+        .encode_batch(truncated, true)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let input_ids: Vec<Vec<u32>> = encodings.iter().map(|e| e.get_ids().to_vec()).collect();
+    let attention_masks: Vec<Vec<u32>> = encodings
+        .iter()
+        .map(|e| e.get_attention_mask().to_vec())
+        .collect();
+
+    let batch_size = input_ids.len();
+    let seq_len = input_ids[0].len();
+
+    let input_ids_flat: Vec<u32> = input_ids.into_iter().flatten().collect();
+    let mask_flat: Vec<u32> = attention_masks.into_iter().flatten().collect();
+
+    let input_ids_tensor =
+        Tensor::from_vec(input_ids_flat, (batch_size, seq_len), device)?.to_dtype(DType::U32)?;
+    let attention_mask_tensor =
+        Tensor::from_vec(mask_flat, (batch_size, seq_len), device)?.to_dtype(DType::U32)?;
+
+    let output = model.forward(&input_ids_tensor, &attention_mask_tensor)?;
+    let embeddings = mean_pooling(&output, &attention_mask_tensor)?;
+
+    // Convert to Vec<Vec<f32>>
+    let mut result = Vec::with_capacity(batch_size);
+    for i in 0..batch_size {
+        let row = embeddings.get(i)?;
+        let values: Vec<f32> = row.to_vec1()?;
+        result.push(values);
+    }
+    Ok(result)
 }
 
 /// Mean pooling with L2 normalization.
@@ -264,6 +220,116 @@ pub fn embed_via_socket_at(socket_path: &Path, texts: &[String]) -> Option<Vec<V
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    // ─── mock-boundary tests (model-free) ───────────────────────────
+
+    /// A model stand-in: returns an all-ones hidden-state tensor shaped to the
+    /// input so `encode_impl`/`mean_pooling` run without a real ModernBert.
+    struct MockModel {
+        hidden: usize,
+    }
+
+    impl EmbeddingModel for MockModel {
+        fn forward(&self, input_ids: &Tensor, _attention_mask: &Tensor) -> Result<Tensor> {
+            let (batch, seq) = input_ids.dims2()?;
+            Tensor::ones((batch, seq, self.hidden), DType::F32, input_ids.device())
+                .map_err(Into::into)
+        }
+    }
+
+    /// A tiny whitespace tokenizer built in code (no model files).
+    fn tiny_tokenizer() -> Tokenizer {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+        use tokenizers::{PaddingParams, PaddingStrategy};
+
+        let wl = WordLevel::builder()
+            .vocab(
+                ["[PAD]", "[UNK]", "hello", "world", "foo"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, w)| (w.to_string(), i as u32))
+                    .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let mut tk = Tokenizer::new(wl);
+        tk.with_pre_tokenizer(Some(Whitespace {}));
+        tk.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::BatchLongest,
+            pad_id: 0,
+            pad_token: "[PAD]".to_string(),
+            ..Default::default()
+        }));
+        tk
+    }
+
+    #[test]
+    fn test_encode_impl_produces_one_vector_per_text() {
+        let model = MockModel { hidden: 4 };
+        let tok = tiny_tokenizer();
+        let texts = vec!["hello world".to_string(), "foo".to_string()];
+
+        let out = encode_impl(&model, &tok, &Device::Cpu, &texts).unwrap();
+
+        assert_eq!(out.len(), 2, "one embedding per input text");
+        assert_eq!(out[0].len(), 4, "embedding dim follows the model output");
+        // Mean-pooled all-ones rows are L2-normalized → unit norm.
+        let norm: f32 = out[0].iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "rows are L2-normalized, got {norm}"
+        );
+    }
+
+    #[test]
+    fn test_encode_impl_empty_input_returns_empty() {
+        let model = MockModel { hidden: 4 };
+        let tok = tiny_tokenizer();
+        let out = encode_impl(&model, &tok, &Device::Cpu, &[]).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_embedder_holder_encode_and_dim() {
+        // Exercises the holder methods (from_parts / encode / dim) so they are
+        // not left uncovered when tests call encode_impl directly.
+        let embedder = Embedder::from_parts(
+            Box::new(MockModel { hidden: 4 }),
+            tiny_tokenizer(),
+            Device::Cpu,
+        );
+        let out = embedder.encode(&["hello world".to_string()]).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(embedder.dim(), config::EMBEDDING_DIM);
+    }
+
+    #[test]
+    fn test_truncate_texts_caps_long_input_at_char_boundary() {
+        let long = "あ".repeat(10_000); // 30_000 bytes, well over MAX_CHARS
+        let out = truncate_texts(&[long.clone(), "short".to_string()]);
+        assert!(out[0].len() <= 8192);
+        assert!(long.starts_with(&out[0]), "truncation keeps a valid prefix");
+        assert_eq!(out[1], "short", "short text is untouched");
+    }
+
+    #[test]
+    fn test_mean_pooling_masks_padding_and_normalizes() {
+        // batch=1, seq=2, hidden=2. Second token is padding (mask=0): only the
+        // first token contributes, so the pooled vector is that token's row,
+        // L2-normalized.
+        let output =
+            Tensor::from_vec(vec![3.0f32, 4.0, 100.0, 100.0], (1, 2, 2), &Device::Cpu).unwrap();
+        let mask = Tensor::from_vec(vec![1u32, 0u32], (1, 2), &Device::Cpu).unwrap();
+
+        let pooled = mean_pooling(&output, &mask).unwrap();
+        let v: Vec<f32> = pooled.get(0).unwrap().to_vec1().unwrap();
+
+        // (3,4) normalized → (0.6, 0.8); padding row ignored despite huge values.
+        assert!((v[0] - 0.6).abs() < 1e-5, "got {v:?}");
+        assert!((v[1] - 0.8).abs() < 1e-5, "got {v:?}");
+    }
 
     #[test]
     fn test_read_write_message_roundtrip() {
@@ -347,40 +413,6 @@ mod tests {
         assert_ne!(counters::embedder_call_count(), 0);
         counters::reset_embedder_calls();
         assert_eq!(counters::embedder_call_count(), 0);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_embedder_load_fails_with_helpful_message_when_no_model() {
-        // Both workspace override and cache are empty — load() must bail with
-        // an actionable message that points the user at `tsm setup`.
-        let tmp_state = tempfile::TempDir::new().unwrap();
-        let tmp_cache = tempfile::TempDir::new().unwrap();
-
-        std::env::set_var("TSM_STATE_DIR", tmp_state.path());
-        std::env::set_var("TSM_CACHE_DIR", tmp_cache.path());
-        config::reload();
-
-        let result = Embedder::load(&Device::Cpu);
-
-        std::env::remove_var("TSM_STATE_DIR");
-        std::env::remove_var("TSM_CACHE_DIR");
-        config::reload();
-
-        // Embedder doesn't implement Debug; use match instead of unwrap_err.
-        let err = match result {
-            Ok(_) => panic!("Embedder::load unexpectedly succeeded with empty dirs"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("tsm setup"),
-            "expected error to mention `tsm setup`, got: {msg}"
-        );
-        assert!(
-            msg.contains("ruri-v3-30m"),
-            "expected error to mention model name, got: {msg}"
-        );
     }
 
     #[test]
