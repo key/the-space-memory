@@ -2,6 +2,7 @@ mod backfill;
 mod child;
 mod daemon_mode;
 mod embedder_mode;
+mod watch_logic;
 mod watcher_mode;
 
 use std::sync::atomic::{AtomicBool, Ordering};
