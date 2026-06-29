@@ -98,3 +98,98 @@ pub fn update(state_dir: &Path, f: impl FnOnce(&mut StatusFile)) {
         Err(e) => log::warn!("failed to serialize status: {e}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_status_path_joins_filename() {
+        let dir = TempDir::new().unwrap();
+        let p = status_path(dir.path());
+        assert_eq!(p, dir.path().join(STATUS_FILENAME));
+        assert!(p.ends_with(STATUS_FILENAME));
+    }
+
+    #[test]
+    fn test_read_absent_file_returns_default() {
+        // No status file written yet → a default (all-None) StatusFile.
+        let dir = TempDir::new().unwrap();
+        let sf = read(dir.path());
+        assert!(sf.daemon.is_none());
+        assert!(sf.embedder.is_none());
+        assert!(sf.watcher.is_none());
+        assert!(sf.backfill.is_none());
+        assert!(sf.reindex.is_none());
+    }
+
+    #[test]
+    fn test_read_invalid_json_returns_default() {
+        // A corrupt file must degrade to default rather than propagate an error.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(status_path(dir.path()), b"{ not valid json ]").unwrap();
+        let sf = read(dir.path());
+        assert!(sf.daemon.is_none());
+    }
+
+    #[test]
+    fn test_update_then_read_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        update(dir.path(), |s| {
+            s.daemon = Some(DaemonStatus {
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                pid: 4242,
+                socket: "/tmp/d.sock".to_string(),
+            });
+        });
+        // The status file now exists and round-trips back through read().
+        assert!(status_path(dir.path()).exists());
+        let sf = read(dir.path());
+        let d = sf.daemon.expect("daemon status persisted");
+        assert_eq!(d.pid, 4242);
+        assert_eq!(d.socket, "/tmp/d.sock");
+    }
+
+    #[test]
+    fn test_update_preserves_other_fields_and_overwrites_atomically() {
+        // First write sets the embedder; a second update mutates the watcher
+        // while the embedder is read back, mutated in place, and re-persisted.
+        let dir = TempDir::new().unwrap();
+        update(dir.path(), |s| {
+            s.embedder = Some(EmbedderStatus {
+                started_at: "t0".to_string(),
+                pid: 7,
+            });
+        });
+        update(dir.path(), |s| {
+            s.watcher = Some(WatcherStatus {
+                started_at: "t1".to_string(),
+                pid: 8,
+            });
+        });
+        let sf = read(dir.path());
+        assert_eq!(sf.embedder.unwrap().pid, 7);
+        assert_eq!(sf.watcher.unwrap().pid, 8);
+        // The atomic-write temp file is renamed away, not left behind.
+        assert!(!status_path(dir.path()).with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn test_write_atomic_writes_and_renames() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("out.json");
+        write_atomic(&path, b"hello").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn test_write_atomic_propagates_error_on_bad_dir() {
+        // Writing under a nonexistent directory surfaces the IO error rather
+        // than silently succeeding.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing-subdir").join("out.json");
+        assert!(write_atomic(&path, b"x").is_err());
+    }
+}

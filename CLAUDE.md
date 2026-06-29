@@ -19,7 +19,7 @@ cargo test --lib frontmatter
 cargo llvm-cov --html
 cargo llvm-cov \
   --ignore-filename-regex \
-  '(embedder|main|cli|status|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' \
+  '(embedder|main|cli|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' \
   --fail-under-lines 90
 
 # Lint (--all-targets also lints test/bench code)
@@ -171,7 +171,19 @@ src/
   1. Write a failing test that defines the expected behavior
   2. Write minimal code to make the test pass
   3. Refactor while keeping tests green
-- **90%+ coverage** — Enforced via `cargo llvm-cov --fail-under-lines 90` in CI
+- **90%+ coverage** — Enforced via `cargo llvm-cov --fail-under-lines 90` in CI.
+  `--fail-under-lines` is a single GLOBAL aggregate over the included set (not a
+  per-file floor), so a file must reach ≈90% itself before leaving the
+  `--ignore-filename-regex`, or it dilutes the total.
+- **Coverage exclusions & rationale** — the regex (see the commands above) covers
+  the entry points (`*main.rs`), the daemon/embedder/watcher I/O loops
+  (`daemon_mode`, `embedder_mode`, `watcher_mode`, `child`, `backfill`), `cli`,
+  `embedder`, and `logging`. `logging.rs` stays excluded for a concrete reason:
+  `init_logger`'s `OnceLock` runs its mode-branch closure only once per process,
+  so the `Daemon` file-logger arm is unreachable from unit tests, and
+  `flexi_logger`'s global UTC-offset state makes any `DeferredNow`-based format
+  test conflict with `init_logger`'s `use_utc()` — so the file cannot reach the
+  global-diluting ≈90% bar. `status.rs` has no such barrier and is gate-counted.
 - **Unit tests required** — All pub functions must have tests in `#[cfg(test)] mod tests`
 - **AAA pattern** — Arrange (setup + state cleanup like `clear_vectors`) → Act → Assert
 - DB tests use in-memory SQLite (`:memory:`) to prevent state leakage
