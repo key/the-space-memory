@@ -942,7 +942,7 @@ pub fn resolve_project_root(
 // ─── Local model directory ──────────────────────────────────────
 
 /// Canonical list of required model files. Used by `models_dir_complete()`,
-/// `embedder_mode::load_model()`, and `doctor_check_with_conn()`.
+/// `embedder_proc::load_model()`, and `doctor_check_with_conn()`.
 pub const MODEL_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
 
 /// Directory for locally cached model files: `{state_dir}/models/ruri-v3-30m/`.

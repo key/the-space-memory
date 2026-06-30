@@ -14,6 +14,8 @@ use the_space_memory::ipc::{accept_blocking, read_message, write_message};
 
 use candle_core::Device;
 
+use crate::embedder_logic;
+
 /// Entry point for `tsmd --embedder`.
 pub fn run(model: Option<PathBuf>, no_idle_timeout: bool) -> Result<()> {
     config::ensure_model_cache_env();
@@ -31,23 +33,30 @@ pub fn run(model: Option<PathBuf>, no_idle_timeout: bool) -> Result<()> {
 
 /// Load model from explicit directory or fall back to default resolution.
 fn load_model(model_dir: Option<&Path>) -> Result<Embedder> {
-    if let Some(dir) = model_dir {
-        let has_all_files = config::MODEL_FILES.iter().all(|f| dir.join(f).is_file());
-        if has_all_files {
-            return Embedder::load_from_paths(
+    // FS completeness check stays in the shell; the policy decision is pure.
+    let all_files_present =
+        model_dir.is_some_and(|dir| config::MODEL_FILES.iter().all(|f| dir.join(f).is_file()));
+    match embedder_logic::resolve_model_load(model_dir, all_files_present) {
+        embedder_logic::ModelLoadPlan::FromDir => {
+            let dir = model_dir.expect("FromDir implies an explicit model directory");
+            Embedder::load_from_paths(
                 &dir.join("config.json"),
                 &dir.join("tokenizer.json"),
                 &dir.join("model.safetensors"),
                 &Device::Cpu,
-            );
+            )
         }
-        log::warn!(
-            "Model files incomplete in {}; falling back to default resolution \
-             (state_dir override → cache_dir). Run `tsm setup` to populate the cache.",
-            dir.display()
-        );
+        embedder_logic::ModelLoadPlan::FallbackIncomplete => {
+            let dir = model_dir.expect("FallbackIncomplete implies an explicit model directory");
+            log::warn!(
+                "Model files incomplete in {}; falling back to default resolution \
+                 (state_dir override → cache_dir). Run `tsm setup` to populate the cache.",
+                dir.display()
+            );
+            Embedder::load(&Device::Cpu)
+        }
+        embedder_logic::ModelLoadPlan::Default => Embedder::load(&Device::Cpu),
     }
-    Embedder::load(&Device::Cpu)
 }
 
 /// Run the embedder socket server loop.
@@ -134,48 +143,26 @@ fn watchdog(
 fn handle_client(mut stream: UnixStream, embedder: &Embedder) -> Result<()> {
     let request_data = read_message(&mut stream)?;
     let request: serde_json::Value = serde_json::from_slice(&request_data)?;
-
-    let texts: Vec<String> = request
-        .get("texts")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let texts = embedder_logic::parse_texts(&request);
 
     let encode_result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| embedder.encode(&texts)));
 
-    let embeddings = match encode_result {
-        Ok(Ok(emb)) => emb,
+    // Build the reply value, logging error/panic causes (logging stays in the
+    // shell); the wire write and shutdown are identical across all outcomes.
+    let response = match encode_result {
+        Ok(Ok(emb)) => embedder_logic::encode_response(Ok(emb)),
         Ok(Err(e)) => {
             log::error!("Encode error: {e}");
-            let err_resp = serde_json::json!({ "error": format!("{e}") });
-            let err_bytes = serde_json::to_vec(&err_resp)?;
-            write_message(&mut stream, &err_bytes)?;
-            let _ = stream.shutdown(Shutdown::Both);
-            return Ok(());
+            embedder_logic::encode_response(Err(e))
         }
         Err(panic_info) => {
-            let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
-                s.clone()
-            } else if let Some(&s) = panic_info.downcast_ref::<&str>() {
-                s.to_string()
-            } else {
-                "unknown panic".to_string()
-            };
+            let msg = embedder_logic::panic_message(&*panic_info);
             log::error!("PANIC in encode: {msg}");
-            let err_resp = serde_json::json!({ "error": format!("panic: {msg}") });
-            let err_bytes = serde_json::to_vec(&err_resp)?;
-            write_message(&mut stream, &err_bytes)?;
-            let _ = stream.shutdown(Shutdown::Both);
-            return Ok(());
+            serde_json::json!({ "error": format!("panic: {msg}") })
         }
     };
 
-    let response = serde_json::json!({ "embeddings": embeddings });
     let response_bytes = serde_json::to_vec(&response)?;
     write_message(&mut stream, &response_bytes)?;
     let _ = stream.shutdown(Shutdown::Both);
