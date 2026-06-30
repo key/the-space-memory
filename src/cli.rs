@@ -2013,7 +2013,7 @@ fn report_vectors_and_backfill(conn: rusqlite::Connection, socket: &Path) -> any
     let vecs: i64 = conn.query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))?;
     drop(conn);
 
-    // Status read short-circuits (only when a backfill could actually start).
+    // Sampled for the decision; the read only matters when vectors are missing.
     let socket_exists = socket.exists();
     let backfill_in_progress =
         socket_exists && chunks > 0 && crate::status::read(&config::state_dir()).backfill.is_some();
