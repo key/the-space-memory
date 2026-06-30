@@ -368,6 +368,17 @@ mod tests {
         let got = render_doctor_report(false, &DoctorReport::default());
         assert!(got.contains("The Space Memory \u{2014} Doctor"));
         assert!(got.contains("All good."));
+        // Every rendered row must share one display width. This guards the
+        // title-is-widest path (content_width = title.chars().count() + 4),
+        // which the populated golden does not exercise: a byte-vs-char
+        // regression there would silently widen the body relative to the
+        // title-sized top border. Measure by columns, not bytes, since the
+        // box contains multi-byte characters.
+        let widths: Vec<usize> = got.lines().map(|l| l.chars().count()).collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "doctor box rows must share one display width: {widths:?}"
+        );
     }
 
     fn base_status() -> StatusInfo {
