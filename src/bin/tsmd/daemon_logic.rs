@@ -37,6 +37,9 @@ pub fn reindex_steps(kind: ReindexKind) -> &'static [ReindexStep] {
     match kind {
         ReindexKind::Fts => &[ReindexStep::Fts],
         ReindexKind::Vectors => &[ReindexStep::Vectors],
+        // The order here is the contract. Adding a new pass to `All` means
+        // adding a `ReindexStep` variant (the match below is exhaustive) AND
+        // extending this slice — the compiler catches the former, not the latter.
         ReindexKind::All => &[ReindexStep::Fts, ReindexStep::Vectors],
     }
 }
@@ -84,9 +87,17 @@ pub fn reload_response(
 pub struct ReindexGuard(Arc<AtomicBool>);
 
 impl ReindexGuard {
-    /// Take ownership of the reindex-active flag; drop clears it.
-    pub fn new(flag: Arc<AtomicBool>) -> Self {
-        ReindexGuard(flag)
+    /// Atomically claim the reindex-active flag. Returns `Some(guard)` if the
+    /// flag was clear (this caller now owns the reindex; drop clears it), or
+    /// `None` if a reindex is already in progress.
+    ///
+    /// Claim and guard creation are one operation — like its sibling
+    /// `backfill_logic::PendingWriteGuard::new` — so the type, not a two-step
+    /// caller protocol, owns the "a guard implies the flag is set" invariant.
+    pub fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| ReindexGuard(Arc::clone(flag)))
     }
 }
 
@@ -191,20 +202,81 @@ mod tests {
     }
 
     #[test]
-    fn test_reindex_guard_clears_flag_on_drop() {
+    fn test_reload_response_combines_base_and_sighup_warning() {
+        let resp = reload_response(vec!["config drifted".to_string()], true, false);
+        let warnings = resp.payload.unwrap()["warnings"].clone();
+        assert_eq!(
+            warnings,
+            serde_json::json!([
+                "config drifted",
+                "failed to send SIGHUP to watcher (may have exited)"
+            ])
+        );
+    }
+
+    #[test]
+    fn test_reload_response_combines_base_and_watcher_absent_warning() {
+        let resp = reload_response(vec!["config drifted".to_string()], false, true);
+        let warnings = resp.payload.unwrap()["warnings"].clone();
+        assert_eq!(
+            warnings,
+            serde_json::json!([
+                "config drifted",
+                "watcher is not running; watch targets not updated"
+            ])
+        );
+    }
+
+    #[test]
+    fn test_reindex_guard_try_acquire_claims_clear_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let guard = ReindexGuard::try_acquire(&flag);
+        assert!(guard.is_some());
+        assert!(flag.load(Ordering::Acquire), "flag is claimed while held");
+    }
+
+    #[test]
+    fn test_reindex_guard_try_acquire_rejects_when_busy() {
         let flag = Arc::new(AtomicBool::new(true));
+        assert!(ReindexGuard::try_acquire(&flag).is_none());
+        assert!(
+            flag.load(Ordering::Acquire),
+            "a rejected claim leaves it set"
+        );
+    }
+
+    #[test]
+    fn test_reindex_guard_clears_flag_on_drop() {
+        let flag = Arc::new(AtomicBool::new(false));
         {
-            let _guard = ReindexGuard::new(Arc::clone(&flag));
+            let _guard = ReindexGuard::try_acquire(&flag).expect("clear flag claims");
             assert!(flag.load(Ordering::Acquire));
         }
         assert!(!flag.load(Ordering::Acquire));
     }
 
     #[test]
+    fn test_reindex_guard_clears_flag_on_panic() {
+        // Panic-safety is the whole point of the RAII guard: a worker thread
+        // that crashes must not wedge the daemon into "reindex in progress".
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_in = Arc::clone(&flag);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = ReindexGuard::try_acquire(&flag_in).expect("clear flag claims");
+            panic!("simulated worker crash");
+        }));
+        assert!(result.is_err());
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "flag must be cleared even after a panic"
+        );
+    }
+
+    #[test]
     fn test_reindex_guard_is_debug() {
         // The guard must derive Debug (#268 item 5): assert it formats.
-        let flag = Arc::new(AtomicBool::new(true));
-        let guard = ReindexGuard::new(flag);
+        let flag = Arc::new(AtomicBool::new(false));
+        let guard = ReindexGuard::try_acquire(&flag).expect("clear flag claims");
         assert!(format!("{guard:?}").contains("ReindexGuard"));
     }
 
@@ -243,6 +315,16 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let pid_path = dir.path().join("test.pid");
         std::fs::write(&pid_path, "12345").unwrap();
+        assert_eq!(read_pid_from_file(&pid_path), Some(12345));
+    }
+
+    #[test]
+    fn test_read_pid_from_file_trailing_newline() {
+        // PID files written by other tools commonly end in a newline; `.trim()`
+        // must absorb it (the watcher child writes its own PID file).
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_path = dir.path().join("nl.pid");
+        std::fs::write(&pid_path, "12345\n").unwrap();
         assert_eq!(read_pid_from_file(&pid_path), Some(12345));
     }
 

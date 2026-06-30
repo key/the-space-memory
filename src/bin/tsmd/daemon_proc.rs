@@ -360,24 +360,23 @@ fn handle_client(
     if let DaemonRequest::Reindex { kind } = req {
         use daemon_logic::ReindexStep;
 
-        if reindex_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        // Claim the reindex flag on this (client) thread so the synchronous
+        // "already in progress" response is written before any thread spawns.
+        // The guard is then moved into the worker thread; its drop clears the
+        // flag, even on panic.
+        let Some(guard) = daemon_logic::ReindexGuard::try_acquire(reindex_active) else {
             write_response(
                 stream,
                 &DaemonResponse::error("reindex already in progress"),
             )?;
             return Ok(());
-        }
+        };
 
         let conn = Arc::clone(conn);
         let writes_pending = Arc::clone(writes_pending);
-        let reindex_active = Arc::clone(reindex_active);
         let state_dir = state_dir.to_path_buf();
         std::thread::spawn(move || {
-            // RAII guard: reset flag even if the thread panics.
-            let _guard = daemon_logic::ReindexGuard::new(Arc::clone(&reindex_active));
+            let _guard = guard;
 
             // `All` expands to Fts then Vectors; honor a mid-sequence shutdown
             // before each step after the first (single-step kinds never wait).
