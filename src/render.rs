@@ -117,12 +117,17 @@ pub fn render_status(resp: DaemonResponse) -> Result<()> {
 }
 
 /// Render a doctor report: pretty JSON for `format == "json"`, otherwise the
-/// text report via `cli::render_doctor_report` (stdout).
-pub fn render_doctor(w: &mut impl Write, resp: DaemonResponse, format: &str) -> Result<()> {
+/// text report via `cli::render_doctor_report`.
+///
+/// Both branches write to stdout (JSON directly; text delegated to the cli
+/// printer), so — like [`render_status`] — this renderer takes no writer rather
+/// than accepting one it would ignore on the text path. Unifying the cli text
+/// printers onto a writer is tracked separately.
+pub fn render_doctor(resp: DaemonResponse, format: &str) -> Result<()> {
     check_resp(&resp)?;
     let payload = resp.payload.unwrap_or_default();
     if format == "json" {
-        write_json(w, &payload)?;
+        write_json(&mut std::io::stdout(), &payload)?;
         return Ok(());
     }
     let report: cli::DoctorReport = serde_json::from_value(payload).map_err(|e| {
@@ -134,19 +139,25 @@ pub fn render_doctor(w: &mut impl Write, resp: DaemonResponse, format: &str) -> 
     Ok(())
 }
 
-/// Render a reload response: surface any warnings on stderr, then confirm.
-pub fn render_reload(w: &mut impl Write, resp: DaemonResponse) -> Result<()> {
+/// Render a reload response: surface any warnings on `err`, then confirm on
+/// `out`. `main` passes stdout/stderr; tests pass buffers so both streams are
+/// assertable.
+pub fn render_reload(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    resp: DaemonResponse,
+) -> Result<()> {
     check_resp(&resp)?;
     if let Some(payload) = &resp.payload {
-        if let Some(warnings) = payload.get("warnings").and_then(|w| w.as_array()) {
+        if let Some(warnings) = payload.get("warnings").and_then(|v| v.as_array()) {
             for warning in warnings {
                 if let Some(s) = warning.as_str() {
-                    eprintln!("warning: {s}");
+                    writeln!(err, "warning: {s}")?;
                 }
             }
         }
     }
-    writeln!(w, "config reloaded")?;
+    writeln!(out, "config reloaded")?;
     Ok(())
 }
 
@@ -212,6 +223,30 @@ mod tests {
         // Empty results have no paths to relativize, so the output is
         // CWD-independent and deterministic (format_text's empty contract).
         assert_eq!(s(&buf), "No results found.");
+    }
+
+    #[test]
+    fn render_search_text_nonempty_deserializes_and_formats() {
+        let mut buf = Vec::new();
+        let resp = DaemonResponse::success(json!({
+            "results": [{
+                "source_file": "/proj/notes/a.md",
+                "source_type": "note",
+                "section_path": "Intro",
+                "snippet": "hello world",
+                "score": 0.5,
+                "status": null,
+                "related_docs": []
+            }],
+            "total_hits": 1
+        }));
+        render_search(&mut buf, resp, "text").unwrap();
+        let out = s(&buf);
+        // Assert the CWD-independent parts of format_text's non-empty output
+        // (the path is relativized against CWD, so it is not asserted).
+        assert!(out.contains("Showing 1 of 1 results"), "got: {out}");
+        assert!(out.contains("[note]"), "got: {out}");
+        assert!(out.contains("hello world"), "got: {out}");
     }
 
     #[test]
@@ -291,41 +326,59 @@ mod tests {
     }
 
     #[test]
-    fn render_doctor_json_writes_pretty_payload() {
-        let mut buf = Vec::new();
+    fn render_doctor_json_parses_and_renders() {
+        // JSON goes to stdout via write_json; assert it parses + runs (the
+        // pretty-print bytes are asserted via render_search_json).
         let resp = DaemonResponse::success(json!({"sections": []}));
-        render_doctor(&mut buf, resp, "json").unwrap();
-        assert!(s(&buf).contains("\"sections\""));
+        render_doctor(resp, "json").unwrap();
     }
 
     #[test]
     fn render_doctor_text_parses_and_renders() {
-        let mut buf = Vec::new();
         let resp = DaemonResponse::success(json!({"sections": []}));
         // Text goes to stdout via cli::render_doctor_report; assert it parses + runs.
-        render_doctor(&mut buf, resp, "text").unwrap();
+        render_doctor(resp, "text").unwrap();
     }
 
     #[test]
     fn render_doctor_bad_payload_text_errors() {
-        let mut buf = Vec::new();
         let resp = DaemonResponse::success(json!({"sections": "nope"}));
-        let err = render_doctor(&mut buf, resp, "text").unwrap_err();
+        let err = render_doctor(resp, "text").unwrap_err();
         assert!(err
             .to_string()
             .contains("Failed to parse daemon doctor report"));
     }
 
     #[test]
-    fn render_reload_confirms_and_handles_warnings() {
-        let mut buf = Vec::new();
-        let resp = DaemonResponse::success(json!({"warnings": ["w1", "w2"]}));
-        render_reload(&mut buf, resp).unwrap();
-        assert_eq!(s(&buf), "config reloaded\n");
+    fn render_doctor_not_ok_bails() {
+        assert!(render_doctor(DaemonResponse::error("down"), "json").is_err());
+    }
 
-        let mut buf2 = Vec::new();
-        render_reload(&mut buf2, DaemonResponse::success_empty()).unwrap();
-        assert_eq!(s(&buf2), "config reloaded\n");
+    #[test]
+    fn render_reload_writes_confirmation_and_warnings() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        // Mixed array: non-string elements are skipped, strings go to `err`.
+        let resp = DaemonResponse::success(json!({"warnings": ["w1", 42, "w2"]}));
+        render_reload(&mut out, &mut err, resp).unwrap();
+        assert_eq!(s(&out), "config reloaded\n");
+        assert_eq!(s(&err), "warning: w1\nwarning: w2\n");
+    }
+
+    #[test]
+    fn render_reload_no_warnings_writes_only_confirmation() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        render_reload(&mut out, &mut err, DaemonResponse::success_empty()).unwrap();
+        assert_eq!(s(&out), "config reloaded\n");
+        assert!(s(&err).is_empty());
+    }
+
+    #[test]
+    fn render_reload_not_ok_bails() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert!(render_reload(&mut out, &mut err, DaemonResponse::error("x")).is_err());
     }
 
     #[test]
@@ -350,5 +403,29 @@ mod tests {
         let mut buf = Vec::new();
         render_import_wordnet(&mut buf, DaemonResponse::success(json!({}))).unwrap();
         assert_eq!(s(&buf), "imported 0 synonym pairs from WordNet\n");
+    }
+
+    // A successful response with no payload writes nothing (the `if let
+    // Some(payload)` guard's None arm). Pins the silent-on-empty behavior.
+    #[test]
+    fn render_index_no_payload_writes_nothing() {
+        let mut buf = Vec::new();
+        render_index(&mut buf, DaemonResponse::success_empty()).unwrap();
+        assert!(s(&buf).is_empty());
+    }
+
+    #[test]
+    fn render_ingest_no_payload_writes_nothing() {
+        let mut buf = Vec::new();
+        let path = std::path::Path::new("/tmp/sess/foo.jsonl");
+        render_ingest(&mut buf, DaemonResponse::success_empty(), path).unwrap();
+        assert!(s(&buf).is_empty());
+    }
+
+    #[test]
+    fn render_import_wordnet_no_payload_writes_nothing() {
+        let mut buf = Vec::new();
+        render_import_wordnet(&mut buf, DaemonResponse::success_empty()).unwrap();
+        assert!(s(&buf).is_empty());
     }
 }

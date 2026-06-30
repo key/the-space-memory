@@ -458,7 +458,7 @@ fn main() -> anyhow::Result<()> {
                 format: format.clone(),
             };
             match daemon_protocol::try_send_request(&socket, &req) {
-                Some(Ok(resp)) => render::render_doctor(&mut std::io::stdout(), resp, &format)?,
+                Some(Ok(resp)) => render::render_doctor(resp, &format)?,
                 // Socket present but unresponsive (broken or shutting-down
                 // daemon): surface the error so it is not silently hidden, but
                 // still produce a local report — a diagnostic must never hard-fail.
@@ -481,6 +481,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Reload => {
             render::render_reload(
                 &mut std::io::stdout(),
+                &mut std::io::stderr(),
                 send_to_daemon(&DaemonRequest::Reload)?,
             )?;
         }
