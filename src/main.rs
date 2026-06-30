@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use the_space_memory::cli;
 use the_space_memory::config;
 use the_space_memory::daemon_protocol::{self, DaemonRequest, DaemonResponse, ReindexKind};
+use the_space_memory::render;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SearchFallbackArg {
@@ -375,7 +376,7 @@ fn main() -> anyhow::Result<()> {
         // ── Daemon-routed (auto-starts tsmd if needed) ──
         Commands::Reindex { kind } => {
             let req = DaemonRequest::Reindex { kind: kind.into() };
-            render_reindex(send_to_daemon(&req)?)?;
+            render::render_reindex(&mut std::io::stdout(), send_to_daemon(&req)?)?;
         }
 
         Commands::Search {
@@ -412,7 +413,7 @@ fn main() -> anyhow::Result<()> {
                 fallback,
                 paths,
             };
-            render_search(send_to_daemon(&req)?, &format)?;
+            render::render_search(&mut std::io::stdout(), send_to_daemon(&req)?, &format)?;
         }
 
         Commands::Index { files_from_stdin } => {
@@ -434,18 +435,18 @@ fn main() -> anyhow::Result<()> {
             } else {
                 DaemonRequest::Index { files: vec![] }
             };
-            render_index(send_to_daemon(&req)?)?;
+            render::render_index(&mut std::io::stdout(), send_to_daemon(&req)?)?;
         }
 
         Commands::IngestSession { session_file } => {
             let req = DaemonRequest::IngestSession {
                 session_file: session_file.to_string_lossy().to_string(),
             };
-            render_ingest(send_to_daemon(&req)?, &session_file)?;
+            render::render_ingest(&mut std::io::stdout(), send_to_daemon(&req)?, &session_file)?;
         }
 
         Commands::Status => {
-            render_status(send_to_daemon(&DaemonRequest::Status)?)?;
+            render::render_status(send_to_daemon(&DaemonRequest::Status)?)?;
         }
 
         Commands::Doctor { format } => {
@@ -457,7 +458,7 @@ fn main() -> anyhow::Result<()> {
                 format: format.clone(),
             };
             match daemon_protocol::try_send_request(&socket, &req) {
-                Some(Ok(resp)) => render_doctor(resp, &format)?,
+                Some(Ok(resp)) => render::render_doctor(&mut std::io::stdout(), resp, &format)?,
                 // Socket present but unresponsive (broken or shutting-down
                 // daemon): surface the error so it is not silently hidden, but
                 // still produce a local report — a diagnostic must never hard-fail.
@@ -474,11 +475,14 @@ fn main() -> anyhow::Result<()> {
             let req = DaemonRequest::ImportWordnet {
                 wordnet_db: wordnet_db.to_string_lossy().to_string(),
             };
-            render_import_wordnet(send_to_daemon(&req)?)?;
+            render::render_import_wordnet(&mut std::io::stdout(), send_to_daemon(&req)?)?;
         }
 
         Commands::Reload => {
-            render_reload(send_to_daemon(&DaemonRequest::Reload)?)?;
+            render::render_reload(
+                &mut std::io::stdout(),
+                send_to_daemon(&DaemonRequest::Reload)?,
+            )?;
         }
     }
     Ok(())
@@ -520,134 +524,6 @@ fn guard_daemon_not_running(command: &str) -> anyhow::Result<()> {
         }
         _ => Ok(()), // No socket or ping returned ok: false — safe to proceed
     }
-}
-
-// ─── Render helpers (daemon response → terminal output) ───────────
-
-fn print_json(value: &serde_json::Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).unwrap_or_default()
-    );
-}
-
-fn check_resp(resp: &DaemonResponse) -> anyhow::Result<()> {
-    if !resp.ok {
-        anyhow::bail!(
-            "{}",
-            resp.error
-                .clone()
-                .unwrap_or_else(|| "(daemon returned error with no message)".into())
-        );
-    }
-    Ok(())
-}
-
-fn render_search(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    let payload = resp.payload.unwrap_or_default();
-    match format {
-        "json" => print_json(&payload),
-        _ => {
-            let total_hits = payload["total_hits"].as_u64().unwrap_or(0) as usize;
-            let results: Vec<the_space_memory::searcher::SearchResult> =
-                serde_json::from_value(payload["results"].clone())
-                    .map_err(|e| anyhow::anyhow!("Failed to parse search results: {e}"))?;
-            // Text output is relative to the caller's CWD.
-            let cwd = std::env::current_dir().unwrap_or_default();
-            print!(
-                "{}",
-                the_space_memory::searcher::format_text(&results, total_hits, &cwd)
-            );
-        }
-    }
-    Ok(())
-}
-
-fn render_index(resp: DaemonResponse) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    if let Some(payload) = resp.payload {
-        let indexed = payload["indexed"].as_i64().unwrap_or(0);
-        let skipped = payload["skipped"].as_i64().unwrap_or(0);
-        let removed = payload["removed"].as_i64().unwrap_or(0);
-        println!("indexed: {indexed}, skipped: {skipped}, removed: {removed}");
-    }
-    Ok(())
-}
-
-fn render_ingest(resp: DaemonResponse, session_file: &std::path::Path) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    let name = session_file
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
-    if let Some(payload) = resp.payload {
-        if payload["indexed"].as_bool().unwrap_or(false) {
-            println!("session indexed: {name}");
-        } else {
-            println!("session unchanged: {name}");
-        }
-    }
-    Ok(())
-}
-
-fn render_status(resp: DaemonResponse) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    if let Some(payload) = resp.payload {
-        let info: cli::StatusInfo = serde_json::from_value(payload).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse daemon status: {e}\nTry `tsm stop && tsm start` to refresh."
-            )
-        })?;
-        cli::print_status_info(&info);
-    }
-    Ok(())
-}
-
-fn render_doctor(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    let payload = resp.payload.unwrap_or_default();
-    if format == "json" {
-        print_json(&payload);
-        return Ok(());
-    }
-    let report: cli::DoctorReport = serde_json::from_value(payload).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse daemon doctor report: {e}\nTry `tsm stop && tsm start` to refresh."
-        )
-    })?;
-    cli::render_doctor_report(&report);
-    Ok(())
-}
-
-fn render_reload(resp: DaemonResponse) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    if let Some(payload) = &resp.payload {
-        if let Some(warnings) = payload.get("warnings").and_then(|w| w.as_array()) {
-            for w in warnings {
-                if let Some(s) = w.as_str() {
-                    eprintln!("warning: {s}");
-                }
-            }
-        }
-    }
-    println!("config reloaded");
-    Ok(())
-}
-
-fn render_reindex(resp: DaemonResponse) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    println!("reindex started. Run `tsm doctor` to check progress.");
-    Ok(())
-}
-
-fn render_import_wordnet(resp: DaemonResponse) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    if let Some(payload) = resp.payload {
-        let count = payload["imported"].as_i64().unwrap_or(0);
-        println!("imported {count} synonym pairs from WordNet");
-    }
-    Ok(())
 }
 
 /// Start the tsmd daemon as a background process.
