@@ -50,7 +50,7 @@ jobs:
         run: >-
           cargo llvm-cov
           --ignore-filename-regex
-          '(model_loader|main|cli|logging|_proc)\.rs'
+          '(main|cli|_proc|model_loader)\.rs'
           --fail-under-lines 90
 
   file-lines:
