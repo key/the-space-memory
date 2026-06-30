@@ -19,7 +19,7 @@ cargo test --lib frontmatter
 cargo llvm-cov --html
 cargo llvm-cov \
   --ignore-filename-regex \
-  '(model_loader|main|cli|logging|_proc)\.rs' \
+  '(main|cli|_proc|model_loader)\.rs' \
   --fail-under-lines 90
 
 # Lint (--all-targets also lints test/bench code)
@@ -183,20 +183,23 @@ src/
   in-file `#[cfg(test)] mod tests` lines as covered, so a test-heavy file's % is
   inflated — when un-excluding a file, read the tests to confirm the *production*
   branches are covered, not just that the number crossed 90.
-- **Coverage exclusions & rationale** — the regex (see the commands above) covers
-  the entry points (`*main.rs`), the daemon-side process/worker shells (the `*_proc`
-  files — `daemon_proc`, `child_proc`, `backfill_proc`, `embedder_proc`,
-  `watcher_proc`), `cli`, `model_loader` (the model-coupled loader: real model
-  files + candle inference, untestable without a GPU/model), and `logging`. The
-  `_proc` term is self-documenting (every excluded daemon shell is a process/worker
-  loop) and collision-safe: it does NOT match `daemon_protocol.rs` or any
-  `*_logic.rs` (the pure logic extracted out of those shells stays counted).
-  `logging.rs` stays excluded for a concrete reason:
-  `init_logger`'s `OnceLock` runs its mode-branch closure only once per process,
-  so the `Daemon` file-logger arm is unreachable from unit tests, and
-  `flexi_logger`'s global UTC-offset state makes any `DeferredNow`-based format
-  test conflict with `init_logger`'s `use_utc()` — so the file cannot reach the
-  global-diluting ≈90% bar. `status.rs` has no such barrier and is gate-counted.
+- **Coverage exclusions & rationale** — the regex (see the commands above) is the
+  self-documenting final set `(main|cli|_proc|model_loader)\.rs`: the entry points
+  (`*main.rs`), `cli` (CLI dispatch), the daemon-side process/worker shells (the
+  `*_proc` files — `daemon_proc`, `child_proc`, `backfill_proc`, `embedder_proc`,
+  `watcher_proc`), and `model_loader` (the model-coupled loader: real model files +
+  candle inference, untestable without a GPU/model). The `_proc` term is
+  self-documenting (every excluded daemon shell is a process/worker loop) and
+  collision-safe: it does NOT match `daemon_protocol.rs` or any `*_logic.rs` (the
+  pure logic extracted out of those shells stays counted).
+- **`logging.rs` is INCLUDED (gate-counted), not excluded** — `tsm_log_format` is
+  unit-tested directly (`Record::builder` + `Vec<u8>` writer), so only the
+  `LogMode::Daemon` file-logger arm of `init_logger` stays uncovered: `init_logger`'s
+  `OnceLock` runs its mode-branch closure only once per process, so the file-logger
+  arm is unreachable once any test initializes the logger in another mode. That
+  residual is ≈20 lines (the `LogMode::Daemon` arm) — a negligible dilution (<0.2pt)
+  against the global total, so the file is counted rather than excluded. `status.rs`
+  is likewise gate-counted.
 - **Unit tests required** — All pub functions must have tests in `#[cfg(test)] mod tests`
 - **AAA pattern** — Arrange (setup + state cleanup like `clear_vectors`) → Act → Assert
 - DB tests use in-memory SQLite (`:memory:`) to prevent state leakage
