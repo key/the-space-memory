@@ -489,10 +489,10 @@ indicators.
 **Example text output:**
 
 ```text
-╭─ Knowledge Search Doctor ──────────────────────────╮
+╭─ The Space Memory — Doctor ─────────────────────────╮
 │                                                     │
 │  Database                                           │
-│    ✔ DB: /home/user/.tsm/tsm.db (12.3 MB)          │
+│    ✔ DB: /home/user/.tsm/tsm.db (12.3 MB)           │
 │    ✔ Documents: 1234                                │
 │    ✔ Chunks: 5678                                   │
 │                                                     │
