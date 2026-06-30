@@ -48,15 +48,6 @@ pub fn spawn_child(label: &str, extra_args: &[&str], pid_path: &Path) -> Option<
     }
 }
 
-/// Check if a PID file points to a running process.
-pub fn is_process_alive(pid_path: &Path) -> bool {
-    let Some(pid) = read_pid_from_file(pid_path) else {
-        return false;
-    };
-    // kill(pid, 0) checks process existence without sending a signal.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
 /// Detect child exit. Returns `true` if the child exited.
 /// The child is NOT restarted — this only logs and cleans up the PID file.
 pub fn reap_child(label: &str, child: &mut Option<Child>, pid_path: &Path) -> bool {
@@ -113,12 +104,6 @@ pub fn stop_child(label: &str, child: Option<Child>, pid_path: &Path) {
     let _ = std::fs::remove_file(pid_path);
 }
 
-/// Read a PID from a PID file. Returns `None` if the file is missing or unreadable.
-pub fn read_pid_from_file(pid_path: &Path) -> Option<u32> {
-    let content = std::fs::read_to_string(pid_path).ok()?;
-    content.trim().parse::<u32>().ok()
-}
-
 /// Remove a stale UNIX socket if it exists.
 pub fn remove_stale_socket(path: &Path) {
     match std::fs::remove_file(path) {
@@ -131,57 +116,6 @@ pub fn remove_stale_socket(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_process_alive_missing_file() {
-        assert!(!is_process_alive(Path::new("/tmp/nonexistent.pid")));
-    }
-
-    #[test]
-    fn test_is_process_alive_invalid_content() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let pid_path = dir.path().join("bad.pid");
-        std::fs::write(&pid_path, "not-a-number").unwrap();
-        assert!(!is_process_alive(&pid_path));
-    }
-
-    #[test]
-    fn test_is_process_alive_self() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let pid_path = dir.path().join("self.pid");
-        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
-        assert!(is_process_alive(&pid_path));
-    }
-
-    #[test]
-    fn test_is_process_alive_dead_process() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let pid_path = dir.path().join("dead.pid");
-        // PID 99999999 is almost certainly not running
-        std::fs::write(&pid_path, "99999999").unwrap();
-        assert!(!is_process_alive(&pid_path));
-    }
-
-    #[test]
-    fn test_read_pid_from_file_valid() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let pid_path = dir.path().join("test.pid");
-        std::fs::write(&pid_path, "12345").unwrap();
-        assert_eq!(read_pid_from_file(&pid_path), Some(12345));
-    }
-
-    #[test]
-    fn test_read_pid_from_file_missing() {
-        assert_eq!(read_pid_from_file(Path::new("/tmp/nonexistent.pid")), None);
-    }
-
-    #[test]
-    fn test_read_pid_from_file_invalid() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let pid_path = dir.path().join("bad.pid");
-        std::fs::write(&pid_path, "not-a-number").unwrap();
-        assert_eq!(read_pid_from_file(&pid_path), None);
-    }
 
     #[test]
     fn test_reap_child_none() {
