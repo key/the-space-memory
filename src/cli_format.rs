@@ -50,7 +50,7 @@ pub fn render_doctor_report(use_color: bool, report: &DoctorReport) -> String {
     };
 
     // Collect all rendered lines to compute box width
-    let title = "Knowledge Search Doctor";
+    let title = "The Space Memory \u{2014} Doctor";
     let mut body_lines: Vec<String> = Vec::new();
 
     for (i, section) in report.sections.iter().enumerate() {
@@ -89,7 +89,7 @@ pub fn render_doctor_report(use_color: bool, report: &DoctorReport) -> String {
         .map(|l| strip_ansi(l).chars().count())
         .max()
         .unwrap_or(0)
-        .max(title.len() + 4);
+        .max(title.chars().count() + 4);
     let box_width = content_width + 2; // padding
 
     let mut out = String::new();
@@ -97,7 +97,7 @@ pub fn render_doctor_report(use_color: bool, report: &DoctorReport) -> String {
     let _ = writeln!(
         out,
         "{dim}\u{256d}\u{2500} {reset}{bold}{title}{reset} {dim}{}\u{256e}{reset}",
-        "\u{2500}".repeat(box_width - title.len() - 3)
+        "\u{2500}".repeat(box_width - title.chars().count() - 3)
     );
     let _ = writeln!(
         out,
@@ -324,7 +324,7 @@ mod tests {
         // Characterization golden captured from the live renderer. The box is
         // sized to the widest visible line ("    ⚠ stale socket  run tsm restart").
         let expected = "\
-╭─ Knowledge Search Doctor ───────────╮
+╭─ The Space Memory — Doctor ─────────╮
 │                                     │
 │  Daemon                             │
 │    ✔ running                        │
@@ -366,7 +366,7 @@ mod tests {
     fn doctor_report_empty_uses_title_width() {
         // No sections → only the summary line; box still sizes to the title.
         let got = render_doctor_report(false, &DoctorReport::default());
-        assert!(got.contains("Knowledge Search Doctor"));
+        assert!(got.contains("The Space Memory \u{2014} Doctor"));
         assert!(got.contains("All good."));
     }
 
