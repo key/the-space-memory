@@ -149,18 +149,23 @@ mod tests {
         );
     }
 
+    // The shared trailer, written as one plain literal (NOT via the production
+    // code's `\`-continuation) so the golden independently pins the exact bytes:
+    // the leading blank line, the single-line notes, the six-space indent, and
+    // the trailing newline. A regression in the renderer's line joining or
+    // indentation fails these byte-exact assertions even though coverage stays
+    // green.
+    const TRAILER: &str = "\nThis will delete the DB and rebuild from scratch.\nNote: ingested session documents (session:*) and their chunks are carried forward (re-indexed from the existing chunks in the DB).\nNote: dictionary verdicts (dictionary_candidates) will be lost.\n      The accepted set and reject list are gone until restored from reject_words.txt (`tsm dict reject --apply`) / `tsm dict import` (once available); a `dict add`/`rm` before then regenerates user_dict.simpledic from the empty DB.\nRun with --apply to proceed.\n";
+
     #[test]
-    fn dry_run_report_db_absent() {
+    fn dry_run_report_db_absent_byte_exact() {
         let got = rebuild_dry_run_report(None, "/x/tsm.db");
-        assert!(got.starts_with("DB does not exist yet.\n"));
-        assert!(got.contains("This will delete the DB and rebuild from scratch."));
-        assert!(got.contains("dictionary verdicts (dictionary_candidates) will be lost."));
-        assert!(got.ends_with("Run with --apply to proceed.\n"));
-        assert!(!got.contains("Documents:"));
+        let expected = format!("DB does not exist yet.\n{TRAILER}");
+        assert_eq!(got, expected);
     }
 
     #[test]
-    fn dry_run_report_with_stats_and_sessions() {
+    fn dry_run_report_with_stats_and_sessions_byte_exact() {
         let stats = DryRunStats {
             size_mb: Some(12.34),
             docs: 100,
@@ -169,14 +174,16 @@ mod tests {
             sessions: 3,
         };
         let got = rebuild_dry_run_report(Some(&stats), "/x/tsm.db");
-        assert!(got.contains("DB: /x/tsm.db (12.3 MB)"));
-        assert!(got.contains("Documents: 100, Chunks: 200, Vectors: 150"));
-        assert!(got.contains("Sessions: 3 (ingested session documents, not re-walked from disk)"));
-        assert!(got.ends_with("Run with --apply to proceed.\n"));
+        let expected = format!(
+            "DB: /x/tsm.db (12.3 MB)\n\
+             Documents: 100, Chunks: 200, Vectors: 150\n\
+             Sessions: 3 (ingested session documents, not re-walked from disk)\n{TRAILER}"
+        );
+        assert_eq!(got, expected);
     }
 
     #[test]
-    fn dry_run_report_stats_without_size_or_sessions() {
+    fn dry_run_report_stats_without_size_or_sessions_byte_exact() {
         let stats = DryRunStats {
             size_mb: None,
             docs: 1,
@@ -185,8 +192,8 @@ mod tests {
             sessions: 0,
         };
         let got = rebuild_dry_run_report(Some(&stats), "/x/tsm.db");
-        assert!(!got.contains("MB)"));
-        assert!(!got.contains("Sessions:"));
-        assert!(got.contains("Documents: 1, Chunks: 2, Vectors: 0"));
+        // No size line (metadata unreadable) and no sessions line (count 0).
+        let expected = format!("Documents: 1, Chunks: 2, Vectors: 0\n{TRAILER}");
+        assert_eq!(got, expected);
     }
 }
