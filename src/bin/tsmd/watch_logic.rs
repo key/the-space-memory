@@ -1,5 +1,5 @@
 //! Pure, unit-testable logic for the fs-watcher: event-kind relevance, debounce
-//! coalescing, and watch-target computation. Kept separate from `watcher_mode`
+//! coalescing, and watch-target computation. Kept separate from `watcher_proc`
 //! (the notify event loop and watch registration glue) so this logic is covered
 //! by the coverage gate while the I/O shell stays excluded.
 

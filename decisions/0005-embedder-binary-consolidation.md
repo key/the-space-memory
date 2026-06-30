@@ -79,8 +79,9 @@ tsmd → watcher: `SIGHUP` で config reload を通知。
 | `main.rs` | Args 定義、モード分岐 |
 | `daemon_proc.rs` | デーモンプロセスシェル（accept loop, handle_client の I/O） |
 | `daemon_logic.rs` | 純粋なデーモンロジック（embedder argv, reindex steps, reload response, ReindexGuard, PID helpers） |
-| `embedder_mode.rs` | embedder モード（ソケットサーバー、推論） |
-| `watcher_mode.rs` | watcher モード（ファイル監視、Index IPC） |
+| `embedder_proc.rs` | embedder プロセスシェル（ソケットサーバーループ、モデルロード I/O） |
+| `embedder_logic.rs` | 純粋な embedder ロジック（parse texts, panic message, encode response, model-load plan） |
+| `watcher_proc.rs` | watcher プロセスシェル（notify イベントループ、watch 登録、Index IPC） |
 | `child_proc.rs` | 子プロセス管理シェル（spawn, reap, stop） |
 | `backfill_proc.rs` | バックフィル/再インデックスのワーカーループ（I/O シェル） |
 
