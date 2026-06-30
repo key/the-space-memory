@@ -1330,7 +1330,12 @@ fn doctor_check_with_conn(
         };
         let processed = bf.filled + bf.errors;
         let eta = if processed > 0 && bf.total > 0 {
-            estimate_eta(&bf.started_at, processed, bf.total as usize)
+            crate::cli_format::estimate_eta(
+                &bf.started_at,
+                processed,
+                bf.total as usize,
+                chrono::Utc::now(),
+            )
         } else {
             "calculating...".to_string()
         };
@@ -1447,7 +1452,12 @@ fn doctor_check_with_conn(
         };
         let processed = (ri.processed + ri.errors) as usize;
         let eta = if processed > 0 && ri.total > 0 {
-            estimate_eta(&ri.started_at, processed, ri.total as usize)
+            crate::cli_format::estimate_eta(
+                &ri.started_at,
+                processed,
+                ri.total as usize,
+                chrono::Utc::now(),
+            )
         } else {
             "calculating...".to_string()
         };
@@ -1482,104 +1492,13 @@ pub fn cmd_doctor(format: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// I/O shell for the doctor box: resolve `NO_COLOR` and print the rendering
+/// produced by [`crate::cli_format::render_doctor_report`].
 pub fn render_doctor_report(report: &DoctorReport) {
     let use_color = std::env::var("NO_COLOR").is_err();
-
-    let (green, yellow, red, bold, dim, reset) = if use_color {
-        (
-            "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[1m", "\x1b[2m", "\x1b[0m",
-        )
-    } else {
-        ("", "", "", "", "", "")
-    };
-
-    // Collect all rendered lines to compute box width
-    let title = "Knowledge Search Doctor";
-    let mut body_lines: Vec<String> = Vec::new();
-
-    for (i, section) in report.sections.iter().enumerate() {
-        if i > 0 {
-            body_lines.push(String::new()); // blank separator
-        }
-        body_lines.push(format!("{bold}  {}{reset}", section.name));
-        for item in &section.items {
-            let (icon, color) = match item.status {
-                CheckStatus::Ok => ("\u{2714}", green),       // ✔
-                CheckStatus::Warning => ("\u{26a0}", yellow), // ⚠
-                CheckStatus::Error => ("\u{2718}", red),      // ✘
-            };
-            let line = match &item.hint {
-                Some(hint) => format!(
-                    "    {color}{icon}{reset} {}  {dim}{hint}{reset}",
-                    item.message
-                ),
-                None => format!("    {color}{icon}{reset} {}", item.message),
-            };
-            body_lines.push(line);
-        }
-    }
-
-    // Summary line
-    let issue_count = report.issue_count();
-    body_lines.push(String::new());
-    if issue_count > 0 {
-        body_lines.push(format!("  {yellow}{issue_count} issue(s) found.{reset}"));
-    } else {
-        body_lines.push(format!("  {green}All good.{reset}"));
-    }
-
-    // Strip ANSI for width calculation
-    let strip_ansi = |s: &str| -> String {
-        let mut out = String::new();
-        let mut in_escape = false;
-        for c in s.chars() {
-            if c == '\x1b' {
-                in_escape = true;
-            } else if in_escape {
-                if c.is_ascii_alphabetic() {
-                    in_escape = false;
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    };
-
-    let content_width = body_lines
-        .iter()
-        .map(|l| strip_ansi(l).chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(title.len() + 4);
-    let box_width = content_width + 2; // padding
-
-    // Render box
-    println!(
-        "{dim}\u{256d}\u{2500} {reset}{bold}{title}{reset} {dim}{}\u{256e}{reset}",
-        "\u{2500}".repeat(box_width - title.len() - 3)
-    );
-    println!(
-        "{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}",
-        " ".repeat(box_width)
-    );
-
-    for line in &body_lines {
-        let visible_len = strip_ansi(line).chars().count();
-        let pad = box_width.saturating_sub(visible_len);
-        println!(
-            "{dim}\u{2502}{reset}{line}{}{dim}\u{2502}{reset}",
-            " ".repeat(pad)
-        );
-    }
-
-    println!(
-        "{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}",
-        " ".repeat(box_width)
-    );
-    println!(
-        "{dim}\u{2570}{}\u{256f}{reset}",
-        "\u{2500}".repeat(box_width)
+    print!(
+        "{}",
+        crate::cli_format::render_doctor_report(use_color, report)
     );
 }
 
@@ -1674,90 +1593,13 @@ pub fn run_status(conn: Option<&rusqlite::Connection>) -> StatusInfo {
     }
 }
 
+/// I/O shell for `tsm status`: sample the clock for the backfill ETA and print
+/// the block produced by [`crate::cli_format::render_status`].
 pub fn print_status_info(info: &StatusInfo) {
-    println!("=== The Space Memory Status ===\n");
-
-    // Daemon
-    if info.daemon_running {
-        if let Some(pid) = info.daemon_pid {
-            println!("  Daemon:    running (PID {pid})");
-        } else {
-            println!("  Daemon:    running");
-        }
-    } else {
-        println!("  Daemon:    stopped");
-    }
-
-    // Embedder
-    if info.embedder_running {
-        if let (Some(pid), Some(ref since)) = (info.embedder_pid, &info.embedder_since) {
-            let since_fmt = format_since(since);
-            println!("  Embedder:  running (since {since_fmt}, PID {pid})");
-        } else {
-            println!("  Embedder:  running");
-        }
-    } else {
-        println!("  Embedder:  stopped");
-    }
-
-    // Watcher
-    if info.watcher_running {
-        if let Some(ref since) = info.watcher_since {
-            let since_fmt = format_since(since);
-            println!("  Watcher:   running (since {since_fmt})");
-        } else {
-            println!("  Watcher:   running");
-        }
-    } else {
-        println!("  Watcher:   stopped");
-    }
-
-    // Backfill
-    if let Some(ref bf) = info.backfill {
-        let pct = if bf.total > 0 {
-            (bf.filled as f64 / bf.total as f64 * 100.0) as u32
-        } else {
-            0
-        };
-        let since = format_since(&bf.since);
-        let processed = bf.filled + bf.errors;
-        let eta = if processed > 0 && bf.total > 0 {
-            estimate_eta(&bf.since, processed, bf.total as usize)
-        } else {
-            "calculating...".to_string()
-        };
-        println!(
-            "  Backfill:  {}/{} ({pct}%) — running since {since}, ETA {eta}",
-            bf.filled, bf.total
-        );
-        if bf.errors > 0 {
-            println!("             {} errors", bf.errors);
-        }
-    } else {
-        println!("  Backfill:  idle");
-    }
-
-    // DB stats
-    if let (Some(docs), Some(chunks), Some(vecs)) = (info.documents, info.chunks, info.vectors) {
-        println!("  Documents: {docs}");
-        println!("  Chunks:    {chunks}");
-        if chunks > 0 {
-            let pct = (vecs as f64 / chunks as f64 * 100.0) as u32;
-            println!("  Vectors:   {vecs}/{chunks} ({pct}%)");
-        } else {
-            println!("  Vectors:   0");
-        }
-
-        if let Some(ready) = info.dict_candidates_ready {
-            if ready > 0 {
-                println!("  Dict:      {ready} candidates ready");
-            } else {
-                println!("  Dict:      no candidates ready");
-            }
-        }
-    } else {
-        println!("  DB:        not found");
-    }
+    print!(
+        "{}",
+        crate::cli_format::render_status(info, chrono::Utc::now())
+    );
 }
 
 pub fn cmd_status() -> anyhow::Result<()> {
@@ -1766,31 +1608,6 @@ pub fn cmd_status() -> anyhow::Result<()> {
     let info = run_status(conn.as_ref());
     print_status_info(&info);
     Ok(())
-}
-
-fn format_since(rfc3339: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(rfc3339)
-        .map(|dt| dt.format("%H:%M:%S").to_string())
-        .unwrap_or_else(|_| rfc3339.to_string())
-}
-
-fn estimate_eta(started_at: &str, processed: usize, total: usize) -> String {
-    let Ok(start) = chrono::DateTime::parse_from_rfc3339(started_at) else {
-        return "unknown".to_string();
-    };
-    let elapsed = chrono::Utc::now().signed_duration_since(start);
-    let elapsed_secs = elapsed.num_seconds() as f64;
-    if elapsed_secs <= 0.0 || processed == 0 {
-        return "calculating...".to_string();
-    }
-    let remaining = total.saturating_sub(processed);
-    let rate = processed as f64 / elapsed_secs;
-    let eta_secs = (remaining as f64 / rate) as i64;
-    if eta_secs < 60 {
-        format!("~{eta_secs}s")
-    } else {
-        format!("~{}m", eta_secs / 60)
-    }
 }
 
 /// `tsm dict update` — show frequent, un-judged candidate words.
@@ -1810,7 +1627,7 @@ pub fn cmd_dict_update(threshold: i64) -> anyhow::Result<()> {
     // Interactive TUI output — bypass log system for clean display
     eprintln!("=== Dictionary Update Candidates ===\n");
     for c in &candidates {
-        print_candidate(c);
+        eprint!("{}", crate::cli_format::render_candidate(c));
     }
     eprintln!(
         "\n{} candidate(s). Accept with `tsm dict add <word> [reading]` \
@@ -2073,16 +1890,6 @@ pub fn cmd_dict_import() -> anyhow::Result<()> {
         materialize_dict(conn)?;
     }
     Ok(())
-}
-
-fn print_candidate(c: &user_dict::Candidate) {
-    eprintln!(
-        "  {:<20} {:>3} hits  (first: {}, last: {})",
-        c.surface,
-        c.frequency,
-        &c.first_seen[..10.min(c.first_seen.len())],
-        &c.last_seen[..10.min(c.last_seen.len())]
-    );
 }
 
 /// Spawn `tsm vector-fill` as a detached child process in a new session.

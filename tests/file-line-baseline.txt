@@ -8,6 +8,6 @@
 # REMOVED, never raised or added (the gate checks it against origin/main). When a
 # file shrinks, lower its number to the new count; once at/under 800, delete the
 # line. See CLAUDE.md ("Per-file line-count gate") for how to regenerate.
-src/cli.rs 2301
+src/cli.rs 2108
 src/config.rs 1115
 src/user_dict.rs 953
