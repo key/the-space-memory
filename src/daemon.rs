@@ -337,7 +337,7 @@ mod tests {
         std::fs::write(daily.join("ok.md"), "# OK\n\nbody").unwrap();
         std::fs::write(private.join("secret.md"), "# Secret\n\nbody").unwrap();
 
-        std::env::set_current_dir(dir.path()).unwrap();
+        let _cwd = crate::test_utils::CwdGuard::change_to(dir.path());
         let req = DaemonRequest::Index {
             files: vec!["daily/ok.md".into(), "private/secret.md".into()],
         };
@@ -362,7 +362,7 @@ mod tests {
         std::fs::write(notes.join("a.md"), "# A\n\nbody").unwrap();
         std::fs::write(notes.join("b.csv"), "x,y\n1,2\n").unwrap();
 
-        std::env::set_current_dir(dir.path()).unwrap();
+        let _cwd = crate::test_utils::CwdGuard::change_to(dir.path());
         let req = DaemonRequest::Index {
             files: vec!["notes/a.md".into(), "notes/b.csv".into()],
         };
@@ -390,7 +390,7 @@ mod tests {
         std::fs::write(daily.join("keep.md"), "# Keep\n\nbody").unwrap();
         std::fs::write(skip.join("drop.md"), "# Drop\n\nbody").unwrap();
 
-        std::env::set_current_dir(dir.path()).unwrap();
+        let _cwd = crate::test_utils::CwdGuard::change_to(dir.path());
         let req = DaemonRequest::Index { files: vec![] };
         let resp = handle_request(&conn, req, dir.path(), &flag);
         assert!(resp.ok);

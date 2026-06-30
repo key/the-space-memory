@@ -1852,13 +1852,12 @@ embedder_idle_timeout_secs = 999
         // /private/var/... — canonicalize upfront so both sides match.
         let dir = tempfile::tempdir().unwrap();
         let dir_path = std::fs::canonicalize(dir.path()).unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir_path).unwrap();
+        // RAII guard: restores the CWD on drop (panic-safe) and tolerates an
+        // already-dangling CWD, so this test neither leaks nor panics on entry.
+        let _cwd = crate::test_utils::CwdGuard::change_to(&dir_path);
         std::fs::write(dir_path.join("tsm.toml"), r#"state_dir = "/rel""#).unwrap();
 
         let (cfg, root) = load_config_from(&[PathBuf::from("tsm.toml")]);
-
-        std::env::set_current_dir(&prev).unwrap();
 
         assert_eq!(cfg.state_dir, Some(PathBuf::from("/rel")));
         // project_root should be CWD (tempdir), not empty / None.
