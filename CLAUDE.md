@@ -63,6 +63,7 @@ src/
 ├── cli_format.rs       — Pure status/doctor/candidate text rendering (String-returning); gate-covered
 ├── cli_dict_logic.rs   — Pure dict verdict→message + reindex-response classification; gate-covered
 ├── cli_rebuild_logic.rs — Pure rebuild backfill-action decision + dry-run report text; gate-covered
+├── cli_args_logic.rs   — Pure path-filter / search-fallback / cache-placement decisions; gate-covered
 ├── render.rs           — Daemon-response → terminal rendering (writer-based); gate-covered
 ├── config.rs           — Configuration (TSM_* env vars, config file, scoring params)
 ├── db.rs               — SQLite (rusqlite) DB init & connection management
