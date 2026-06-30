@@ -59,7 +59,8 @@ cargo test --features bench-counters   # counter-instrumented tests (off by defa
 src/
 ├── lib.rs              — Crate root
 ├── main.rs             — CLI entry point (clap); thin shell that dispatches to cli/render
-├── cli.rs              — CLI command implementations
+├── cli.rs              — CLI command dispatch + I/O shell (env/clock/FS/stdout); gate-excluded
+├── cli_format.rs       — Pure status/doctor/candidate text rendering (String-returning); gate-covered
 ├── render.rs           — Daemon-response → terminal rendering (writer-based); gate-covered
 ├── config.rs           — Configuration (TSM_* env vars, config file, scoring params)
 ├── db.rs               — SQLite (rusqlite) DB init & connection management
