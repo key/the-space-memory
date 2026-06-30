@@ -427,6 +427,38 @@ mod tests {
     }
 
     #[test]
+    fn status_embedder_running_with_pid_but_no_since_is_bare() {
+        // The extended suffix needs BOTH pid and since; a partial (pid only)
+        // must fall through to a bare "running" line, same as the original.
+        let mut info = base_status();
+        info.embedder_running = true;
+        info.embedder_pid = Some(7);
+        info.embedder_since = None;
+        let got = render_status(&info, Utc::now());
+        assert!(got.contains("Embedder:  running\n"));
+        assert!(!got.contains("PID 7"));
+    }
+
+    #[test]
+    fn status_backfill_no_errors_still_computes_eta() {
+        // filled>0, errors=0, total>0: ETA is computed and the errors line is
+        // absent (guards the `bf.errors > 0` branch independently of the ETA).
+        let mut info = base_status();
+        info.backfill = Some(BackfillInfo {
+            filled: 50,
+            total: 100,
+            errors: 0,
+            since: "2026-06-30T08:00:00Z".to_string(),
+        });
+        let now = DateTime::parse_from_rfc3339("2026-06-30T08:01:40Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let got = render_status(&info, now);
+        assert!(got.contains("Backfill:  50/100 (50%) — running since 08:00:00, ETA ~"));
+        assert!(!got.contains("errors"));
+    }
+
+    #[test]
     fn status_backfill_progress_and_eta() {
         let mut info = base_status();
         info.backfill = Some(BackfillInfo {
@@ -485,6 +517,19 @@ mod tests {
     }
 
     #[test]
+    fn status_db_stats_present_but_dict_count_absent_omits_dict_line() {
+        // DB stats present with dict_candidates_ready = None: no `Dict:` line.
+        let mut info = base_status();
+        info.documents = Some(5);
+        info.chunks = Some(10);
+        info.vectors = Some(10);
+        info.dict_candidates_ready = None;
+        let got = render_status(&info, Utc::now());
+        assert!(got.contains("Vectors:   10/10 (100%)"));
+        assert!(!got.contains("Dict:"));
+    }
+
+    #[test]
     fn format_since_parses_and_falls_back() {
         assert_eq!(format_since("2026-06-30T08:09:10Z"), "08:09:10");
         assert_eq!(format_since("not-a-date"), "not-a-date");
@@ -538,5 +583,24 @@ mod tests {
         assert!(got.contains("last: 2026-06-30"));
         assert!(!got.contains("00:00:00"));
         assert!(got.ends_with('\n'));
+    }
+
+    #[test]
+    fn render_candidate_short_dates_do_not_panic() {
+        // Dates shorter than 10 chars exercise the `10.min(len)` guard's
+        // len-branch (vs the always-10 branch the 20-char case takes); the
+        // slice must clamp to the string length rather than panicking.
+        let c = user_dict::Candidate {
+            surface: "x".to_string(),
+            frequency: 1,
+            pos: "名詞".to_string(),
+            source: "auto".to_string(),
+            first_seen: "2026-06".to_string(),
+            last_seen: "26".to_string(),
+            status: "pending".to_string(),
+        };
+        let got = render_candidate(&c);
+        assert!(got.contains("first: 2026-06,"));
+        assert!(got.contains("last: 26)"));
     }
 }
