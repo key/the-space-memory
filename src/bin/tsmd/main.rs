@@ -3,7 +3,8 @@ mod backfill_proc;
 mod child_proc;
 mod daemon_logic;
 mod daemon_proc;
-mod embedder_mode;
+mod embedder_logic;
+mod embedder_proc;
 mod watch_logic;
 mod watcher_mode;
 
@@ -81,7 +82,7 @@ fn main() -> Result<()> {
     }
 
     if args.embedder {
-        embedder_mode::run(args.model, args.no_idle_timeout)
+        embedder_proc::run(args.model, args.no_idle_timeout)
     } else if args.fs_watcher {
         watcher_mode::run()
     } else {

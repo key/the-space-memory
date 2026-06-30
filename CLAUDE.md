@@ -19,7 +19,7 @@ cargo test --lib frontmatter
 cargo llvm-cov --html
 cargo llvm-cov \
   --ignore-filename-regex \
-  '(ruri_model|main|cli|logging|_proc|embedder_mode|watcher_mode)\.rs' \
+  '(model_loader|main|cli|logging|_proc|watcher_mode)\.rs' \
   --fail-under-lines 90
 
 # Lint (--all-targets also lints test/bench code)
@@ -76,7 +76,7 @@ src/
 │   ├── rank.rs          — Rank stage: metadata fetch (time/path filter), RRF fusion, score hook, sort
 │   └── format.rs        — Format stage: text / JSON output rendering
 ├── embedder.rs          — Encode pipeline behind the `EmbeddingModel` trait; gate-covered via a mock model
-├── ruri_model.rs        — Real ruri-v3-30m loader + ModernBert forward (model-coupled shell; gate-excluded)
+├── model_loader.rs      — Real ruri-v3-30m loader + ModernBert forward (model-coupled shell; gate-excluded)
 ├── lua_hooks.rs         — Embedded Lua runtime for extract/score hooks
 ├── hooks/extract/       — Embedded default extract hook (10-md_frontmatter.lua)
 ├── hooks/score/         — Embedded default score hook (10-default.lua)
@@ -100,7 +100,8 @@ src/
     ├── main.rs          — tsmd entry point, mode dispatch (--embedder / --fs-watcher)
     ├── daemon_proc.rs   — Daemon process shell (accept loop, client dispatch I/O)
     ├── daemon_logic.rs  — Pure daemon logic (embedder argv, reindex steps, reload, ReindexGuard, PID helpers); covered
-    ├── embedder_mode.rs — Embedder child process (socket server, model inference)
+    ├── embedder_proc.rs — Embedder process shell (socket server loop, model load I/O)
+    ├── embedder_logic.rs — Pure embedder logic (parse texts, panic message, encode response, model-load plan); covered
     ├── watcher_mode.rs  — FS watcher child process: notify event loop + watch registration (I/O shell)
     ├── watch_logic.rs   — Pure fs-watcher logic (event relevance, debounce, watch targets); gate-covered
     ├── child_proc.rs    — Child process management shell (spawn, reap, stop, stale-socket I/O)
@@ -184,12 +185,13 @@ src/
   branches are covered, not just that the number crossed 90.
 - **Coverage exclusions & rationale** — the regex (see the commands above) covers
   the entry points (`*main.rs`), the daemon-side process/worker shells (the `*_proc`
-  files — `daemon_proc`, `child_proc`, `backfill_proc`, plus `embedder_mode` /
-  `watcher_mode` until they too are renamed to `*_proc`), `cli`, `ruri_model`, and
-  `logging`. The `_proc` term is self-documenting (every excluded daemon shell is a
-  process/worker loop) and collision-safe: it does NOT match `daemon_protocol.rs`
-  or any `*_logic.rs` (the pure logic extracted out of those shells stays counted).
-  `logging.rs` stays excluded for a concrete reason:
+  files — `daemon_proc`, `child_proc`, `backfill_proc`, `embedder_proc`, plus
+  `watcher_mode` until it too is renamed to `*_proc`), `cli`, `model_loader` (the
+  model-coupled loader: real model files + candle inference, untestable without a
+  GPU/model), and `logging`. The `_proc` term is self-documenting (every excluded
+  daemon shell is a process/worker loop) and collision-safe: it does NOT match
+  `daemon_protocol.rs` or any `*_logic.rs` (the pure logic extracted out of those
+  shells stays counted). `logging.rs` stays excluded for a concrete reason:
   `init_logger`'s `OnceLock` runs its mode-branch closure only once per process,
   so the `Daemon` file-logger arm is unreachable from unit tests, and
   `flexi_logger`'s global UTC-offset state makes any `DeferredNow`-based format

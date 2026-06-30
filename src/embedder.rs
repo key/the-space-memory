@@ -36,7 +36,7 @@ pub mod counters {
 
 /// Abstraction over the model's forward pass so the encode pipeline can be
 /// unit-tested against a mock. The real ruri/ModernBert wrapper lives behind
-/// this trait in `ruri_model.rs` (kept out of the coverage gate).
+/// this trait in `model_loader.rs` (kept out of the coverage gate).
 pub trait EmbeddingModel {
     /// Run the transformer forward pass: `(input_ids, attention_mask)` →
     /// hidden states shaped `(batch, seq_len, hidden)`.
@@ -46,7 +46,7 @@ pub trait EmbeddingModel {
 /// The embedder engine: holds a model + tokenizer and produces embeddings.
 ///
 /// The model is type-erased behind [`EmbeddingModel`] so the encode pipeline is
-/// testable with a mock; construction from real files lives in `ruri_model.rs`.
+/// testable with a mock; construction from real files lives in `model_loader.rs`.
 pub struct Embedder {
     model: Box<dyn EmbeddingModel>,
     tokenizer: Tokenizer,
@@ -54,7 +54,7 @@ pub struct Embedder {
 }
 
 impl Embedder {
-    /// Assemble an embedder from its parts. Used by the loader (`ruri_model.rs`)
+    /// Assemble an embedder from its parts. Used by the loader (`model_loader.rs`)
     /// and by tests; the struct fields stay private.
     pub(crate) fn from_parts(
         model: Box<dyn EmbeddingModel>,
