@@ -10,5 +10,4 @@
 # line. See CLAUDE.md ("Per-file line-count gate") for how to regenerate.
 src/cli.rs 2301
 src/config.rs 1115
-src/main.rs 899
 src/user_dict.rs 953
