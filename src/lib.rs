@@ -3,6 +3,7 @@ pub mod classifier;
 pub mod cli;
 pub mod cli_dict_logic;
 pub mod cli_format;
+pub mod cli_rebuild_logic;
 pub mod config;
 mod config_accessors;
 pub mod daemon;

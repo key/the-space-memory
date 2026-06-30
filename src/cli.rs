@@ -1879,36 +1879,28 @@ fn spawn_background_backfill() {
 /// Print what `tsm rebuild --apply` would do, without deleting or rebuilding
 /// the DB. (Opening the DB may still apply idempotent schema migrations.)
 fn rebuild_dry_run(db_path: &Path) -> anyhow::Result<()> {
-    if db_path.exists() {
-        if let Ok(meta) = std::fs::metadata(db_path) {
-            let size_mb = meta.len() as f64 / 1024.0 / 1024.0;
-            eprintln!("DB: {} ({size_mb:.1} MB)", db_path.display());
-        }
+    use crate::cli_rebuild_logic::{rebuild_dry_run_report, DryRunStats};
+
+    let stats = if db_path.exists() {
+        let size_mb = std::fs::metadata(db_path)
+            .ok()
+            .map(|meta| meta.len() as f64 / 1024.0 / 1024.0);
         let conn = db::get_connection(db_path)?;
         let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0);
-        let docs = count("SELECT COUNT(*) FROM documents");
-        let chunks = count("SELECT COUNT(*) FROM chunks");
-        let vecs = count("SELECT COUNT(*) FROM chunks_vec");
-        let sessions = count("SELECT COUNT(*) FROM documents WHERE file_path LIKE 'session:%'");
-        eprintln!("Documents: {docs}, Chunks: {chunks}, Vectors: {vecs}");
-        if sessions > 0 {
-            eprintln!("Sessions: {sessions} (ingested session documents, not re-walked from disk)");
-        }
+        Some(DryRunStats {
+            size_mb,
+            docs: count("SELECT COUNT(*) FROM documents"),
+            chunks: count("SELECT COUNT(*) FROM chunks"),
+            vecs: count("SELECT COUNT(*) FROM chunks_vec"),
+            sessions: count("SELECT COUNT(*) FROM documents WHERE file_path LIKE 'session:%'"),
+        })
     } else {
-        eprintln!("DB does not exist yet.");
-    }
-    eprintln!("\nThis will delete the DB and rebuild from scratch.");
-    eprintln!(
-        "Note: ingested session documents (session:*) and their chunks are carried \
-         forward (re-indexed from the existing chunks in the DB)."
+        None
+    };
+    eprint!(
+        "{}",
+        rebuild_dry_run_report(stats.as_ref(), &db_path.display().to_string())
     );
-    eprintln!("Note: dictionary verdicts (dictionary_candidates) will be lost.");
-    eprintln!(
-        "      The accepted set and reject list are gone until restored from \
-         reject_words.txt (`tsm dict reject --apply`) / `tsm dict import` (once available); \
-         a `dict add`/`rm` before then regenerates user_dict.simpledic from the empty DB."
-    );
-    eprintln!("Run with --apply to proceed.");
     Ok(())
 }
 
@@ -2015,23 +2007,31 @@ pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
 /// Report vector coverage after a rebuild and start async backfill when chunks
 /// still lack vectors. Consumes `conn`, dropping it before any backfill spawns.
 fn report_vectors_and_backfill(conn: rusqlite::Connection, socket: &Path) -> anyhow::Result<()> {
+    use crate::cli_rebuild_logic::{decide_backfill_action, BackfillAction};
+
     let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
     let vecs: i64 = conn.query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))?;
     drop(conn);
 
-    if vecs >= chunks {
-        println!("Vectors: {vecs} (matches all chunks)");
-    } else if socket.exists() && chunks > 0 {
-        let current_status = crate::status::read(&config::state_dir());
-        if current_status.backfill.is_some() {
+    // Status read short-circuits (only when a backfill could actually start).
+    let socket_exists = socket.exists();
+    let backfill_in_progress =
+        socket_exists && chunks > 0 && crate::status::read(&config::state_dir()).backfill.is_some();
+
+    match decide_backfill_action(vecs, chunks, socket_exists, backfill_in_progress) {
+        BackfillAction::VectorsMatch => println!("Vectors: {vecs} (matches all chunks)"),
+        BackfillAction::AlreadyInProgress => {
             println!("Vectors: {vecs} / {chunks} — backfill already in progress");
-        } else {
+            println!("Run `tsm doctor` to check progress.");
+        }
+        BackfillAction::StartBackfill => {
             println!("Vectors: {vecs} / {chunks} — starting backfill in background...");
             spawn_background_backfill();
+            println!("Run `tsm doctor` to check progress.");
         }
-        println!("Run `tsm doctor` to check progress.");
-    } else if chunks > 0 {
-        log::warn!("Vectors: {vecs} / {chunks} — embedder not running, skipping backfill");
+        BackfillAction::EmbedderDown => {
+            log::warn!("Vectors: {vecs} / {chunks} — embedder not running, skipping backfill")
+        }
     }
     Ok(())
 }
