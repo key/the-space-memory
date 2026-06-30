@@ -14,6 +14,11 @@ use crate::SHUTDOWN;
 // ─── Pending-write guard ────────────────────────────────────────────
 
 /// RAII guard that increments a counter on creation and decrements on drop.
+///
+/// The decrement happens in `Drop`, so leaking the guard (e.g. `mem::forget`)
+/// leaves the counter permanently elevated and the fairness path would then
+/// believe a write is forever pending.
+#[derive(Debug)]
 pub struct PendingWriteGuard(Arc<AtomicUsize>);
 
 impl PendingWriteGuard {
