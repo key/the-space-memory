@@ -6,7 +6,7 @@ mod daemon_proc;
 mod embedder_logic;
 mod embedder_proc;
 mod watch_logic;
-mod watcher_mode;
+mod watcher_proc;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -84,7 +84,7 @@ fn main() -> Result<()> {
     if args.embedder {
         embedder_proc::run(args.model, args.no_idle_timeout)
     } else if args.fs_watcher {
-        watcher_mode::run()
+        watcher_proc::run()
     } else {
         daemon_proc::run(args)
     }
