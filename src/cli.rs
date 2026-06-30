@@ -1637,36 +1637,6 @@ pub fn cmd_dict_update(threshold: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What to do with the daemon's response to a dict-triggered FTS reindex.
-#[derive(Debug, PartialEq, Eq)]
-enum ReindexPlan {
-    /// No daemon is running — rebuild the FTS index locally.
-    Local,
-    /// The daemon accepted the request and is reindexing in the background.
-    BackgroundStarted,
-    /// The daemon was reachable but the reindex failed; surface this rather than
-    /// silently falling back to a local rebuild that races the daemon's writer.
-    Failed(String),
-}
-
-/// Classify a daemon reindex response. Only a missing daemon (`None`) warrants a
-/// local rebuild; an IPC error (`Some(Err)`) or an explicit rejection
-/// (`Some(Ok)` with `ok == false`) is surfaced so the caller does not quietly
-/// run a competing local rebuild against the daemon-owned DB.
-fn classify_reindex(
-    resp: Option<anyhow::Result<crate::daemon_protocol::DaemonResponse>>,
-) -> ReindexPlan {
-    match resp {
-        None => ReindexPlan::Local,
-        Some(Ok(r)) if r.ok => ReindexPlan::BackgroundStarted,
-        Some(Ok(r)) => ReindexPlan::Failed(
-            r.error
-                .unwrap_or_else(|| "daemon rejected the reindex request".to_string()),
-        ),
-        Some(Err(e)) => ReindexPlan::Failed(e.to_string()),
-    }
-}
-
 /// Rebuild the FTS index so the tokenizer picks up a user-dictionary change.
 /// A reachable daemon reindexes over IPC (it resets its own segmenter); with no
 /// daemon, rebuild locally. An IPC error or a daemon rejection is surfaced (not
@@ -1679,6 +1649,7 @@ fn reindex_fts_after_dict_change() -> anyhow::Result<()> {
     };
     let resp = crate::daemon_protocol::try_send_request(&daemon_socket, &reindex_req);
 
+    use crate::cli_dict_logic::{classify_reindex, ReindexPlan};
     match classify_reindex(resp) {
         ReindexPlan::BackgroundStarted => {
             println!("\nFTS reindex started in background. Run `tsm doctor` to check progress.");
@@ -1723,11 +1694,8 @@ fn mutate_verdict(
 
 /// Surface the implicit DB change when the reconcile recovered on-disk terms.
 fn report_reconcile(r: &user_dict::ReconcileOutcome) {
-    if !r.is_empty() {
-        eprintln!(
-            "Recovered {} accepted and {} rejected term(s) from the on-disk files into the database.",
-            r.accepted_healed, r.rejected_healed
-        );
+    if let Some(msg) = crate::cli_dict_logic::reconcile_message(r) {
+        eprintln!("{msg}");
     }
 }
 
@@ -1776,10 +1744,7 @@ pub fn cmd_dict_add(surface: &str, yomi: Option<&str>) -> anyhow::Result<()> {
     let (t, reconciled) =
         mutate_verdict(&conn, surface, user_dict::Verdict::Accepted, Some(&reading))?;
     report_reconcile(&reconciled);
-    match t.from {
-        Some(user_dict::Verdict::Accepted) => println!("'{surface}' is already accepted."),
-        _ => println!("Accepted '{surface}'."),
-    }
+    println!("{}", crate::cli_dict_logic::accept_message(t.from, surface));
     materialize_dict(conn)
 }
 
@@ -1789,10 +1754,7 @@ pub fn cmd_dict_rm(word: &str) -> anyhow::Result<()> {
     let conn = db::get_connection(&config::db_path())?;
     let (t, reconciled) = mutate_verdict(&conn, word, user_dict::Verdict::Pending, None)?;
     report_reconcile(&reconciled);
-    match t.from {
-        Some(user_dict::Verdict::Pending) => println!("'{word}' is already pending."),
-        _ => println!("Reset '{word}' to pending."),
-    }
+    println!("{}", crate::cli_dict_logic::reset_message(t.from, word));
     materialize_dict(conn)
 }
 
@@ -1805,14 +1767,7 @@ pub fn cmd_dict_reject(word: &str) -> anyhow::Result<()> {
     let conn = db::get_connection(&config::db_path())?;
     let (t, reconciled) = mutate_verdict(&conn, word, user_dict::Verdict::Rejected, None)?;
     report_reconcile(&reconciled);
-    match t.from {
-        None => println!("Rejected '{word}' (new entry)."),
-        Some(user_dict::Verdict::Rejected) => println!("'{word}' is already rejected."),
-        Some(user_dict::Verdict::Accepted) => {
-            println!("Rejected '{word}' (was accepted; dictionary regenerated).")
-        }
-        Some(user_dict::Verdict::Pending) => println!("Rejected '{word}'."),
-    }
+    println!("{}", crate::cli_dict_logic::reject_message(t.from, word));
     materialize_dict(conn)
 }
 
@@ -2109,48 +2064,6 @@ pub fn cmd_rebuild_fts() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon_protocol::DaemonResponse;
-
-    fn resp(ok: bool, error: Option<&str>) -> DaemonResponse {
-        DaemonResponse {
-            ok,
-            error: error.map(str::to_string),
-            payload: None,
-        }
-    }
-
-    #[test]
-    fn classify_reindex_none_is_local() {
-        assert_eq!(classify_reindex(None), ReindexPlan::Local);
-    }
-
-    #[test]
-    fn classify_reindex_ok_true_is_background() {
-        assert_eq!(
-            classify_reindex(Some(Ok(resp(true, None)))),
-            ReindexPlan::BackgroundStarted
-        );
-    }
-
-    #[test]
-    fn classify_reindex_daemon_rejection_is_failed_with_message() {
-        // Some(Ok{ok:false}) must surface, not fall back to a local rebuild.
-        assert_eq!(
-            classify_reindex(Some(Ok(resp(false, Some("queue full"))))),
-            ReindexPlan::Failed("queue full".to_string())
-        );
-        // Missing error string still fails (with a default message), never Local.
-        assert_eq!(
-            classify_reindex(Some(Ok(resp(false, None)))),
-            ReindexPlan::Failed("daemon rejected the reindex request".to_string())
-        );
-    }
-
-    #[test]
-    fn classify_reindex_ipc_error_is_failed() {
-        let plan = classify_reindex(Some(Err(anyhow::anyhow!("broken pipe"))));
-        assert_eq!(plan, ReindexPlan::Failed("broken pipe".to_string()));
-    }
 
     #[test]
     fn normalize_path_filters_abs_and_rel_and_dedup() {

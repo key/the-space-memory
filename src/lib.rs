@@ -1,6 +1,7 @@
 pub mod chunker;
 pub mod classifier;
 pub mod cli;
+pub mod cli_dict_logic;
 pub mod cli_format;
 pub mod config;
 mod config_accessors;
