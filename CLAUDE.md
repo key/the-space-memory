@@ -197,8 +197,9 @@ src/
   `LogMode::Daemon` file-logger arm of `init_logger` stays uncovered: `init_logger`'s
   `OnceLock` runs its mode-branch closure only once per process, so the file-logger
   arm is unreachable once any test initializes the logger in another mode. That
-  residual is ≈18 lines — a negligible dilution (<0.2pt) against the global total,
-  so the file is counted rather than excluded. `status.rs` is likewise gate-counted.
+  residual is ≈20 lines (the `LogMode::Daemon` arm) — a negligible dilution (<0.2pt)
+  against the global total, so the file is counted rather than excluded. `status.rs`
+  is likewise gate-counted.
 - **Unit tests required** — All pub functions must have tests in `#[cfg(test)] mod tests`
 - **AAA pattern** — Arrange (setup + state cleanup like `clear_vectors`) → Act → Assert
 - DB tests use in-memory SQLite (`:memory:`) to prevent state leakage

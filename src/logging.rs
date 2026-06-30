@@ -149,9 +149,11 @@ mod tests {
         //
         // `force_utc()` pins flexi_logger's process-global time-offset to UTC up front.
         // Without it, the first `DeferredNow::format` here would lazily latch the offset
-        // to *local*, after which `init_logger`'s `use_utc()` (in a sibling test) panics
-        // with "offset is already initialized not to enforce UTC". UTC also matches what
-        // `init_logger` enforces in production, so this exercises the real format path.
+        // to *local*, after which a sibling test's `init_logger` panics: `Logger::start()`
+        // calls `DeferredNow::force_utc()` when the builder's `use_utc` flag is set, and
+        // `force_utc()` panics ("offset is already initialized not to enforce UTC") once
+        // the global is `Some(false)`. UTC also matches what `init_logger` enforces in
+        // production, so this exercises the real format path.
         DeferredNow::force_utc();
         let mut buf: Vec<u8> = Vec::new();
         let mut now = DeferredNow::new();
