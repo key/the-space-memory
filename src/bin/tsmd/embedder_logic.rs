@@ -52,23 +52,27 @@ pub fn encode_response(result: Result<Vec<Vec<f32>>>) -> Value {
 
 /// How the embedder should obtain its model, given an optional explicit
 /// directory and whether that directory holds every required file.
+///
+/// The two directory-bearing variants carry the path, so the caller pattern-binds
+/// it instead of re-deriving it from the original `Option` — the "a directory was
+/// given" invariant lives in the type, not in a panic message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelLoadPlan {
+pub enum ModelLoadPlan<'a> {
     /// Load from the explicit directory (all files present).
-    FromDir,
+    FromDir(&'a Path),
     /// The explicit directory is incomplete; warn and fall back to default
     /// resolution (state-dir override → cache-dir).
-    FallbackIncomplete,
+    FallbackIncomplete(&'a Path),
     /// No directory was given; use default resolution.
     Default,
 }
 
 /// Decide how to load the model. The filesystem completeness check is the
 /// caller's job (it passes `all_files_present`); this only encodes the policy.
-pub fn resolve_model_load(model_dir: Option<&Path>, all_files_present: bool) -> ModelLoadPlan {
+pub fn resolve_model_load(model_dir: Option<&Path>, all_files_present: bool) -> ModelLoadPlan<'_> {
     match model_dir {
-        Some(_) if all_files_present => ModelLoadPlan::FromDir,
-        Some(_) => ModelLoadPlan::FallbackIncomplete,
+        Some(dir) if all_files_present => ModelLoadPlan::FromDir(dir),
+        Some(dir) => ModelLoadPlan::FallbackIncomplete(dir),
         None => ModelLoadPlan::Default,
     }
 }
@@ -109,6 +113,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_texts_null_value() {
+        // `texts` present but JSON null: `null.as_array()` is None → empty vec.
+        let req = serde_json::json!({ "texts": null });
+        assert!(parse_texts(&req).is_empty());
+    }
+
+    #[test]
     fn test_panic_message_from_string() {
         let payload: Box<dyn Any + Send> = Box::new("boom".to_string());
         assert_eq!(panic_message(&*payload), "boom");
@@ -142,9 +153,20 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_response_ok_empty() {
+        // Empty texts → embedder returns Ok(vec![]); the reply is an empty
+        // embeddings array, NOT an error.
+        let resp = encode_response(Ok(vec![]));
+        assert_eq!(resp, serde_json::json!({ "embeddings": [] }));
+    }
+
+    #[test]
     fn test_resolve_model_load_from_dir_when_complete() {
         let dir = PathBuf::from("/cache/ruri-v3-30m");
-        assert_eq!(resolve_model_load(Some(&dir), true), ModelLoadPlan::FromDir);
+        assert_eq!(
+            resolve_model_load(Some(&dir), true),
+            ModelLoadPlan::FromDir(&dir)
+        );
     }
 
     #[test]
@@ -152,7 +174,7 @@ mod tests {
         let dir = PathBuf::from("/cache/ruri-v3-30m");
         assert_eq!(
             resolve_model_load(Some(&dir), false),
-            ModelLoadPlan::FallbackIncomplete
+            ModelLoadPlan::FallbackIncomplete(&dir)
         );
     }
 

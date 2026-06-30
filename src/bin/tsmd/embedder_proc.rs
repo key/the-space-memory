@@ -37,17 +37,13 @@ fn load_model(model_dir: Option<&Path>) -> Result<Embedder> {
     let all_files_present =
         model_dir.is_some_and(|dir| config::MODEL_FILES.iter().all(|f| dir.join(f).is_file()));
     match embedder_logic::resolve_model_load(model_dir, all_files_present) {
-        embedder_logic::ModelLoadPlan::FromDir => {
-            let dir = model_dir.expect("FromDir implies an explicit model directory");
-            Embedder::load_from_paths(
-                &dir.join("config.json"),
-                &dir.join("tokenizer.json"),
-                &dir.join("model.safetensors"),
-                &Device::Cpu,
-            )
-        }
-        embedder_logic::ModelLoadPlan::FallbackIncomplete => {
-            let dir = model_dir.expect("FallbackIncomplete implies an explicit model directory");
+        embedder_logic::ModelLoadPlan::FromDir(dir) => Embedder::load_from_paths(
+            &dir.join("config.json"),
+            &dir.join("tokenizer.json"),
+            &dir.join("model.safetensors"),
+            &Device::Cpu,
+        ),
+        embedder_logic::ModelLoadPlan::FallbackIncomplete(dir) => {
             log::warn!(
                 "Model files incomplete in {}; falling back to default resolution \
                  (state_dir override → cache_dir). Run `tsm setup` to populate the cache.",
@@ -159,7 +155,9 @@ fn handle_client(mut stream: UnixStream, embedder: &Embedder) -> Result<()> {
         Err(panic_info) => {
             let msg = embedder_logic::panic_message(&*panic_info);
             log::error!("PANIC in encode: {msg}");
-            serde_json::json!({ "error": format!("panic: {msg}") })
+            // Route through encode_response so the `{"error": ...}` envelope
+            // lives in one place; the message keeps its `panic:` prefix.
+            embedder_logic::encode_response(Err(anyhow::anyhow!("panic: {msg}")))
         }
     };
 
