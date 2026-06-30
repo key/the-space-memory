@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use the_space_memory::cli;
+use the_space_memory::cli_args_logic;
 use the_space_memory::config;
 use the_space_memory::daemon_protocol::{self, DaemonRequest, DaemonResponse, ReindexKind};
 use the_space_memory::render;
@@ -400,7 +401,7 @@ fn main() -> anyhow::Result<()> {
             // --path accepts absolute or CWD-relative; normalized to
             // deduped absolute paths anchored at the caller's CWD.
             let cwd = std::env::current_dir()?;
-            let paths = cli::normalize_path_filters(&paths, &cwd)?;
+            let paths = cli_args_logic::normalize_path_filters(&paths, &cwd)?;
             let req = DaemonRequest::Search {
                 query,
                 top_k,

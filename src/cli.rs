@@ -209,21 +209,25 @@ pub fn cmd_init_with(paths: &InitPaths<'_>) -> anyhow::Result<()> {
 ///   would delete the cache and leave a dangling self-symlink. Skipping
 ///   leaves the existing resource in place.
 fn should_place_cache_resource(src: &Path, dst: &Path) -> bool {
-    if !src.exists() {
-        log::warn!(
-            "cache resource not found: {} — run `tsm setup` to populate it, then re-run `tsm init`.",
-            src.display()
-        );
-        return false;
+    use crate::cli_args_logic::{placement_decision, PlacementDecision};
+
+    match placement_decision(src.exists(), same_entry_location(src, dst)) {
+        PlacementDecision::Place => true,
+        PlacementDecision::SkipMissing => {
+            log::warn!(
+                "cache resource not found: {} — run `tsm setup` to populate it, then re-run `tsm init`.",
+                src.display()
+            );
+            false
+        }
+        PlacementDecision::SkipSameLocation => {
+            log::warn!(
+                "cache resource {} is also the workspace destination; skipping placement to avoid destroying it (cache_dir == state_dir).",
+                src.display()
+            );
+            false
+        }
     }
-    if same_entry_location(src, dst) {
-        log::warn!(
-            "cache resource {} is also the workspace destination; skipping placement to avoid destroying it (cache_dir == state_dir).",
-            src.display()
-        );
-        return false;
-    }
-    true
 }
 
 /// Whether `a` and `b` name the same filesystem entry. The parent directory
@@ -238,10 +242,7 @@ fn same_entry_location(a: &Path, b: &Path) -> bool {
         let parent = p.parent()?.canonicalize().ok()?;
         Some(parent.join(p.file_name()?))
     };
-    match (location(a), location(b)) {
-        (Some(la), Some(lb)) => la == lb,
-        _ => false,
-    }
+    crate::cli_args_logic::same_resolved_location(location(a), location(b))
 }
 
 /// Materialize a cache directory into the workspace, or warn-and-continue
@@ -380,25 +381,6 @@ pub fn read_paths_from_stdin(project_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Normalize `--path` args to deduped, CWD-anchored absolute paths.
-/// Accepts absolute or relative input; empty string is the only error.
-pub fn normalize_path_filters(args: &[String], cwd: &Path) -> anyhow::Result<Option<Vec<String>>> {
-    if args.is_empty() {
-        return Ok(None);
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
-    for a in args {
-        let p = crate::paths::normalize_filter_path(a, cwd)?
-            .to_string_lossy()
-            .to_string();
-        if seen.insert(p.clone()) {
-            out.push(p);
-        }
-    }
-    Ok(Some(out))
-}
-
 pub struct SearchOptions<'a> {
     pub query: &'a str,
     pub top_k: usize,
@@ -417,19 +399,14 @@ pub fn run_search(
     conn: &rusqlite::Connection,
     opts: &SearchOptions,
 ) -> anyhow::Result<searcher::SearchOutput> {
+    use crate::cli_args_logic::{require_vector, resolve_fallback};
     use crate::temporal;
 
     // Resolve fallback policy: CLI flag > config > default (Error)
-    let fallback = match opts.fallback {
-        Some(s) => s
-            .parse::<config::SearchFallback>()
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
-        None => config::search_fallback(),
-    };
+    let fallback = resolve_fallback(opts.fallback, config::search_fallback())?;
+    let needs_vector = require_vector(fallback);
 
-    let require_vector = fallback == config::SearchFallback::Error;
-
-    if !require_vector {
+    if !needs_vector {
         let embedder_socket = config::embedder_socket_path();
         if !embedder_socket.exists() {
             log::warn!("Embedder is not running. Falling back to FTS-only search.");
@@ -450,7 +427,7 @@ pub fn run_search(
         search_query,
         opts.top_k,
         filter.as_ref(),
-        require_vector,
+        needs_vector,
         opts.paths,
     )
 }
@@ -2064,37 +2041,6 @@ pub fn cmd_rebuild_fts() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normalize_path_filters_abs_and_rel_and_dedup() {
-        let cwd = std::path::Path::new("/root/repoA");
-        let got = normalize_path_filters(
-            &[
-                "daily".into(),
-                "/root/repoA/daily".into(),
-                "../repoB".into(),
-            ],
-            cwd,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            got,
-            vec!["/root/repoA/daily".to_string(), "/root/repoB".to_string()]
-        );
-    }
-
-    #[test]
-    fn normalize_path_filters_empty_arg_errors() {
-        assert!(normalize_path_filters(&["".into()], std::path::Path::new("/c")).is_err());
-    }
-
-    #[test]
-    fn normalize_path_filters_none_when_no_args() {
-        assert!(normalize_path_filters(&[], std::path::Path::new("/c"))
-            .unwrap()
-            .is_none());
-    }
 
     #[test]
     fn test_build_section_reports_version_and_date() {
