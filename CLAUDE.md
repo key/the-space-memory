@@ -19,7 +19,7 @@ cargo test --lib frontmatter
 cargo llvm-cov --html
 cargo llvm-cov \
   --ignore-filename-regex \
-  '(ruri_model|main|cli|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' \
+  '(ruri_model|main|cli|logging|_proc|embedder_mode|watcher_mode)\.rs' \
   --fail-under-lines 90
 
 # Lint (--all-targets also lints test/bench code)
@@ -97,12 +97,13 @@ src/
 ├── test_utils.rs        — Shared test helpers
 └── bin/tsmd/
     ├── main.rs          — tsmd entry point, mode dispatch (--embedder / --fs-watcher)
-    ├── daemon_mode.rs   — Daemon mode (accept loop, client handling)
+    ├── daemon_proc.rs   — Daemon process shell (accept loop, client dispatch I/O)
+    ├── daemon_logic.rs  — Pure daemon logic (embedder argv, reindex steps, reload, ReindexGuard, PID helpers); covered
     ├── embedder_mode.rs — Embedder child process (socket server, model inference)
     ├── watcher_mode.rs  — FS watcher child process: notify event loop + watch registration (I/O shell)
     ├── watch_logic.rs   — Pure fs-watcher logic (event relevance, debounce, watch targets); gate-covered
-    ├── child.rs         — Child process management (spawn, reap, stop)
-    ├── backfill.rs      — Backfill/reindex passes (embedder-socket + status I/O shell)
+    ├── child_proc.rs    — Child process management shell (spawn, reap, stop, stale-socket I/O)
+    ├── backfill_proc.rs — Backfill/reindex passes (embedder-socket + status I/O shell)
     └── backfill_logic.rs — Pure backfill logic (write guard, yield, harvest, synonym cleanup); gate-covered
 ```
 
@@ -181,9 +182,13 @@ src/
   inflated — when un-excluding a file, read the tests to confirm the *production*
   branches are covered, not just that the number crossed 90.
 - **Coverage exclusions & rationale** — the regex (see the commands above) covers
-  the entry points (`*main.rs`), the daemon/embedder/watcher I/O loops
-  (`daemon_mode`, `embedder_mode`, `watcher_mode`, `child`, `backfill`), `cli`,
-  `embedder`, and `logging`. `logging.rs` stays excluded for a concrete reason:
+  the entry points (`*main.rs`), the daemon-side process/worker shells (the `*_proc`
+  files — `daemon_proc`, `child_proc`, `backfill_proc`, plus `embedder_mode` /
+  `watcher_mode` until they too are renamed to `*_proc`), `cli`, `ruri_model`, and
+  `logging`. The `_proc` term is self-documenting (every excluded daemon shell is a
+  process/worker loop) and collision-safe: it does NOT match `daemon_protocol.rs`
+  or any `*_logic.rs` (the pure logic extracted out of those shells stays counted).
+  `logging.rs` stays excluded for a concrete reason:
   `init_logger`'s `OnceLock` runs its mode-branch closure only once per process,
   so the `Daemon` file-logger arm is unreachable from unit tests, and
   `flexi_logger`'s global UTC-offset state makes any `DeferredNow`-based format

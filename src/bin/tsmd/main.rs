@@ -1,7 +1,8 @@
-mod backfill;
 mod backfill_logic;
-mod child;
-mod daemon_mode;
+mod backfill_proc;
+mod child_proc;
+mod daemon_logic;
+mod daemon_proc;
 mod embedder_mode;
 mod watch_logic;
 mod watcher_mode;
@@ -84,6 +85,6 @@ fn main() -> Result<()> {
     } else if args.fs_watcher {
         watcher_mode::run()
     } else {
-        daemon_mode::run(args)
+        daemon_proc::run(args)
     }
 }

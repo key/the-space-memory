@@ -77,11 +77,12 @@ tsmd → watcher: `SIGHUP` で config reload を通知。
 | ファイル | 責務 |
 |---|---|
 | `main.rs` | Args 定義、モード分岐 |
-| `daemon_mode.rs` | デーモンモード（accept loop, handle_client） |
+| `daemon_proc.rs` | デーモンプロセスシェル（accept loop, handle_client の I/O） |
+| `daemon_logic.rs` | 純粋なデーモンロジック（embedder argv, reindex steps, reload response, ReindexGuard, PID helpers） |
 | `embedder_mode.rs` | embedder モード（ソケットサーバー、推論） |
 | `watcher_mode.rs` | watcher モード（ファイル監視、Index IPC） |
-| `child.rs` | 子プロセス管理（spawn, reap, stop） |
-| `backfill.rs` | バックフィルオーケストレーション |
+| `child_proc.rs` | 子プロセス管理シェル（spawn, reap, stop） |
+| `backfill_proc.rs` | バックフィル/再インデックスのワーカーループ（I/O シェル） |
 
 `src/embedder.rs` は純粋な推論ライブラリ（`Embedder` struct +
 クライアント関数）に整理。デーモンコードは `embedder_mode.rs` に移動。

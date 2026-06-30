@@ -15,7 +15,7 @@ use the_space_memory::db;
 use the_space_memory::ipc::accept_blocking;
 use the_space_memory::status;
 
-use crate::{backfill, backfill_logic, child, Args, SHUTDOWN};
+use crate::{backfill_logic, backfill_proc, child_proc, daemon_logic, Args, SHUTDOWN};
 
 pub fn run(args: Args) -> Result<()> {
     config::ensure_model_cache_env();
@@ -162,8 +162,8 @@ pub fn run(args: Args) -> Result<()> {
     let embedder_pid_path = state_dir.join("embedder.pid");
 
     let mut embedder_child: Option<Child> = if !args.no_embedder {
-        if child::is_process_alive(&embedder_pid_path) {
-            if let Some(pid) = child::read_pid_from_file(&embedder_pid_path) {
+        if daemon_logic::is_process_alive(&embedder_pid_path) {
+            if let Some(pid) = daemon_logic::read_pid_from_file(&embedder_pid_path) {
                 log::info!("embedder already running (PID {pid})");
             } else {
                 log::info!(
@@ -174,25 +174,17 @@ pub fn run(args: Args) -> Result<()> {
             None
         } else {
             let _ = std::fs::remove_file(&embedder_pid_path);
-            child::remove_stale_socket(&config::embedder_socket_path());
-            let spawned = if let Some(dir) = config::models_dir_complete() {
-                let model_arg = format!("--model={}", dir.display());
-                child::spawn_child(
-                    "embedder",
-                    &["--embedder", "--no-idle-timeout", &model_arg],
-                    &embedder_pid_path,
-                )
-            } else {
+            child_proc::remove_stale_socket(&config::embedder_socket_path());
+            let model_dir = config::models_dir_complete();
+            if model_dir.is_none() {
                 log::warn!(
                     "Local model files not found in {}; embedder will use HF Hub cache",
                     config::models_dir().display()
                 );
-                child::spawn_child(
-                    "embedder",
-                    &["--embedder", "--no-idle-timeout"],
-                    &embedder_pid_path,
-                )
-            };
+            }
+            let args = daemon_logic::embedder_child_args(model_dir.as_deref());
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let spawned = child_proc::spawn_child("embedder", &arg_refs, &embedder_pid_path);
             if let Some(ref c) = spawned {
                 status::update(&state_dir, |s| {
                     s.embedder = Some(status::EmbedderStatus {
@@ -213,8 +205,8 @@ pub fn run(args: Args) -> Result<()> {
     let watcher_pid = Arc::new(AtomicU32::new(0));
 
     let mut watcher_child: Option<Child> = if !args.no_watcher {
-        if child::is_process_alive(&watcher_pid_path) {
-            if let Some(existing_pid) = child::read_pid_from_file(&watcher_pid_path) {
+        if daemon_logic::is_process_alive(&watcher_pid_path) {
+            if let Some(existing_pid) = daemon_logic::read_pid_from_file(&watcher_pid_path) {
                 watcher_pid.store(existing_pid, Ordering::Release);
                 log::info!("watcher already running (PID {existing_pid})");
             } else {
@@ -223,7 +215,7 @@ pub fn run(args: Args) -> Result<()> {
             None
         } else {
             let _ = std::fs::remove_file(&watcher_pid_path);
-            let spawned = child::spawn_child("watcher", &["--fs-watcher"], &watcher_pid_path);
+            let spawned = child_proc::spawn_child("watcher", &["--fs-watcher"], &watcher_pid_path);
             if let Some(ref c) = spawned {
                 watcher_pid.store(c.id(), Ordering::Release);
                 status::update(&state_dir, |s| {
@@ -272,7 +264,7 @@ pub fn run(args: Args) -> Result<()> {
                 return;
             }
             log::info!("starting startup backfill...");
-            backfill::run_backfill_pass(&conn, &writes_pending);
+            backfill_proc::run_backfill_pass(&conn, &writes_pending);
             log::info!("startup backfill complete");
         });
     }
@@ -283,7 +275,7 @@ pub fn run(args: Args) -> Result<()> {
         let conn = Arc::clone(&conn);
         let writes_pending = Arc::clone(&writes_pending);
         std::thread::spawn(move || {
-            backfill::periodic_backfill(&conn, &writes_pending, backfill_interval_secs);
+            backfill_proc::periodic_backfill(&conn, &writes_pending, backfill_interval_secs);
         });
     }
 
@@ -315,10 +307,10 @@ pub fn run(args: Args) -> Result<()> {
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if child::reap_child("embedder", &mut embedder_child, &embedder_pid_path) {
+                if child_proc::reap_child("embedder", &mut embedder_child, &embedder_pid_path) {
                     status::update(&state_dir, |s| s.embedder = None);
                 }
-                if child::reap_child("watcher", &mut watcher_child, &watcher_pid_path) {
+                if child_proc::reap_child("watcher", &mut watcher_child, &watcher_pid_path) {
                     watcher_pid.store(0, Ordering::Release);
                     status::update(&state_dir, |s| s.watcher = None);
                 }
@@ -333,8 +325,8 @@ pub fn run(args: Args) -> Result<()> {
 
     // ─── Cleanup ─────────────────────────────────────────────────────
     log::info!("shutting down");
-    child::stop_child("embedder", embedder_child, &embedder_pid_path);
-    child::stop_child("watcher", watcher_child, &watcher_pid_path);
+    child_proc::stop_child("embedder", embedder_child, &embedder_pid_path);
+    child_proc::stop_child("watcher", watcher_child, &watcher_pid_path);
 
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&pid_path);
@@ -366,44 +358,38 @@ fn handle_client(
 
     // Handle Reindex: spawn background thread and respond immediately
     if let DaemonRequest::Reindex { kind } = req {
-        use the_space_memory::daemon_protocol::ReindexKind;
+        use daemon_logic::ReindexStep;
 
-        if reindex_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        // Claim the reindex flag on this (client) thread so the synchronous
+        // "already in progress" response is written before any thread spawns.
+        // The guard is then moved into the worker thread; its drop clears the
+        // flag, even on panic.
+        let Some(guard) = daemon_logic::ReindexGuard::try_acquire(reindex_active) else {
             write_response(
                 stream,
                 &DaemonResponse::error("reindex already in progress"),
             )?;
             return Ok(());
-        }
+        };
 
         let conn = Arc::clone(conn);
         let writes_pending = Arc::clone(writes_pending);
-        let reindex_active = Arc::clone(reindex_active);
         let state_dir = state_dir.to_path_buf();
         std::thread::spawn(move || {
-            // RAII guard: reset flag even if the thread panics
-            struct ReindexGuard(Arc<AtomicBool>);
-            impl Drop for ReindexGuard {
-                fn drop(&mut self) {
-                    self.0.store(false, Ordering::Release);
-                }
-            }
-            let _guard = ReindexGuard(Arc::clone(&reindex_active));
+            let _guard = guard;
 
-            match kind {
-                ReindexKind::Fts => {
-                    backfill::run_reindex_fts_pass(&conn, &writes_pending, &state_dir);
+            // `All` expands to Fts then Vectors; honor a mid-sequence shutdown
+            // before each step after the first (single-step kinds never wait).
+            for (i, step) in daemon_logic::reindex_steps(kind).iter().enumerate() {
+                if i > 0 && SHUTDOWN.load(Ordering::SeqCst) {
+                    break;
                 }
-                ReindexKind::Vectors => {
-                    backfill::run_reindex_vectors_pass(&conn, &writes_pending, &state_dir);
-                }
-                ReindexKind::All => {
-                    backfill::run_reindex_fts_pass(&conn, &writes_pending, &state_dir);
-                    if !SHUTDOWN.load(Ordering::SeqCst) {
-                        backfill::run_reindex_vectors_pass(&conn, &writes_pending, &state_dir);
+                match step {
+                    ReindexStep::Fts => {
+                        backfill_proc::run_reindex_fts_pass(&conn, &writes_pending, &state_dir);
+                    }
+                    ReindexStep::Vectors => {
+                        backfill_proc::run_reindex_vectors_pass(&conn, &writes_pending, &state_dir);
                     }
                 }
             }
@@ -415,23 +401,17 @@ fn handle_client(
 
     // Handle Reload: notify watcher child via SIGHUP
     if matches!(req, DaemonRequest::Reload) {
-        let mut warnings = config::reload();
+        let warnings = config::reload();
         let pid = watcher_pid.load(Ordering::Acquire);
-        if pid > 0 {
-            let rc = unsafe { libc::kill(pid as i32, libc::SIGHUP) };
-            if rc != 0 {
-                warnings.push("failed to send SIGHUP to watcher (may have exited)".to_string());
-            }
+        let watcher_pid_present = pid > 0;
+        // SIGHUP is only sent when a watcher PID is known; pass `true` otherwise
+        // so the response builder takes the "watcher absent" branch.
+        let sighup_ok = if watcher_pid_present {
+            unsafe { libc::kill(pid as i32, libc::SIGHUP) == 0 }
         } else {
-            warnings.push("watcher is not running; watch targets not updated".to_string());
-        }
-        let resp = if warnings.is_empty() {
-            DaemonResponse::success_empty()
-        } else {
-            DaemonResponse::success(serde_json::json!({
-                "warnings": warnings,
-            }))
+            true
         };
+        let resp = daemon_logic::reload_response(warnings, watcher_pid_present, sighup_ok);
         write_response(stream, &resp)?;
         return Ok(());
     }
