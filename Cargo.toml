@@ -48,6 +48,7 @@ flate2 = "1"
 tempfile = "3"
 serial_test = "3"
 criterion = { version = "0.8", default-features = false }
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 
 [features]
 # Enables atomic counters in production code (e.g. embedder client) for bench instrumentation.
