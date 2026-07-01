@@ -3566,6 +3566,7 @@ dependencies = [
  "log",
  "mlua",
  "notify",
+ "proc-macro2",
  "regex",
  "rusqlite",
  "serde",

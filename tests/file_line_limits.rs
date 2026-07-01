@@ -13,6 +13,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
+
 /// Flat code-line cap for any file without a (larger) frozen baseline.
 const LIMIT: usize = 800;
 
@@ -20,74 +22,183 @@ const LIMIT: usize = 800;
 /// `include_str!` (current tree) and `git show` (base branch).
 const BASELINE_REL: &str = "tests/file-line-baseline.txt";
 
-// ── Counting (with fail-closed test-module validation) ───────────────────────
+// ── Counting (lexer-based test-module detection) ─────────────────────────────
 
-/// Count production code lines in a Rust source file: every physical line up to
-/// the trailing inline `#[cfg(test)] mod tests { … }` block. Blank lines and
-/// comments in production code are counted; only that trailing unit-test module
-/// is excluded.
+/// Count production code lines in a Rust source file using proc-macro2 token
+/// scanning. Every physical line is counted except the span of the **last**
+/// top-level `#[cfg(test)] mod tests { … }` item, including its leading
+/// attribute run. Lines before **and** after the module are both counted.
 ///
-/// The boundary is the **last** top-level `#[cfg(test)]` whose next non-blank
-/// line opens `mod tests`. Test-only support items that legitimately appear in
-/// the production region — `#[cfg(test)] pub fn helper()`, `#[cfg(test)] pub mod
-/// test_utils;` — stay counted as code; only the trailing test module is
-/// stripped. A file with no such trailing module counts in full.
+/// Detection: the top-level token sequence is scanned for the anchor pattern
+/// `mod tests Group(Brace)`. Each anchor is walked backward over optional
+/// visibility (`pub` / `pub(…)`) and a contiguous run of outer attributes
+/// (`# Group(Bracket)`). If any attribute in the run is exactly `cfg(test)`
+/// (ident `cfg` + parenthesised single ident `test`), the item is a match.
+/// Broader predicates (`cfg(all(test,…))`) and `cfg_attr(…)` are out of scope
+/// and count as production. The **last** match determines the excluded region.
 ///
-/// Boundary guard, with a documented limit. The module *interior* is never
-/// scanned: test fixtures legitimately contain raw strings (`r#"…"#`) with
-/// column-0 content, which a brace-depth scan would misread. Instead we require
-/// the file to end at the test module's column-0 `}`; if anything else trails it
-/// (prose, comments, an unbalanced line) we error rather than strip too much.
+/// Span: `start_line` = source line of the first `#` in the attribute run;
+/// `end_line` = source line of the block's closing `}` (`Group::span_close`).
+/// The `span-locations` feature of proc-macro2 is required for real line numbers.
 ///
-/// This is NOT a complete guard: because we do not lex, a full production item
-/// placed *after* the trailing `mod tests` that itself ends in a column-0 `}`
-/// would pass and be excluded from the count. The gate therefore assumes the
-/// repo convention that the inline test module is the file's last item. A
-/// lexer-based detector that makes the boundary exact is tracked as a follow-up.
+/// Boundary-isolation (fail-closed): if a top-level production token ends on
+/// `start_line` or starts on `end_line`, the boundary is ambiguous and the
+/// function returns `Err` rather than silently miscount. A lex error also
+/// returns `Err` (fail-closed; in practice `src/**/*.rs` always tokenises).
+///
+/// No matching module → count equals `content.lines().count()` (whole file).
 fn code_line_count(content: &str) -> Result<usize, String> {
-    let lines: Vec<&str> = content.lines().collect();
+    let stream = content
+        .parse::<TokenStream>()
+        .map_err(|e| format!("lex error: {e}"))?;
 
-    // Boundary = the last column-0 `#[cfg(test)]` immediately followed by a
-    // `mod tests` opener.
-    let mut boundary: Option<usize> = None;
-    for (i, l) in lines.iter().enumerate() {
-        if l.starts_with("#[cfg(test)]")
-            && lines[i + 1..]
-                .iter()
-                .find(|x| !x.trim().is_empty())
-                .is_some_and(|x| opens_test_module(x))
-        {
-            boundary = Some(i);
+    let tokens: Vec<TokenTree> = stream.into_iter().collect();
+    let total = content.lines().count();
+    let n = tokens.len();
+
+    // Span of the last matching #[cfg(test)] mod tests { … } item.
+    struct Candidate {
+        start_line: usize, // 1-based; line of the first `#` in the attribute run
+        end_line: usize,   // 1-based; line of the block's closing `}`
+        run_start: usize,  // token index of the first `#` in the attribute run
+        brace_idx: usize,  // token index of the block Group
+    }
+
+    let mut last: Option<Candidate> = None;
+    let mut i = 0;
+
+    while i < n {
+        // Locate the anchor: Ident("mod") Ident("tests") Group(Brace).
+        let brace_group = if i + 2 < n {
+            match (&tokens[i], &tokens[i + 1], &tokens[i + 2]) {
+                (TokenTree::Ident(m), TokenTree::Ident(t), TokenTree::Group(g))
+                    if m == "mod" && t == "tests" && g.delimiter() == Delimiter::Brace =>
+                {
+                    Some(g)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let Some(brace_group) = brace_group else {
+            i += 1;
+            continue;
+        };
+
+        let brace_idx = i + 2;
+        let mut j = i; // walk backward from `mod`
+
+        // Walk back over optional visibility: pub / pub(…).
+        if j > 0 {
+            match &tokens[j - 1] {
+                TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => {
+                    // Could be the `(crate)` in `pub(crate)`.
+                    if j >= 2 {
+                        if let TokenTree::Ident(id) = &tokens[j - 2] {
+                            if id == "pub" {
+                                j -= 2;
+                            }
+                        }
+                    }
+                }
+                TokenTree::Ident(id) if id == "pub" => {
+                    j -= 1;
+                }
+                _ => {}
+            }
+        }
+
+        // Walk back over a contiguous run of outer attributes: each is `#` + `Group(Bracket)`.
+        let mut run_start = j;
+        let mut has_cfg_test = false;
+        while j >= 2 {
+            match (&tokens[j - 2], &tokens[j - 1]) {
+                (TokenTree::Punct(p), TokenTree::Group(g))
+                    if p.as_char() == '#' && g.delimiter() == Delimiter::Bracket =>
+                {
+                    if is_cfg_test(g) {
+                        has_cfg_test = true;
+                    }
+                    run_start = j - 2;
+                    j -= 2;
+                }
+                _ => break,
+            }
+        }
+
+        if has_cfg_test {
+            last = Some(Candidate {
+                start_line: tokens[run_start].span().start().line,
+                end_line: brace_group.span_close().start().line,
+                run_start,
+                brace_idx,
+            });
+        }
+
+        i = brace_idx + 1;
+    }
+
+    let Some(c) = last else {
+        return Ok(total);
+    };
+
+    // Boundary-isolation: the excluded span covers whole physical lines, which is
+    // only correct when no production token shares a boundary line.
+    if c.run_start > 0 {
+        let prev = &tokens[c.run_start - 1];
+        if prev.span().end().line == c.start_line {
+            return Err(format!(
+                "a production token ends on the same line as the `#[cfg(test)]` \
+                 attribute (line {}) — the attribute must open on its own line",
+                c.start_line
+            ));
+        }
+    }
+    if c.brace_idx + 1 < n {
+        let next = &tokens[c.brace_idx + 1];
+        if next.span().start().line == c.end_line {
+            return Err(format!(
+                "a production token starts on the same line as the `mod tests` \
+                 closing `}}` (line {}) — the closing brace must be on its own line",
+                c.end_line
+            ));
         }
     }
 
-    let Some(i) = boundary else {
-        return Ok(lines.len()); // No inline test module — whole file is code.
-    };
-
-    let last = lines.iter().rev().find(|l| !l.trim().is_empty());
-    if last.map(|l| l.trim_end()) != Some("}") {
-        return Err(format!(
-            "trailing `#[cfg(test)] mod tests` (line {}) is not the file's last item \
-             (last non-blank line is not a column-0 `}}`) — code appears after it",
-            i + 1
-        ));
-    }
-    Ok(i) // Lines [0, i) are production code.
+    let excluded = c.end_line - c.start_line + 1;
+    Ok(total - excluded)
 }
 
-/// Whether `line` opens a `mod tests` block (optionally `pub` / `pub(crate)`),
-/// not merely a name starting with `tests` (e.g. `mod tests_helpers`).
-fn opens_test_module(line: &str) -> bool {
-    let t = line.trim_start();
-    let t = t
-        .strip_prefix("pub(crate) ")
-        .or_else(|| t.strip_prefix("pub "))
-        .unwrap_or(t);
-    match t.strip_prefix("mod tests") {
-        Some(rest) => rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == '{'),
-        None => false,
+/// Return `true` if `bracket` is the `[…]` content of a `#[cfg(test)]` attribute:
+/// ident `cfg` followed by a parenthesised group containing the single ident `test`.
+/// Broader predicates (`cfg(all(test,…))`) and `cfg_attr(…)` return `false`.
+fn is_cfg_test(bracket: &Group) -> bool {
+    let inner: Vec<TokenTree> = bracket.stream().into_iter().collect();
+    // Must be at least `cfg(test)` — two tokens.
+    if inner.len() < 2 {
+        return false;
     }
+    // First token must be ident `cfg` (not `cfg_attr`, `allow`, `doc`, …).
+    let TokenTree::Ident(name) = &inner[0] else {
+        return false;
+    };
+    if name != "cfg" {
+        return false;
+    }
+    // Second token must be a parenthesised group containing a single ident `test`.
+    let TokenTree::Group(paren) = &inner[1] else {
+        return false;
+    };
+    if paren.delimiter() != Delimiter::Parenthesis {
+        return false;
+    }
+    let paren_tokens: Vec<TokenTree> = paren.stream().into_iter().collect();
+    if paren_tokens.len() != 1 {
+        return false;
+    }
+    matches!(&paren_tokens[0], TokenTree::Ident(id) if id == "test")
 }
 
 // ── Baseline parsing ─────────────────────────────────────────────────────────
@@ -346,17 +457,132 @@ mod tests {
     }
 
     #[test]
-    fn count_rejects_production_code_after_test_module() {
-        // Code must not hide past the trailing test module: the file must end at
-        // the module's closing `}`.
+    fn count_counts_production_code_after_test_module() {
+        // Production code after the trailing test module is now counted (not rejected).
+        // fn a (line 1) + fn hidden (line 6) = 2 production lines.
         let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nfn hidden() {}\n";
+        assert_eq!(code_line_count(src), Ok(2));
+    }
+
+    #[test]
+    fn count_counts_comment_after_test_module() {
+        // A trailing comment counts as a production line (comments are not tokens;
+        // no boundary error, but content.lines() counts the line).
+        let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n// trailing\n";
+        assert_eq!(code_line_count(src), Ok(2));
+    }
+
+    // ── New tests: core behavior ──────────────────────────────────────────────
+
+    #[test]
+    fn count_strips_midfile_test_module_and_counts_rest() {
+        // A mod tests that is not at EOF: production code before and after is counted.
+        // fn a + fn b before (2 lines) and fn c after (1 line) = 3 production lines.
+        let src = "fn a() {}\nfn b() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nfn c() {}\n";
+        assert_eq!(code_line_count(src), Ok(3));
+    }
+
+    // ── New tests: raw-string correctness ─────────────────────────────────────
+
+    #[test]
+    fn count_strips_test_module_with_col0_raw_string() {
+        // The module body contains a raw string with column-0 `{` / `}`.
+        // A lexer treats the whole raw string as one token, so the boundary is exact.
+        let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    let s = r#\"\n{\n}\n\"#;\n}\n";
+        // 8 total lines; mod tests spans lines 2-8 (7 lines excluded) → count = 1.
+        assert_eq!(code_line_count(src), Ok(1));
+    }
+
+    // ── New tests: attribute-matching robustness ──────────────────────────────
+
+    #[test]
+    fn count_matches_cfg_test_not_first_attribute() {
+        // cfg(test) need not be the first attribute in the run; the whole run
+        // (from #[allow(dead_code)]) is excluded with the block.
+        let src = "fn a() {}\n#[allow(dead_code)]\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
+        // mod tests spans lines 2-6 (5 lines excluded from 6 total) → count = 1.
+        assert_eq!(code_line_count(src), Ok(1));
+    }
+
+    #[test]
+    fn count_matches_cfg_test_after_doc_comment() {
+        // A doc comment lowers to #[doc = "..."] in the token stream and is treated
+        // as a leading attribute; the whole run (doc + cfg(test)) is excluded.
+        let src = "fn a() {}\n/// Tests module.\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
+        // mod tests spans lines 2-6 (5 lines excluded from 6 total) → count = 1.
+        assert_eq!(code_line_count(src), Ok(1));
+    }
+
+    #[test]
+    fn count_does_not_match_cfg_attr_wrapped() {
+        // cfg_attr(…) is not matched (documented out of scope); the mod counts as
+        // production, so the whole file is counted.
+        let src =
+            "fn a() {}\n#[cfg_attr(feature = \"x\", cfg(test))]\nmod tests {\n    fn t() {}\n}\n";
+        assert_eq!(code_line_count(src), Ok(5));
+    }
+
+    #[test]
+    fn count_takes_last_of_multiple_mod_tests() {
+        // Two #[cfg(test)] mod tests blocks; only the last is the boundary.
+        // fn a + #[cfg(test)] + mod tests { + fn t1 + } + fn b = 6 production lines.
+        let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t1() {}\n}\nfn b() {}\n\
+                   #[cfg(test)]\nmod tests {\n    fn t2() {}\n}\n";
+        assert_eq!(code_line_count(src), Ok(6));
+    }
+
+    // ── New tests: boundary-isolation + fail-closed ───────────────────────────
+
+    #[test]
+    fn count_errors_on_code_sharing_attribute_line() {
+        // A production token on the same physical line as the #[cfg(test)] attribute
+        // returns Err (boundary-isolation fail-closed).
+        let src = "fn a() {} #[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
         assert!(code_line_count(src).is_err());
     }
 
     #[test]
-    fn count_rejects_content_after_test_module() {
-        let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n// trailing\n";
+    fn count_errors_on_code_sharing_close_brace_line() {
+        // A production token on the same physical line as the closing `}` returns Err.
+        let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n} fn after() {}\n";
         assert!(code_line_count(src).is_err());
+    }
+
+    #[test]
+    fn count_errors_on_unlexable_input() {
+        // An unterminated string literal (or any lexically-invalid input) returns Err
+        // (fail-closed: we cannot count what we cannot lex).
+        let src = "fn a() {}\nlet x = \"unterminated";
+        assert!(code_line_count(src).is_err());
+    }
+
+    // ── New tests: span-location characterization ─────────────────────────────
+
+    #[test]
+    fn spans_report_real_lines_for_multiline_module() {
+        // Characterizes that proc-macro2 fallback-mode spans return real line numbers
+        // (requires the `span-locations` feature; without it, spans would return
+        // line = 0 and the exclusion would be computed incorrectly).
+        let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t1() {}\n    fn t2() {}\n\
+                   fn t3() {}\n}\n";
+        // 7 total lines; mod tests spans lines 2-7 (6 excluded) → count = 1.
+        assert_eq!(code_line_count(src), Ok(1));
+    }
+
+    #[test]
+    fn count_correct_without_trailing_newline() {
+        // A file whose last line has no trailing '\n' still counts correctly.
+        let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}";
+        // 5 total lines (no trailing newline); mod tests spans lines 2-5 → count = 1.
+        assert_eq!(code_line_count(src), Ok(1));
+    }
+
+    #[test]
+    fn count_correct_with_raw_string_spanning_lines() {
+        // A multiline raw string inside the module does not shift the detected end_line.
+        let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    let s = r#\"\nline2\nline3\n\"#;\n}\n";
+        // 8 total lines; mod tests spans lines 2-8 (7 excluded) → count = 1.
+        assert_eq!(code_line_count(src), Ok(1));
     }
 
     #[test]
