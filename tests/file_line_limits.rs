@@ -1,5 +1,5 @@
 //! Per-file code-line gate (ADR-0018). Every `src/**/*.rs` file's *code* line
-//! count (the production lines, excluding the trailing `#[cfg(test)] mod tests`
+//! count (the production lines, excluding the last `#[cfg(test)] mod tests`
 //! block) must stay within `max(800, baseline[file])`, where `baseline` is the
 //! checked-in `tests/file-line-baseline.txt`. The baseline is a frozen ratchet:
 //! it may only shrink or lose entries, never grow — enforced against
@@ -168,7 +168,12 @@ fn code_line_count(content: &str) -> Result<usize, String> {
     }
 
     let excluded = c.end_line - c.start_line + 1;
-    Ok(total - excluded)
+    total.checked_sub(excluded).ok_or_else(|| {
+        format!(
+            "internal: excluded span {excluded} exceeds total lines {total} \
+             (span-locations regression?)"
+        )
+    })
 }
 
 /// Return `true` if `bracket` is the `[…]` content of a `#[cfg(test)]` attribute:
@@ -423,7 +428,7 @@ mod tests {
     #[test]
     fn count_excludes_trailing_test_module() {
         let src = "use x;\n\nfn a() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n";
-        // Production = lines before `#[cfg(test)]` (index 3) = 3 lines.
+        // Production = the 3 lines before `#[cfg(test)]`.
         assert_eq!(code_line_count(src), Ok(3));
     }
 
@@ -583,6 +588,29 @@ mod tests {
         let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    let s = r#\"\nline2\nline3\n\"#;\n}\n";
         // 8 total lines; mod tests spans lines 2-8 (7 excluded) → count = 1.
         assert_eq!(code_line_count(src), Ok(1));
+    }
+
+    #[test]
+    fn count_allows_pub_crate_visibility_on_test_module() {
+        // pub(crate) exercises the Group(Parenthesis) walk-back branch that bare `pub` does not.
+        let src = "fn a() {}\n#[cfg(test)]\npub(crate) mod tests {\n    fn t() {}\n}\n";
+        assert_eq!(code_line_count(src), Ok(1));
+    }
+
+    #[test]
+    fn count_zero_when_file_is_only_test_module() {
+        // No production code before the module: run_start == 0 (skips the prev-token
+        // boundary check) and the count floors at 0.
+        let src = "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
+        assert_eq!(code_line_count(src), Ok(0));
+    }
+
+    #[test]
+    fn count_whole_file_when_test_module_is_nested() {
+        // A nested `mod tests` is invisible to the top-level scan (documented
+        // out-of-scope, fail-noisy): the whole file counts as production.
+        let src = "fn a() {}\nmod outer {\n    #[cfg(test)]\n    mod tests {\n        fn t() {}\n    }\n}\n";
+        assert_eq!(code_line_count(src), Ok(7));
     }
 
     #[test]
