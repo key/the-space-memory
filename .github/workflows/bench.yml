@@ -79,11 +79,23 @@ jobs:
       - name: Wait for vector backfill
         working-directory: tests/e2e/testdata
         run: |
-          for _ in $(seq 1 30); do
-            tsm status | grep -qE "Vectors:.*100%" && exit 0
+          # `Vectors:   0/0 (100%)` is a trivial (and, on a freshly booted
+          # embedder, common) false positive: the ratio is 100% before the
+          # embedder has finished loading and before any chunk has actually
+          # been embedded, simply because the "needs vectors" denominator
+          # hasn't been counted yet. Require non-zero counts on both sides,
+          # not just the percentage, and give the CPU model load real time
+          # (cold fp32 load on a CI runner is much slower than a warm
+          # daemon on a dev machine).
+          for _ in $(seq 1 90); do
+            out=$(tsm status)
+            echo "$out"
+            if echo "$out" | grep -qE "Vectors:\s+[1-9][0-9]*/[1-9][0-9]*\s+\(100%\)"; then
+              exit 0
+            fi
             sleep 2
           done
-          echo "::error::vector backfill did not reach 100% in time"
+          echo "::error::vector backfill did not reach a non-trivial 100% in time"
           exit 1
 
       - name: Record current-run metrics
@@ -172,11 +184,23 @@ jobs:
       - name: Wait for vector backfill
         working-directory: tests/e2e/testdata
         run: |
-          for _ in $(seq 1 30); do
-            tsm status | grep -qE "Vectors:.*100%" && exit 0
+          # `Vectors:   0/0 (100%)` is a trivial (and, on a freshly booted
+          # embedder, common) false positive: the ratio is 100% before the
+          # embedder has finished loading and before any chunk has actually
+          # been embedded, simply because the "needs vectors" denominator
+          # hasn't been counted yet. Require non-zero counts on both sides,
+          # not just the percentage, and give the CPU model load real time
+          # (cold fp32 load on a CI runner is much slower than a warm
+          # daemon on a dev machine).
+          for _ in $(seq 1 90); do
+            out=$(tsm status)
+            echo "$out"
+            if echo "$out" | grep -qE "Vectors:\s+[1-9][0-9]*/[1-9][0-9]*\s+\(100%\)"; then
+              exit 0
+            fi
             sleep 2
           done
-          echo "::error::vector backfill did not reach 100% in time"
+          echo "::error::vector backfill did not reach a non-trivial 100% in time"
           exit 1
 
       - name: Record metrics
