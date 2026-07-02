@@ -231,44 +231,12 @@ end
 
 ## ベンチマーク
 
-検索・インデックスパイプラインの性能ベンチ。現状は検索レイテンシのベンチのみ
-実装済みで、インデックスベンチと CI のリグレッションゲートは後続 PR で追加する
-（[#181](https://github.com/key/the-space-memory/issues/181) 参照）。
-
-### 前提条件
-
-- `tsmd` が embedder 準備完了で稼働中（`tsm start` 後 `tsm status` で確認）
-- 標準の testdata コーパスがインデックス済み:
-
-  ```bash
-  cd tests/e2e/testdata
-  tsm init && tsm index
-  ```
-
-### 実行
-
-```bash
-# 検索レイテンシ（ハイブリッド: FTS5 + ベクター + エンティティ）
-cargo bench --bench search_latency
-```
-
-### Embedder 呼び出しカウンタ
-
-embedder の呼び出し回数を検証したいベンチでは、`bench-counters` フィーチャを
-有効にしてビルドする。デフォルトでは無効で、リリースビルドではカウンタが
-完全にコンパイルアウトされる。
-
-```bash
-cargo build --features bench-counters
-```
-
-```rust
-use the_space_memory::embedder::counters;
-
-counters::reset_embedder_calls();
-// ... embed_via_socket_at を呼ぶコードを実行 ...
-println!("calls: {}", counters::embedder_call_count());
-```
+検索・インデックスパイプラインの性能ベンチと、`src/`・`benches/`・`Cargo.toml`
+を変更する全 PR で走る CI リグレッションゲート。リグレッションゲートの対象は
+embedder 呼び出し回数のみ（決定的な値のため完全一致判定）で、インデックス
+スループットと検索レイテンシは記録のみでゲート対象外。設計の背景、ローカルでの
+実行方法、CI ワークフローの内部構造は
+[docs/benchmarks.md](docs/benchmarks.md)（英語）を参照。
 
 ## ドキュメント
 
@@ -277,6 +245,7 @@ println!("calls: {}", counters::embedder_call_count());
 - [データフロー](docs/data-flow.md) — インデックスと検索のフロー図
 - [設定リファレンス](docs/configuration.md) — 環境変数と設定ファイルのリファレンス
 - [ユーザー辞書](docs/user-dictionary.md) — カスタム辞書の管理
+- [ベンチマーク](docs/benchmarks.md) — 性能ベンチ、CI リグレッションゲート、ベースラインのライフサイクル
 - [設計判断](decisions/) — ADR（アーキテクチャ決定記録）
 
 ## 背景

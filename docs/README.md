@@ -45,4 +45,5 @@ For the full quick-start tour, see the project
 | [Configuration](configuration.md) | `tsm.toml` and environment variable reference |
 | [Command Reference](command-reference.md) | Every `tsm` subcommand, flags, and examples |
 | [User Dictionary](user-dictionary.md) | Custom terminology for the lindera tokenizer |
+| [Benchmarks](benchmarks.md) | Perf benches, CI regression gate, baseline lifecycle |
 | [Claude Code prompt format](claude-code/claude-code-prompt-format.md) | Output format used by the auto-search hook |

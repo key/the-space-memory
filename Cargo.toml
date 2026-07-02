@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "tsmd"
 path = "src/bin/tsmd/main.rs"
 
+[[bin]]
+name = "tsm-bench-check"
+path = "src/bin/tsm-bench-check/main.rs"
+
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled", "load_extension"] }
 mlua = { version = "0.11", features = ["lua54", "vendored", "anyhow"] }
@@ -58,3 +62,8 @@ bench-counters = []
 [[bench]]
 name = "search_latency"
 harness = false
+
+[[bench]]
+name = "record_metrics"
+harness = false
+required-features = ["bench-counters"]
