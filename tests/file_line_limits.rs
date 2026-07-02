@@ -216,7 +216,11 @@ fn is_cfg_test(bracket: &Group) -> bool {
 /// or *raised* relative to what they're given, so a corrupted line that simply
 /// vanishes from the parsed map is indistinguishable from a legitimately
 /// shrunk-and-removed entry — it must not be able to hide a raised count.
-fn parse_baseline(s: &str) -> (BTreeMap<String, usize>, Vec<String>) {
+///
+/// `source` labels the bad-line messages (e.g. `BASELINE_REL` for the
+/// working-tree copy vs. `origin/main:<BASELINE_REL>` for the base-branch
+/// copy) so the two are distinguishable when both are parsed in the same run.
+fn parse_baseline(s: &str, source: &str) -> (BTreeMap<String, usize>, Vec<String>) {
     let mut m = BTreeMap::new();
     let mut bad = Vec::new();
     for (i, raw_line) in s.lines().enumerate() {
@@ -238,7 +242,7 @@ fn parse_baseline(s: &str) -> (BTreeMap<String, usize>, Vec<String>) {
                 m.insert(path, n);
             }
             None => bad.push(format!(
-                "{BASELINE_REL}:{}: cannot parse as `path count`: {raw_line:?}",
+                "{source}:{}: cannot parse as `path count`: {raw_line:?}",
                 i + 1
             )),
         }
@@ -477,7 +481,8 @@ fn enforce_per_file_line_limits() {
         }
     }
 
-    let (baseline, bad_baseline_lines) = parse_baseline(include_str!("file-line-baseline.txt"));
+    let (baseline, bad_baseline_lines) =
+        parse_baseline(include_str!("file-line-baseline.txt"), BASELINE_REL);
     violations.extend(bad_baseline_lines);
     violations.extend(growth_and_tightness_violations(&current, &baseline));
 
@@ -487,7 +492,8 @@ fn enforce_per_file_line_limits() {
     let strict = invariant3_is_strict();
     match base_baseline(root) {
         BaseBaseline::Content(base) => {
-            let (base_baseline, bad_base_lines) = parse_baseline(&base);
+            let (base_baseline, bad_base_lines) =
+                parse_baseline(&base, &format!("origin/main:{BASELINE_REL}"));
             violations.extend(bad_base_lines);
             violations.extend(immutability_violations(&baseline, &base_baseline));
         }
@@ -730,7 +736,7 @@ mod tests {
     #[test]
     fn parse_baseline_ignores_comments_and_blanks() {
         let s = "# header\n\nsrc/cli.rs 2301\nsrc/config.rs 1212\n";
-        let (m, bad) = parse_baseline(s);
+        let (m, bad) = parse_baseline(s, BASELINE_REL);
         assert_eq!(m.get("src/cli.rs"), Some(&2301));
         assert_eq!(m.get("src/config.rs"), Some(&1212));
         assert_eq!(m.len(), 2);
@@ -740,7 +746,7 @@ mod tests {
     #[test]
     fn parse_baseline_flags_line_with_non_numeric_count() {
         let s = "src/cli.rs 2301\nsrc/broken.rs notanumber\n";
-        let (m, bad) = parse_baseline(s);
+        let (m, bad) = parse_baseline(s, BASELINE_REL);
         assert_eq!(m.len(), 1, "the malformed line must not silently vanish");
         assert_eq!(bad.len(), 1);
         assert!(bad[0].contains("src/broken.rs notanumber"), "{bad:?}");
@@ -749,9 +755,33 @@ mod tests {
     #[test]
     fn parse_baseline_flags_line_without_whitespace_separator() {
         let s = "src/cli.rs 2301\nsrc/broken.rs-no-space-2000\n";
-        let (m, bad) = parse_baseline(s);
+        let (m, bad) = parse_baseline(s, BASELINE_REL);
         assert_eq!(m.len(), 1);
         assert_eq!(bad.len(), 1);
+    }
+
+    #[test]
+    fn parse_baseline_bad_line_message_is_labeled_with_source() {
+        let s = "notanumber\n";
+        let (_, bad) = parse_baseline(s, BASELINE_REL);
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].starts_with(&format!("{BASELINE_REL}:1:")), "{bad:?}");
+    }
+
+    #[test]
+    fn parse_baseline_disambiguates_working_tree_vs_base_branch_source() {
+        // The gate parses the same corrupted content from two sources — the
+        // working-tree baseline and origin/main's copy — in the same run. Their
+        // bad-line messages must be distinguishable, not just both say
+        // "tests/file-line-baseline.txt:1: ...".
+        let s = "notanumber\n";
+        let (_, working_tree_bad) = parse_baseline(s, BASELINE_REL);
+        let (_, base_branch_bad) = parse_baseline(s, &format!("origin/main:{BASELINE_REL}"));
+        assert_ne!(working_tree_bad[0], base_branch_bad[0]);
+        assert!(
+            base_branch_bad[0].starts_with("origin/main:"),
+            "{base_branch_bad:?}"
+        );
     }
 
     #[test]
