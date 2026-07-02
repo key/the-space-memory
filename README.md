@@ -322,7 +322,9 @@ bash tests/quality_bench.sh --update-baseline
 ```
 
 Do not update the baseline to make a regression pass — if the gate fails,
-fix the change under review, not the baseline.
+fix the change under review, not the baseline. `--update-baseline` enforces
+this: it refuses to overwrite an existing baseline when this run failed the
+gate against it (a regression), unless `--force` is also passed.
 
 ## Documentation
 

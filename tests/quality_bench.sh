@@ -129,14 +129,22 @@ log "tsm index"
 (cd "$BENCH_DIR/proj" && tsm index)
 
 log "Waiting for vector backfill..."
-# `tsm status` prints "Vectors N/N (100%)" once fully backfilled — but right
-# after `tsm index` returns, the backfill count can transiently read
-# "Vectors: 0/0 (100%)" (0 of 0 chunks counted as needing vectors yet, which
-# is trivially "100%"). A bare `grep "(100%)"` matches that immediately and
-# exits the wait before the embedder has done any work, so the measurement
-# would silently run against zero-vector chunks. Require a non-zero count on
-# BOTH sides of the ratio. Logging the full status each poll (not just the
-# match) makes a genuine timeout diagnosable from CI output alone.
+# `tsm status` prints "Vectors N/N (100%)" once fully backfilled. Naively
+# `grep`-ing just for "(100%)" is unsafe: `render_db_stats` (src/cli_format.rs)
+# only prints a percentage at all when chunks > 0 — a chunks == 0 reading
+# prints the bare "Vectors:   0" (no "%", no fraction) — but a transient
+# small-N/N race is still possible in general (e.g. a status poll landing
+# between an incremental chunk-count update and its matching vector-count
+# update could read a fraction like "3/3 (100%)" while more chunks are still
+# being indexed elsewhere), and this repo's own #181 perf-bench harness hit
+# exactly that shape of trivial-match bug in CI. A bare `grep "(100%)"` would
+# exit the wait on any such reading, before the embedder has done the real
+# work, so the measurement would silently run against zero-vector chunks.
+# Require a non-zero count on BOTH sides of the ratio so a fraction that
+# happens to read "100%" only counts once N is the corpus's real chunk
+# count, not some transient partial count. Logging the full status each
+# poll (not just the match) makes a genuine timeout diagnosable from CI
+# output alone.
 VECTORS_READY=0
 for _ in $(seq 1 90); do
     STATUS_OUT="$(cd "$BENCH_DIR/proj" && tsm status 2>/dev/null || true)"
