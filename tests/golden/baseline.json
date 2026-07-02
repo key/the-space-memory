@@ -1,0 +1,221 @@
+{
+  "hybrid": {
+    "mode": "hybrid",
+    "mean_precision_at_5": 0.4142857142857144,
+    "mean_precision_at_5_ceiling": 0.47142857142857153,
+    "mean_mrr": 0.8928571428571429,
+    "mean_ndcg_at_5": 0.8580588761707519,
+    "mean_latency_ms": 254.92355364285712,
+    "per_query": [
+      {
+        "id": "E1",
+        "category": "entity",
+        "precision_at_5": 0.4,
+        "precision_at_5_ceiling": 0.4,
+        "reciprocal_rank": 1.0,
+        "ndcg_at_5": 1.0,
+        "latency_ms": 1727.959583,
+        "ranked": [
+          "search-engine/lindera-tokenizer.md",
+          "search-engine/sqlite-fts5.md",
+          "search-engine/rust-search-arch.md",
+          "search-engine/candle-embedding.md"
+        ]
+      },
+      {
+        "id": "E2",
+        "category": "entity",
+        "precision_at_5": 0.8,
+        "precision_at_5_ceiling": 0.8,
+        "reciprocal_rank": 1.0,
+        "ndcg_at_5": 1.0,
+        "latency_ms": 108.76958400000001,
+        "ranked": [
+          "lora-tracker/telemetry-firmware.md",
+          "lora-tracker/lora-module-select.md",
+          "lora-tracker/gps-fallback.md",
+          "lora-tracker/field-test-report.md",
+          "hunting/season-report-recent.md"
+        ]
+      },
+      {
+        "id": "E3",
+        "category": "entity",
+        "precision_at_5": 0.2,
+        "precision_at_5_ceiling": 0.2,
+        "reciprocal_rank": 1.0,
+        "ndcg_at_5": 1.0,
+        "latency_ms": 109.90216699999999,
+        "ranked": [
+          "search-engine/candle-embedding.md",
+          "search-engine/lindera-tokenizer.md",
+          "search-engine/sqlite-fts5.md"
+        ]
+      },
+      {
+        "id": "F1",
+        "category": "fts-basic",
+        "precision_at_5": 0.4,
+        "precision_at_5_ceiling": 0.4,
+        "reciprocal_rank": 1.0,
+        "ndcg_at_5": 0.9639404333166532,
+        "latency_ms": 115.59750000000001,
+        "ranked": [
+          "hunting/shotgun-maintenance.md",
+          "hunting/license-renewal.md",
+          "hunting/handload-safety.md",
+          "hunting/season-report-recent.md",
+          "lora-tracker/telemetry-firmware.md"
+        ]
+      },
+      {
+        "id": "F2",
+        "category": "fts-basic",
+        "precision_at_5": 0.6,
+        "precision_at_5_ceiling": 0.6,
+        "reciprocal_rank": 1.0,
+        "ndcg_at_5": 1.0,
+        "latency_ms": 216.026167,
+        "ranked": [
+          "microfactory/concept-overview.md",
+          "microfactory/funding-notes.md",
+          "microfactory/cnc-tooling.md",
+          "hunting/handload-safety.md",
+          "search-engine/candle-embedding.md"
+        ]
+      },
+      {
+        "id": "F3",
+        "category": "fts-basic",
+        "precision_at_5": 0.4,
+        "precision_at_5_ceiling": 0.4,
+        "reciprocal_rank": 1.0,
+        "ndcg_at_5": 1.0,
+        "latency_ms": 226.77766599999998,
+        "ranked": [
+          "search-engine/sqlite-fts5.md",
+          "search-engine/rust-search-arch.md",
+          "search-engine/lindera-tokenizer.md"
+        ]
+      },
+      {
+        "id": "V1",
+        "category": "vector-semantic",
+        "precision_at_5": 0.8,
+        "precision_at_5_ceiling": 0.8,
+        "reciprocal_rank": 1.0,
+        "ndcg_at_5": 1.0,
+        "latency_ms": 120.13225,
+        "ranked": [
+          "lora-tracker/gps-fallback.md",
+          "lora-tracker/telemetry-firmware.md",
+          "lora-tracker/field-test-report.md",
+          "lora-tracker/lora-module-select.md",
+          "hunting/season-report-recent.md"
+        ]
+      },
+      {
+        "id": "V2",
+        "category": "vector-semantic",
+        "precision_at_5": 0.2,
+        "precision_at_5_ceiling": 0.4,
+        "reciprocal_rank": 0.5,
+        "ndcg_at_5": 0.52129602861432,
+        "latency_ms": 119.329375,
+        "ranked": [
+          "hunting/season-report-recent.md",
+          "search-engine/lindera-tokenizer.md",
+          "search-engine/rust-search-arch.md"
+        ]
+      },
+      {
+        "id": "V3",
+        "category": "vector-semantic",
+        "precision_at_5": 0.4,
+        "precision_at_5_ceiling": 0.4,
+        "reciprocal_rank": 1.0,
+        "ndcg_at_5": 0.9639404333166532,
+        "latency_ms": 115.764042,
+        "ranked": [
+          "hunting/shotgun-maintenance.md",
+          "hunting/license-renewal.md",
+          "hunting/handload-safety.md",
+          "lora-tracker/telemetry-firmware.md",
+          "garden/compost-tips.md"
+        ]
+      },
+      {
+        "id": "R1",
+        "category": "mixed",
+        "precision_at_5": 0.6,
+        "precision_at_5_ceiling": 0.8,
+        "reciprocal_rank": 1.0,
+        "ndcg_at_5": 0.7437707309491556,
+        "latency_ms": 127.25425000000001,
+        "ranked": [
+          "search-engine/rust-search-arch.md",
+          "search-engine/sqlite-fts5.md",
+          "search-engine/candle-embedding.md"
+        ]
+      },
+      {
+        "id": "R2",
+        "category": "mixed",
+        "precision_at_5": 0.4,
+        "precision_at_5_ceiling": 0.6,
+        "reciprocal_rank": 1.0,
+        "ndcg_at_5": 0.819876640193745,
+        "latency_ms": 229.42991600000002,
+        "ranked": [
+          "hunting/gear-review.md",
+          "microfactory/funding-notes.md",
+          "hunting/season-report-recent.md",
+          "hunting/license-renewal.md",
+          "hunting/shotgun-maintenance.md"
+        ]
+      },
+      {
+        "id": "T1",
+        "category": "temporal",
+        "precision_at_5": 0.2,
+        "precision_at_5_ceiling": 0.2,
+        "reciprocal_rank": 1.0,
+        "ndcg_at_5": 1.0,
+        "latency_ms": 114.92108400000001,
+        "ranked": [
+          "hunting/season-report-recent.md",
+          "hunting/handload-safety.md",
+          "hunting/gear-review.md",
+          "hunting/shotgun-maintenance.md",
+          "hunting/license-renewal.md"
+        ]
+      },
+      {
+        "id": "T2",
+        "category": "temporal",
+        "precision_at_5": 0.0,
+        "precision_at_5_ceiling": 0.2,
+        "reciprocal_rank": 0.0,
+        "ndcg_at_5": -0.0,
+        "latency_ms": 118.044042,
+        "ranked": []
+      },
+      {
+        "id": "G1",
+        "category": "distractor",
+        "precision_at_5": 0.4,
+        "precision_at_5_ceiling": 0.4,
+        "reciprocal_rank": 1.0,
+        "ndcg_at_5": 1.0,
+        "latency_ms": 119.022125,
+        "ranked": [
+          "garden/compost-tips.md",
+          "garden/tomato-growing.md",
+          "garden/pickling-recipe.md",
+          "hunting/shotgun-maintenance.md",
+          "search-engine/candle-embedding.md"
+        ]
+      }
+    ]
+  }
+}

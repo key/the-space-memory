@@ -15,6 +15,7 @@ tsm.toml
 
 # Isolated benchmark / perf-test environment (see CLAUDE.md "Testing")
 .bench/
+.qbench/
 
 # Legacy data directory
 /data/

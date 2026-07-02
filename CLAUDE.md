@@ -51,6 +51,10 @@ bash tests/e2e.sh
 # Benchmarks (requires live tsmd + indexed corpus; see README "Benchmarks")
 cargo bench --bench search_latency
 cargo test --features bench-counters   # counter-instrumented tests (off by default)
+
+# Search quality bench (Precision@5 / MRR / nDCG@5 vs tests/golden/baseline.json)
+bash tests/quality_bench.sh                    # builds an isolated env, indexes tests/golden/corpus/, gates
+bash tests/quality_bench.sh --update-baseline  # regenerate the baseline after an intentional quality change
 ```
 
 ## Architecture

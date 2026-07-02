@@ -270,6 +270,50 @@ counters::reset_embedder_calls();
 println!("calls: {}", counters::embedder_call_count());
 ```
 
+## 検索品質
+
+手動で正解付けした golden コーパス（`tests/golden/corpus/` +
+`tests/golden/queries.yaml`）に対して Precision@5 / MRR / nDCG@5 を計測し、
+コミット済みのベースライン（`tests/golden/baseline.json`）に対して CI で
+gate する。辞書変更・スコアリングパラメータ調整・Lua フック変更・シノニム
+展開の変更など、既存テストは壊さないが検索品質を静かに劣化させる類の
+変更を検知するのが目的。
+
+ローカルでも CI と同じ方法で実行できる:
+
+```bash
+bash tests/quality_bench.sh
+```
+
+このスクリプトは上記の性能ベンチと同じパターンで gitignore された隔離
+環境を構築し、実機の embedder で golden コーパスをインデックスした上で
+2パスを計測する。
+
+- **hybrid** — デフォルトの検索経路（FTS5 + ベクター + エンティティ）。
+  ベースラインに対して gate される。
+- **fts_only** — 計測途中で embedder を停止し、正真正銘の FTS5 のみの
+  計測を行う。比較用の記録のみで gate 対象外
+  （embedder が稼働したままの `--fallback fts_only` はエラーハンドリングの
+  挙動を変えるだけでベクター検索自体は止めないため、真の FTS-only 計測
+  にはならない。詳細は `tests/quality_bench.rs` のモジュールドキュメント
+  参照）。
+
+指標算出（`precision_at_k` / `reciprocal_rank` / `ndcg_at_k`）は純粋関数で
+通常の `cargo test` でユニットテストされる。実機計測・gate パスは
+`#[ignore]` 付きの結合テストで、スクリプトから明示的に呼び出す
+（実機デーモンと実機 embedder が必要なため、素の `cargo test` では
+実行できない）。
+
+検索品質を意図的に改善する変更を行った場合は、ベースラインを再生成して
+その変更と一緒にコミットする:
+
+```bash
+bash tests/quality_bench.sh --update-baseline
+```
+
+回帰を通すためだけにベースラインを更新してはならない。gate が失敗したら
+レビュー対象の変更側を直すこと。
+
 ## ドキュメント
 
 - [コマンドリファレンス](docs/command-reference.md) — CLIコマンド、フラグ、使用例
