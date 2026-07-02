@@ -122,11 +122,17 @@ fn ndcg_at_k(ranked: &[String], relevant: &HashMap<String, u8>, k: usize) -> f64
 }
 
 fn dcg_at_k(grades: impl Iterator<Item = u8>, k: usize) -> f64 {
-    grades
+    let sum: f64 = grades
         .take(k)
         .enumerate()
         .map(|(i, grade)| (2f64.powi(grade as i32) - 1.0) / (i as f64 + 2.0).log2())
-        .sum()
+        .sum();
+    // `Sum for f64` folds from -0.0 (the IEEE754-correct additive identity,
+    // since -0.0 + -0.0 stays -0.0 while +0.0 + -0.0 would flip it) — so an
+    // empty `grades` iterator (e.g. a query with zero search results) yields
+    // -0.0 here, which is numerically equal to 0.0 but serializes as "-0.0"
+    // in JSON. Normalize it: -0.0 + 0.0 == 0.0 per IEEE754.
+    sum + 0.0
 }
 
 /// The best Precision@k a query can possibly achieve given its gold set,
@@ -354,6 +360,24 @@ const MAX_PRECISION_DROP: f64 = 0.05;
 const MAX_MRR_DROP: f64 = 0.05;
 const MAX_NDCG_DROP: f64 = 0.05;
 
+/// Per-query max-drop thresholds. The aggregate thresholds above are
+/// diluted by n=14 queries: a single query's reciprocal rank sliding from
+/// rank 1 to rank 3 (RR 1.0 -> 0.333) only moves the AGGREGATE mean MRR by
+/// 0.667/14 ~= 0.048, under MAX_MRR_DROP, even though that one query
+/// regressed badly — and a top-1 result silently downgrading from a
+/// grade-2 to a grade-1 relevant doc doesn't change reciprocal rank at all
+/// (still rank 1) but nearly triples nDCG@5's gap from ideal for a
+/// single-relevant-doc query. Per-query thresholds close both gaps: nDCG
+/// is graded-relevance-aware so it independently catches the grade
+/// downgrade, and RR independently catches the rank slide, regardless of
+/// what the aggregate does. 0.2 is roughly "a relevant result moved by two
+/// or more ranks, or the top hit's grade was meaningfully replaced" — loose
+/// enough to tolerate the coarse-grained jitter this 20-doc corpus
+/// naturally produces between adjacent low-relevance ranks, tight enough to
+/// catch both evasions above.
+const MAX_PER_QUERY_RR_DROP: f64 = 0.2;
+const MAX_PER_QUERY_NDCG_DROP: f64 = 0.2;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Baseline {
     hybrid: ModeReport,
@@ -407,10 +431,11 @@ fn check_regressions(baseline: &ModeReport, current: &ModeReport) -> Vec<String>
         ));
     }
 
-    // Per-query hard gate: a gold-standard query whose top relevant doc used
-    // to land in the top 5 must not fall out of the top 5 entirely, even if
-    // the aggregate drop stays under threshold (a regression hidden by
-    // averaging is still a regression for that query's users).
+    // Per-query hard gates. Aggregate thresholds alone are evadable: a
+    // single query's regression gets diluted by averaging over n queries
+    // (see MAX_PER_QUERY_*_DROP docs above for the two concrete evasions
+    // this closes). These run per query so neither evasion can hide behind
+    // the other 13 queries staying flat.
     let current_by_id: HashMap<&str, &QueryMetrics> = current
         .per_query
         .iter()
@@ -427,12 +452,42 @@ fn check_regressions(baseline: &ModeReport, current: &ModeReport) -> Vec<String>
                         1.0 / base_q.reciprocal_rank
                     ));
                 }
+                Some(cur_q) => {
+                    let rr_drop = base_q.reciprocal_rank - cur_q.reciprocal_rank;
+                    if rr_drop > MAX_PER_QUERY_RR_DROP {
+                        failures.push(format!(
+                            "query {} ({}): reciprocal rank dropped {rr_drop:.3} (baseline {:.3} -> current {:.3}, max allowed drop {MAX_PER_QUERY_RR_DROP})",
+                            base_q.id, base_q.category, base_q.reciprocal_rank, cur_q.reciprocal_rank
+                        ));
+                    }
+                }
                 None => failures.push(format!(
                     "query {} present in baseline but missing from current run",
                     base_q.id
                 )),
-                _ => {}
             }
+        }
+
+        // nDCG is graded-relevance-aware, so it catches a top-ranked doc
+        // being replaced by a *lower-graded* relevant doc even when RR
+        // (rank-only) sees no change at all. Checked independent of the RR
+        // branch above (and independent of `base_q.reciprocal_rank > 0.0`)
+        // since a query can gain nDCG signal even where RR was already 0.
+        if base_q.ndcg_at_5 > 0.0 {
+            if let Some(cur_q) = current_by_id.get(base_q.id.as_str()) {
+                let ndcg_drop = base_q.ndcg_at_5 - cur_q.ndcg_at_5;
+                if ndcg_drop > MAX_PER_QUERY_NDCG_DROP {
+                    failures.push(format!(
+                        "query {} ({}): nDCG@5 dropped {ndcg_drop:.3} (baseline {:.3} -> current {:.3}, max allowed drop {MAX_PER_QUERY_NDCG_DROP})",
+                        base_q.id, base_q.category, base_q.ndcg_at_5, cur_q.ndcg_at_5
+                    ));
+                }
+            }
+            // A query missing from `current` entirely is already reported
+            // by the reciprocal_rank branch above when reciprocal_rank > 0;
+            // ndcg_at_5 > 0.0 implies reciprocal_rank > 0.0 (a query can't
+            // have graded gain without at least one relevant hit), so this
+            // never needs its own "missing" branch.
         }
     }
 
@@ -624,6 +679,23 @@ mod tests {
         assert_eq!(n, 0.0);
     }
 
+    #[test]
+    fn ndcg_at_5_zero_search_results_is_positive_zero_not_negative_zero() {
+        // A query with relevant docs (idcg > 0) but zero search results
+        // (e.g. a filtered-out temporal query): DCG sums over an empty
+        // iterator, which `Sum for f64` folds from -0.0. -0.0 == 0.0
+        // numerically (this assert would pass either way), but a JSON
+        // report showing "-0.0" reads as a bug to anyone skimming
+        // baseline.json, so also assert the sign bit explicitly.
+        let r: Vec<String> = vec![];
+        let rel = relmap(&[("a", 2)]);
+
+        let n = ndcg_at_k(&r, &rel, 5);
+
+        assert_eq!(n, 0.0);
+        assert!(n.is_sign_positive(), "expected +0.0, got -0.0");
+    }
+
     // ---- dedup_by_source_file ----
 
     #[test]
@@ -720,13 +792,17 @@ mod tests {
     }
 
     fn qm(id: &str, reciprocal_rank: f64) -> QueryMetrics {
+        qm_ndcg(id, reciprocal_rank, 0.0)
+    }
+
+    fn qm_ndcg(id: &str, reciprocal_rank: f64, ndcg_at_5: f64) -> QueryMetrics {
         QueryMetrics {
             id: id.to_string(),
             category: "test".to_string(),
             precision_at_5: 0.0,
             precision_at_5_ceiling: 1.0,
             reciprocal_rank,
-            ndcg_at_5: 0.0,
+            ndcg_at_5,
             latency_ms: 0.0,
             ranked: vec![],
         }
@@ -792,5 +868,65 @@ mod tests {
 
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("missing from current run"));
+    }
+
+    #[test]
+    fn check_regressions_per_query_rank_slide_fails_even_though_aggregate_hides_it() {
+        // A single query's RR sliding from rank 1 (RR 1.0) to rank 3
+        // (RR 0.333) only moves the 14-query aggregate mean MRR by
+        // ~0.048 (0.667 / 14) — under the 0.05 aggregate threshold — but
+        // the per-query drop (0.667) is far past MAX_PER_QUERY_RR_DROP and
+        // must fail on its own.
+        let base_queries: Vec<QueryMetrics> = (0..14)
+            .map(|i| qm(&format!("Q{i}"), if i == 0 { 1.0 } else { 0.7 }))
+            .collect();
+        let mut cur_queries = base_queries.clone();
+        cur_queries[0] = qm("Q0", 1.0 / 3.0);
+
+        let baseline_mean_mrr = base_queries.iter().map(|q| q.reciprocal_rank).sum::<f64>() / 14.0;
+        let current_mean_mrr = cur_queries.iter().map(|q| q.reciprocal_rank).sum::<f64>() / 14.0;
+        assert!(
+            baseline_mean_mrr - current_mean_mrr < MAX_MRR_DROP,
+            "test setup invariant broken: aggregate drop should hide under the aggregate threshold"
+        );
+
+        let baseline = mode_report(0.80, baseline_mean_mrr, 0.75, base_queries);
+        let current = mode_report(0.80, current_mean_mrr, 0.75, cur_queries);
+
+        let failures = check_regressions(&baseline, &current);
+
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("Q0") && f.contains("reciprocal rank")),
+            "expected a per-query reciprocal rank failure for Q0, got: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn check_regressions_per_query_grade_downgrade_fails_via_ndcg_even_though_rr_unchanged() {
+        // Top-1 result silently replaced by a lower-graded relevant doc:
+        // reciprocal rank is unchanged (still rank 1 -> RR 1.0 either way),
+        // so the RR-based checks see nothing. nDCG@5 is graded-relevance-
+        // aware and must catch this on its own.
+        let baseline = mode_report(0.80, 0.70, 0.75, vec![qm_ndcg("E1", 1.0, 1.0)]);
+        let current = mode_report(0.80, 0.70, 0.75, vec![qm_ndcg("E1", 1.0, 0.333)]);
+
+        let failures = check_regressions(&baseline, &current);
+
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("E1") && f.contains("nDCG@5")),
+            "expected a per-query nDCG@5 failure for E1, got: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn check_regressions_per_query_small_jitter_within_threshold_passes() {
+        let baseline = mode_report(0.80, 0.70, 0.75, vec![qm_ndcg("E1", 1.0, 1.0)]);
+        let current = mode_report(0.80, 0.70, 0.75, vec![qm_ndcg("E1", 0.9, 0.9)]);
+
+        assert!(check_regressions(&baseline, &current).is_empty());
     }
 }
