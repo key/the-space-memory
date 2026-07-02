@@ -243,89 +243,12 @@ tsm also honors `RUST_LOG` (log level, default `info`) and `NO_COLOR`
 ## Benchmarks
 
 Performance benches for the search/index pipeline, plus a CI regression
-gate (`.github/workflows/bench.yml`) that runs on every PR touching
-`src/`, `benches/`, or `Cargo.toml`.
-
-**Only `embedder_calls` (full-index and single-query-hybrid call counts)
-is regression-gated**, on exact equality — it's deterministic for a fixed
-corpus and batching strategy. Indexing throughput and search latency are
-recorded into the CI job summary for trend visibility only, explicitly
-labeled "recorded, not gated": on the current 5-file testdata corpus,
-hybrid search latency swung 15-49% between two back-to-back runs on an
-idle machine with zero code changes, and incremental single-file reindex
-latency showed a ~3.4x warm-up transient across 5 identical runs — no
-percentage threshold at this corpus size would separate a real regression
-from noise. Revisit gating those metrics once the corpus is meaningfully
-larger.
-
-### Prerequisites
-
-- `tsmd` running with embedder ready (`tsm start` and verify via `tsm status`)
-- The standard testdata corpus indexed:
-
-  ```bash
-  cd tests/e2e/testdata
-  tsm init && tsm index
-  ```
-
-### Running
-
-```bash
-# Search latency (hybrid: FTS5 + vector + entity) — human-facing criterion
-# exploration, statistical distributions printed to the terminal.
-cargo bench --bench search_latency
-
-# Full metrics recording (indexing throughput with Prepare/Persist/Embed
-# breakdown, incremental-index latency, hybrid search latency, embedder
-# call counts) — the CI-facing tool. Prints one JSON document to stdout
-# matching benches/baseline.json's schema.
-cargo bench --features bench-counters --bench record_metrics
-```
-
-Every probe query in both benches must return at least one hit — a
-zero-hit query lets `searcher::search` short-circuit before reaching the
-embedder or FTS5, so its latency measures an early-return path, not
-search work (observed: microseconds instead of hundreds of milliseconds
-for a real query).
-
-### Regression gate
-
-`tsm-bench-check` is the pure diff/threshold logic (unit-tested in
-`src/bench_baseline.rs`) behind a thin CLI shell:
-
-```bash
-cargo run --bin tsm-bench-check -- benches/baseline.json current.json
-```
-
-Exit codes: `0` (no regression, or `benches/baseline.json` doesn't exist
-yet — reported as `BOOTSTRAP`, not a silent pass), `1` (an embedder call
-count regressed), `2` (usage error or a file that fails to parse). A PR
-label, `bench-baseline-bump`, skips the gate job entirely for a change
-that legitimately alters call counts or recorded numbers on purpose; the
-next merge-to-main run then adopts the new numbers as the baseline.
-
-`benches/baseline.json` is bootstrapped by the first CI run rather than
-committed with locally-measured numbers, since the gate is scoped to the
-CI environment (`ubuntu-latest`, CPU inference) and a macOS developer
-machine's numbers wouldn't be comparable.
-
-### Embedder call counter
-
-For benches that need to verify embedder call counts, build with the
-`bench-counters` feature. Off by default; release builds compile the
-counters out entirely.
-
-```bash
-cargo build --features bench-counters
-```
-
-```rust
-use the_space_memory::embedder::counters;
-
-counters::reset_embedder_calls();
-// ... run code that calls embed_via_socket_at ...
-println!("calls: {}", counters::embedder_call_count());
-```
+gate that runs on every PR touching `src/`, `benches/`, or `Cargo.toml`.
+Only embedder call counts are regression-gated (deterministic, exact
+equality); indexing throughput and search latency are recorded for trend
+visibility only. See [docs/benchmarks.md](docs/benchmarks.md) for the
+full design rationale, how to run the benches locally, and the CI
+workflow internals.
 
 ## Documentation
 
@@ -334,6 +257,7 @@ println!("calls: {}", counters::embedder_call_count());
 - [Data Flow](docs/data-flow.md) — Indexing and search flow diagrams
 - [Configuration](docs/configuration.md) — Environment variables and config file reference
 - [User Dictionary](docs/user-dictionary.md) — Custom dictionary management
+- [Benchmarks](docs/benchmarks.md) — Perf benches, CI regression gate, baseline lifecycle
 - [Design Decisions](decisions/) — ADR (Architecture Decision Records)
 
 ## Background

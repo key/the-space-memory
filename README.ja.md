@@ -232,85 +232,11 @@ end
 ## ベンチマーク
 
 検索・インデックスパイプラインの性能ベンチと、`src/`・`benches/`・`Cargo.toml`
-を変更する全 PR で走る CI リグレッションゲート（`.github/workflows/bench.yml`）。
-
-**リグレッションゲートの対象は `embedder_calls`（フルインデックス時・単一クエリ
-ハイブリッド検索時の呼び出し回数）のみ**で、完全一致で判定する。固定コーパス・
-固定バッチ戦略のもとでは決定的な値になるため。インデックススループットと検索
-レイテンシは CI のジョブサマリに「recorded, not gated（記録のみ・ゲート対象外）」
-と明示した上で記録するだけに留める。現状の 5 ファイル testdata コーパスでは、
-無変更のコード・アイドル状態のマシンでも連続 2 回の実行でハイブリッド検索
-レイテンシが 15〜49% 振れ、単一ファイルの差分再インデックスも 5 回連続実行で
-約 3.4 倍のウォームアップ変動を示した。このコーパス規模ではどんな割合閾値も
-本物のリグレッションとノイズを区別できない。コーパスが十分に拡大した段階で
-ゲート化を再検討する。
-
-### 前提条件
-
-- `tsmd` が embedder 準備完了で稼働中（`tsm start` 後 `tsm status` で確認）
-- 標準の testdata コーパスがインデックス済み:
-
-  ```bash
-  cd tests/e2e/testdata
-  tsm init && tsm index
-  ```
-
-### 実行
-
-```bash
-# 検索レイテンシ（ハイブリッド: FTS5 + ベクター + エンティティ）— 人間向けの
-# criterion 探索ツール。統計分布をターミナルに表示する。
-cargo bench --bench search_latency
-
-# フルメトリクス記録（Prepare/Persist/Embed 段別内訳付きインデックス
-# スループット、差分インデックスレイテンシ、ハイブリッド検索レイテンシ、
-# embedder 呼び出し回数）— CI 向けツール。benches/baseline.json と同じ
-# スキーマの JSON を stdout に1つ出力する。
-cargo bench --features bench-counters --bench record_metrics
-```
-
-両ベンチのプローブクエリは必ず1件以上ヒットする必要がある。0件ヒットの
-クエリは `searcher::search` が embedder や FTS5 に到達する前に早期リターン
-するため、そのレイテンシは検索の実処理ではなく早期リターン経路を計測して
-しまう（実測: 実クエリの数百ミリ秒に対し、0件ヒットクエリは数マイクロ秒）。
-
-### リグレッションゲート
-
-`tsm-bench-check` は純粋な diff/閾値判定ロジック（`src/bench_baseline.rs` で
-ユニットテスト済み）を薄い CLI シェルでラップしたもの:
-
-```bash
-cargo run --bin tsm-bench-check -- benches/baseline.json current.json
-```
-
-終了コード: `0`（リグレッションなし、または `benches/baseline.json` が
-まだ存在しない ── サイレントパスではなく `BOOTSTRAP` として明示的に報告）、
-`1`（embedder 呼び出し回数がリグレッション）、`2`（使用法エラー、または
-パース不能なファイル）。PR ラベル `bench-baseline-bump` を付けると意図的な
-呼び出し回数・記録値の変更に対してゲートジョブ自体をスキップでき、次回の
-main マージ後に新しい値がベースラインとして採用される。
-
-`benches/baseline.json` はローカルで計測した値をコミットするのではなく、
-最初の CI 実行でブートストラップする。ゲートは CI 環境（`ubuntu-latest`、
-CPU 推論）に限定されており、macOS 開発機での値は比較対象にならないため。
-
-### Embedder 呼び出しカウンタ
-
-embedder の呼び出し回数を検証したいベンチでは、`bench-counters` フィーチャを
-有効にしてビルドする。デフォルトでは無効で、リリースビルドではカウンタが
-完全にコンパイルアウトされる。
-
-```bash
-cargo build --features bench-counters
-```
-
-```rust
-use the_space_memory::embedder::counters;
-
-counters::reset_embedder_calls();
-// ... embed_via_socket_at を呼ぶコードを実行 ...
-println!("calls: {}", counters::embedder_call_count());
-```
+を変更する全 PR で走る CI リグレッションゲート。リグレッションゲートの対象は
+embedder 呼び出し回数のみ（決定的な値のため完全一致判定）で、インデックス
+スループットと検索レイテンシは記録のみでゲート対象外。設計の背景、ローカルでの
+実行方法、CI ワークフローの内部構造は
+[docs/benchmarks.md](docs/benchmarks.md)（英語）を参照。
 
 ## ドキュメント
 
@@ -319,6 +245,7 @@ println!("calls: {}", counters::embedder_call_count());
 - [データフロー](docs/data-flow.md) — インデックスと検索のフロー図
 - [設定リファレンス](docs/configuration.md) — 環境変数と設定ファイルのリファレンス
 - [ユーザー辞書](docs/user-dictionary.md) — カスタム辞書の管理
+- [ベンチマーク](docs/benchmarks.md) — 性能ベンチ、CI リグレッションゲート、ベースラインのライフサイクル
 - [設計判断](decisions/) — ADR（アーキテクチャ決定記録）
 
 ## 背景
