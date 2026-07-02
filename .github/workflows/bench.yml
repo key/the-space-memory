@@ -1,0 +1,219 @@
+name: Bench
+
+# Only `embedder_calls` (full-index and single-query-hybrid call counts) is
+# regression-gated on PRs — it's deterministic for a fixed corpus and
+# batching strategy. Indexing throughput and search latency are recorded
+# into the job summary for trend visibility only: on the current 5-file
+# testdata corpus, hybrid search latency swung 15-49% between two
+# back-to-back runs on an idle machine with zero code changes, and
+# incremental single-file reindex latency showed a ~3.4x warm-up transient
+# across 5 identical runs — no percentage threshold at this corpus size
+# would separate a real regression from noise.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/bench.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+jobs:
+  gate:
+    # A PR may legitimately move the recorded numbers (e.g. a deliberate
+    # perf trade-off for a new feature) without regressing embedder call
+    # counts, or may need to adjust the call counts themselves on purpose;
+    # `bench-baseline-bump` skips the gate so the nightly job's next run
+    # picks up the new numbers as the baseline.
+    if: >-
+      github.event_name != 'pull_request' ||
+      !contains(github.event.pull_request.labels.*.name, 'bench-baseline-bump')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: Build release binaries (bench-counters)
+        run: cargo build --release --features bench-counters
+
+      - name: Cache ruri-v3-30m model
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ runner.temp }}/tsm-models
+          key: ruri-v3-30m-model
+
+      - name: Add binaries to PATH
+        run: echo "${{ github.workspace }}/target/release" >> "$GITHUB_PATH"
+
+      - name: Download model
+        run: tsm setup
+        env:
+          HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
+          TSM_CACHE_DIR: ${{ github.workspace }}/.tsm
+          TSM_STATE_DIR: ${{ github.workspace }}/.tsm
+
+      - name: Index testdata corpus
+        working-directory: tests/e2e/testdata
+        run: |
+          tsm init
+          tsm start
+          tsm index
+        env:
+          HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
+          TSM_CACHE_DIR: ${{ github.workspace }}/.tsm
+
+      - name: Wait for vector backfill
+        working-directory: tests/e2e/testdata
+        run: |
+          for _ in $(seq 1 30); do
+            tsm status | grep -qE "Vectors:.*100%" && exit 0
+            sleep 2
+          done
+          echo "::error::vector backfill did not reach 100% in time"
+          exit 1
+
+      - name: Record current-run metrics
+        working-directory: tests/e2e/testdata
+        run: |
+          cargo bench \
+            --manifest-path "${{ github.workspace }}/Cargo.toml" \
+            --features bench-counters --bench record_metrics \
+            > "${{ runner.temp }}/current.json"
+
+      - name: Stop daemon
+        if: always()
+        working-directory: tests/e2e/testdata
+        run: tsm stop || true
+
+      - name: Regression gate
+        run: |
+          cargo run --quiet --bin tsm-bench-check -- \
+            benches/baseline.json "${{ runner.temp }}/current.json" \
+            | tee "${{ runner.temp }}/gate-report.txt"
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Bench gate result"
+            echo ""
+            echo "Only \`embedder_calls\` is regression-gated (exact equality)."
+            echo "Indexing throughput and search latency below are **recorded,"
+            echo "not gated** — see the workflow file header for why."
+            echo ""
+            echo '```'
+            cat "${{ runner.temp }}/gate-report.txt" 2>/dev/null || echo "(no report produced)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  update-baseline:
+    # Runs after every merge to main rather than on a separate cron schedule
+    # — main only accepts squash-merged PRs, so this already fires at most
+    # once per landed change, which is the granularity a "nightly" baseline
+    # update is trying to approximate.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: Build release binaries (bench-counters)
+        run: cargo build --release --features bench-counters
+
+      - name: Cache ruri-v3-30m model
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ runner.temp }}/tsm-models
+          key: ruri-v3-30m-model
+
+      - name: Add binaries to PATH
+        run: echo "${{ github.workspace }}/target/release" >> "$GITHUB_PATH"
+
+      - name: Download model
+        run: tsm setup
+        env:
+          HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
+          TSM_CACHE_DIR: ${{ github.workspace }}/.tsm
+          TSM_STATE_DIR: ${{ github.workspace }}/.tsm
+
+      - name: Index testdata corpus
+        working-directory: tests/e2e/testdata
+        run: |
+          tsm init
+          tsm start
+          tsm index
+        env:
+          HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
+          TSM_CACHE_DIR: ${{ github.workspace }}/.tsm
+
+      - name: Wait for vector backfill
+        working-directory: tests/e2e/testdata
+        run: |
+          for _ in $(seq 1 30); do
+            tsm status | grep -qE "Vectors:.*100%" && exit 0
+            sleep 2
+          done
+          echo "::error::vector backfill did not reach 100% in time"
+          exit 1
+
+      - name: Record metrics
+        working-directory: tests/e2e/testdata
+        run: |
+          cargo bench \
+            --manifest-path "${{ github.workspace }}/Cargo.toml" \
+            --features bench-counters --bench record_metrics \
+            > "${{ github.workspace }}/benches/baseline.json"
+
+      - name: Stop daemon
+        if: always()
+        working-directory: tests/e2e/testdata
+        run: tsm stop || true
+
+      - name: Open baseline update PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet -- benches/baseline.json; then
+            echo "benches/baseline.json unchanged, nothing to do."
+            exit 0
+          fi
+          gh label create bench-baseline-bump \
+            --description "Skips the bench regression gate for this PR" \
+            --color BFD4F2 2>/dev/null || true
+          BRANCH="chore/bench-baseline-update-$(date -u +%Y%m%d-%H%M%S)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add benches/baseline.json
+          git commit -m "chore(bench): update performance baseline"
+          git push origin "$BRANCH"
+          BODY="Automated update of \`benches/baseline.json\` from the post-merge run on \`main\`."
+          BODY="$BODY Only \`embedder_calls\` is regression-gated; indexing and"
+          BODY="$BODY search numbers are recorded for trend visibility only."
+          gh pr create \
+            --title "chore(bench): update performance baseline" \
+            --body "$BODY" \
+            --label bench-baseline-bump

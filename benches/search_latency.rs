@@ -17,7 +17,13 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use the_space_memory::{config, db, embedder, searcher};
 
-const QUERIES: &[&str] = &["銀河", "坊っちゃん", "メロス", "夏目", "走れ"];
+// Every probe query must return at least one hit. A zero-hit query lets
+// `searcher::search` short-circuit before it ever reaches the embedder or
+// FTS5, so its latency measures an early-return path, not search work — on
+// this corpus, a zero-hit query ran in single-digit microseconds versus
+// 120-370ms for a real hybrid search, a ~40,000x gap unrelated to any code
+// change. `"走れ"` (an earlier probe, since replaced) was such a query.
+const QUERIES: &[&str] = &["銀河", "坊っちゃん", "メロス", "夏目", "猫"];
 const TOP_K: usize = 5;
 
 fn bench_search_hybrid(c: &mut Criterion) {

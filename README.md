@@ -242,9 +242,21 @@ tsm also honors `RUST_LOG` (log level, default `info`) and `NO_COLOR`
 
 ## Benchmarks
 
-Performance benches for the search/index pipeline. Currently only the
-search latency bench is implemented; indexing benches and the CI
-regression gate ship in a follow-up PR (see [#181](https://github.com/key/the-space-memory/issues/181)).
+Performance benches for the search/index pipeline, plus a CI regression
+gate (`.github/workflows/bench.yml`) that runs on every PR touching
+`src/`, `benches/`, or `Cargo.toml`.
+
+**Only `embedder_calls` (full-index and single-query-hybrid call counts)
+is regression-gated**, on exact equality — it's deterministic for a fixed
+corpus and batching strategy. Indexing throughput and search latency are
+recorded into the CI job summary for trend visibility only, explicitly
+labeled "recorded, not gated": on the current 5-file testdata corpus,
+hybrid search latency swung 15-49% between two back-to-back runs on an
+idle machine with zero code changes, and incremental single-file reindex
+latency showed a ~3.4x warm-up transient across 5 identical runs — no
+percentage threshold at this corpus size would separate a real regression
+from noise. Revisit gating those metrics once the corpus is meaningfully
+larger.
 
 ### Prerequisites
 
@@ -259,9 +271,43 @@ regression gate ship in a follow-up PR (see [#181](https://github.com/key/the-sp
 ### Running
 
 ```bash
-# Search latency (hybrid: FTS5 + vector + entity)
+# Search latency (hybrid: FTS5 + vector + entity) — human-facing criterion
+# exploration, statistical distributions printed to the terminal.
 cargo bench --bench search_latency
+
+# Full metrics recording (indexing throughput with Prepare/Persist/Embed
+# breakdown, incremental-index latency, hybrid search latency, embedder
+# call counts) — the CI-facing tool. Prints one JSON document to stdout
+# matching benches/baseline.json's schema.
+cargo bench --features bench-counters --bench record_metrics
 ```
+
+Every probe query in both benches must return at least one hit — a
+zero-hit query lets `searcher::search` short-circuit before reaching the
+embedder or FTS5, so its latency measures an early-return path, not
+search work (observed: microseconds instead of hundreds of milliseconds
+for a real query).
+
+### Regression gate
+
+`tsm-bench-check` is the pure diff/threshold logic (unit-tested in
+`src/bench_baseline.rs`) behind a thin CLI shell:
+
+```bash
+cargo run --bin tsm-bench-check -- benches/baseline.json current.json
+```
+
+Exit codes: `0` (no regression, or `benches/baseline.json` doesn't exist
+yet — reported as `BOOTSTRAP`, not a silent pass), `1` (an embedder call
+count regressed), `2` (usage error or a file that fails to parse). A PR
+label, `bench-baseline-bump`, skips the gate job entirely for a change
+that legitimately alters call counts or recorded numbers on purpose; the
+next merge-to-main run then adopts the new numbers as the baseline.
+
+`benches/baseline.json` is bootstrapped by the first CI run rather than
+committed with locally-measured numbers, since the gate is scoped to the
+CI environment (`ubuntu-latest`, CPU inference) and a macOS developer
+machine's numbers wouldn't be comparable.
 
 ### Embedder call counter
 
