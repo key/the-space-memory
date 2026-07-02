@@ -25,16 +25,30 @@ on:
       - "benches/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/workflows/bench.yml"
+
+# Explicit `bash` (not the platform default) so every `run:` step gets
+# `-o pipefail`: a `cmd | tee file` step must fail when `cmd` fails, not
+# report `tee`'s always-zero exit code.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   gate:
+    # Compares the current run against the last committed baseline, so it
+    # only makes sense on a PR (or a manual dispatch to test the workflow
+    # itself) — a push to main has nothing to compare against that
+    # `update-baseline` doesn't already handle, and running both would
+    # double the ~20-minute CI cost on every merge.
+    #
     # A PR may legitimately move the recorded numbers (e.g. a deliberate
     # perf trade-off for a new feature) without regressing embedder call
     # counts, or may need to adjust the call counts themselves on purpose;
-    # `bench-baseline-bump` skips the gate so the nightly job's next run
-    # picks up the new numbers as the baseline.
+    # `bench-baseline-bump` skips the gate so the next `update-baseline`
+    # run picks up the new numbers as the baseline.
     if: >-
-      github.event_name != 'pull_request' ||
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') &&
       !contains(github.event.pull_request.labels.*.name, 'bench-baseline-bump')
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -49,6 +63,17 @@ jobs:
 
       - name: Build release binaries (bench-counters)
         run: cargo build --release --features bench-counters
+
+      # Compiled ahead of `tsm start`, not after: `cargo bench` pulls in
+      # criterion and its dependency tree (not part of the release build
+      # above, since they're dev-dependencies), and that compile is CPU-
+      # heavy enough to starve the live embedder daemon's scheduling for
+      # several seconds — observed in CI as "Embedder not reachable"
+      # immediately after `tsm status` had just reported a genuine 100%
+      # vector backfill moments earlier. Compiling here, before the daemon
+      # exists, removes the contention window entirely.
+      - name: Pre-build record_metrics bench
+        run: cargo bench --features bench-counters --bench record_metrics --no-run
 
       - name: Cache ruri-v3-30m model
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -105,6 +130,8 @@ jobs:
             --manifest-path "${{ github.workspace }}/Cargo.toml" \
             --features bench-counters --bench record_metrics \
             > "${{ runner.temp }}/current.json"
+        env:
+          TSM_BENCH_ENV: ubuntu-latest-cpu
 
       - name: Stop daemon
         if: always()
@@ -143,6 +170,11 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    # Two merges landing close together must not race to open competing
+    # baseline-update PRs — queue them instead of cancelling either.
+    concurrency:
+      group: bench-baseline-update
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
@@ -154,6 +186,17 @@ jobs:
 
       - name: Build release binaries (bench-counters)
         run: cargo build --release --features bench-counters
+
+      # Compiled ahead of `tsm start`, not after: `cargo bench` pulls in
+      # criterion and its dependency tree (not part of the release build
+      # above, since they're dev-dependencies), and that compile is CPU-
+      # heavy enough to starve the live embedder daemon's scheduling for
+      # several seconds — observed in CI as "Embedder not reachable"
+      # immediately after `tsm status` had just reported a genuine 100%
+      # vector backfill moments earlier. Compiling here, before the daemon
+      # exists, removes the contention window entirely.
+      - name: Pre-build record_metrics bench
+        run: cargo bench --features bench-counters --bench record_metrics --no-run
 
       - name: Cache ruri-v3-30m model
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -210,6 +253,8 @@ jobs:
             --manifest-path "${{ github.workspace }}/Cargo.toml" \
             --features bench-counters --bench record_metrics \
             > "${{ github.workspace }}/benches/baseline.json"
+        env:
+          TSM_BENCH_ENV: ubuntu-latest-cpu
 
       - name: Stop daemon
         if: always()

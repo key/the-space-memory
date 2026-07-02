@@ -63,13 +63,23 @@ fn corpus_files() -> Vec<PathBuf> {
 /// Preflight: confirm the embedder is reachable so the recorded numbers
 /// actually measure CPU inference, not a silent FTS-only fallback (see the
 /// same check in `search_latency.rs`).
-fn assert_embedder_reachable() {
+///
+/// Called both before and after each measurement phase in `main`, not just
+/// once at startup: `embed::insert_vectors` and `searcher::search` (with
+/// `require_vector=false`) both degrade silently — an empty `Option` or a
+/// quiet FTS-only fallback, no error — when the embedder socket disappears
+/// mid-run. `tsmd` does not restart a crashed embedder child automatically,
+/// so a mid-run death would otherwise show up only as suspiciously fast,
+/// suspiciously low-call-count numbers, not a failed CI run. Tagging each
+/// call with `stage` pinpoints where a dead embedder was first observed.
+fn assert_embedder_reachable(stage: &str) {
     let probe = embedder::embed_via_socket(&[String::from("preflight")]);
     assert!(
         probe.is_some(),
-        "Embedder not reachable — record_metrics needs the real embedder \
-         (mocking would defeat the point of a CPU-inference baseline). \
-         Run `tsm start` and verify `tsm status` before running this bench."
+        "Embedder not reachable ({stage}) — record_metrics needs the real \
+         embedder for every phase (mocking, or a silent fallback partway \
+         through, would defeat the point of a CPU-inference baseline). Run \
+         `tsm start` and verify `tsm status` before running this bench."
     );
 }
 
@@ -194,6 +204,13 @@ fn measure_hybrid_search(conn: &Connection) -> (SearchMetrics, u64) {
     let single_query_hybrid_calls = counters::embedder_call_count();
 
     let mut by_query = BTreeMap::new();
+    // Pooled, warmup-trimmed raw per-request latencies across all queries.
+    // `hybrid_ms.p50`/`p95` are computed over this pool — a genuine
+    // request-latency distribution — rather than over the 5 per-query
+    // means, which would understate tail latency and misrepresent what a
+    // "p95" is supposed to mean. `by_query` below stays per-query (that's
+    // what its name promises).
+    let mut pooled_samples: Vec<f64> = Vec::with_capacity(SEARCH_QUERIES.len() * SEARCH_SAMPLES);
     for &q in SEARCH_QUERIES {
         let mut samples = Vec::with_capacity(SEARCH_SAMPLES);
         for _ in 0..SEARCH_SAMPLES {
@@ -209,10 +226,15 @@ fn measure_hybrid_search(conn: &Connection) -> (SearchMetrics, u64) {
             );
         }
         by_query.insert(q.to_string(), mean_or_raw(&samples, WARMUP));
+        let trimmed = if samples.len() > WARMUP {
+            &samples[WARMUP..]
+        } else {
+            &samples[..]
+        };
+        pooled_samples.extend_from_slice(trimmed);
     }
 
-    let mut values: Vec<f64> = by_query.values().copied().collect();
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    pooled_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     (
         SearchMetrics {
@@ -220,8 +242,8 @@ fn measure_hybrid_search(conn: &Connection) -> (SearchMetrics, u64) {
             // search_latency.rs); left zeroed until that lands.
             fts5_only_ms: LatencyStats::default(),
             hybrid_ms: LatencyStats {
-                p50: percentile(&values, 50.0),
-                p95: percentile(&values, 95.0),
+                p50: percentile(&pooled_samples, 50.0),
+                p95: percentile(&pooled_samples, 95.0),
                 by_query,
             },
         },
@@ -230,12 +252,14 @@ fn measure_hybrid_search(conn: &Connection) -> (SearchMetrics, u64) {
 }
 
 fn main() {
-    assert_embedder_reachable();
+    assert_embedder_reachable("preflight");
 
     let files = corpus_files();
     let project_root = testdata_dir();
     let (full_throughput, full_index_calls) = measure_full_index(&files, &project_root);
+    assert_embedder_reachable("after full-index measurement");
     let incremental_latency_seconds = measure_incremental(&files[0]);
+    assert_embedder_reachable("after incremental-index measurement");
 
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path).unwrap_or_else(|e| {
@@ -246,6 +270,7 @@ fn main() {
         );
     });
     let (search, single_query_hybrid_calls) = measure_hybrid_search(&conn);
+    assert_embedder_reachable("after search-latency measurement");
 
     let baseline = Baseline {
         schema_version: "1".to_string(),
