@@ -29,18 +29,24 @@ queries:
       - doc: search-engine/sqlite-fts5.md
         grade: 1
 
+  - id: E2
+    category: entity
+    query: "赤道儀"
+    relevant:
+      - doc: astro-photo/mount-select.md
+        grade: 2
+      - doc: astro-photo/observation-report.md
+        grade: 2
+      - doc: astro-photo/guiding-troubleshooting.md
+        grade: 1
+      - doc: astro-photo/stacking-software.md
+        grade: 1
+
   - id: E3
     category: entity
     query: "candle"
     relevant:
       - doc: search-engine/candle-embedding.md
-        grade: 2
-
-  - id: E4
-    category: entity
-    query: "狩猟免許"
-    relevant:
-      - doc: hunting/license-renewal.md
         grade: 2
 
   - id: F1
@@ -52,6 +58,17 @@ queries:
       - doc: hunting/handload-safety.md
         grade: 1
 
+  - id: F2
+    category: fts-basic
+    query: "自家焙煎"
+    relevant:
+      - doc: coffee-roast/concept-overview.md
+        grade: 2
+      - doc: coffee-roast/roaster-equipment.md
+        grade: 2
+      - doc: coffee-roast/cost-notes.md
+        grade: 2
+
   - id: F3
     category: fts-basic
     query: "SQLite 全文検索"
@@ -61,13 +78,17 @@ queries:
       - doc: search-engine/rust-search-arch.md
         grade: 1
 
-  - id: F4
-    category: fts-basic
-    query: "家庭菜園"
+  - id: V1
+    category: vector-semantic
+    query: "夜間に望遠鏡を天体に向けたまま長時間ずれないように保つには"
     relevant:
-      - doc: garden/tomato-growing.md
+      - doc: astro-photo/mount-select.md
         grade: 2
-      - doc: garden/compost-tips.md
+      - doc: astro-photo/observation-report.md
+        grade: 2
+      - doc: astro-photo/guiding-troubleshooting.md
+        grade: 1
+      - doc: astro-photo/stacking-software.md
         grade: 1
 
   - id: V2

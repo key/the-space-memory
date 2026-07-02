@@ -29,12 +29,12 @@ appear in a public repository. Annotating those queries with
 relevant-document IDs would require either shipping a slice of that
 private corpus into a public repository, or a corpus that doesn't actually
 match the queries. Neither is workable for an automated, CI-run gate, so
-this harness ships its own small, self-contained corpus and query set
-instead, restricted to topics with no product, business, or in-development
-project content: this repository's own tech stack, and two personal-hobby
-domains of the corpus author. `tests/search-test-patterns.md` remains the
-reference for manual, exploratory quality checks against a real workspace;
-this harness is the automated regression gate.
+this harness ships its own entirely fictional, self-contained corpus and
+query set instead — chosen to have no topical or functional overlap with
+any real project, product, or business content.
+`tests/search-test-patterns.md` remains the reference for manual,
+exploratory quality checks against a real workspace; this harness is the
+automated regression gate.
 
 ### Why graded relevance, not binary
 
@@ -57,7 +57,7 @@ a document is edited, when `MAX_CHUNK_CHARS` changes, or when the
 chunker's heading-detection logic changes — so pinning judgments to a
 chunk ID would make the golden set fragile to unrelated changes.
 Empirically, this corpus's documents are short enough that each produces
-close to one chunk each (13 documents → 17 chunks), so the practical
+close to one chunk each (20 documents → 29 chunks), so the practical
 difference is small, but the judgment format doesn't depend on that
 staying true.
 
@@ -69,7 +69,7 @@ targets. It gates on regression relative to a committed baseline instead,
 for two reasons:
 
 1. **The targets are corpus-dependent, and this corpus makes some of them
-   structurally unreachable.** Most queries in this 13-document corpus
+   structurally unreachable.** Most queries in this 20-document corpus
    have fewer than 5 gold-relevant documents by design — a query about
    one narrow topic in a small, multi-cluster corpus naturally has 1–4
    relevant documents, not 5+. Even a perfect ranking can only put those
@@ -79,9 +79,9 @@ for two reasons:
    `oracle_precision_at_k`: `min(relevant_count, k) / k`, i.e. Precision@5
    under an ideal ranking, and reported alongside the measured value as
    `mean_precision_at_5_ceiling` in `baseline.json`. On the current
-   corpus the ceiling is 0.385 — already below the 80% target — so a
+   corpus the ceiling is 0.471 — already below the 80% target — so a
    measured Precision@5 should be read against the ceiling (currently
-   measuring at 88% of it), not against 1.0 or the aspirational figure.
+   measuring at 91% of it), not against 1.0 or the aspirational figure.
 2. **The point of this harness is regression detection for ongoing
    tuning work, not a one-time bar to clear.** A PR that changes scoring
    parameters, dictionary entries, or hooks should be judged on whether
@@ -93,10 +93,10 @@ for two reasons:
 The gate checks aggregate mean drops (Precision@5 / MRR / nDCG@5, each
 capped at a 0.05 absolute drop) *and* per-query drops, for a reason
 discovered during review: aggregate-only thresholds are evadable by
-dilution. A single query's relevant result sliding from rank 1 to rank 2
-(reciprocal rank 1.0 → 0.5) only moves a 13-query aggregate mean MRR by
-about 0.038 — under the aggregate threshold — even though that one
-query regressed. Per-query gates close this: each query's own
+dilution. A single query's relevant result sliding from rank 1 to rank 3
+(reciprocal rank 1.0 → 0.333) only moves a 14-query aggregate mean MRR by
+about 0.048 — under the aggregate threshold — even though that one
+query regressed badly. Per-query gates close this: each query's own
 reciprocal rank and nDCG@5 are checked against baseline independently,
 with a 0.2 max-drop threshold (loose enough to tolerate this corpus's
 naturally coarse-grained jitter between adjacent low-relevance ranks,
@@ -118,8 +118,8 @@ if it also affects other queries.
 
 | Path | Contents |
 |---|---|
-| `tests/golden/corpus/` | 13 Markdown documents across 3 topic clusters, deliberately restricted to content with no product, business, or in-development project overlap: `search-engine/` (this repo's own stack — rust, lindera, candle, SQLite), `hunting/` (射撃/ハンドロード/狩猟, a personal hobby domain of the corpus author, not a product or business), and `garden/` (a distractor cluster with no topical overlap to the other two, used as a negative control). Two documents (`hunting/season-report-{recent,old}.md`) exist solely to exercise temporal filtering. |
-| `tests/golden/queries.yaml` | 13 queries. Each has an `id`, a `category` (entity / fts-basic / vector-semantic / mixed / temporal / distractor), the `query` text, and a `relevant` list of `{doc, grade}` judgments (`doc` is a corpus-relative path, `grade` is 0–2). |
+| `tests/golden/corpus/` | 20 Markdown documents across 5 fictional topic clusters, chosen to have no overlap with any real project or business: `search-engine/` (this repo's own stack — rust, lindera, candle, SQLite), `astro-photo/` (amateur astrophotography), `hunting/` (射撃/ハンドロード/狩猟, a genuinely private hobby domain of the corpus author with no product/business content), `coffee-roast/` (home coffee roasting), and `garden/` (a distractor cluster with no topical overlap, used as a negative control). Two documents (`hunting/season-report-{recent,old}.md`) exist solely to exercise temporal filtering. |
+| `tests/golden/queries.yaml` | 14 queries. Each has an `id`, a `category` (entity / fts-basic / vector-semantic / mixed / temporal / distractor), the `query` text, and a `relevant` list of `{doc, grade}` judgments (`doc` is a corpus-relative path, `grade` is 0–2). |
 | `tests/golden/baseline.json` | The committed baseline: a `ModeReport` for the `hybrid` mode — `mean_precision_at_5`, `mean_precision_at_5_ceiling`, `mean_mrr`, `mean_ndcg_at_5`, `mean_latency_ms`, and a `per_query` array of the same metrics plus `id`, `category`, `latency_ms`, and `ranked` (the actual result list at measurement time). |
 | `tests/quality_bench.rs` | Pure metric functions (`precision_at_k`, `reciprocal_rank`, `ndcg_at_k`, `oracle_precision_at_k`) and the regression gate (`check_regressions`), all unit-tested under plain `cargo test`; plus `#[ignore]`d live integration tests (`measure_hybrid`, `measure_fts_only`, `gate_against_baseline`) that drive the real `tsm` CLI. |
 | `tests/quality_bench.sh` | Orchestration: builds an isolated environment, indexes the corpus, runs the two measurement passes, and runs the gate. |
