@@ -29,24 +29,18 @@ queries:
       - doc: search-engine/sqlite-fts5.md
         grade: 1
 
-  - id: E2
-    category: entity
-    query: "LoRa"
-    relevant:
-      - doc: lora-tracker/lora-module-select.md
-        grade: 2
-      - doc: lora-tracker/telemetry-firmware.md
-        grade: 2
-      - doc: lora-tracker/gps-fallback.md
-        grade: 2
-      - doc: lora-tracker/field-test-report.md
-        grade: 1
-
   - id: E3
     category: entity
     query: "candle"
     relevant:
       - doc: search-engine/candle-embedding.md
+        grade: 2
+
+  - id: E4
+    category: entity
+    query: "狩猟免許"
+    relevant:
+      - doc: hunting/license-renewal.md
         grade: 2
 
   - id: F1
@@ -58,17 +52,6 @@ queries:
       - doc: hunting/handload-safety.md
         grade: 1
 
-  - id: F2
-    category: fts-basic
-    query: "マイクロファクトリー"
-    relevant:
-      - doc: microfactory/concept-overview.md
-        grade: 2
-      - doc: microfactory/cnc-tooling.md
-        grade: 2
-      - doc: microfactory/funding-notes.md
-        grade: 2
-
   - id: F3
     category: fts-basic
     query: "SQLite 全文検索"
@@ -78,17 +61,13 @@ queries:
       - doc: search-engine/rust-search-arch.md
         grade: 1
 
-  - id: V1
-    category: vector-semantic
-    query: "動物の位置を遠隔で把握する方法"
+  - id: F4
+    category: fts-basic
+    query: "家庭菜園"
     relevant:
-      - doc: lora-tracker/telemetry-firmware.md
+      - doc: garden/tomato-growing.md
         grade: 2
-      - doc: lora-tracker/gps-fallback.md
-        grade: 2
-      - doc: lora-tracker/lora-module-select.md
-        grade: 1
-      - doc: lora-tracker/field-test-report.md
+      - doc: garden/compost-tips.md
         grade: 1
 
   - id: V2
