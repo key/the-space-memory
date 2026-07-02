@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -209,20 +210,40 @@ fn is_cfg_test(bracket: &Group) -> bool {
 // ── Baseline parsing ─────────────────────────────────────────────────────────
 
 /// Parse `path<space>count` lines; `#` comments and blank lines are ignored.
-fn parse_baseline(s: &str) -> BTreeMap<String, usize> {
+/// A line that is neither blank/comment nor parses as `path count` is returned
+/// as a violation message instead of being dropped: `immutability_violations`
+/// and `growth_and_tightness_violations` only detect entries that were *added*
+/// or *raised* relative to what they're given, so a corrupted line that simply
+/// vanishes from the parsed map is indistinguishable from a legitimately
+/// shrunk-and-removed entry — it must not be able to hide a raised count.
+fn parse_baseline(s: &str) -> (BTreeMap<String, usize>, Vec<String>) {
     let mut m = BTreeMap::new();
-    for line in s.lines() {
-        let line = line.trim();
+    let mut bad = Vec::new();
+    for (i, raw_line) in s.lines().enumerate() {
+        let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((path, count)) = line.rsplit_once(char::is_whitespace) {
-            if let Ok(n) = count.trim().parse::<usize>() {
-                m.insert(path.trim().to_string(), n);
+        let parsed = line
+            .rsplit_once(char::is_whitespace)
+            .and_then(|(path, count)| {
+                count
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .map(|n| (path.trim().to_string(), n))
+            });
+        match parsed {
+            Some((path, n)) => {
+                m.insert(path, n);
             }
+            None => bad.push(format!(
+                "{BASELINE_REL}:{}: cannot parse as `path count`: {raw_line:?}",
+                i + 1
+            )),
         }
     }
-    m
+    (m, bad)
 }
 
 // ── Invariants ───────────────────────────────────────────────────────────────
@@ -291,32 +312,55 @@ fn immutability_violations(
 
 // ── Filesystem / git glue (thin; the logic above is what's tested) ───────────
 
-fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
+/// Recursively collect `.rs` file paths under `dir` into `out`. Propagates
+/// I/O errors (an unreadable subtree, a directory entry that vanishes mid-scan)
+/// instead of skipping them: a baseline-less (typically < 800 line) file that a
+/// silently-skipped subtree hides would pass the gate with no diagnostic at all.
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let p = entry?.path();
         if p.is_dir() {
-            collect_rs_files(&p, out);
+            collect_rs_files(&p, out)?;
         } else if p.extension().is_some_and(|e| e == "rs") {
             out.push(p);
         }
     }
+    Ok(())
 }
 
 /// State of the base branch's baseline, used to drive invariant 3.
+#[derive(Debug)]
 enum BaseBaseline {
     /// `origin/main` has the baseline file — enforce invariant 3 against it.
     Content(String),
-    /// `origin/main` resolves but carries no baseline file yet. This is the
-    /// bootstrap window: only the introducing PR (and the commits before this
-    /// gate first lands on `main`) hit it. Invariant 3 arms automatically once
-    /// the baseline exists on `main`.
+    /// `origin/main` resolves and positively confirmed (via `git ls-tree`) to
+    /// carry no baseline file yet. This is the bootstrap window: only the
+    /// introducing PR (and the commits before this gate first lands on `main`)
+    /// hit it. Invariant 3 arms automatically once the baseline exists on
+    /// `main`.
     BootstrapAbsent,
+    /// `git show` failed for the baseline path, but its absence from
+    /// `origin/main` could not be positively confirmed (the `git ls-tree`
+    /// double-check also failed, or unexpectedly found the file present). This
+    /// covers transient failures — object DB hiccups, stale fetches — that must
+    /// not be silently treated as the bootstrap window.
+    AbsenceUnconfirmed,
     /// `origin/main` could not be resolved at all (shallow/local checkout, or a
     /// CI job that failed to fetch it). Invariant 3 cannot be checked.
     RefUnavailable,
+}
+
+/// Classify a failed `git show origin/main:<baseline>` using a probe of
+/// whether the path is actually absent from `origin/main`, expressed as data
+/// (`Some(true)` = `git ls-tree` succeeded with empty output, i.e. confirmed
+/// absent; `Some(false)` = it succeeded but reported the path present;
+/// `None` = the probe command itself failed to answer) so the bootstrap vs.
+/// indeterminate-failure decision is unit-testable without invoking git.
+fn classify_show_failure(ls_tree_confirmed_absent: Option<bool>) -> BaseBaseline {
+    match ls_tree_confirmed_absent {
+        Some(true) => BaseBaseline::BootstrapAbsent,
+        Some(false) | None => BaseBaseline::AbsenceUnconfirmed,
+    }
 }
 
 fn base_baseline(root: &Path) -> BaseBaseline {
@@ -329,8 +373,6 @@ fn base_baseline(root: &Path) -> BaseBaseline {
     if !ref_ok {
         return BaseBaseline::RefUnavailable;
     }
-    // `origin/main` exists; a failed `git show` here means the baseline file is
-    // simply not in that tree yet (bootstrap), not a missing ref.
     match Command::new("git")
         .args(["show", &format!("origin/main:{BASELINE_REL}")])
         .current_dir(root)
@@ -339,7 +381,19 @@ fn base_baseline(root: &Path) -> BaseBaseline {
         Ok(o) if o.status.success() => {
             BaseBaseline::Content(String::from_utf8_lossy(&o.stdout).into_owned())
         }
-        _ => BaseBaseline::BootstrapAbsent,
+        // `git show` failed. Rather than assuming that means the file is simply
+        // not in that tree yet (bootstrap), positively confirm the absence with
+        // `git ls-tree` before drawing that conclusion.
+        _ => {
+            let ls_tree_confirmed_absent = Command::new("git")
+                .args(["ls-tree", "origin/main", "--", BASELINE_REL])
+                .current_dir(root)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| o.stdout.iter().all(u8::is_ascii_whitespace));
+            classify_show_failure(ls_tree_confirmed_absent)
+        }
     }
 }
 
@@ -351,32 +405,80 @@ fn invariant3_is_strict() -> bool {
     std::env::var_os("TSM_FILE_LINE_GATE_STRICT").is_some()
 }
 
+/// The two ways invariant 3 can end up without a usable base baseline —
+/// `origin/main` doesn't resolve at all, or it resolves but the baseline
+/// file's absence couldn't be positively confirmed. Both are fail-closed in
+/// the strict `file-lines` job and an informational skip otherwise.
+enum UnresolvedBase {
+    RefUnavailable,
+    AbsenceUnconfirmed,
+}
+
+/// Decide invariant 3's outcome for an unresolved base state: `Err` is a gate
+/// violation (fail-closed, pushed into `violations`); `Ok` means skip (the
+/// caller logs an explanatory `eprintln!`). Pure so the strict × state matrix
+/// is unit-testable without invoking git.
+fn unresolved_base_gate_result(state: UnresolvedBase, strict: bool) -> Result<(), String> {
+    if !strict {
+        return Ok(());
+    }
+    Err(match state {
+        UnresolvedBase::RefUnavailable => {
+            "invariant 3 (immutability) could not run: origin/main is unavailable in the \
+             strict file-lines job — it must fetch the base branch before running"
+                .to_string()
+        }
+        UnresolvedBase::AbsenceUnconfirmed => {
+            "invariant 3 (immutability) could not run: origin/main resolved, but the baseline \
+             file's absence could not be positively confirmed (git show and git ls-tree both \
+             failed to establish it) — the strict file-lines job must not fail open on a \
+             transient git failure"
+                .to_string()
+        }
+    })
+}
+
+/// Compute a `(crate-relative path, code-line count)` pair for one file, or a
+/// violation message naming the file. Used in place of `unwrap()` so that one
+/// unreadable file (or a path outside `root`, which should not occur but is
+/// handled rather than assumed) fails closed as a named violation instead of
+/// panicking the whole gate and losing every other file's diagnostics.
+fn line_count_for_file(root: &Path, f: &Path) -> Result<(String, usize), String> {
+    let rel = f
+        .strip_prefix(root)
+        .map_err(|e| format!("{}: not under crate root: {e}", f.display()))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let content = fs::read_to_string(f).map_err(|e| format!("{rel}: failed to read file: {e}"))?;
+    code_line_count(&content)
+        .map(|c| (rel.clone(), c))
+        .map_err(|e| format!("{rel}: {e}"))
+}
+
 #[test]
 fn enforce_per_file_line_limits() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
 
+    let mut violations: Vec<String> = Vec::new();
+
     let mut files = Vec::new();
-    collect_rs_files(&root.join("src"), &mut files);
+    if let Err(e) = collect_rs_files(&root.join("src"), &mut files) {
+        violations.push(format!("failed to walk src/ for the line-count gate: {e}"));
+    }
     files.sort();
 
-    let mut violations: Vec<String> = Vec::new();
     let mut current: BTreeMap<String, usize> = BTreeMap::new();
     for f in &files {
-        let rel = f
-            .strip_prefix(root)
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
-        let content = fs::read_to_string(f).unwrap();
-        match code_line_count(&content) {
-            Ok(c) => {
+        match line_count_for_file(root, f) {
+            Ok((rel, c)) => {
                 current.insert(rel, c);
             }
-            Err(e) => violations.push(format!("{rel}: {e}")),
+            Err(e) => violations.push(e),
         }
     }
 
-    let baseline = parse_baseline(include_str!("file-line-baseline.txt"));
+    let (baseline, bad_baseline_lines) = parse_baseline(include_str!("file-line-baseline.txt"));
+    violations.extend(bad_baseline_lines);
     violations.extend(growth_and_tightness_violations(&current, &baseline));
 
     // Invariant 3 (immutability) needs the base branch. It is authoritative only
@@ -385,21 +487,33 @@ fn enforce_per_file_line_limits() {
     let strict = invariant3_is_strict();
     match base_baseline(root) {
         BaseBaseline::Content(base) => {
-            violations.extend(immutability_violations(&baseline, &parse_baseline(&base)));
+            let (base_baseline, bad_base_lines) = parse_baseline(&base);
+            violations.extend(bad_base_lines);
+            violations.extend(immutability_violations(&baseline, &base_baseline));
         }
         BaseBaseline::BootstrapAbsent => eprintln!(
             "[file-lines] no baseline on origin/main yet (bootstrap); invariant 3 \
              (immutability) arms once this lands on main"
         ),
-        BaseBaseline::RefUnavailable if strict => violations.push(
-            "invariant 3 (immutability) could not run: origin/main is unavailable in the \
-             strict file-lines job — it must fetch the base branch before running"
-                .to_string(),
-        ),
-        BaseBaseline::RefUnavailable => eprintln!(
-            "[file-lines] origin/main unavailable (local/shallow checkout); invariant 3 \
-             (immutability) is enforced by the strict file-lines CI job"
-        ),
+        BaseBaseline::AbsenceUnconfirmed => {
+            match unresolved_base_gate_result(UnresolvedBase::AbsenceUnconfirmed, strict) {
+                Err(msg) => violations.push(msg),
+                Ok(()) => eprintln!(
+                    "[file-lines] could not positively confirm the baseline file is absent \
+                     from origin/main (git show and git ls-tree both failed); invariant 3 \
+                     (immutability) is enforced by the strict file-lines CI job"
+                ),
+            }
+        }
+        BaseBaseline::RefUnavailable => {
+            match unresolved_base_gate_result(UnresolvedBase::RefUnavailable, strict) {
+                Err(msg) => violations.push(msg),
+                Ok(()) => eprintln!(
+                    "[file-lines] origin/main unavailable (local/shallow checkout); invariant \
+                     3 (immutability) is enforced by the strict file-lines CI job"
+                ),
+            }
+        }
     }
 
     assert!(
@@ -616,10 +730,28 @@ mod tests {
     #[test]
     fn parse_baseline_ignores_comments_and_blanks() {
         let s = "# header\n\nsrc/cli.rs 2301\nsrc/config.rs 1212\n";
-        let m = parse_baseline(s);
+        let (m, bad) = parse_baseline(s);
         assert_eq!(m.get("src/cli.rs"), Some(&2301));
         assert_eq!(m.get("src/config.rs"), Some(&1212));
         assert_eq!(m.len(), 2);
+        assert!(bad.is_empty(), "{bad:?}");
+    }
+
+    #[test]
+    fn parse_baseline_flags_line_with_non_numeric_count() {
+        let s = "src/cli.rs 2301\nsrc/broken.rs notanumber\n";
+        let (m, bad) = parse_baseline(s);
+        assert_eq!(m.len(), 1, "the malformed line must not silently vanish");
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].contains("src/broken.rs notanumber"), "{bad:?}");
+    }
+
+    #[test]
+    fn parse_baseline_flags_line_without_whitespace_separator() {
+        let s = "src/cli.rs 2301\nsrc/broken.rs-no-space-2000\n";
+        let (m, bad) = parse_baseline(s);
+        assert_eq!(m.len(), 1);
+        assert_eq!(bad.len(), 1);
     }
 
     #[test]
@@ -691,5 +823,104 @@ mod tests {
         let current = map(&[("src/cli.rs", 2000)]);
         let base = map(&[("src/cli.rs", 2301), ("src/config.rs", 1212)]);
         assert!(immutability_violations(&current, &base).is_empty());
+    }
+
+    // ── collect_rs_files: read-failure propagation ────────────────────────────
+
+    #[test]
+    fn collect_rs_files_propagates_read_dir_failure() {
+        let mut out = Vec::new();
+        let result = collect_rs_files(Path::new("/nonexistent/does-not-exist-xyz"), &mut out);
+        assert!(result.is_err());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn collect_rs_files_collects_rs_files_recursively() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        fs::write(dir.path().join("b.txt"), "not rust\n").unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("c.rs"), "fn c() {}\n").unwrap();
+
+        let mut out = Vec::new();
+        collect_rs_files(dir.path(), &mut out).unwrap();
+        out.sort();
+
+        assert_eq!(out, vec![dir.path().join("a.rs"), sub.join("c.rs")]);
+    }
+
+    // ── base_baseline: bootstrap vs indeterminate classification ──────────────
+
+    #[test]
+    fn classify_show_failure_confirmed_absent_is_bootstrap() {
+        assert!(matches!(
+            classify_show_failure(Some(true)),
+            BaseBaseline::BootstrapAbsent
+        ));
+    }
+
+    #[test]
+    fn classify_show_failure_ls_tree_command_failed_is_unconfirmed() {
+        // `git ls-tree` itself could not answer the question (e.g. object DB
+        // hiccup, stale fetch) — absence was never positively confirmed.
+        assert!(matches!(
+            classify_show_failure(None),
+            BaseBaseline::AbsenceUnconfirmed
+        ));
+    }
+
+    #[test]
+    fn classify_show_failure_ls_tree_shows_content_is_unconfirmed() {
+        // `git ls-tree` succeeded but reports the file exists — contradicts the
+        // earlier `git show` failure, so treat as unconfirmed rather than as a
+        // confident "the file is absent" bootstrap window.
+        assert!(matches!(
+            classify_show_failure(Some(false)),
+            BaseBaseline::AbsenceUnconfirmed
+        ));
+    }
+
+    // ── unresolved_base_gate_result: strict fail-closed decision ──────────────
+
+    #[test]
+    fn unresolved_base_strict_ref_unavailable_is_violation() {
+        assert!(unresolved_base_gate_result(UnresolvedBase::RefUnavailable, true).is_err());
+    }
+
+    #[test]
+    fn unresolved_base_strict_absence_unconfirmed_is_violation() {
+        assert!(unresolved_base_gate_result(UnresolvedBase::AbsenceUnconfirmed, true).is_err());
+    }
+
+    #[test]
+    fn unresolved_base_non_strict_is_skip() {
+        assert!(unresolved_base_gate_result(UnresolvedBase::RefUnavailable, false).is_ok());
+        assert!(unresolved_base_gate_result(UnresolvedBase::AbsenceUnconfirmed, false).is_ok());
+    }
+
+    // ── line_count_for_file: read-failure violation aggregation ───────────────
+
+    #[test]
+    fn line_count_for_file_reports_missing_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let missing = root.join("src/does-not-exist-xyz.rs");
+        assert!(line_count_for_file(root, &missing).is_err());
+    }
+
+    #[test]
+    fn line_count_for_file_reports_path_outside_root() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let outside = Path::new("/completely/unrelated/path.rs");
+        assert!(line_count_for_file(root, outside).is_err());
+    }
+
+    #[test]
+    fn line_count_for_file_succeeds_for_real_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (rel, count) = line_count_for_file(root, &root.join("src/lib.rs")).unwrap();
+        assert_eq!(rel, "src/lib.rs");
+        assert!(count > 0);
     }
 }
