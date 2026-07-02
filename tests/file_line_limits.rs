@@ -220,6 +220,12 @@ fn is_cfg_test(bracket: &Group) -> bool {
 /// `source` labels the bad-line messages (e.g. `BASELINE_REL` for the
 /// working-tree copy vs. `origin/main:<BASELINE_REL>` for the base-branch
 /// copy) so the two are distinguishable when both are parsed in the same run.
+///
+/// A second line for a path already seen earlier in `s` is also a violation
+/// (not a silent overwrite): `BTreeMap::insert` would let the later line win
+/// with no diagnostic, so a duplicate could smuggle a raised count past
+/// invariant 2/3 the same way a corrupted line could. The first occurrence
+/// wins in the returned map; later ones are reported and dropped.
 fn parse_baseline(s: &str, source: &str) -> (BTreeMap<String, usize>, Vec<String>) {
     let mut m = BTreeMap::new();
     let mut bad = Vec::new();
@@ -239,7 +245,15 @@ fn parse_baseline(s: &str, source: &str) -> (BTreeMap<String, usize>, Vec<String
             });
         match parsed {
             Some((path, n)) => {
-                m.insert(path, n);
+                if let Some(&existing) = m.get(&path) {
+                    bad.push(format!(
+                        "{source}:{}: duplicate baseline entry for `{path}` (already {existing}, \
+                         this line has {n})",
+                        i + 1
+                    ));
+                } else {
+                    m.insert(path, n);
+                }
             }
             None => bad.push(format!(
                 "{source}:{}: cannot parse as `path count`: {raw_line:?}",
@@ -255,9 +269,19 @@ fn parse_baseline(s: &str, source: &str) -> (BTreeMap<String, usize>, Vec<String
 /// Invariant 1 (no growth) + invariant 2 (tight baselines): every file stays
 /// within `max(LIMIT, baseline)`, and every baseline entry is `> LIMIT` and
 /// equals its file's current count (stale/oversized headroom is rejected).
+///
+/// `scan_complete` distinguishes "this baselined file is genuinely gone" from
+/// "the file walk didn't finish, so we don't actually know": when the
+/// filesystem walk that produced `current` failed partway (see
+/// `collect_rs_files`), a baselined file inside the unscanned subtree is
+/// simply absent from `current` too, and would otherwise be misreported as
+/// "no longer exists" even though it's still there. The walk failure itself
+/// is already a separate violation, so this only suppresses a misleading
+/// message — it does not weaken fail-closed behavior.
 fn growth_and_tightness_violations(
     current: &BTreeMap<String, usize>,
     baseline: &BTreeMap<String, usize>,
+    scan_complete: bool,
 ) -> Vec<String> {
     let mut v = Vec::new();
 
@@ -279,9 +303,10 @@ fn growth_and_tightness_violations(
             continue;
         }
         match current.get(f) {
-            None => v.push(format!(
+            None if scan_complete => v.push(format!(
                 "{f}: baseline entry for a file that no longer exists; remove it"
             )),
+            None => {}
             Some(&c) if c < b => v.push(format!(
                 "{f}: shrank to {c}; lower its baseline from {b} to {c}"
             )),
@@ -459,6 +484,69 @@ fn line_count_for_file(root: &Path, f: &Path) -> Result<(String, usize), String>
         .map_err(|e| format!("{rel}: {e}"))
 }
 
+/// Parse the base branch's baseline content and compute invariant 3's
+/// contribution to the violations list against it: malformed/duplicate lines
+/// (labeled with the `origin/main:<BASELINE_REL>` source, distinct from the
+/// working-tree copy) plus any entry added or raised relative to
+/// `current_baseline`.
+fn content_base_violations(
+    current_baseline: &BTreeMap<String, usize>,
+    base_content: &str,
+) -> Vec<String> {
+    let (base_baseline, mut v) =
+        parse_baseline(base_content, &format!("origin/main:{BASELINE_REL}"));
+    v.extend(immutability_violations(current_baseline, &base_baseline));
+    v
+}
+
+/// Compute invariant 3's contribution to the violations list for an already
+/// resolved `BaseBaseline` state. `BaseBaseline` variants carry no I/O
+/// handles — they're plain data — so every state (including `Content` with
+/// arbitrary, possibly corrupted text) is directly constructible in tests,
+/// making the full state × strict-mode dispatch unit-testable without
+/// invoking git.
+fn base_baseline_violations(
+    state: BaseBaseline,
+    current_baseline: &BTreeMap<String, usize>,
+    strict: bool,
+) -> Vec<String> {
+    match state {
+        BaseBaseline::Content(base) => content_base_violations(current_baseline, &base),
+        BaseBaseline::BootstrapAbsent => {
+            eprintln!(
+                "[file-lines] no baseline on origin/main yet (bootstrap); invariant 3 \
+                 (immutability) arms once this lands on main"
+            );
+            Vec::new()
+        }
+        BaseBaseline::AbsenceUnconfirmed => {
+            match unresolved_base_gate_result(UnresolvedBase::AbsenceUnconfirmed, strict) {
+                Err(msg) => vec![msg],
+                Ok(()) => {
+                    eprintln!(
+                        "[file-lines] could not positively confirm the baseline file is absent \
+                         from origin/main (git show and git ls-tree both failed); invariant 3 \
+                         (immutability) is enforced by the strict file-lines CI job"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        BaseBaseline::RefUnavailable => {
+            match unresolved_base_gate_result(UnresolvedBase::RefUnavailable, strict) {
+                Err(msg) => vec![msg],
+                Ok(()) => {
+                    eprintln!(
+                        "[file-lines] origin/main unavailable (local/shallow checkout); \
+                         invariant 3 (immutability) is enforced by the strict file-lines CI job"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn enforce_per_file_line_limits() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -466,9 +554,13 @@ fn enforce_per_file_line_limits() {
     let mut violations: Vec<String> = Vec::new();
 
     let mut files = Vec::new();
-    if let Err(e) = collect_rs_files(&root.join("src"), &mut files) {
-        violations.push(format!("failed to walk src/ for the line-count gate: {e}"));
-    }
+    let scan_complete = match collect_rs_files(&root.join("src"), &mut files) {
+        Ok(()) => true,
+        Err(e) => {
+            violations.push(format!("failed to walk src/ for the line-count gate: {e}"));
+            false
+        }
+    };
     files.sort();
 
     let mut current: BTreeMap<String, usize> = BTreeMap::new();
@@ -484,43 +576,21 @@ fn enforce_per_file_line_limits() {
     let (baseline, bad_baseline_lines) =
         parse_baseline(include_str!("file-line-baseline.txt"), BASELINE_REL);
     violations.extend(bad_baseline_lines);
-    violations.extend(growth_and_tightness_violations(&current, &baseline));
+    violations.extend(growth_and_tightness_violations(
+        &current,
+        &baseline,
+        scan_complete,
+    ));
 
     // Invariant 3 (immutability) needs the base branch. It is authoritative only
     // in the strict `file-lines` job; elsewhere it is skipped (that job covers
     // it). In strict mode an unresolvable base is fail-closed, not fail-open.
     let strict = invariant3_is_strict();
-    match base_baseline(root) {
-        BaseBaseline::Content(base) => {
-            let (base_baseline, bad_base_lines) =
-                parse_baseline(&base, &format!("origin/main:{BASELINE_REL}"));
-            violations.extend(bad_base_lines);
-            violations.extend(immutability_violations(&baseline, &base_baseline));
-        }
-        BaseBaseline::BootstrapAbsent => eprintln!(
-            "[file-lines] no baseline on origin/main yet (bootstrap); invariant 3 \
-             (immutability) arms once this lands on main"
-        ),
-        BaseBaseline::AbsenceUnconfirmed => {
-            match unresolved_base_gate_result(UnresolvedBase::AbsenceUnconfirmed, strict) {
-                Err(msg) => violations.push(msg),
-                Ok(()) => eprintln!(
-                    "[file-lines] could not positively confirm the baseline file is absent \
-                     from origin/main (git show and git ls-tree both failed); invariant 3 \
-                     (immutability) is enforced by the strict file-lines CI job"
-                ),
-            }
-        }
-        BaseBaseline::RefUnavailable => {
-            match unresolved_base_gate_result(UnresolvedBase::RefUnavailable, strict) {
-                Err(msg) => violations.push(msg),
-                Ok(()) => eprintln!(
-                    "[file-lines] origin/main unavailable (local/shallow checkout); invariant \
-                     3 (immutability) is enforced by the strict file-lines CI job"
-                ),
-            }
-        }
-    }
+    violations.extend(base_baseline_violations(
+        base_baseline(root),
+        &baseline,
+        strict,
+    ));
 
     assert!(
         violations.is_empty(),
@@ -785,9 +855,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_baseline_flags_duplicate_path() {
+        // Two lines for the same path: the first must not silently vanish under
+        // the second (`BTreeMap::insert` overwrite would drop it without a trace).
+        let s = "src/cli.rs 2301\nsrc/cli.rs 2400\n";
+        let (m, bad) = parse_baseline(s, BASELINE_REL);
+        assert_eq!(
+            m.get("src/cli.rs"),
+            Some(&2301),
+            "first entry must win, not the silently-overwriting duplicate"
+        );
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].contains("src/cli.rs"), "{bad:?}");
+        assert!(bad[0].contains("duplicate"), "{bad:?}");
+    }
+
+    #[test]
+    fn parse_baseline_empty_content_yields_no_entries_or_violations() {
+        let (m, bad) = parse_baseline("", BASELINE_REL);
+        assert!(m.is_empty());
+        assert!(bad.is_empty());
+    }
+
+    #[test]
     fn growth_flags_new_file_over_limit() {
         let current = map(&[("src/new.rs", 850)]);
-        let v = growth_and_tightness_violations(&current, &BTreeMap::new());
+        let v = growth_and_tightness_violations(&current, &BTreeMap::new(), true);
         assert_eq!(v.len(), 1, "{v:?}");
         assert!(v[0].contains("src/new.rs"));
     }
@@ -796,14 +889,14 @@ mod tests {
     fn growth_allows_baselined_file_at_baseline() {
         let current = map(&[("src/cli.rs", 2301)]);
         let baseline = map(&[("src/cli.rs", 2301)]);
-        assert!(growth_and_tightness_violations(&current, &baseline).is_empty());
+        assert!(growth_and_tightness_violations(&current, &baseline, true).is_empty());
     }
 
     #[test]
     fn growth_flags_baselined_file_that_grew() {
         let current = map(&[("src/cli.rs", 2302)]);
         let baseline = map(&[("src/cli.rs", 2301)]);
-        let v = growth_and_tightness_violations(&current, &baseline);
+        let v = growth_and_tightness_violations(&current, &baseline, true);
         assert!(v.iter().any(|m| m.contains("exceed")), "{v:?}");
     }
 
@@ -811,7 +904,7 @@ mod tests {
     fn tightness_flags_shrunk_file_needing_lower_baseline() {
         let current = map(&[("src/cli.rs", 2000)]);
         let baseline = map(&[("src/cli.rs", 2301)]);
-        let v = growth_and_tightness_violations(&current, &baseline);
+        let v = growth_and_tightness_violations(&current, &baseline, true);
         assert!(v.iter().any(|m| m.contains("lower its baseline")), "{v:?}");
     }
 
@@ -819,15 +912,27 @@ mod tests {
     fn tightness_flags_baseline_at_or_below_limit() {
         let current = map(&[("src/x.rs", 700)]);
         let baseline = map(&[("src/x.rs", 800)]);
-        let v = growth_and_tightness_violations(&current, &baseline);
+        let v = growth_and_tightness_violations(&current, &baseline, true);
         assert!(v.iter().any(|m| m.contains("remove this entry")), "{v:?}");
     }
 
     #[test]
     fn tightness_flags_baseline_for_missing_file() {
         let baseline = map(&[("src/gone.rs", 1500)]);
-        let v = growth_and_tightness_violations(&BTreeMap::new(), &baseline);
+        let v = growth_and_tightness_violations(&BTreeMap::new(), &baseline, true);
         assert!(v.iter().any(|m| m.contains("no longer exists")), "{v:?}");
+    }
+
+    #[test]
+    fn tightness_suppresses_missing_file_violation_when_scan_incomplete() {
+        // A baselined file whose subtree failed to scan (collect_rs_files
+        // returned Err) is indistinguishable from a genuinely deleted file by
+        // `current` alone. When the scan didn't complete, don't claim removal —
+        // the walk-failure violation (pushed separately by the caller) already
+        // fails the gate.
+        let baseline = map(&[("src/gone.rs", 1500)]);
+        let v = growth_and_tightness_violations(&BTreeMap::new(), &baseline, false);
+        assert!(v.iter().all(|m| !m.contains("no longer exists")), "{v:?}");
     }
 
     #[test]
@@ -863,6 +968,35 @@ mod tests {
         let result = collect_rs_files(Path::new("/nonexistent/does-not-exist-xyz"), &mut out);
         assert!(result.is_err());
         assert!(out.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_rs_files_propagates_mid_walk_unreadable_subdirectory() {
+        // A root that itself reads fine, but whose subdirectory doesn't — the
+        // failure must surface even though it isn't the top-level read_dir call.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let sub = dir.path().join("locked");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("b.rs"), "fn b() {}\n").unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Running as root (common in some container images) ignores permission
+        // bits, making this case impossible to trigger; skip rather than flake.
+        if fs::read_dir(&sub).is_ok() {
+            fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipping: running as a user that bypasses directory permissions");
+            return;
+        }
+
+        let mut out = Vec::new();
+        let result = collect_rs_files(dir.path(), &mut out);
+
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
@@ -928,6 +1062,103 @@ mod tests {
     fn unresolved_base_non_strict_is_skip() {
         assert!(unresolved_base_gate_result(UnresolvedBase::RefUnavailable, false).is_ok());
         assert!(unresolved_base_gate_result(UnresolvedBase::AbsenceUnconfirmed, false).is_ok());
+    }
+
+    // ── content_base_violations: corrupted origin/main-side baseline ──────────
+
+    #[test]
+    fn content_base_violations_surfaces_corrupted_base_line_with_prefix() {
+        let current = map(&[("src/cli.rs", 2301)]);
+        let v = content_base_violations(&current, "src/cli.rs notanumber\n");
+        assert!(
+            v.iter()
+                .any(|m| m.starts_with(&format!("origin/main:{BASELINE_REL}:1:"))),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn content_base_violations_still_checks_immutability_alongside_bad_lines() {
+        // A corrupted line and a raised entry in the same base content must
+        // both surface — the bad-line detour must not short-circuit invariant 3.
+        let current = map(&[("src/cli.rs", 2500)]);
+        let v = content_base_violations(&current, "src/cli.rs 2301\nbroken line\n");
+        assert!(v.iter().any(|m| m.contains("raised")), "{v:?}");
+        assert!(v.iter().any(|m| m.starts_with("origin/main:")), "{v:?}");
+    }
+
+    // ── base_baseline_violations: full state × strict dispatch, no git needed ─
+    //
+    // `BaseBaseline` variants are plain data, so every state (including
+    // `Content` with corrupted text) is constructible directly — these tests
+    // exercise the whole invariant-3 dispatch end to end without touching git.
+
+    #[test]
+    fn base_baseline_violations_strict_absence_unconfirmed_fails_closed() {
+        let v = base_baseline_violations(BaseBaseline::AbsenceUnconfirmed, &BTreeMap::new(), true);
+        assert_eq!(v.len(), 1, "{v:?}");
+    }
+
+    #[test]
+    fn base_baseline_violations_non_strict_absence_unconfirmed_skips() {
+        let v = base_baseline_violations(BaseBaseline::AbsenceUnconfirmed, &BTreeMap::new(), false);
+        assert!(v.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn base_baseline_violations_strict_ref_unavailable_fails_closed() {
+        let v = base_baseline_violations(BaseBaseline::RefUnavailable, &BTreeMap::new(), true);
+        assert_eq!(v.len(), 1, "{v:?}");
+    }
+
+    #[test]
+    fn base_baseline_violations_bootstrap_absent_is_always_empty() {
+        let v = base_baseline_violations(BaseBaseline::BootstrapAbsent, &BTreeMap::new(), true);
+        assert!(v.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn base_baseline_violations_content_surfaces_corrupted_base_line() {
+        let current = map(&[("src/cli.rs", 2301)]);
+        let v = base_baseline_violations(
+            BaseBaseline::Content("src/cli.rs notanumber\n".to_string()),
+            &current,
+            true,
+        );
+        assert!(v.iter().any(|m| m.starts_with("origin/main:")), "{v:?}");
+    }
+
+    // ── Multi-violation aggregation ────────────────────────────────────────────
+
+    #[test]
+    fn violations_aggregate_from_multiple_sources_simultaneously() {
+        // Mirrors enforce_per_file_line_limits' aggregation pipeline: a
+        // malformed baseline line, a growth violation, and (via
+        // base_baseline_violations) invariant 3 must all land in the same
+        // violations list rather than the first problem masking the rest.
+        let current = map(&[("src/new.rs", 900), ("src/cli.rs", 2500)]);
+        let (baseline, mut violations) =
+            parse_baseline("src/cli.rs 2301\nbroken line\n", BASELINE_REL);
+        violations.extend(growth_and_tightness_violations(&current, &baseline, true));
+        violations.extend(base_baseline_violations(
+            BaseBaseline::Content("src/cli.rs 2301\n".to_string()),
+            &baseline,
+            true,
+        ));
+
+        assert!(violations.len() >= 3, "{violations:?}");
+        assert!(
+            violations.iter().any(|m| m.contains("broken line")),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|m| m.contains("src/new.rs")),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|m| m.contains("src/cli.rs")),
+            "{violations:?}"
+        );
     }
 
     // ── line_count_for_file: read-failure violation aggregation ───────────────
