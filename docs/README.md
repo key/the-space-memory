@@ -45,4 +45,5 @@ For the full quick-start tour, see the project
 | [Configuration](configuration.md) | `tsm.toml` and environment variable reference |
 | [Command Reference](command-reference.md) | Every `tsm` subcommand, flags, and examples |
 | [User Dictionary](user-dictionary.md) | Custom terminology for the lindera tokenizer |
+| [Search Quality](search-quality.md) | Precision/MRR/nDCG regression gate: golden corpus, gate design, updating the baseline |
 | [Claude Code prompt format](claude-code/claude-code-prompt-format.md) | Output format used by the auto-search hook |

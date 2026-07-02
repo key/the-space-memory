@@ -283,48 +283,15 @@ println!("calls: {}", counters::embedder_call_count());
 
 ## Search Quality
 
-Precision@5 / MRR / nDCG@5 measured against a hand-graded golden corpus
-(`tests/golden/corpus/` + `tests/golden/queries.yaml`), gated in CI against
-a committed baseline (`tests/golden/baseline.json`). This catches quality
-regressions from dictionary changes, scoring parameter tuning, Lua hook
-edits, or synonym expansion changes — the kind of change that doesn't break
-any existing test but silently makes search worse.
+Precision@5 / MRR / nDCG@5 measured against a hand-graded golden corpus,
+gated in CI against a committed baseline — catches quality regressions from
+dictionary, scoring, or hook changes that don't break any existing test but
+silently make search worse. Run it locally with
+`bash tests/quality_bench.sh`.
 
-Run it locally the same way CI does:
-
-```bash
-bash tests/quality_bench.sh
-```
-
-The script builds an isolated, gitignored environment (the same pattern as
-the perf-bench setup above), indexes the golden corpus with a real
-embedder, and measures two passes:
-
-- **hybrid** — the default search path (FTS5 + vector + entity). Gated
-  against the baseline.
-- **fts_only** — embedder stopped mid-run for a genuine FTS5-only
-  measurement. Recorded for comparison, not gated. (An embedder-up
-  `--fallback fts_only` run would not be a true FTS-only measurement: that
-  flag only changes error-handling behavior, not whether vector retrieval
-  runs — see `tests/quality_bench.rs` module docs.)
-
-Metric computation (`precision_at_k`, `reciprocal_rank`, `ndcg_at_k`) is
-pure and unit-tested under plain `cargo test`; the live measurement and
-gate passes are `#[ignore]`d integration tests invoked by the script (they
-need a live daemon and a real embedder, so they can't run in plain
-`cargo test`).
-
-When a change intentionally improves search quality, regenerate the
-baseline and commit it alongside the change:
-
-```bash
-bash tests/quality_bench.sh --update-baseline
-```
-
-Do not update the baseline to make a regression pass — if the gate fails,
-fix the change under review, not the baseline. `--update-baseline` enforces
-this: it refuses to overwrite an existing baseline when this run failed the
-gate against it (a regression), unless `--force` is also passed.
+See [Search Quality](docs/search-quality.md) for the full guide: design
+rationale, the golden corpus/query format, running and updating the
+baseline, and how the regression gate works.
 
 ## Documentation
 
@@ -333,6 +300,7 @@ gate against it (a regression), unless `--force` is also passed.
 - [Data Flow](docs/data-flow.md) — Indexing and search flow diagrams
 - [Configuration](docs/configuration.md) — Environment variables and config file reference
 - [User Dictionary](docs/user-dictionary.md) — Custom dictionary management
+- [Search Quality](docs/search-quality.md) — Precision/MRR/nDCG regression gate: golden corpus, gate design, updating the baseline
 - [Design Decisions](decisions/) — ADR (Architecture Decision Records)
 
 ## Background
