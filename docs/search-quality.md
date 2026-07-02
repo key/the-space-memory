@@ -138,10 +138,10 @@ Prerequisites: `cargo build --release` (or binaries already on `PATH`), the
 `HF_HUB_CACHE`), and `jq`.
 
 The script builds an isolated, gitignored environment (`.qbench/`, the
-same isolation pattern used by the performance benches), copies
-`tests/golden/corpus/` into it, substitutes date
-placeholders (`__TODAY__` / `__1Y_AGO__`, the same mechanism as
-`tests/e2e.sh`), indexes it with a real embedder, and measures two passes:
+same isolation pattern used by the [performance benches](benchmarks.md)),
+copies `tests/golden/corpus/` into it, substitutes date placeholders
+(`__TODAY__` / `__1Y_AGO__`, the same mechanism as `tests/e2e.sh`), indexes
+it with a real embedder, and measures two passes:
 
 - **hybrid** — the default search path (FTS5 + vector + entity). This is
   the mode gated against the baseline.

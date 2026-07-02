@@ -1,6 +1,6 @@
 [package]
 name = "the-space-memory"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 
 [[bin]]
@@ -10,6 +10,10 @@ path = "src/main.rs"
 [[bin]]
 name = "tsmd"
 path = "src/bin/tsmd/main.rs"
+
+[[bin]]
+name = "tsm-bench-check"
+path = "src/bin/tsm-bench-check/main.rs"
 
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled", "load_extension"] }
@@ -58,3 +62,8 @@ bench-counters = []
 [[bench]]
 name = "search_latency"
 harness = false
+
+[[bench]]
+name = "record_metrics"
+harness = false
+required-features = ["bench-counters"]

@@ -81,12 +81,26 @@ fn directory_from_rel_path(rel_path: &str) -> String {
 
 use prepare::ChunkInput;
 
-/// Index a single file. Returns true if the file was (re-)indexed, false if skipped.
-pub fn index_file(
+/// Per-stage wall-clock timings for one [`index_file`] invocation.
+/// Collection cost is a handful of `Instant::now()` calls — negligible
+/// next to file I/O and socket I/O — so it is always measured; only the
+/// bench-facing accessor ([`index_file_timed`]) is feature-gated.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IndexTimings {
+    pub prepare: std::time::Duration,
+    pub persist: std::time::Duration,
+    pub embed: std::time::Duration,
+}
+
+fn index_file_inner(
     conn: &Connection,
     file_path: &Path,
     project_root: &Path,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(bool, IndexTimings)> {
+    use std::time::Instant;
+
+    let mut timings = IndexTimings::default();
+
     // file_path is stored as a lexical absolute path. The directory
     // label (used for source_type + chunking) is still derived from the
     // project_root-relative path so source-type classification is unaffected.
@@ -119,15 +133,18 @@ pub fn index_file(
 
     if let Some((_, ref old_hash)) = existing {
         if *old_hash == current_hash {
-            return Ok(false); // unchanged
+            return Ok((false, timings)); // unchanged
         }
     }
 
     // Hook API contract: extract hooks see the project-relative path as
     // `ctx.path`, unchanged by absolute-path storage. Only DB persistence uses
     // the absolute `stored_path` (file identity). Keep these two separate.
+    let t0 = Instant::now();
     let prepared = prepare::prepare(file_path, &rel_for_label, &directory, &filename)?;
+    timings.prepare = t0.elapsed();
 
+    let t1 = Instant::now();
     let diff = persist::persist(
         conn,
         &stored_path,
@@ -135,13 +152,38 @@ pub fn index_file(
         existing.map(|(id, _)| id),
         &prepared,
     )?;
+    timings.persist = t1.elapsed();
 
     // Vector embedding outside transaction (socket I/O)
     if !diff.chunks_needing_vectors.is_empty() {
+        let t2 = Instant::now();
         embed::insert_vectors(conn, &diff.chunks_needing_vectors);
+        timings.embed = t2.elapsed();
     }
 
-    Ok(true)
+    Ok((true, timings))
+}
+
+/// Index a single file. Returns true if the file was (re-)indexed, false if skipped.
+pub fn index_file(
+    conn: &Connection,
+    file_path: &Path,
+    project_root: &Path,
+) -> anyhow::Result<bool> {
+    index_file_inner(conn, file_path, project_root).map(|(indexed, _)| indexed)
+}
+
+/// Bench-only entry point: same as [`index_file`] but also returns the
+/// per-stage [`IndexTimings`]. Used by the indexing throughput bench to
+/// report a Prepare/Persist/Embed breakdown without duplicating the
+/// pipeline logic (see `bench-counters` feature).
+#[cfg(feature = "bench-counters")]
+pub fn index_file_timed(
+    conn: &Connection,
+    file_path: &Path,
+    project_root: &Path,
+) -> anyhow::Result<(bool, IndexTimings)> {
+    index_file_inner(conn, file_path, project_root)
 }
 
 /// Index all given files under `policy`. Returns stats.
@@ -547,6 +589,43 @@ mod tests {
             .unwrap();
         assert_eq!(stored, f.to_string_lossy());
         assert!(std::path::Path::new(&stored).is_absolute());
+    }
+
+    #[cfg(feature = "bench-counters")]
+    #[test]
+    fn index_file_timed_reports_nonzero_prepare_and_persist() {
+        let conn = crate::db::get_memory_connection().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("note.md");
+        std::fs::write(&f, "# Title\n\nbody").unwrap();
+
+        let (indexed, timings) = index_file_timed(&conn, &f, dir.path()).unwrap();
+
+        assert!(indexed);
+        // All three stages run for a new file: `embed::insert_vectors` is
+        // still called (and its own socket-existence check still costs a
+        // few microseconds under the `Instant::now()` wrapper) even though
+        // no embedder is running in this test env, so `embed` is nonzero
+        // too, not exactly zero.
+        assert!(timings.prepare > std::time::Duration::ZERO);
+        assert!(timings.persist > std::time::Duration::ZERO);
+        assert!(timings.embed > std::time::Duration::ZERO);
+    }
+
+    #[cfg(feature = "bench-counters")]
+    #[test]
+    fn index_file_timed_reports_zero_for_unchanged_file() {
+        let conn = crate::db::get_memory_connection().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("note.md");
+        std::fs::write(&f, "# Title\n\nbody").unwrap();
+
+        index_file_timed(&conn, &f, dir.path()).unwrap();
+        let (indexed, timings) = index_file_timed(&conn, &f, dir.path()).unwrap();
+
+        assert!(!indexed);
+        assert_eq!(timings.prepare, std::time::Duration::ZERO);
+        assert_eq!(timings.persist, std::time::Duration::ZERO);
     }
 
     #[test]

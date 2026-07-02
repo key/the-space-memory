@@ -1,3 +1,4 @@
+pub mod bench_baseline;
 pub mod chunker;
 pub mod classifier;
 pub mod cli;

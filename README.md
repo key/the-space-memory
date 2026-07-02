@@ -242,44 +242,13 @@ tsm also honors `RUST_LOG` (log level, default `info`) and `NO_COLOR`
 
 ## Benchmarks
 
-Performance benches for the search/index pipeline. Currently only the
-search latency bench is implemented; indexing benches and the CI
-regression gate ship in a follow-up PR (see [#181](https://github.com/key/the-space-memory/issues/181)).
-
-### Prerequisites
-
-- `tsmd` running with embedder ready (`tsm start` and verify via `tsm status`)
-- The standard testdata corpus indexed:
-
-  ```bash
-  cd tests/e2e/testdata
-  tsm init && tsm index
-  ```
-
-### Running
-
-```bash
-# Search latency (hybrid: FTS5 + vector + entity)
-cargo bench --bench search_latency
-```
-
-### Embedder call counter
-
-For benches that need to verify embedder call counts, build with the
-`bench-counters` feature. Off by default; release builds compile the
-counters out entirely.
-
-```bash
-cargo build --features bench-counters
-```
-
-```rust
-use the_space_memory::embedder::counters;
-
-counters::reset_embedder_calls();
-// ... run code that calls embed_via_socket_at ...
-println!("calls: {}", counters::embedder_call_count());
-```
+Performance benches for the search/index pipeline, plus a CI regression
+gate that runs on every PR touching `src/`, `benches/`, or `Cargo.toml`.
+Only embedder call counts are regression-gated (deterministic, exact
+equality); indexing throughput and search latency are recorded for trend
+visibility only. See [docs/benchmarks.md](docs/benchmarks.md) for the
+full design rationale, how to run the benches locally, and the CI
+workflow internals.
 
 ## Search Quality
 
@@ -300,6 +269,7 @@ baseline, and how the regression gate works.
 - [Data Flow](docs/data-flow.md) — Indexing and search flow diagrams
 - [Configuration](docs/configuration.md) — Environment variables and config file reference
 - [User Dictionary](docs/user-dictionary.md) — Custom dictionary management
+- [Benchmarks](docs/benchmarks.md) — Perf benches, CI regression gate, baseline lifecycle
 - [Search Quality](docs/search-quality.md) — Precision/MRR/nDCG regression gate: golden corpus, gate design, updating the baseline
 - [Design Decisions](decisions/) — ADR (Architecture Decision Records)
 
