@@ -19,8 +19,21 @@
 //! into scratch in-memory databases — it does not touch the already-indexed
 //! DB or any tracked file.
 //!
-//! Usage:
+//! Usage (run from inside the indexed project, e.g. `tests/e2e/testdata`,
+//! matching `tsm start`'s own CWD — see the CWD note below):
 //!   cargo bench --features bench-counters --bench record_metrics
+//!
+//! CWD note: this binary discovers the embedder socket and DB via
+//! `config`'s CWD-relative default resolution (`.tsm/embedder.sock` etc.,
+//! the same convention `tsmd` itself relies on) — it does not accept an
+//! explicit project-root argument. `cargo bench --manifest-path <elsewhere>`
+//! runs the *compiled binary* with CWD set to the manifest's directory, not
+//! the invoking shell's CWD, which silently breaks this resolution (the
+//! socket check then reports "not found" against the wrong directory, not
+//! a build error). In CI (`.github/workflows/bench.yml`), the binary is
+//! therefore built once (`cargo bench --no-run`) and then invoked directly
+//! by path with `working-directory` pinned to the indexed project — never
+//! via `cargo bench --manifest-path` from a different CWD.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -111,11 +111,15 @@ jobs:
           # hasn't been counted yet. Require non-zero counts on both sides,
           # not just the percentage, and give the CPU model load real time
           # (cold fp32 load on a CI runner is much slower than a warm
-          # daemon on a dev machine).
+          # daemon on a dev machine). Also require `Embedder:  running`
+          # explicitly — on a rerun against an already-populated DB, a
+          # non-trivial 100% can be leftover state from a previous backfill
+          # while the embedder child is still mid-boot for *this* run.
           for _ in $(seq 1 90); do
             out=$(tsm status)
             echo "$out"
-            if echo "$out" | grep -qE "Vectors:\s+[1-9][0-9]*/[1-9][0-9]*\s+\(100%\)"; then
+            if echo "$out" | grep -qE "Embedder:\s+running" &&
+               echo "$out" | grep -qE "Vectors:\s+[1-9][0-9]*/[1-9][0-9]*\s+\(100%\)"; then
               exit 0
             fi
             sleep 2
@@ -124,12 +128,24 @@ jobs:
           exit 1
 
       - name: Record current-run metrics
+        # `cargo bench --manifest-path <elsewhere>` runs the compiled
+        # binary with CWD = the manifest's directory, not this step's
+        # `working-directory` — it silently breaks record_metrics.rs's
+        # CWD-relative embedder/DB discovery (same convention `tsmd`
+        # itself relies on), reporting "not reachable" against the wrong
+        # directory rather than a build error. Invoke the already-built
+        # binary (from "Pre-build record_metrics bench") directly instead,
+        # so cargo never touches CWD for this step. See the CWD note atop
+        # benches/record_metrics.rs.
         working-directory: tests/e2e/testdata
         run: |
-          cargo bench \
-            --manifest-path "${{ github.workspace }}/Cargo.toml" \
-            --features bench-counters --bench record_metrics \
-            > "${{ runner.temp }}/current.json"
+          DEPS="${{ github.workspace }}/target/release/deps"
+          BIN=$(ls -t "$DEPS"/record_metrics-* 2>/dev/null | grep -v '\.d$' | head -1)
+          if [ -z "$BIN" ]; then
+            echo "::error::record_metrics binary not found — did the pre-build step run?"
+            exit 1
+          fi
+          "$BIN" > "${{ runner.temp }}/current.json"
         env:
           TSM_BENCH_ENV: ubuntu-latest-cpu
 
@@ -234,11 +250,15 @@ jobs:
           # hasn't been counted yet. Require non-zero counts on both sides,
           # not just the percentage, and give the CPU model load real time
           # (cold fp32 load on a CI runner is much slower than a warm
-          # daemon on a dev machine).
+          # daemon on a dev machine). Also require `Embedder:  running`
+          # explicitly — on a rerun against an already-populated DB, a
+          # non-trivial 100% can be leftover state from a previous backfill
+          # while the embedder child is still mid-boot for *this* run.
           for _ in $(seq 1 90); do
             out=$(tsm status)
             echo "$out"
-            if echo "$out" | grep -qE "Vectors:\s+[1-9][0-9]*/[1-9][0-9]*\s+\(100%\)"; then
+            if echo "$out" | grep -qE "Embedder:\s+running" &&
+               echo "$out" | grep -qE "Vectors:\s+[1-9][0-9]*/[1-9][0-9]*\s+\(100%\)"; then
               exit 0
             fi
             sleep 2
@@ -247,12 +267,18 @@ jobs:
           exit 1
 
       - name: Record metrics
+        # See the "Record current-run metrics" step in the `gate` job for
+        # why this invokes the pre-built binary directly instead of
+        # `cargo bench --manifest-path <elsewhere>`.
         working-directory: tests/e2e/testdata
         run: |
-          cargo bench \
-            --manifest-path "${{ github.workspace }}/Cargo.toml" \
-            --features bench-counters --bench record_metrics \
-            > "${{ github.workspace }}/benches/baseline.json"
+          DEPS="${{ github.workspace }}/target/release/deps"
+          BIN=$(ls -t "$DEPS"/record_metrics-* 2>/dev/null | grep -v '\.d$' | head -1)
+          if [ -z "$BIN" ]; then
+            echo "::error::record_metrics binary not found — did the pre-build step run?"
+            exit 1
+          fi
+          "$BIN" > "${{ github.workspace }}/benches/baseline.json"
         env:
           TSM_BENCH_ENV: ubuntu-latest-cpu
 
