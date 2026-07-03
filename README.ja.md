@@ -238,6 +238,18 @@ embedder 呼び出し回数のみ（決定的な値のため完全一致判定�
 実行方法、CI ワークフローの内部構造は
 [docs/benchmarks.md](docs/benchmarks.md)（英語）を参照。
 
+## 検索品質
+
+手動で正解付けした golden コーパスに対して Precision@5 / MRR / nDCG@5 を
+計測し、コミット済みのベースラインに対して CI で gate する。辞書・
+スコアリング・フックの変更など、既存テストは壊さないが検索品質を静かに
+劣化させる類の変更を検知するのが目的。ローカルでは
+`bash tests/quality_bench.sh` で実行できる。
+
+設計方針、golden コーパス/クエリのフォーマット、ベースラインの実行・更新
+方法、gate の仕組みの詳細は [Search Quality](docs/search-quality.md)
+（英語）を参照。
+
 ## ドキュメント
 
 - [コマンドリファレンス](docs/command-reference.md) — CLIコマンド、フラグ、使用例
@@ -246,6 +258,7 @@ embedder 呼び出し回数のみ（決定的な値のため完全一致判定�
 - [設定リファレンス](docs/configuration.md) — 環境変数と設定ファイルのリファレンス
 - [ユーザー辞書](docs/user-dictionary.md) — カスタム辞書の管理
 - [ベンチマーク](docs/benchmarks.md) — 性能ベンチ、CI リグレッションゲート、ベースラインのライフサイクル
+- [Search Quality](docs/search-quality.md)（英語） — Precision/MRR/nDCG 回帰 gate: golden コーパス、gate 設計、ベースライン更新
 - [設計判断](decisions/) — ADR（アーキテクチャ決定記録）
 
 ## 背景

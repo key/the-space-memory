@@ -72,6 +72,25 @@ fn build_filter_clauses(
     (time_sql, path_sql, extra_params)
 }
 
+/// Total order for ranking results: score descending, then a deterministic
+/// tie-break (`source_file`, then `section_path`) so an exact-score tie
+/// always resolves the same way regardless of SQL row return order.
+///
+/// Without the tie-break, `Vec::sort_by`'s stability just preserves
+/// whatever order the rows happened to arrive from the DB in — and that
+/// order depends on `all_chunk_ids`, which (before this was made a
+/// `BTreeSet`) came from `HashSet` iteration, randomized per process by
+/// Rust's default SipHash seed. Two runs of an identical query could
+/// therefore rank exact-score ties differently, which a quality-regression
+/// gate comparing "did document X drop out of the top 5" cannot tolerate.
+fn compare_results_desc(a: &SearchResult, b: &SearchResult) -> std::cmp::Ordering {
+    b.score
+        .partial_cmp(&a.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.source_file.cmp(&b.source_file))
+        .then_with(|| a.section_path.cmp(&b.section_path))
+}
+
 /// Greedy per-document diversification of score-sorted results.
 ///
 /// Walks the (score-descending) candidate pool and keeps a chunk only while its
@@ -119,13 +138,19 @@ pub(crate) fn rank(
 ) -> anyhow::Result<SearchOutput> {
     let cls = &plan.classification;
 
+    // `BTreeSet` (not `HashSet`) so chunk ID order — and therefore SQL row
+    // return order, and therefore initial `results` insertion order — is
+    // reproducible across runs. `HashSet` iteration order is randomized per
+    // process (SipHash's random seed), which combined with `sort_by`'s
+    // stability below would make any exact-score tie's final rank
+    // nondeterministic.
     let all_chunk_ids: Vec<i64> = candidates
         .fts
         .keys()
         .chain(candidates.vec.keys())
         .chain(candidates.entity.keys())
         .copied()
-        .collect::<std::collections::HashSet<i64>>()
+        .collect::<std::collections::BTreeSet<i64>>()
         .into_iter()
         .collect();
 
@@ -228,11 +253,7 @@ pub(crate) fn rank(
         });
     }
 
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    results.sort_by(compare_results_desc);
     let total_hits = results.len();
     // Per-document diversity cap (#299): cap same-document flooding and let
     // below-cliff documents rise into freed slots. Runs on every path
@@ -324,6 +345,64 @@ mod tests {
 
     fn files(results: &[SearchResult]) -> Vec<&str> {
         results.iter().map(|r| r.source_file.as_str()).collect()
+    }
+
+    // ─── compare_results_desc tests ─────────────────────────────────
+
+    fn sr_section(file: &str, section_path: &str, score: f64) -> SearchResult {
+        SearchResult {
+            section_path: section_path.to_string(),
+            ..sr(file, score)
+        }
+    }
+
+    #[test]
+    fn compare_results_desc_orders_by_score_when_scores_differ() {
+        let mut results = vec![sr("a.md", 0.1), sr("b.md", 0.9), sr("c.md", 0.5)];
+        results.sort_by(compare_results_desc);
+        assert_eq!(files(&results), vec!["b.md", "c.md", "a.md"]);
+    }
+
+    #[test]
+    fn compare_results_desc_breaks_score_ties_by_source_file() {
+        // Insertion order deliberately reversed vs. the expected tie-break
+        // order (b, then z, then a alphabetically) — a correct tie-break
+        // must not just preserve input order.
+        let mut results = vec![sr("z.md", 0.5), sr("a.md", 0.5), sr("b.md", 0.5)];
+        results.sort_by(compare_results_desc);
+        assert_eq!(files(&results), vec!["a.md", "b.md", "z.md"]);
+    }
+
+    #[test]
+    fn compare_results_desc_breaks_source_file_ties_by_section_path() {
+        let mut results = [
+            sr_section("a.md", "z-section", 0.5),
+            sr_section("a.md", "a-section", 0.5),
+        ];
+        results.sort_by(compare_results_desc);
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.section_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-section", "z-section"]
+        );
+    }
+
+    #[test]
+    fn compare_results_desc_is_stable_regardless_of_input_order() {
+        // The same set of tied-score results, fed in two different input
+        // orders, must sort to the identical output order — this is the
+        // property the original HashSet-based chunk ID collection + bare
+        // score comparator could violate across runs.
+        let forward = vec![sr("a.md", 0.5), sr("b.md", 0.5), sr("c.md", 0.5)];
+        let mut reversed = vec![sr("c.md", 0.5), sr("b.md", 0.5), sr("a.md", 0.5)];
+
+        let mut forward_sorted = forward;
+        forward_sorted.sort_by(compare_results_desc);
+        reversed.sort_by(compare_results_desc);
+
+        assert_eq!(files(&forward_sorted), files(&reversed));
     }
 
     #[test]

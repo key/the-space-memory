@@ -250,6 +250,18 @@ visibility only. See [docs/benchmarks.md](docs/benchmarks.md) for the
 full design rationale, how to run the benches locally, and the CI
 workflow internals.
 
+## Search Quality
+
+Precision@5 / MRR / nDCG@5 measured against a hand-graded golden corpus,
+gated in CI against a committed baseline — catches quality regressions from
+dictionary, scoring, or hook changes that don't break any existing test but
+silently make search worse. Run it locally with
+`bash tests/quality_bench.sh`.
+
+See [Search Quality](docs/search-quality.md) for the full guide: design
+rationale, the golden corpus/query format, running and updating the
+baseline, and how the regression gate works.
+
 ## Documentation
 
 - [Command Reference](docs/command-reference.md) — CLI commands, flags, and usage examples
@@ -258,6 +270,7 @@ workflow internals.
 - [Configuration](docs/configuration.md) — Environment variables and config file reference
 - [User Dictionary](docs/user-dictionary.md) — Custom dictionary management
 - [Benchmarks](docs/benchmarks.md) — Perf benches, CI regression gate, baseline lifecycle
+- [Search Quality](docs/search-quality.md) — Precision/MRR/nDCG regression gate: golden corpus, gate design, updating the baseline
 - [Design Decisions](decisions/) — ADR (Architecture Decision Records)
 
 ## Background
