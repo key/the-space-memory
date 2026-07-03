@@ -1,0 +1,52 @@
+{
+  "schema_version": "1",
+  "env": "ubuntu-latest-cpu",
+  "embedder": "ruri-v3-30m-fp32",
+  "corpus": "tests/e2e/testdata/notes",
+  "indexing": {
+    "full_throughput": {
+      "total_seconds": 3.207257712,
+      "files_per_sec": 1.5589642145975453,
+      "chunks_per_sec": 8.730199601746254,
+      "breakdown": {
+        "prepare_seconds": 0.003646739666666667,
+        "embed_seconds": 3.184289724333333,
+        "persist_seconds": 0.018984888000000002
+      }
+    },
+    "incremental_latency_seconds": {
+      "mean": 0.16849861919999998,
+      "samples": [
+        0.160234619,
+        0.160123362,
+        0.160889921,
+        0.165696133,
+        0.170126791,
+        0.174859725,
+        0.170920526
+      ]
+    }
+  },
+  "search": {
+    "fts5_only_ms": {
+      "p50": 0.0,
+      "p95": 0.0,
+      "by_query": {}
+    },
+    "hybrid_ms": {
+      "p50": 112.16689000000001,
+      "p95": 113.24288200000001,
+      "by_query": {
+        "メロス": 112.6311598,
+        "坊っちゃん": 112.7181028,
+        "夏目": 111.8428726,
+        "猫": 111.5849714,
+        "銀河": 112.01391120000001
+      }
+    }
+  },
+  "embedder_calls": {
+    "full_index": 5,
+    "single_query_hybrid": 1
+  }
+}
