@@ -291,7 +291,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if git diff --quiet -- benches/baseline.json; then
+          # `git diff --quiet` only compares tracked files against the
+          # index/HEAD — on the first bootstrap run, benches/baseline.json
+          # is untracked, so `git diff` reports nothing and this always
+          # took the "unchanged" branch, silently skipping the PR forever.
+          # Stage first, then diff the index against HEAD (`--cached`),
+          # which correctly reports a new untracked file as a change while
+          # still reporting no change once the file exists with identical
+          # content (the steady-state case) — verified locally for both.
+          git add benches/baseline.json
+          if git diff --cached --quiet -- benches/baseline.json; then
             echo "benches/baseline.json unchanged, nothing to do."
             exit 0
           fi
@@ -302,7 +311,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add benches/baseline.json
           git commit -m "chore(bench): update performance baseline"
           git push origin "$BRANCH"
           BODY="Automated update of \`benches/baseline.json\` from the post-merge run on \`main\`."
