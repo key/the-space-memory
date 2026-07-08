@@ -367,8 +367,30 @@ mod tests {
         let body = format!("# Title\n\n## {huge_heading}\n\nShort body text.\n");
         let chunks = chunk_markdown(&body, "daily/notes", "test", 800);
         assert!(!chunks.is_empty());
+
+        // MAX_HEADING_CHARS (120) is divisible by 3, so for a 3-byte-per-char
+        // heading a byte cap (120 bytes = 40 chars) and a char cap (120 chars
+        // = 360 bytes) would BOTH satisfy a `<= MAX_HEADING_CHARS * 3` bound
+        // (360 bytes) — that check can't tell a byte-cap regression from a
+        // char-cap regression. Assert the truncated heading's actual BYTE
+        // length directly against MAX_HEADING_CHARS instead.
+        // The pre-header "# Title" text becomes its own chunk with
+        // section_path == "Title" (no heading), so locate the chunk actually
+        // under the huge H2 heading (section_path == "Title > <heading>").
+        let heading_part = chunks
+            .iter()
+            .find_map(|c| c.section_path.strip_prefix("Title > "))
+            .expect("one chunk's section_path must contain the truncated heading");
+        assert!(
+            heading_part.len() <= MAX_HEADING_CHARS,
+            "truncated heading is {} bytes, expected <= {MAX_HEADING_CHARS} bytes \
+             (a char-cap regression would produce {} bytes here)",
+            heading_part.len(),
+            MAX_HEADING_CHARS * 3,
+        );
+
         for c in &chunks {
-            assert!(c.content.len() <= 800 + MAX_HEADING_CHARS * 3 + 200);
+            assert!(c.content.len() <= 800 + MAX_HEADING_CHARS + 200);
         }
     }
 

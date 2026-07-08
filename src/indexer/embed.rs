@@ -626,4 +626,34 @@ mod tests {
             .unwrap();
         assert_eq!(vecs, 20);
     }
+
+    // ─── backfill_vectors clamp test ────────────────────────────
+
+    #[test]
+    fn test_backfill_vectors_clamps_batch_size_to_backfill_cap() {
+        // Mirrors test_next_batch_clamps_batch_size_to_backfill_cap but for
+        // the `tsm vector-fill --batch-size` entry point (backfill_vectors
+        // itself), which sends each SQL page whole to encode_fn and must
+        // clamp the caller-supplied batch size the same way.
+        let (conn, _dir, entries) = arrange_chunks(20);
+        let batch_sizes = std::cell::RefCell::new(Vec::new());
+        let recording_encode = |texts: &[String]| {
+            batch_sizes.borrow_mut().push(texts.len());
+            mock_encode(texts)
+        };
+
+        let stats = backfill_vectors(&conn, &recording_encode, 64, None).unwrap();
+
+        assert_eq!(entries.len(), 20);
+        assert_eq!(stats.filled, 20);
+        assert_eq!(stats.errors, 0);
+        assert!(!batch_sizes.borrow().is_empty());
+        for size in batch_sizes.borrow().iter() {
+            assert!(*size <= config::BACKFILL_BATCH_SIZE);
+        }
+        let vecs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vecs, 20);
+    }
 }
