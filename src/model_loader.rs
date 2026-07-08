@@ -19,8 +19,10 @@ use crate::embedder::{Embedder, EmbeddingModel};
 /// (batch, heads, seq, seq) attention matrix, so memory grows with seq².
 /// Chunks target ~800 chars (see config::MAX_CHUNK_CHARS); 2048 tokens is
 /// ample headroom. The batch dimension is bounded by callers in the indexer
-/// (BACKFILL_BATCH_SIZE = 8), so a full-size request stays around ~0.5GB
-/// of attention memory.
+/// (BACKFILL_BATCH_SIZE = 8), so a full-size request materializes ~0.5GB per
+/// attention tensor — but candle's non-in-place broadcast_add/softmax ops
+/// allocate transient copies on top of that, so realistic peak memory for a
+/// full-size request is more like 1-2GB, not 0.5GB.
 const MAX_TOKENS: usize = 2048;
 
 /// Apply padding and truncation settings shared by all load paths.
