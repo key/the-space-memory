@@ -234,6 +234,11 @@ A change is merge-ready when **all** of the following hold:
 - **Segmenter is cached** — `tokenizer::get_segmenter()` caches the Segmenter
   (including user dict). Call `reset_segmenter()` after writing new simpledic
   if rebuilding FTS in the same process
+- **Embedder memory is O(batch × seq²)** — candle's ModernBert materializes
+  the full attention matrix. All embed requests must stay within
+  `BACKFILL_BATCH_SIZE` texts (indexer sub-batches `insert_vectors`) and the
+  tokenizer truncates at 2048 tokens. Do not send unbounded batches to
+  `embed_via_socket`.
 
 ## Design Decisions (ADR)
 
