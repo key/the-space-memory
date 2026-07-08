@@ -95,11 +95,7 @@ pub fn resolve_model_load(model_dir: Option<&Path>, all_files_present: bool) -> 
 /// A failure in any sub-batch aborts the whole call and returns that error,
 /// matching the pre-existing whole-request failure behavior (the caller
 /// still sees one `Err` for the whole request, never a partial result).
-pub fn encode_in_batches(
-    encode: EncodeFn,
-    texts: &[String],
-    cap: usize,
-) -> Result<Vec<Vec<f32>>> {
+pub fn encode_in_batches(encode: EncodeFn, texts: &[String], cap: usize) -> Result<Vec<Vec<f32>>> {
     let cap = cap.max(1);
     let mut result = Vec::with_capacity(texts.len());
     for batch in texts.chunks(cap) {
