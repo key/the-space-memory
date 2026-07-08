@@ -141,8 +141,16 @@ fn handle_client(mut stream: UnixStream, embedder: &Embedder) -> Result<()> {
     let request: serde_json::Value = serde_json::from_slice(&request_data)?;
     let texts = embedder_logic::parse_texts(&request);
 
-    let encode_result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| embedder.encode(&texts)));
+    // Sub-batch server-side (mirrors the indexer's client-side
+    // BACKFILL_BATCH_SIZE cap): the only other bound on `texts` here is ipc's
+    // 64MB message cap, so without this a client talking to the embedder
+    // socket directly could send an oversized request and force candle to
+    // materialize an O(batch × seq²) attention tensor. See
+    // `embedder_logic::encode_in_batches`.
+    let encode_fn = |batch: &[String]| embedder.encode(batch);
+    let encode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        embedder_logic::encode_in_batches(&encode_fn, &texts, config::BACKFILL_BATCH_SIZE)
+    }));
 
     // Build the reply value, logging error/panic causes (logging stays in the
     // shell); the wire write and shutdown are identical across all outcomes.

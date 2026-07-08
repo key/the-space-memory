@@ -11,6 +11,10 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::Value;
 
+/// Encode function type: takes a slice of texts, returns embedding vectors.
+/// Mirrors `crate::indexer::embed::EncodeFn` — same shape, separate binary.
+pub type EncodeFn<'a> = &'a dyn Fn(&[String]) -> Result<Vec<Vec<f32>>>;
+
 /// Extract the `texts` array from an embed request, dropping non-string and
 /// absent entries. A missing or non-array `texts` yields an empty vec (the
 /// embedder then returns no embeddings rather than erroring).
@@ -75,6 +79,33 @@ pub fn resolve_model_load(model_dir: Option<&Path>, all_files_present: bool) -> 
         Some(dir) => ModelLoadPlan::FallbackIncomplete(dir),
         None => ModelLoadPlan::Default,
     }
+}
+
+/// Split `texts` into sub-batches of at most `cap` items, run `encode` on each
+/// sub-batch, and concatenate the resulting embeddings in order.
+///
+/// This is the server-side counterpart of the indexer's client-side
+/// `BACKFILL_BATCH_SIZE` cap: a client that talks to the embedder socket
+/// directly (bypassing the indexer) could otherwise submit an arbitrarily
+/// large `texts` array — bounded only by ipc's 64MB message cap — and force
+/// candle's ModernBert to materialize an O(batch × heads × seq²) attention
+/// tensor per layer. Sub-batching here means no caller, trusted or not, can
+/// trigger that blowup through the socket.
+///
+/// A failure in any sub-batch aborts the whole call and returns that error,
+/// matching the pre-existing whole-request failure behavior (the caller
+/// still sees one `Err` for the whole request, never a partial result).
+pub fn encode_in_batches(
+    encode: EncodeFn,
+    texts: &[String],
+    cap: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let cap = cap.max(1);
+    let mut result = Vec::with_capacity(texts.len());
+    for batch in texts.chunks(cap) {
+        result.extend(encode(batch)?);
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -183,5 +214,72 @@ mod tests {
         assert_eq!(resolve_model_load(None, false), ModelLoadPlan::Default);
         // Defensive: a `true` flag with no dir is still Default (no dir to use).
         assert_eq!(resolve_model_load(None, true), ModelLoadPlan::Default);
+    }
+
+    // ─── encode_in_batches ─────────────────────────────
+
+    /// Deterministic stand-in for a real encode call: one embedding per text,
+    /// each holding the text's length so order is verifiable end-to-end.
+    fn len_encode(texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|t| vec![t.len() as f32]).collect())
+    }
+
+    #[test]
+    fn test_encode_in_batches_preserves_order_across_sub_batches() {
+        let texts: Vec<String> = (0..10).map(|i| "x".repeat(i + 1)).collect();
+        let result = encode_in_batches(&len_encode, &texts, 3).unwrap();
+        let expected: Vec<Vec<f32>> = texts.iter().map(|t| vec![t.len() as f32]).collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_encode_in_batches_respects_cap() {
+        let texts: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+        let sizes = std::cell::RefCell::new(Vec::new());
+        let recording = |batch: &[String]| {
+            sizes.borrow_mut().push(batch.len());
+            len_encode(batch)
+        };
+        let result = encode_in_batches(&recording, &texts, 4).unwrap();
+        assert_eq!(*sizes.borrow(), vec![4, 4, 2]);
+        assert_eq!(result.len(), 10);
+    }
+
+    #[test]
+    fn test_encode_in_batches_propagates_error_from_any_sub_batch() {
+        let texts: Vec<String> = (0..6).map(|i| format!("t{i}")).collect();
+        let calls = std::cell::Cell::new(0usize);
+        let flaky = |batch: &[String]| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                anyhow::bail!("sub-batch encode failed");
+            }
+            len_encode(batch)
+        };
+        let result = encode_in_batches(&flaky, &texts, 2);
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 2, "should stop at the failing sub-batch");
+    }
+
+    #[test]
+    fn test_encode_in_batches_empty_input() {
+        let texts: Vec<String> = Vec::new();
+        let result = encode_in_batches(&len_encode, &texts, 4).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_encode_in_batches_cap_zero_treated_as_one() {
+        // A cap of 0 would make `chunks()` panic; guard against a misconfigured
+        // caller by treating 0 as 1 (still makes progress, one text at a time).
+        let texts: Vec<String> = vec!["a".to_string(), "bb".to_string()];
+        let sizes = std::cell::RefCell::new(Vec::new());
+        let recording = |batch: &[String]| {
+            sizes.borrow_mut().push(batch.len());
+            len_encode(batch)
+        };
+        let result = encode_in_batches(&recording, &texts, 0).unwrap();
+        assert_eq!(*sizes.borrow(), vec![1, 1]);
+        assert_eq!(result, vec![vec![1.0], vec![2.0]]);
     }
 }
