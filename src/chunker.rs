@@ -5,6 +5,14 @@ use crate::config::MAX_CHUNK_CHARS;
 
 static H1_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^#\s+(.+)").unwrap());
 
+/// Cap on heading text (H1/H2/H3) used to build the `【dir/file】section` chunk
+/// prefix. `hard_split` bounds paragraph bodies, but heading text comes
+/// straight from the source line with no length limit of its own — one
+/// pathologically long heading line would otherwise make the prefix (and thus
+/// every chunk under it) arbitrarily large. 120 bytes is generous for a real
+/// heading while keeping the worst case bounded.
+const MAX_HEADING_CHARS: usize = 120;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     pub content: String,
@@ -108,7 +116,7 @@ fn chunk_markdown_inner(
 fn extract_title(body: &str) -> Option<&str> {
     let first_line = body.lines().find(|l| !l.trim().is_empty())?;
     let caps = H1_RE.captures(first_line)?;
-    Some(caps.get(1)?.as_str().trim())
+    Some(truncate_heading(caps.get(1)?.as_str().trim()))
 }
 
 fn split_by_header(body: &str, level: usize) -> Vec<(String, String)> {
@@ -122,7 +130,7 @@ fn split_by_header(body: &str, level: usize) -> Vec<(String, String)> {
 
     for caps in re.captures_iter(body) {
         let m = caps.get(0).unwrap();
-        let heading = caps.get(1).unwrap().as_str().trim().to_string();
+        let heading = truncate_heading(caps.get(1).unwrap().as_str().trim()).to_string();
 
         // Text before this header
         let text_before = &body[last_end..m.start()];
@@ -159,6 +167,19 @@ fn split_paragraphs(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Walk back from `max_bytes` to the nearest UTF-8 char boundary at or before
+/// it, returning that byte offset (0 if `max_bytes` lands before the first
+/// char boundary, e.g. `max_bytes` smaller than the text's first char).
+/// Shared by [`hard_split`] and [`truncate_heading`] so both cap at a byte
+/// length without ever slicing mid-character.
+fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// Split a text into pieces of at most `max_bytes` bytes, cutting only at
 /// UTF-8 char boundaries. Needed because a single paragraph (e.g. a pasted
 /// log or minified line) can exceed max_chars and would otherwise become
@@ -167,10 +188,7 @@ fn hard_split(text: &str, max_bytes: usize) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut rest = text;
     while rest.len() > max_bytes {
-        let mut end = max_bytes;
-        while end > 0 && !rest.is_char_boundary(end) {
-            end -= 1;
-        }
+        let end = char_boundary_at_or_before(rest, max_bytes);
         if end == 0 {
             break; // max_bytes smaller than one char; emit remainder as-is
         }
@@ -181,6 +199,14 @@ fn hard_split(text: &str, max_bytes: usize) -> Vec<&str> {
         parts.push(rest);
     }
     parts
+}
+
+/// Cap heading text (H1/H2/H3, already trimmed) at [`MAX_HEADING_CHARS`]
+/// bytes, cutting only at a UTF-8 char boundary. Applied where headings are
+/// captured so every downstream section-name/prefix build is already bounded.
+fn truncate_heading(heading: &str) -> &str {
+    let end = char_boundary_at_or_before(heading, MAX_HEADING_CHARS);
+    &heading[..end]
 }
 
 fn merge_small_chunks(paragraphs: &[&str], max_chars: usize) -> Vec<String> {
@@ -312,6 +338,38 @@ mod tests {
             .map(|c| c.content.split_once('\n').unwrap().1)
             .collect();
         assert_eq!(joined.chars().filter(|c| *c == 'あ').count(), 1000);
+    }
+
+    #[test]
+    fn test_oversized_heading_prefix_is_capped() {
+        // A pathologically long H2 heading line must not make the prefix (and
+        // therefore the chunk) unbounded — heading text is capped
+        // independently of hard_split's paragraph-body cap.
+        let huge_heading = "H".repeat(5000);
+        let body = format!("# Title\n\n## {huge_heading}\n\nShort body text.\n");
+        let chunks = chunk_markdown(&body, "daily/notes", "test", 800);
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert!(
+                c.content.len() <= 800 + MAX_HEADING_CHARS + 200,
+                "chunk too large: {} bytes",
+                c.content.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_oversized_multibyte_heading_does_not_panic() {
+        // 3-byte-per-char heading whose byte length is not a multiple of
+        // MAX_HEADING_CHARS: the truncation boundary walk must not panic on a
+        // non-char-boundary cut.
+        let huge_heading = "見".repeat(2000); // 6000 bytes, no ASCII at all
+        let body = format!("# Title\n\n## {huge_heading}\n\nShort body text.\n");
+        let chunks = chunk_markdown(&body, "daily/notes", "test", 800);
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert!(c.content.len() <= 800 + MAX_HEADING_CHARS * 3 + 200);
+        }
     }
 
     #[test]
