@@ -44,14 +44,37 @@ pub(crate) fn insert_vectors(conn: &Connection, chunk_entries: &[(i64, String)])
         return;
     }
 
-    let texts: Vec<String> = chunk_entries.iter().map(|(_, text)| text.clone()).collect();
-    let embeddings = match embedder::embed_via_socket(&texts) {
-        Some(e) => e,
-        None => return,
+    let encode_fn = |texts: &[String]| {
+        embedder::embed_via_socket(texts).ok_or_else(|| anyhow::anyhow!("embedder not available"))
     };
+    insert_vectors_batched(conn, chunk_entries, &encode_fn, config::BACKFILL_BATCH_SIZE);
+}
 
-    for ((chunk_id, _), emb) in chunk_entries.iter().zip(embeddings.iter()) {
-        write_vec_row(conn, *chunk_id, emb);
+/// Embed and store vectors in sub-batches so a document with many chunks
+/// (sessions have been observed with 350+) never lands in the embedder as
+/// one request — attention memory there grows with batch × seq².
+/// On encode failure, stop: the embedder is likely down and the periodic
+/// backfill will fill the remaining chunks.
+fn insert_vectors_batched(
+    conn: &Connection,
+    chunk_entries: &[(i64, String)],
+    encode_fn: EncodeFn,
+    batch_size: usize,
+) {
+    for batch in chunk_entries.chunks(batch_size.max(1)) {
+        let texts: Vec<String> = batch.iter().map(|(_, text)| text.clone()).collect();
+        let embeddings = match encode_fn(&texts) {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!(
+                    "insert_vectors_batched: encode failed ({e}); leaving remaining chunks to backfill"
+                );
+                return;
+            }
+        };
+        for ((chunk_id, _), emb) in batch.iter().zip(embeddings.iter()) {
+            write_vec_row(conn, *chunk_id, emb);
+        }
     }
 }
 
@@ -238,6 +261,13 @@ pub fn backfill_next_batch(
     batch_size: usize,
     last_id: i64,
 ) -> anyhow::Result<(BackfillStats, bool)> {
+    // Clamp the caller-supplied batch size: embedder memory is
+    // O(batch × seq²), so a page larger than BACKFILL_BATCH_SIZE sent whole
+    // to `encode_fn` (as this function does) can still exhaust memory even
+    // with the per-input token cap. Treat the caller's value as an upper
+    // hint only.
+    let batch_size = batch_size.clamp(1, config::BACKFILL_BATCH_SIZE);
+
     if !db::has_vec_table(conn) {
         return Ok((BackfillStats::default(), false));
     }
@@ -301,6 +331,13 @@ pub fn backfill_vectors(
     batch_size: usize,
     progress_cb: Option<&dyn Fn(i64, usize, usize)>,
 ) -> anyhow::Result<BackfillStats> {
+    // Clamp the caller-supplied batch size (e.g. `tsm vector-fill
+    // --batch-size`): embedder memory is O(batch × seq²), and this function
+    // sends each SQL page whole to `encode_fn`, so an unclamped caller value
+    // can still exhaust memory even with the per-input token cap. Treat the
+    // caller's value as an upper hint only.
+    let batch_size = batch_size.clamp(1, config::BACKFILL_BATCH_SIZE);
+
     if !db::has_vec_table(conn) {
         return Ok(BackfillStats::default());
     }
@@ -337,4 +374,145 @@ pub fn backfill_vectors(
 
     log_summary(&stats);
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::indexer::index_file;
+    use std::io::Write;
+
+    fn setup() -> (Connection, tempfile::TempDir) {
+        crate::test_utils::setup_db_with_dir()
+    }
+
+    fn write_md(dir: &std::path::Path, rel_path: &str, content: &str) -> std::path::PathBuf {
+        let full = dir.join(rel_path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&full).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        full
+    }
+
+    /// Clear all vectors so tests start from a known state. Needed because
+    /// `index_file` may insert vectors if the embedder daemon is running.
+    fn clear_vectors(conn: &Connection) {
+        let _ = conn.execute("DELETE FROM chunks_vec", []);
+    }
+
+    fn mock_encode(texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|_| {
+                (0..config::EMBEDDING_DIM)
+                    .map(|i| i as f32 / 256.0)
+                    .collect()
+            })
+            .collect())
+    }
+
+    fn mock_encode_fail(_texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::bail!("encode failed")
+    }
+
+    // ─── insert_vectors_batched tests ─────────────────────────────
+
+    /// Index a markdown file with `n` H2 sections; return (chunk_id, content).
+    fn arrange_chunks(n: usize) -> (Connection, tempfile::TempDir, Vec<(i64, String)>) {
+        let (conn, dir) = setup();
+        // No leading H1 line: any non-blank text before the first H2 header
+        // becomes its own chunk (see chunker::split_by_header), which would
+        // throw off the exact chunk count asserted below.
+        let mut body = String::new();
+        for i in 0..n {
+            body.push_str(&format!("\n## Section {i}\n\nContent number {i} here.\n"));
+        }
+        let path = write_md(dir.path(), "daily/notes/many.md", &body);
+        index_file(&conn, &path, dir.path()).unwrap();
+        clear_vectors(&conn);
+        let entries: Vec<(i64, String)> = conn
+            .prepare("SELECT id, content FROM chunks ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(entries.len(), n);
+        (conn, dir, entries)
+    }
+
+    #[test]
+    fn test_insert_vectors_batched_caps_request_size() {
+        let (conn, _dir, entries) = arrange_chunks(20);
+        let batch_sizes = std::cell::RefCell::new(Vec::new());
+        let recording_encode = |texts: &[String]| {
+            batch_sizes.borrow_mut().push(texts.len());
+            mock_encode(texts)
+        };
+        insert_vectors_batched(&conn, &entries, &recording_encode, 8);
+
+        // Every request capped at 8; all 20 chunks embedded
+        assert_eq!(*batch_sizes.borrow(), vec![8, 8, 4]);
+        let vecs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vecs, 20);
+    }
+
+    #[test]
+    fn test_insert_vectors_batched_stops_on_failure() {
+        let (conn, _dir, entries) = arrange_chunks(10);
+        let calls = std::cell::Cell::new(0usize);
+        let flaky_encode = |texts: &[String]| {
+            calls.set(calls.get() + 1);
+            if calls.get() >= 2 {
+                mock_encode_fail(texts)
+            } else {
+                mock_encode(texts)
+            }
+        };
+        insert_vectors_batched(&conn, &entries, &flaky_encode, 8);
+
+        // First batch (8) written, second failed → stop, rest left for backfill
+        let vecs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vecs, 8);
+        assert_eq!(calls.get(), 2);
+    }
+
+    // ─── backfill_next_batch clamp test ────────────────────────
+
+    #[test]
+    fn test_next_batch_clamps_batch_size_to_backfill_cap() {
+        let (conn, _dir, entries) = arrange_chunks(20);
+        let batch_sizes = std::cell::RefCell::new(Vec::new());
+        let recording_encode = |texts: &[String]| {
+            batch_sizes.borrow_mut().push(texts.len());
+            mock_encode(texts)
+        };
+
+        // Caller passes 64 (e.g. tsm vector-fill --batch-size default) — must
+        // be clamped to BACKFILL_BATCH_SIZE so the SQL page (and thus the
+        // encode_fn call) never exceeds the attention-memory-safe size.
+        let mut last_id = 0i64;
+        loop {
+            let (stats, has_more) =
+                backfill_next_batch(&conn, &recording_encode, 64, last_id).unwrap();
+            if !has_more {
+                break;
+            }
+            last_id = stats.last_id;
+        }
+
+        assert_eq!(entries.len(), 20);
+        assert!(!batch_sizes.borrow().is_empty());
+        for size in batch_sizes.borrow().iter() {
+            assert!(*size <= config::BACKFILL_BATCH_SIZE);
+        }
+        let vecs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vecs, 20);
+    }
 }

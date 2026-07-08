@@ -10,10 +10,35 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::modernbert::{Config, ModernBert};
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use crate::config;
 use crate::embedder::{Embedder, EmbeddingModel};
+
+/// Hard cap on tokens per input. candle's ModernBert materializes the full
+/// (batch, heads, seq, seq) attention matrix, so memory grows with seq².
+/// Chunks target ~800 chars (see config::MAX_CHUNK_CHARS); 2048 tokens is
+/// ample headroom. The batch dimension is bounded by callers in the indexer
+/// (BACKFILL_BATCH_SIZE = 8), so a full-size request stays around ~0.5GB
+/// of attention memory.
+const MAX_TOKENS: usize = 2048;
+
+/// Apply padding and truncation settings shared by all load paths.
+fn configure_tokenizer(tokenizer: &mut Tokenizer, pad_token_id: u32) -> Result<()> {
+    tokenizer.with_padding(Some(PaddingParams {
+        strategy: PaddingStrategy::BatchLongest,
+        pad_id: pad_token_id,
+        pad_token: "[PAD]".to_string(),
+        ..Default::default()
+    }));
+    tokenizer
+        .with_truncation(Some(TruncationParams {
+            max_length: MAX_TOKENS,
+            ..Default::default()
+        }))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
 
 /// The real ModernBert-backed model. Thin wrapper: forwards to candle.
 pub struct RuriModel(ModernBert);
@@ -74,12 +99,7 @@ impl Embedder {
 
         let mut tokenizer =
             Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        tokenizer.with_padding(Some(PaddingParams {
-            strategy: PaddingStrategy::BatchLongest,
-            pad_id: pad_token_id,
-            pad_token: "[PAD]".to_string(),
-            ..Default::default()
-        }));
+        configure_tokenizer(&mut tokenizer, pad_token_id)?;
 
         let tensors = load_tensors_with_prefix(weights_path, device)?;
         let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
@@ -108,6 +128,31 @@ fn load_tensors_with_prefix(path: &Path, device: &Device) -> Result<HashMap<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_configure_tokenizer_truncates_and_pads() {
+        // Minimal word-level tokenizer built from inline JSON (no model files)
+        let tok_json = r#"{
+            "version": "1.0",
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"[PAD]": 0, "hello": 1},
+                "unk_token": "[PAD]"
+            },
+            "pre_tokenizer": {"type": "Whitespace"}
+        }"#;
+        let mut tokenizer = Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+        configure_tokenizer(&mut tokenizer, 0).unwrap();
+
+        let long_text = "hello ".repeat(3000); // 3000 tokens before truncation
+        let encodings = tokenizer
+            .encode_batch(vec![long_text, "hello".to_string()], true)
+            .unwrap();
+
+        // Long input truncated to MAX_TOKENS; short input padded to batch longest
+        assert_eq!(encodings[0].get_ids().len(), MAX_TOKENS);
+        assert_eq!(encodings[1].get_ids().len(), MAX_TOKENS);
+    }
 
     #[test]
     #[serial_test::serial]
