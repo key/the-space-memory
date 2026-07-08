@@ -22,9 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # stable
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # stable
         with:
           toolchain: stable
 
@@ -34,7 +34,7 @@ jobs:
         run: cargo build --release
 
       - name: Cache ruri-v3-30m model
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ runner.temp }}/tsm-models
           key: ruri-v3-30m-model
@@ -46,8 +46,22 @@ jobs:
         run: tsm setup
         env:
           HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
+          # `tsm setup` populates the machine-wide cache at `{cache_dir}/models/
+          # ruri-v3-30m` (ADR-0008); it does not touch the workspace `.tsm/`. Pin
+          # TSM_CACHE_DIR to an absolute `{workspace}/.tsm` so the install path is
+          # explicit and matches the TSM_CACHE_DIR the test step points the
+          # embedder at. TSM_STATE_DIR is irrelevant to setup but kept aligned.
+          TSM_CACHE_DIR: ${{ github.workspace }}/.tsm
+          TSM_STATE_DIR: ${{ github.workspace }}/.tsm
 
       - name: Run E2E tests
         run: bash tests/e2e.sh
         env:
           HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
+          # The model was installed under `{workspace}/.tsm/models/ruri-v3-30m`
+          # above. e2e.sh overrides TSM_STATE_DIR with a fresh mktemp dir, so the
+          # embedder's workspace lookup is empty and it falls back to the machine-
+          # wide cache (`cache_models_dir` = `{TSM_CACHE_DIR}/models/ruri-v3-30m`).
+          # Point TSM_CACHE_DIR at the same `{workspace}/.tsm` so it resolves to
+          # that install. (e2e.sh sets TSM_STATE_DIR but not TSM_CACHE_DIR.)
+          TSM_CACHE_DIR: ${{ github.workspace }}/.tsm

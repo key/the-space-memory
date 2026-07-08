@@ -1,7 +1,11 @@
+---
+status: accepted
+created: 2026-04-15
+updated: 2026-06-23
+---
+
 # ADR-0007: tsm の処理を Index / Search の 2 パイプラインに分解し段を明示する
 
-- **Status**: **Proposed**
-- **Date**: 2026-04-15
 - **Deciders**: key
 - **Related**:
   [ADR-0001](./0001-process-roles-and-responsibilities.md),
@@ -26,15 +30,20 @@ tsm の処理を以下 2 つのパイプラインとして定義する。
 
 ### Index パイプライン（3段）
 
+同期コア（Prepare → Persist）でドキュメントは Persist commit 時点で FTS5
+検索可能になる。ベクトル埋め込みは下流で非同期に走る。Persist がチャンク
+text を enqueue し、Embed が out-of-band でベクトルを生成・書き込むため、
+indexing は embedder を待たない。
+
 ```text
-Prepare（並列可）─▶ Embed（直列）─▶ Persist（直列）
+Prepare（並列可・同期）─▶ Persist（直列・同期）┄enqueue┄▶ Embed（直列・非同期）
 ```
 
 | 段 | 性質 | 責務 |
 |---|---|---|
-| Prepare | IO/CPU bound、ファイル単位で並列 | Load / frontmatter / チャンク分割 / メタデータ抽出 |
-| Embed | GPU bound、直列（embedder 契約） | embedder 呼び出し |
-| Persist | DB Mutex bound、直列 | FTS5 / vector / metadata 書き込み（1 ファイル = 1 transaction） |
+| Prepare | IO/CPU bound、ファイル単位で並列、同期 | Load / frontmatter / チャンク分割 / メタデータ抽出 |
+| Persist | DB Mutex bound、直列、同期 | documents / chunks / FTS5 / entity / link を 1 ファイル = 1 transaction で書き込み。commit 時点で FTS 検索可能 |
+| Embed | GPU bound、直列、非同期 | commit 後にチャンク text を enqueue。embedder が out-of-band でベクトルを生成し vector 行を書き込む |
 
 ### Search パイプライン（4段）
 
@@ -54,9 +63,14 @@ Plan ─▶ Retrieve（FTS5 / Vector 並列）─▶ Rank ─▶ Format
 段分解後も以下を維持する。破ると簡単に性能劣化する。
 
 1. **バッチ粒度**: 段間を流れる最小単位は「チャンクの集合」。per-chunk に flatten しない
-2. **Persist トランザクション境界**: 1 ファイル = 1 transaction を維持する
+2. **Persist トランザクション境界**: 1 ファイルのリレーショナル + FTS5
+   書き込みを 1 transaction にする（vector 行は Embed が別途書く）
 3. **Tokenizer 整合性**: Prepare と Plan で同一 tokenizer 実装を参照する。差し替え時は再インデックス必須
 4. **Embed 直列契約**: embedder の呼び出しは Embed 段からのみ行い、他段・プラグインから直接叩かない
+5. **ベクトルは常に非同期**: FTS5 は Persist commit 時点で利用可能。
+   ベクトルは後続で生成・書き込み（commit 後 best-effort + backfill）。
+   embedder 停止中でも indexing は FTS-only で完走し、ベクトルは
+   backfill で補完する
 
 ### プラグインのフック点
 
@@ -98,8 +112,8 @@ Plan ─▶ Retrieve（FTS5 / Vector 並列）─▶ Rank ─▶ Format
 プラグイン都合で段が歪み、責務と並列度の設計が崩れる。
 
 **なぜ 3 段 + 4 段という粒度か**:
-段の境界は「並列度とリソース制約が変わる点」で切る。Prepare（並列）/ Embed
-（GPU 直列）/ Persist（DB Mutex 直列）は実際のリソース境界と一致する。
+段の境界は「並列度とリソース制約が変わる点」で切る。Prepare（並列）/ Persist
+（DB Mutex 直列）/ Embed（GPU 直列）は実際のリソース境界と一致する。
 それ以上細かく切ると段間オーバーヘッドと型定義コストが増えるだけで、
 責務分離の効果が薄れる。Search 側の Rank と Format の分離は
 「順序決定」と「表示」の責務が明確に異なるため必要。
@@ -107,8 +121,14 @@ Plan ─▶ Retrieve（FTS5 / Vector 並列）─▶ Rank ─▶ Format
 **なぜ直列段を残すか**:
 Embed は embedder のシングルスレッド accept、Persist は `Arc<Mutex<Connection>>`
 で既に直列。段分解は事実の明文化であり、新たな直列化ではない。
-むしろ stage pipelining（A ファイルの Persist 中に B ファイルの Embed を
-並行させる）の余地を作る方向に働く。
+
+**なぜ Embed を Persist の下流・非同期に置くか**:
+ベクトル埋め込みを Persist 前に同期化すると、indexing スループットと検索
+可用性が embedder のレイテンシ・稼働状況に結合する。Persist を先に確定して
+FTS5 を即時利用可能にし、Embed を非同期にすることで、embedder 停止中でも
+indexing は FTS-only で完走する（vectors-always-async 原則）。これにより
+stage pipelining（A ファイルの Embed 中に B ファイルの Persist を進める）の
+余地も生まれる。
 
 ## Consequences
 

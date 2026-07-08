@@ -1,0 +1,168 @@
+use std::net::Shutdown;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use std::path::PathBuf;
+
+use the_space_memory::config;
+use the_space_memory::embedder::Embedder;
+use the_space_memory::ipc::{accept_blocking, read_message, write_message};
+
+use candle_core::Device;
+
+use crate::embedder_logic;
+
+/// Entry point for `tsmd --embedder`.
+pub fn run(model: Option<PathBuf>, no_idle_timeout: bool) -> Result<()> {
+    config::ensure_model_cache_env();
+    if no_idle_timeout {
+        // Must be set BEFORE init_logger, which triggers config singleton init.
+        // SAFETY: called single-threaded before any thread spawn or logger init.
+        unsafe { std::env::set_var("TSM_EMBEDDER_IDLE_TIMEOUT", "0") };
+    }
+    // Log to stderr (inherited from the daemon, captured into tsmd-stderr.log);
+    // children do not manage their own log files.
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::DaemonStderr)?;
+    let socket_path = config::embedder_socket_path();
+    run_daemon(&socket_path, model.as_deref())
+}
+
+/// Load model from explicit directory or fall back to default resolution.
+fn load_model(model_dir: Option<&Path>) -> Result<Embedder> {
+    // FS completeness check stays in the shell; the policy decision is pure.
+    let all_files_present =
+        model_dir.is_some_and(|dir| config::MODEL_FILES.iter().all(|f| dir.join(f).is_file()));
+    match embedder_logic::resolve_model_load(model_dir, all_files_present) {
+        embedder_logic::ModelLoadPlan::FromDir(dir) => Embedder::load_from_paths(
+            &dir.join("config.json"),
+            &dir.join("tokenizer.json"),
+            &dir.join("model.safetensors"),
+            &Device::Cpu,
+        ),
+        embedder_logic::ModelLoadPlan::FallbackIncomplete(dir) => {
+            log::warn!(
+                "Model files incomplete in {}; falling back to default resolution \
+                 (state_dir override → cache_dir). Run `tsm setup` to populate the cache.",
+                dir.display()
+            );
+            Embedder::load(&Device::Cpu)
+        }
+        embedder_logic::ModelLoadPlan::Default => Embedder::load(&Device::Cpu),
+    }
+}
+
+/// Run the embedder socket server loop.
+fn run_daemon(socket_path: &Path, model_dir: Option<&Path>) -> Result<()> {
+    // Clean up stale socket
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path)?;
+    }
+
+    log::info!("Loading model...");
+    let embedder = load_model(model_dir)?;
+    log::info!("Model loaded.");
+
+    log::info!("Listening on {}", socket_path.display());
+
+    let listener = UnixListener::bind(socket_path)?;
+    listener.set_nonblocking(true)?;
+
+    let running = Arc::new(AtomicBool::new(true));
+    let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
+
+    // Watchdog thread (skipped when idle timeout is 0)
+    let idle_timeout_secs = config::embedder_idle_timeout_secs();
+    if idle_timeout_secs > 0 {
+        let running = Arc::clone(&running);
+        let last_activity = Arc::clone(&last_activity);
+        let socket_path = socket_path.to_path_buf();
+        std::thread::spawn(move || {
+            watchdog(&running, &last_activity, &socket_path, idle_timeout_secs);
+        });
+    } else {
+        log::info!("Idle timeout disabled.");
+    }
+
+    while running.load(Ordering::Relaxed) {
+        match accept_blocking(&listener) {
+            Ok((stream, _)) => {
+                *last_activity.lock().unwrap() = Instant::now();
+                if let Err(e) = handle_client(stream, &embedder) {
+                    log::warn!("Client error: {e}");
+                }
+                *last_activity.lock().unwrap() = Instant::now();
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                if running.load(Ordering::Relaxed) {
+                    log::error!("fatal accept error: {e}; embedder shutting down");
+                    running.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    log::info!("Shutting down.");
+    let _ = std::fs::remove_file(socket_path);
+    Ok(())
+}
+
+fn watchdog(
+    running: &AtomicBool,
+    last_activity: &std::sync::Mutex<Instant>,
+    socket_path: &Path,
+    timeout_secs: u64,
+) {
+    let timeout = Duration::from_secs(timeout_secs);
+    loop {
+        std::thread::sleep(Duration::from_secs(10));
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        let elapsed = last_activity.lock().unwrap().elapsed();
+        if elapsed >= timeout {
+            log::info!("Idle timeout reached ({timeout_secs}s). Stopping.");
+            running.store(false, Ordering::Relaxed);
+            // Poke the listener to unblock accept
+            let _ = UnixStream::connect(socket_path);
+            break;
+        }
+    }
+}
+
+fn handle_client(mut stream: UnixStream, embedder: &Embedder) -> Result<()> {
+    let request_data = read_message(&mut stream)?;
+    let request: serde_json::Value = serde_json::from_slice(&request_data)?;
+    let texts = embedder_logic::parse_texts(&request);
+
+    let encode_result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| embedder.encode(&texts)));
+
+    // Build the reply value, logging error/panic causes (logging stays in the
+    // shell); the wire write and shutdown are identical across all outcomes.
+    let response = match encode_result {
+        Ok(Ok(emb)) => embedder_logic::encode_response(Ok(emb)),
+        Ok(Err(e)) => {
+            log::error!("Encode error: {e}");
+            embedder_logic::encode_response(Err(e))
+        }
+        Err(panic_info) => {
+            let msg = embedder_logic::panic_message(&*panic_info);
+            log::error!("PANIC in encode: {msg}");
+            // Route through encode_response so the `{"error": ...}` envelope
+            // lives in one place; the message keeps its `panic:` prefix.
+            embedder_logic::encode_response(Err(anyhow::anyhow!("panic: {msg}")))
+        }
+    };
+
+    let response_bytes = serde_json::to_vec(&response)?;
+    write_message(&mut stream, &response_bytes)?;
+    let _ = stream.shutdown(Shutdown::Both);
+    Ok(())
+}

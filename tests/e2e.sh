@@ -127,14 +127,35 @@ wait_embedder_ready() {
     return 1
 }
 
+# Sum the file counts across the watcher's "detected N changed file(s)" log
+# lines. The watcher logs to stderr, which the daemon captures into
+# logs/tsmd-stderr.log; we read it directly and compute the sum here so the
+# value lands in the e2e job's stdout (CI does not surface tsmd's own logs).
+# Used by the parallel-ingest race as a loop-absence guard (#149): a healthy
+# burst forwards ≈RACE_COUNT events, while the old index→open→reindex loop
+# forwarded ~1361. awk (not bc) keeps it dependency-free.
+watcher_detected_sum() {
+    local log="$TSM_STATE_DIR/logs/tsmd-stderr.log"
+    [[ -f "$log" ]] || { echo 0; return; }
+    grep -oE 'detected [0-9]+ changed' "$log" 2>/dev/null \
+        | grep -oE '[0-9]+' | awk '{s += $1} END {print s + 0}'
+}
+
 # ── Environment setup ─────────────────────────────────────────────────
 
 export TSM_STATE_DIR
 TSM_STATE_DIR="$(mktemp -d)"
-export TSM_INDEX_ROOT
-TSM_INDEX_ROOT="$(mktemp -d)"
+# ADR-0009 §2 / §3: tsm resolves the project root from the CWD's tsm.toml.
+# Run from a dedicated temp project dir so `tsm init` scaffolds tsm.toml there
+# (not in the repo) and every later command resolves to the same root.
+# Content is placed directly under TSM_PROJECT_DIR (no separate TSM_INDEX_ROOT).
+TSM_PROJECT_DIR="$(mktemp -d)"
+cd "$TSM_PROJECT_DIR" || exit 1
 export TSM_EMBEDDER_IDLE_TIMEOUT=0
 export TSM_EMBEDDER_BACKFILL_INTERVAL=0
+# Small batch so a reindex-in-progress spans multiple yields; lets the
+# write-preemption test observe real preemption rather than a no-op race.
+export TSM_REINDEX_FTS_BATCH_SIZE=10
 
 # Compute dynamic dates
 TODAY=$(date +%Y-%m-%d)
@@ -145,7 +166,7 @@ THREE_MONTHS_AGO_START=$(date -d '3 months ago' +%Y-%m-01)
 THREE_MONTHS_AGO_END=$(date -d '2 months ago' +%Y-%m-01)
 
 log "TSM_STATE_DIR=$TSM_STATE_DIR"
-log "TSM_INDEX_ROOT=$TSM_INDEX_ROOT"
+log "TSM_PROJECT_DIR=$TSM_PROJECT_DIR"
 log "TODAY=$TODAY  1Y_AGO=$ONE_YEAR_AGO  3M_AGO=$THREE_MONTHS_AGO"
 
 # Cleanup on exit (invoked via trap below)
@@ -153,17 +174,47 @@ log "TODAY=$TODAY  1Y_AGO=$ONE_YEAR_AGO  3M_AGO=$THREE_MONTHS_AGO"
 cleanup() {
     log "Cleaning up..."
     tsm stop 2>/dev/null || true
-    rm -rf "$TSM_STATE_DIR" "$TSM_INDEX_ROOT"
+    rm -rf "$TSM_STATE_DIR" "$TSM_PROJECT_DIR"
 }
 trap cleanup EXIT
 
 # ── Prepare test data ─────────────────────────────────────────────────
 
 log "Preparing test data..."
-cp -r "$SCRIPT_DIR/e2e/testdata/"* "$TSM_INDEX_ROOT/"
+cp -r "$SCRIPT_DIR/e2e/testdata/"* "$TSM_PROJECT_DIR/"
 sed -i \
     "s/__TODAY__/$TODAY/g; s/__1Y_AGO__/$ONE_YEAR_AGO/g; s/__3M_AGO__/$THREE_MONTHS_AGO/g" \
-    "$TSM_INDEX_ROOT"/notes/*.md
+    "$TSM_PROJECT_DIR"/notes/*.md \
+    "$TSM_PROJECT_DIR"/sessions/*.jsonl
+
+# ── Fail-fast: uninitialized `tsm start` leaves no stray state ────────
+# Regression guard: starting with a tsm.toml present but no initialized DB must
+# fail with "Run `tsm init` first" WITHOUT materializing the state directory.
+# Both main.rs and daemon_mode.rs are excluded from unit coverage, so this
+# process-level check is the only automated guard for that ordering.
+log "=== Fail-fast on uninitialized DB (no stray state) ==="
+UNINIT_PROJECT="$(mktemp -d)"
+UNINIT_STATE_PARENT="$(mktemp -d)"
+UNINIT_STATE="$UNINIT_STATE_PARENT/state"   # deliberately does not exist yet
+printf '[[index.content_dirs]]\npath = "."\nweight = 1.0\n' > "$UNINIT_PROJECT/tsm.toml"
+# Capture both streams: the fail-fast error is printed to stderr. The `cd` runs
+# inside the command-substitution subshell, so the suite's CWD is untouched.
+set +e
+UNINIT_OUT=$(cd "$UNINIT_PROJECT" && TSM_STATE_DIR="$UNINIT_STATE" tsm start 2>&1)
+UNINIT_EXIT=$?
+set -e
+assert_fail "uninit-start: exits non-zero" "$UNINIT_EXIT"
+if echo "$UNINIT_OUT" | grep -q 'Run .tsm init. first'; then
+    pass "uninit-start: error tells user to run tsm init"
+else
+    fail "uninit-start: error tells user to run tsm init" "got: $UNINIT_OUT"
+fi
+if [[ ! -e "$UNINIT_STATE" ]]; then
+    pass "uninit-start: state dir not materialized"
+else
+    fail "uninit-start: state dir not materialized" "exists: $(ls -a "$UNINIT_STATE" 2>/dev/null)"
+fi
+rm -rf "$UNINIT_PROJECT" "$UNINIT_STATE_PARENT"
 
 # ── Init & start daemon ──────────────────────────────────────────────
 
@@ -250,6 +301,54 @@ assert_json "options: --include-content adds content field" \
 set +e; CAPTURED_OUTPUT=$(tsm search -q "メロス" -k 1 2>/dev/null); CAPTURED_EXIT=$?; set -e
 assert_contains "options: text format shows source file" "hashire-melos" "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
+# ── Path scoping (--path, ADR-0017) ──────────────────────────────────
+# Stored file_path is absolute; --path accepts CWD-relative or absolute input
+# and matches at a directory boundary. CWD is TSM_PROJECT_DIR.
+
+echo ""
+log "=== Path scoping (--path) ==="
+
+# In-scope, CWD-relative: a bare relative path is resolved against the CWD
+# (TSM_PROJECT_DIR) before matching — `notes` → `<project>/notes`.
+run search_json "メロス" --path notes
+assert_json "path: relative --path notes includes hashire-melos" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# In-scope, CWD-relative with explicit `./` prefix resolves the same way.
+run search_json "メロス" --path ./notes
+assert_json "path: relative --path ./notes includes hashire-melos" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# In-scope: absolute directory also works (same hit as the relative form).
+run search_json "メロス" --path "$TSM_PROJECT_DIR/notes"
+assert_json "path: absolute --path includes hashire-melos" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# In-scope, parent traversal: a `../` round-trip back into the project resolves
+# lexically to `<project>/notes`. CWD is TSM_PROJECT_DIR, so `../<base>/notes`
+# folds to the same in-scope directory. Verifies `..` is resolved (ADR-0017).
+PROJECT_BASE="$(basename "$TSM_PROJECT_DIR")"
+run search_json "メロス" --path "../$PROJECT_BASE/notes"
+assert_json "path: parent-traversal --path ../<base>/notes includes hashire-melos" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# Out-of-scope parent path: `../<base>/note` (boundary) must NOT match notes/.
+run search_json "メロス" --path "../$PROJECT_BASE/note"
+assert_json "path: parent-traversal --path ../<base>/note excludes notes/ (boundary)" \
+    'all(.results[]; (.source_file | contains("hashire-melos")) | not)' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# Case-insensitive (ADR-0017, deliberate owner-accepted tradeoff): an upper-case
+# `NOTES` still matches the lower-case `notes/` directory. This pins the chosen
+# forgiving behavior so a future change to case-sensitive matching is caught.
+run search_json "メロス" --path NOTES
+assert_json "path: --path is case-insensitive (NOTES matches notes/)" \
+    'any(.results[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# Boundary: `note` must NOT match the `notes/` directory (no substring leak)
+run search_json "メロス" --path note
+assert_json "path: --path note excludes notes/ (boundary)" \
+    'all(.results[]; (.source_file | contains("hashire-melos")) | not)' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
 # ── Entity search (tag boost) ────────────────────────────────────────
 
 echo ""
@@ -290,7 +389,12 @@ assert_json "temporal: --after/--before hits seasonal-text" \
 echo ""
 log "=== Vector search ==="
 
-run search_json "学校の先生と生徒"
+# Use a wider window than the default top-5: `tsm init` imports the full
+# Japanese WordNet, and query expansion lets one multi-chunk document fill the
+# first several hybrid-ranked slots, pushing the semantically-matched botchan
+# just past the default cutoff. -k 10 keeps the assertion about semantic recall
+# without depending on the exact rank.
+run search_json "学校の先生と生徒" -k 10
 assert_json "vector: 学校の先生と生徒 → botchan" \
     'any(.results[]; .source_file | contains("botchan"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
@@ -372,7 +476,7 @@ assert_fail "edge: --recent garbage → error" "$CAPTURED_EXIT"
 echo ""
 log "=== Ingest session ==="
 
-SESSION_FILE="$SCRIPT_DIR/e2e/testdata/sessions/test-session.jsonl"
+SESSION_FILE="$TSM_PROJECT_DIR/sessions/test-session.jsonl"
 set +e; CAPTURED_OUTPUT=$(tsm ingest-session "$SESSION_FILE" 2>&1); CAPTURED_EXIT=$?; set -e
 assert_contains "ingest-session: succeeds" "session indexed" "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
@@ -391,7 +495,7 @@ echo ""
 log "=== Watcher ==="
 
 # Create a new file and wait for watcher to pick it up
-WATCHER_FILE="$TSM_INDEX_ROOT/notes/watcher-test.md"
+WATCHER_FILE="$TSM_PROJECT_DIR/notes/watcher-test.md"
 cat > "$WATCHER_FILE" <<HEREDOC
 ---
 status: current
@@ -439,23 +543,38 @@ fi
 # ── Parallel ingest race ─────────────────────────────────────────────
 #
 # Verifies that concurrent file creations all land in the index without
-# dedup drops or lost events. Watcher debounces at 2s (watcher_mode.rs:47),
-# so 20 parallel writes should coalesce into one batch.
+# dedup drops or lost events. The watcher debounces changes and coalesces a
+# burst into one index request, so 20 parallel writes should all be indexed.
 # Also checks the reverse direction: concurrent deletions remove all entries.
 #
-# ⚠️ Currently gated behind TSM_E2E_RUN_RACE=1 because the pre-refactor
-# pipeline drops events under parallel load (see issue #149 / ADR-0007).
-# Re-enable by default once the pipeline stage refactor lands.
+# Regression guard for #149: the watcher used to forward notify `Access(Open)`
+# events, so the daemon reading a file to index it re-triggered indexing in an
+# infinite loop that starved most of a parallel burst (only ~5/20 indexed).
+# The watcher now filters to content events; this exercises that fix on Linux.
 
 echo ""
 log "=== 並列投入 race ==="
 
-if [[ "${TSM_E2E_RUN_RACE:-0}" != "1" ]]; then
-    log "SKIP parallel ingest race — tracked in #149, re-enable after pipeline refactor"
-else
-
 RACE_COUNT=20
-RACE_DIR="$TSM_INDEX_ROOT/notes"
+RACE_DIR="$TSM_PROJECT_DIR/notes"
+
+# All race files share the tokens "unique"/"marker" plus an identical Japanese
+# phrase, so every `unique-marker-$i` query matches all RACE_COUNT docs. The
+# default top-k (5) would then return only the 5 highest-scoring docs, and the
+# other 15 would look "missing" even when fully indexed — a search-ranking
+# artifact, not an event drop. Request more than RACE_COUNT results so the
+# presence check reflects indexing, not top-k truncation. (A genuinely
+# unindexed file is absent from results at any -k, so this never hides a drop.)
+RACE_K=$((RACE_COUNT + 5))
+
+# Loop-absence guard (#149): a healthy burst makes the watcher forward
+# ≈RACE_COUNT file-events (measured: 20/20/20 across runs); the old
+# index→open→reindex loop forwarded ~1361. Snapshot the running total now and
+# diff after the burst so the count isolates this race (earlier watcher tests
+# also log "detected" lines). 100 is well above the healthy ceiling and far
+# below the loop, so it catches a regression without flaking.
+RACE_LOOP_THRESHOLD=100
+DETECTED_BEFORE="$(watcher_detected_sum)"
 
 # Parallel create
 for i in $(seq 1 "$RACE_COUNT"); do
@@ -486,7 +605,7 @@ MISSING_CREATE=()
 while [[ $RACE_ELAPSED -lt $RACE_TIMEOUT ]]; do
     MISSING_CREATE=()
     for i in $(seq 1 "$RACE_COUNT"); do
-        if ! search_json "unique-marker-$i" 2>/dev/null \
+        if ! search_json "unique-marker-$i" -k "$RACE_K" 2>/dev/null \
              | jq -e "any(.results[]; .source_file | contains(\"race-$i.md\"))" \
                >/dev/null 2>&1; then
             MISSING_CREATE+=("$i")
@@ -506,6 +625,26 @@ else
          "not indexed: ${MISSING_CREATE[*]}"
 fi
 
+# Loop-absence guard: the index-completeness check above cannot tell a healthy
+# index from one produced by a still-running index→open→reindex loop (the loop
+# eventually indexes everything too — it just never stops). Assert the watcher
+# forwarded a bounded number of events during the burst. A drift in the
+# "detected N" log wording would make the delta 0, so a 0 delta fails here
+# rather than passing silently.
+DETECTED_AFTER="$(watcher_detected_sum)"
+RACE_FORWARDED=$((DETECTED_AFTER - DETECTED_BEFORE))
+log "race: watcher forwarded $RACE_FORWARDED file-event(s) during the burst" \
+    "(healthy ≈ $RACE_COUNT; the #149 loop forwarded ~1361; threshold $RACE_LOOP_THRESHOLD)"
+if [[ "$RACE_FORWARDED" -le 0 ]]; then
+    fail "race: loop-guard could not read the watcher forward count" \
+         "delta=$RACE_FORWARDED (missing tsmd-stderr.log or changed 'detected N' log format?)"
+elif [[ "$RACE_FORWARDED" -ge "$RACE_LOOP_THRESHOLD" ]]; then
+    fail "race: watcher forwarded $RACE_FORWARDED events (>= $RACE_LOOP_THRESHOLD)" \
+         "index→open→reindex loop appears to have regressed (#149)"
+else
+    pass "race: loop absent — watcher forwarded $RACE_FORWARDED < $RACE_LOOP_THRESHOLD events"
+fi
+
 # Parallel delete — verifies concurrent removals also coalesce correctly.
 for i in $(seq 1 "$RACE_COUNT"); do
     rm -f "$RACE_DIR/race-$i.md" &
@@ -520,7 +659,7 @@ STILL_PRESENT=()
 while [[ $RACE_ELAPSED -lt $RACE_TIMEOUT ]]; do
     STILL_PRESENT=()
     for i in $(seq 1 "$RACE_COUNT"); do
-        if search_json "unique-marker-$i" 2>/dev/null \
+        if search_json "unique-marker-$i" -k "$RACE_K" 2>/dev/null \
            | jq -e "any(.results[]; .source_file | contains(\"race-$i.md\"))" \
              >/dev/null 2>&1; then
             STILL_PRESENT+=("$i")
@@ -539,8 +678,6 @@ else
     fail "race: parallel delete left ${#STILL_PRESENT[@]}/$RACE_COUNT entries" \
          "still indexed: ${STILL_PRESENT[*]}"
 fi
-
-fi  # end TSM_E2E_RUN_RACE gate
 
 # ── Embedder crash recovery ──────────────────────────────────────────
 #
@@ -646,6 +783,156 @@ else
         # say "running". We rely on search exit code / error instead.
     fi
 fi
+
+# ── ADR-0015 regression: reads stay responsive during reindex ─────────
+#
+# Kick a background reindex and immediately time a `tsm status` call.
+# Before ADR-0015 (reader pool), status blocked on the writer lock and
+# could freeze for the full reindex duration. The 2000ms ceiling is a
+# generous guard — the freeze it protects against was multi-second to
+# indefinite; the read should complete in <100ms with a reader pool.
+# After timing, drain the reindex so it doesn't contaminate the next
+# block.
+
+echo ""
+log "=== ADR-0015 regression: reads responsive during reindex ==="
+
+tsm reindex all >/dev/null 2>&1 &
+_reindex_read_pid=$!
+_start_ns=$(date +%s%N)
+set +e; tsm status >/dev/null 2>&1; _rc=$?; set -e
+_elapsed_ms=$(( ($(date +%s%N) - _start_ns) / 1000000 ))
+wait "$_reindex_read_pid" 2>/dev/null || true
+
+if [ "$_rc" -ne 0 ]; then
+    fail "rw-split: status responsive during reindex" "command failed (exit $_rc)"
+elif [ "$_elapsed_ms" -gt 2000 ]; then
+    fail "rw-split: status responsive during reindex" \
+        "took ${_elapsed_ms}ms (expected < 2000ms)"
+else
+    pass "rw-split: status responsive during reindex (${_elapsed_ms}ms)"
+fi
+
+# Drain the reindex before the next block.
+for _i in $(seq 1 30); do
+    _doc_json=$(tsm doctor -f json 2>/dev/null)
+    if ! echo "$_doc_json" | jq -e '.sections[] | select(.name == "Reindex")' >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+if [ "$_i" -eq 30 ]; then log "WARNING: reindex did not drain within 30s"; fi
+
+# ── ADR-0015 regression: file index preempts in-progress reindex ──────
+#
+# Kick a background reindex (small batch via TSM_REINDEX_FTS_BATCH_SIZE=10
+# set before daemon start), then immediately pipe a real corpus file into
+# `tsm index --files-from-stdin`. The reindex yields after each batch so
+# the index request should be served before all batches complete.
+# The 3000ms ceiling guards against the pre-ADR-0015 behaviour where a
+# file index had to wait for the entire reindex to finish.
+
+echo ""
+log "=== ADR-0015 regression: file index preempts reindex ==="
+
+tsm reindex fts >/dev/null 2>&1 &
+_reindex_write_pid=$!
+_start_ns=$(date +%s%N)
+set +e; echo "notes/botchan.md" | tsm index --files-from-stdin >/dev/null 2>&1; _rc=$?; set -e
+_elapsed_ms=$(( ($(date +%s%N) - _start_ns) / 1000000 ))
+wait "$_reindex_write_pid" 2>/dev/null || true
+
+if [ "$_rc" -ne 0 ]; then
+    fail "rw-split: index preempts reindex" "command failed (exit $_rc)"
+elif [ "$_elapsed_ms" -gt 3000 ]; then
+    fail "rw-split: index preempts reindex" \
+        "took ${_elapsed_ms}ms (expected preemption < 3000ms)"
+else
+    pass "rw-split: index preempts reindex (${_elapsed_ms}ms)"
+fi
+
+# Drain before cleanup.
+for _i in $(seq 1 30); do
+    _doc_json=$(tsm doctor -f json 2>/dev/null)
+    if ! echo "$_doc_json" | jq -e '.sections[] | select(.name == "Reindex")' >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+if [ "$_i" -eq 30 ]; then log "WARNING: reindex did not drain within 30s"; fi
+
+# ── ADR-0015 regression (issue #151): search stays fast during reindex ─
+#
+# A burst of searches runs while a vectors reindex re-embeds the whole
+# corpus on the writer connection. With the ADR-0015 reader pool, search
+# is served from a query_only reader connection that never blocks on the
+# reindex writer, so every search must stay well under 2000ms. Before the
+# reader pool this would starve: searches blocked behind the reindex
+# writer for seconds. (Issue #151 was filed against the older
+# `yield_to_search` mechanism, which #266 replaced with the reader pool;
+# the reader pool is the property this now guards.)
+#
+# No-op guard: the e2e corpus is tiny, so a single `reindex vectors`
+# finishes in well under the burst duration and most searches would run
+# with no reindex in flight — proving nothing. A background loop keeps a
+# reindex continuously in flight (the daemon rejects overlapping requests
+# cheaply, so each finished pass is immediately re-kicked), and we assert
+# via doctor that a reindex was actually observed active.
+
+echo ""
+log "=== ADR-0015 regression (issue #151): search responsive during reindex ==="
+
+_keep_reindexing="$TSM_STATE_DIR/.keep_reindexing_151"
+: > "$_keep_reindexing"
+( while [ -f "$_keep_reindexing" ]; do tsm reindex vectors >/dev/null 2>&1 || true; done ) &
+_reindex_loop_pid=$!
+
+# Confirm the contention window opened: wait up to ~5s for doctor to
+# report an active Reindex. If it never appears, the burst would be a
+# no-op, so fail loudly rather than pass on an untested code path.
+_observed_active=0
+for _i in $(seq 1 50); do
+    if tsm doctor -f json 2>/dev/null | jq -e '.sections[] | select(.name == "Reindex")' >/dev/null 2>&1; then
+        _observed_active=1
+        break
+    fi
+    sleep 0.1
+done
+
+_slow=0
+for _i in $(seq 1 50); do
+    _start_ns=$(date +%s%N)
+    set +e; tsm search -q "メロス" -k 5 -f json >/dev/null 2>&1; set -e
+    _elapsed_ms=$(( ($(date +%s%N) - _start_ns) / 1000000 ))
+    if [ "$_elapsed_ms" -gt 2000 ]; then
+        _slow=$((_slow + 1))
+        echo "  slow search $_i: ${_elapsed_ms}ms"
+    fi
+done
+
+# Stop the reindex loop, then drain any pass still running in the daemon.
+rm -f "$_keep_reindexing"
+wait "$_reindex_loop_pid" 2>/dev/null || true
+
+if [ "$_observed_active" -eq 0 ]; then
+    fail "rw-split: search responsive during reindex" \
+        "reindex never observed in progress; burst was a no-op (corpus too small?)"
+elif [ "$_slow" -ne 0 ]; then
+    fail "rw-split: search responsive during reindex" \
+        "$_slow/50 searches exceeded 2000ms"
+else
+    pass "rw-split: search responsive during reindex (50/50 < 2000ms)"
+fi
+
+# Drain before cleanup.
+for _i in $(seq 1 30); do
+    _doc_json=$(tsm doctor -f json 2>/dev/null)
+    if ! echo "$_doc_json" | jq -e '.sections[] | select(.name == "Reindex")' >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+if [ "$_i" -eq 30 ]; then log "WARNING: reindex did not drain within 30s"; fi
 
 # ══════════════════════════════════════════════════════════════════════
 # Summary

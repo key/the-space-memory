@@ -1,0 +1,826 @@
+//! Embedded Lua runtime for user-editable metadata `extract` and scoring
+//! `score` hooks.
+
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use mlua::{Lua, LuaOptions, StdLib};
+use serde_json::{Map, Value};
+
+use crate::config;
+
+/// Per-VM memory ceiling for hook execution (bytes). Sandboxing: no stdlib
+/// (`io`/`os`/`package` absent) so hooks cannot touch FS/process/network.
+const LUA_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Embedded default extract hook (reproduces frontmatter.rs behavior).
+pub const DEFAULT_EXTRACT_HOOK: &str = include_str!("hooks/extract/10-md_frontmatter.lua");
+
+/// Embedded default score hook (time-decay × status-based penalty scoring).
+pub const DEFAULT_SCORE_HOOK: &str = include_str!("hooks/score/10-default.lua");
+
+/// A single Lua hook script with its logical name and source text.
+#[derive(Debug, Clone)]
+pub struct HookScript {
+    pub name: String,
+    pub source: String,
+}
+
+/// All hook scripts for the process, split by hook type.
+#[derive(Debug, Clone, Default)]
+pub struct HookSources {
+    pub extract: Vec<HookScript>,
+    pub score: Vec<HookScript>,
+}
+
+/// Create a sandboxed Lua VM: no standard library, bounded memory.
+fn new_sandboxed_lua() -> anyhow::Result<Lua> {
+    let lua = Lua::new_with(StdLib::NONE, LuaOptions::default())?;
+    lua.set_memory_limit(LUA_MEMORY_LIMIT)?;
+    Ok(lua)
+}
+
+/// Read `*.lua` from `dir` sorted by file name. Empty/absent dir -> empty vec.
+fn read_scripts(dir: &Path) -> anyhow::Result<Vec<HookScript>> {
+    let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(Result::ok).map(|e| e.path()).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    entries.retain(|p| p.extension().and_then(|s| s.to_str()) == Some("lua"));
+    entries.sort();
+    let mut out = Vec::new();
+    for p in entries {
+        let name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        let source = std::fs::read_to_string(&p)?;
+        out.push(HookScript { name, source });
+    }
+    Ok(out)
+}
+
+/// Validate each script compiles and defines `entrypoint`. Returns Err naming
+/// the first offending script (fail-fast).
+fn validate(scripts: &[HookScript], entrypoint: &str) -> anyhow::Result<()> {
+    for s in scripts {
+        let lua = new_sandboxed_lua()?;
+        lua.load(&s.source)
+            .exec()
+            .map_err(|e| anyhow::anyhow!("hook {}: compile error: {e}", s.name))?;
+        let f: mlua::Value = lua.globals().get(entrypoint)?;
+        if !matches!(f, mlua::Value::Function(_)) {
+            anyhow::bail!("hook {}: missing `{}` function", s.name, entrypoint);
+        }
+    }
+    Ok(())
+}
+
+/// Discover `*.lua` scripts from disk (sorted), fall back to embedded defaults
+/// when a directory has no scripts, and validate every script compiles and
+/// defines its entrypoint. Returns `Err` on the first failing script (fail-fast).
+pub fn load_hook_sources(extract_dir: &Path, score_dir: &Path) -> anyhow::Result<HookSources> {
+    let mut extract = read_scripts(extract_dir)?;
+    if extract.is_empty() {
+        extract.push(HookScript {
+            name: "<embedded:10-md_frontmatter.lua>".into(),
+            source: DEFAULT_EXTRACT_HOOK.into(),
+        });
+    }
+    let mut score = read_scripts(score_dir)?;
+    if score.is_empty() {
+        score.push(HookScript {
+            name: "<embedded:10-default.lua>".into(),
+            source: DEFAULT_SCORE_HOOK.into(),
+        });
+    }
+    validate(&extract, "extract")?;
+    validate(&score, "score")?;
+    Ok(HookSources { extract, score })
+}
+
+static HOOKS: Mutex<Option<Arc<HookSources>>> = Mutex::new(None);
+
+/// Eager process-wide load from `config` dirs (fail-fast, for daemon startup).
+pub fn init_hooks() -> anyhow::Result<()> {
+    let sources = load_hook_sources(&config::hooks_extract_dir(), &config::hooks_score_dir())?;
+    let mut guard = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(Arc::new(sources));
+    Ok(())
+}
+
+/// Lazy accessor (CLI path): loads on first use. On a user-hook error, logs
+/// and falls back to embedded defaults so search/index never hard-fails here.
+pub fn hooks() -> Arc<HookSources> {
+    let mut guard = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = guard.as_ref() {
+        return Arc::clone(h);
+    }
+    let sources = load_hook_sources(&config::hooks_extract_dir(), &config::hooks_score_dir())
+        .unwrap_or_else(|e| {
+            log::warn!("hook load failed, using embedded defaults: {e}");
+            HookSources {
+                extract: vec![HookScript {
+                    name: "<embedded:10-md_frontmatter.lua>".into(),
+                    source: DEFAULT_EXTRACT_HOOK.into(),
+                }],
+                score: vec![HookScript {
+                    name: "<embedded:10-default.lua>".into(),
+                    source: DEFAULT_SCORE_HOOK.into(),
+                }],
+            }
+        });
+    let arc = Arc::new(sources);
+    *guard = Some(Arc::clone(&arc));
+    arc
+}
+
+/// Convert a YAML sequence to a 1-indexed Lua array table of scalar strings.
+/// Non-scalar items are skipped.
+fn yaml_seq_to_lua_table(lua: &Lua, seq: &[serde_yaml::Value]) -> mlua::Result<mlua::Table> {
+    let arr = lua.create_table()?;
+    let mut idx = 1usize;
+    for item in seq {
+        let s = match item {
+            serde_yaml::Value::String(s) => Some(s.clone()),
+            serde_yaml::Value::Number(n) => Some(n.to_string()),
+            serde_yaml::Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        };
+        if let Some(s) = s {
+            arr.set(idx, s)?;
+            idx += 1;
+        }
+    }
+    Ok(arr)
+}
+
+/// Set a single YAML value into a Lua table under the given key.
+/// Null and nested mappings are skipped (no entry set).
+fn set_yaml_value(
+    lua: &Lua,
+    tbl: &mlua::Table,
+    key: &str,
+    val: &serde_yaml::Value,
+) -> anyhow::Result<()> {
+    match val {
+        serde_yaml::Value::String(s) => tbl.set(key, s.clone())?,
+        serde_yaml::Value::Bool(b) => tbl.set(key, *b)?,
+        serde_yaml::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                tbl.set(key, i)?;
+            } else if let Some(f) = n.as_f64() {
+                tbl.set(key, f)?;
+            }
+        }
+        serde_yaml::Value::Sequence(seq) => {
+            tbl.set(key, yaml_seq_to_lua_table(lua, seq)?)?;
+        }
+        // Null and nested mappings are skipped (already excluded by parse_map,
+        // but guard here for direct callers with raw maps)
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Build the `ctx.frontmatter` table from the full parsed YAML map.
+///
+/// Converts each top-level key to the matching Lua value type:
+/// - String/Bool/Number scalars → Lua string/bool/number
+/// - Sequences → 1-indexed Lua array table of their scalar string elements
+/// - Null / nested mappings → skipped
+fn frontmatter_table(
+    lua: &Lua,
+    fm_map: &std::collections::BTreeMap<String, serde_yaml::Value>,
+) -> anyhow::Result<mlua::Table> {
+    let t = lua.create_table()?;
+    for (key, val) in fm_map {
+        set_yaml_value(lua, &t, key, val)?;
+    }
+    Ok(t)
+}
+
+/// Build a Lua table from a JSON object map (scalar values only).
+///
+/// String/Bool/Number entries are set; non-scalar values are skipped.
+/// Integers are represented as f64 (via `as_f64()`).
+fn json_map_to_lua_table(lua: &Lua, map: &Map<String, Value>) -> mlua::Result<mlua::Table> {
+    let tbl = lua.create_table()?;
+    for (k, v) in map {
+        match v {
+            Value::String(s) => tbl.set(k.as_str(), s.as_str())?,
+            Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    tbl.set(k.as_str(), f)?;
+                }
+            }
+            Value::Bool(b) => tbl.set(k.as_str(), *b)?,
+            _ => {}
+        }
+    }
+    Ok(tbl)
+}
+
+/// Parse optional metadata JSON into a Lua table.
+///
+/// Returns an empty table when `json` is `None`, unparseable, or not an object.
+fn metadata_json_to_lua(lua: &Lua, json: Option<&str>) -> mlua::Result<mlua::Table> {
+    let Some(raw) = json else {
+        return lua.create_table();
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw) else {
+        return lua.create_table();
+    };
+    json_map_to_lua_table(lua, &map)
+}
+
+/// Convert a Lua table of scalars into JSON object entries (present keys only).
+/// Only string-keyed entries are included; integer-keyed (array) entries are dropped.
+fn lua_table_to_json(t: &mlua::Table, out: &mut Map<String, Value>) {
+    for pair in t.pairs::<String, mlua::Value>() {
+        let Ok((k, v)) = pair else {
+            continue;
+        };
+        let jv = match v {
+            mlua::Value::String(s) => Value::String(s.to_string_lossy().to_string()),
+            mlua::Value::Integer(i) => Value::from(i),
+            mlua::Value::Number(n) => Value::from(n),
+            mlua::Value::Boolean(b) => Value::from(b),
+            mlua::Value::Nil => continue,
+            _ => continue, // non-scalar (tables, functions): skip (ADR: scalar map only)
+        };
+        out.insert(k, jv);
+    }
+}
+
+/// Run the extract chain; shallow-merge present keys (last-wins). Per-script
+/// runtime errors are logged and skipped (fail-safe).
+pub fn run_extract(
+    sources: &HookSources,
+    path: &str,
+    body: &str,
+    fm_map: &std::collections::BTreeMap<String, serde_yaml::Value>,
+) -> Value {
+    let mut acc: Map<String, Value> = Map::new();
+    for script in &sources.extract {
+        if let Err(e) = run_one_extract(script, path, body, fm_map, &mut acc) {
+            log::warn!("extract hook {} failed: {e}", script.name);
+        }
+    }
+    Value::Object(acc)
+}
+
+fn run_one_extract(
+    script: &HookScript,
+    path: &str,
+    body: &str,
+    fm_map: &std::collections::BTreeMap<String, serde_yaml::Value>,
+    acc: &mut Map<String, Value>,
+) -> anyhow::Result<()> {
+    let lua = new_sandboxed_lua()?;
+    lua.load(&script.source).exec()?;
+    let ctx = lua.create_table()?;
+    ctx.set("path", path)?;
+    ctx.set("body", body)?;
+    ctx.set("frontmatter", frontmatter_table(&lua, fm_map)?)?;
+    // Accumulated metadata so far, for earlier-wins/conditional policies.
+    ctx.set("metadata", json_map_to_lua_table(&lua, acc)?)?;
+    let f: mlua::Function = lua.globals().get("extract")?;
+    let ret: mlua::Table = f.call(ctx)?;
+    lua_table_to_json(&ret, acc);
+    Ok(())
+}
+
+/// Register builtins available to score hooks:
+/// - `decay(date, half_life_days)` → f64 multiplier
+/// - `today()` → `%Y-%m-%d` date string (UTC)
+fn register_score_builtins(lua: &Lua) -> anyhow::Result<()> {
+    let decay_fn = lua.create_function(|_, (date, half_life): (Option<String>, f64)| {
+        Ok(crate::searcher::decay_with_half_life(
+            date.as_deref(),
+            half_life,
+        ))
+    })?;
+    lua.globals().set("decay", decay_fn)?;
+    let today_fn = lua.create_function(|_, ()| Ok(crate::searcher::today_string()))?;
+    lua.globals().set("today", today_fn)?;
+    Ok(())
+}
+
+fn run_one_score(
+    script: &HookScript,
+    metadata_json: Option<&str>,
+    rrf: f64,
+    source_type: &str,
+    path: &str,
+    half_life_days: f64,
+) -> anyhow::Result<f64> {
+    let lua = new_sandboxed_lua()?;
+    register_score_builtins(&lua)?;
+    lua.load(&script.source).exec()?;
+    let ctx = lua.create_table()?;
+    ctx.set("metadata", metadata_json_to_lua(&lua, metadata_json)?)?;
+    ctx.set("rrf", rrf)?;
+    ctx.set("source_type", source_type)?;
+    ctx.set("path", path)?;
+    ctx.set("half_life_days", half_life_days)?;
+    let f: mlua::Function = lua.globals().get("score")?;
+    Ok(f.call(ctx)?)
+}
+
+/// Run the score chain; returns the product of each hook's multiplier.
+///
+/// Per hook: if it errors, returns a non-number, NaN, ±Inf, or negative value,
+/// that hook contributes `1.0` and a warning is logged. Never returns `Err`.
+pub fn run_score(
+    sources: &HookSources,
+    metadata_json: Option<&str>,
+    rrf: f64,
+    source_type: &str,
+    path: &str,
+    half_life_days: f64,
+) -> f64 {
+    let mut product = 1.0_f64;
+    for script in &sources.score {
+        match run_one_score(
+            script,
+            metadata_json,
+            rrf,
+            source_type,
+            path,
+            half_life_days,
+        ) {
+            Ok(v) if v.is_finite() && v >= 0.0 => product *= v,
+            Ok(v) => log::warn!("score hook {} returned invalid {v}; using 1.0", script.name),
+            Err(e) => log::warn!("score hook {} failed: {e}; using 1.0", script.name),
+        }
+    }
+    product
+}
+
+/// Test/reset helper for the process-wide cache.
+#[cfg(test)]
+pub fn reset_hooks_cache() {
+    let mut guard = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    // ── Sandbox tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_lua_define_call_number_and_table() {
+        // Arrange: a sandboxed VM with a score-like fn and an extract-like fn.
+        let lua = new_sandboxed_lua().unwrap();
+        lua.load(
+            r#"
+            function score(ctx) return (ctx.base or 1.0) * 0.5 end
+            function extract(ctx) return { status = ctx.fm_status } end
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        // Act + Assert: call score -> f64.
+        let globals = lua.globals();
+        let score_fn: mlua::Function = globals.get("score").unwrap();
+        let ctx = lua.create_table().unwrap();
+        ctx.set("base", 2.0_f64).unwrap();
+        let got: f64 = score_fn.call(ctx).unwrap();
+        assert_eq!(got, 1.0);
+
+        // Act + Assert: call extract -> table, read a key.
+        let extract_fn: mlua::Function = globals.get("extract").unwrap();
+        let ectx = lua.create_table().unwrap();
+        ectx.set("fm_status", "current").unwrap();
+        let out: mlua::Table = extract_fn.call(ectx).unwrap();
+        let status: Option<String> = out.get("status").unwrap();
+        assert_eq!(status.as_deref(), Some("current"));
+    }
+
+    #[test]
+    fn test_sandbox_has_no_io() {
+        // Arrange/Act: io, os, and package must all be nil under StdLib::NONE.
+        let lua = new_sandboxed_lua().unwrap();
+        let all_nil: bool = lua
+            .load("return io == nil and os == nil and package == nil")
+            .eval()
+            .unwrap();
+        // Assert
+        assert!(
+            all_nil,
+            "io, os, and package must all be unavailable in sandboxed VM"
+        );
+    }
+
+    // ── Discovery + fallback + fail-fast tests ──────────────────────────────
+
+    #[test]
+    fn test_load_falls_back_to_embedded_when_dirs_empty() {
+        let tmp = TempDir::new().unwrap();
+        let ex = tmp.path().join("extract");
+        let sc = tmp.path().join("score");
+        fs::create_dir_all(&ex).unwrap();
+        fs::create_dir_all(&sc).unwrap();
+        let s = load_hook_sources(&ex, &sc).unwrap();
+        assert_eq!(s.extract.len(), 1);
+        assert_eq!(s.extract[0].name, "<embedded:10-md_frontmatter.lua>");
+        assert_eq!(s.score.len(), 1);
+        assert!(s.score[0].source.contains("function score"));
+    }
+
+    #[test]
+    fn test_load_reads_sorted_disk_scripts() {
+        let tmp = TempDir::new().unwrap();
+        let ex = tmp.path().join("extract");
+        let sc = tmp.path().join("score");
+        fs::create_dir_all(&ex).unwrap();
+        fs::create_dir_all(&sc).unwrap();
+        fs::write(ex.join("20-b.lua"), "function extract(ctx) return {} end").unwrap();
+        fs::write(ex.join("10-a.lua"), "function extract(ctx) return {} end").unwrap();
+        fs::write(ex.join("notes.txt"), "ignored").unwrap();
+        fs::write(
+            sc.join("10-default.lua"),
+            "function score(ctx) return 1.0 end",
+        )
+        .unwrap();
+        let s = load_hook_sources(&ex, &sc).unwrap();
+        assert_eq!(
+            s.extract
+                .iter()
+                .map(|h| h.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["10-a.lua", "20-b.lua"]
+        );
+    }
+
+    #[test]
+    fn test_load_fails_fast_on_syntax_error() {
+        let tmp = TempDir::new().unwrap();
+        let ex = tmp.path().join("extract");
+        let sc = tmp.path().join("score");
+        fs::create_dir_all(&ex).unwrap();
+        fs::create_dir_all(&sc).unwrap();
+        fs::write(ex.join("10-bad.lua"), "function extract(ctx) return {").unwrap();
+        fs::write(
+            sc.join("10-default.lua"),
+            "function score(ctx) return 1.0 end",
+        )
+        .unwrap();
+        let err = load_hook_sources(&ex, &sc).unwrap_err();
+        assert!(err.to_string().contains("10-bad.lua"));
+    }
+
+    #[test]
+    fn test_load_fails_fast_on_missing_entrypoint() {
+        let tmp = TempDir::new().unwrap();
+        let ex = tmp.path().join("extract");
+        let sc = tmp.path().join("score");
+        fs::create_dir_all(&ex).unwrap();
+        fs::create_dir_all(&sc).unwrap();
+        fs::write(ex.join("10-noentry.lua"), "local x = 1").unwrap();
+        fs::write(
+            sc.join("10-default.lua"),
+            "function score(ctx) return 1.0 end",
+        )
+        .unwrap();
+        let err = load_hook_sources(&ex, &sc).unwrap_err();
+        assert!(err.to_string().contains("extract"));
+    }
+
+    // ── Process-wide cache tests ────────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn test_init_hooks_loads_embedded_defaults_when_dirs_absent() {
+        // Arrange: point state_dir at a temp dir with no hooks subdirs.
+        let tmp = TempDir::new().unwrap();
+        unsafe { std::env::set_var("TSM_STATE_DIR", tmp.path()) };
+        reset_hooks_cache();
+
+        // Act
+        let result = init_hooks();
+
+        // Assert
+        unsafe { std::env::remove_var("TSM_STATE_DIR") };
+        reset_hooks_cache();
+        result.unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_init_hooks_caches_embedded_when_absent() {
+        // Arrange: temp state_dir with no hooks subdirs (absent, not empty).
+        let tmp = TempDir::new().unwrap();
+        unsafe { std::env::set_var("TSM_STATE_DIR", tmp.path()) };
+        reset_hooks_cache();
+        // Act: init_hooks loads and caches without error.
+        init_hooks().unwrap();
+        let h = hooks();
+        // Assert: at least the embedded defaults in each slot.
+        unsafe { std::env::remove_var("TSM_STATE_DIR") };
+        reset_hooks_cache();
+        assert!(!h.extract.is_empty());
+        assert!(!h.score.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_hooks_lazy_accessor_returns_populated_sources() {
+        // Arrange: temp state_dir, no user hooks -> embedded defaults used.
+        let tmp = TempDir::new().unwrap();
+        unsafe { std::env::set_var("TSM_STATE_DIR", tmp.path()) };
+        reset_hooks_cache();
+
+        // Act
+        let h = hooks();
+
+        // Assert: at least the embedded default in each slot.
+        unsafe { std::env::remove_var("TSM_STATE_DIR") };
+        reset_hooks_cache();
+        assert!(!h.extract.is_empty());
+        assert!(!h.score.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_hooks_returns_cached_arc_on_second_call() {
+        // Arrange
+        let tmp = TempDir::new().unwrap();
+        unsafe { std::env::set_var("TSM_STATE_DIR", tmp.path()) };
+        reset_hooks_cache();
+
+        // Act
+        let a = hooks();
+        let b = hooks();
+
+        // Assert: same allocation.
+        unsafe { std::env::remove_var("TSM_STATE_DIR") };
+        reset_hooks_cache();
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_hooks_falls_back_to_embedded_on_bad_user_hook() {
+        // Arrange: user hook that fails to compile.
+        let tmp = TempDir::new().unwrap();
+        let ex = tmp.path().join("hooks/extract");
+        fs::create_dir_all(&ex).unwrap();
+        fs::write(ex.join("10-bad.lua"), "function extract(ctx) return {").unwrap();
+        unsafe { std::env::set_var("TSM_STATE_DIR", tmp.path()) };
+        reset_hooks_cache();
+
+        // Act: lazy accessor should not panic; falls back to embedded.
+        let h = hooks();
+
+        // Assert: still has sources (embedded defaults).
+        unsafe { std::env::remove_var("TSM_STATE_DIR") };
+        reset_hooks_cache();
+        assert!(!h.extract.is_empty());
+    }
+
+    // ── run_extract tests ────────────────────────────────────────────────────
+
+    use std::collections::BTreeMap;
+
+    fn empty_fm() -> BTreeMap<String, serde_yaml::Value> {
+        BTreeMap::new()
+    }
+
+    fn fm_with(pairs: &[(&str, &str)]) -> BTreeMap<String, serde_yaml::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_yaml::Value::String(v.to_string())))
+            .collect()
+    }
+
+    fn sources_from(extract_src: &str, score_src: &str) -> HookSources {
+        HookSources {
+            extract: vec![HookScript {
+                name: "t".into(),
+                source: extract_src.into(),
+            }],
+            score: vec![HookScript {
+                name: "t".into(),
+                source: score_src.into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_run_extract_default_maps_frontmatter() {
+        let s = sources_from(DEFAULT_EXTRACT_HOOK, "function score(c) return 1 end");
+        let fm = fm_with(&[("status", "current"), ("updated", "2026-03-01")]);
+        let v = run_extract(&s, "a.md", "body", &fm);
+        assert_eq!(v["status"], serde_json::json!("current"));
+        assert_eq!(v["effective_date"], serde_json::json!("2026-03-01"));
+    }
+
+    #[test]
+    fn test_run_extract_chain_last_wins_present_keys() {
+        let s = HookSources {
+            extract: vec![
+                HookScript {
+                    name: "10".into(),
+                    source: "function extract(c) return { status='a', kept='x' } end".into(),
+                },
+                HookScript {
+                    name: "20".into(),
+                    source: "function extract(c) return { status='b' } end".into(),
+                },
+            ],
+            score: vec![HookScript {
+                name: "s".into(),
+                source: "function score(c) return 1 end".into(),
+            }],
+        };
+        let v = run_extract(&s, "a.md", "body", &empty_fm());
+        assert_eq!(v["status"], serde_json::json!("b")); // last-wins
+        assert_eq!(v["kept"], serde_json::json!("x")); // present-key from earlier survives
+    }
+
+    #[test]
+    fn test_run_extract_runtime_error_is_swallowed() {
+        let s = HookSources {
+            extract: vec![
+                HookScript {
+                    name: "ok".into(),
+                    source: "function extract(c) return { a=1 } end".into(),
+                },
+                HookScript {
+                    name: "boom".into(),
+                    source: "function extract(c) error('boom') end".into(),
+                },
+            ],
+            score: vec![HookScript {
+                name: "s".into(),
+                source: "function score(c) return 1 end".into(),
+            }],
+        };
+        let v = run_extract(&s, "a.md", "body", &empty_fm());
+        assert_eq!(v["a"], serde_json::json!(1)); // first script's contribution kept
+    }
+
+    #[test]
+    fn test_run_extract_non_standard_frontmatter_key_readable() {
+        // A non-standard key (priority) must reach the extract hook.
+        // Also verify that sequences (tags) arrive as an array table.
+        let s = sources_from(
+            r#"function extract(c)
+                local fm = c.frontmatter or {}
+                return {
+                    p = fm.priority,
+                    first_tag = fm.tags and fm.tags[1] or "none",
+                }
+            end"#,
+            "function score(c) return 1 end",
+        );
+        let mut fm: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
+        fm.insert(
+            "priority".to_string(),
+            serde_yaml::Value::String("high".to_string()),
+        );
+        fm.insert(
+            "tags".to_string(),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("Rust".to_string()),
+                serde_yaml::Value::String("検索".to_string()),
+            ]),
+        );
+        let v = run_extract(&s, "a.md", "body", &fm);
+        assert_eq!(
+            v["p"],
+            serde_json::json!("high"),
+            "non-standard key must be visible to extract hook"
+        );
+        assert_eq!(
+            v["first_tag"],
+            serde_json::json!("Rust"),
+            "tags sequence must arrive as 1-indexed Lua array"
+        );
+    }
+
+    // ── run_score tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_run_score_default_reproduces_penalty_and_decay() {
+        let s = sources_from(DEFAULT_EXTRACT_HOOK, DEFAULT_SCORE_HOOK);
+        // outdated penalty=0.4; effective_date today -> decay≈1.0; half_life 90.
+        let today = crate::searcher::today_string();
+        let meta = format!("{{\"status\":\"outdated\",\"effective_date\":\"{today}\"}}");
+        let got = run_score(&s, Some(&meta), 1.0, "note", "a.md", 90.0);
+        assert!((got - 0.4).abs() < 0.05, "got {got}");
+    }
+
+    #[test]
+    fn test_run_score_default_penalizes_deprecated_and_proposed() {
+        let s = sources_from(DEFAULT_EXTRACT_HOOK, DEFAULT_SCORE_HOOK);
+        let today = crate::searcher::today_string();
+        // effective_date today -> decay≈1.0, so the multiplier is the status penalty.
+        let score_for = |status: &str| {
+            let meta = format!("{{\"status\":\"{status}\",\"effective_date\":\"{today}\"}}");
+            run_score(&s, Some(&meta), 1.0, "note", "a.md", 90.0)
+        };
+        assert!((score_for("deprecated") - 0.3).abs() < 0.05, "deprecated");
+        assert!((score_for("proposed") - 0.7).abs() < 0.05, "proposed");
+        // accepted is not in the table -> neutral 1.0.
+        assert!((score_for("accepted") - 1.0).abs() < 0.05, "accepted");
+    }
+
+    #[test]
+    fn test_run_score_invalid_return_is_neutral() {
+        let s = sources_from(
+            "function extract(c) return {} end",
+            "function score(c) return -5 end",
+        );
+        let got = run_score(&s, Some("{}"), 1.0, "note", "a.md", 90.0);
+        assert_eq!(got, 1.0); // negative -> neutral
+    }
+
+    #[test]
+    fn test_run_score_chain_is_product() {
+        let s = HookSources {
+            extract: vec![HookScript {
+                name: "e".into(),
+                source: "function extract(c) return {} end".into(),
+            }],
+            score: vec![
+                HookScript {
+                    name: "10".into(),
+                    source: "function score(c) return 0.5 end".into(),
+                },
+                HookScript {
+                    name: "20".into(),
+                    source: "function score(c) return 0.5 end".into(),
+                },
+            ],
+        };
+        let got = run_score(&s, Some("{}"), 1.0, "note", "a.md", 90.0);
+        assert_eq!(got, 0.25);
+    }
+
+    #[test]
+    fn test_run_score_today_builtin_returns_date_string() {
+        let s = sources_from(
+            "function extract(c) return {} end",
+            r#"function score(c) local t = today(); if type(t) == "string" and #t == 10 then return 1.0 else return 0.0 end end"#,
+        );
+        let got = run_score(&s, Some("{}"), 1.0, "note", "a.md", 90.0);
+        assert_eq!(got, 1.0, "today() should return a 10-char date string");
+    }
+
+    #[test]
+    fn test_run_score_error_is_neutral() {
+        let s = sources_from(
+            "function extract(c) return {} end",
+            "function score(c) error('boom') end",
+        );
+        let got = run_score(&s, Some("{}"), 1.0, "note", "a.md", 90.0);
+        assert_eq!(got, 1.0); // error -> neutral 1.0
+    }
+
+    #[test]
+    fn test_run_extract_later_script_sees_accumulated_metadata() {
+        // Arrange: 2-script chain.  Script 1 sets a bool flag and a string.
+        // Script 2 reads ctx.metadata.flag and branches on it.
+        let s = HookSources {
+            extract: vec![
+                HookScript {
+                    name: "10-first".into(),
+                    source: "function extract(c) return { flag=true, kept='x' } end".into(),
+                },
+                HookScript {
+                    name: "20-second".into(),
+                    source: r#"function extract(c)
+                        if c.metadata.flag then
+                            return { saw='yes' }
+                        else
+                            return { saw='no' }
+                        end
+                    end"#
+                        .into(),
+                },
+            ],
+            score: vec![HookScript {
+                name: "s".into(),
+                source: "function score(c) return 1 end".into(),
+            }],
+        };
+
+        // Act
+        let v = run_extract(&s, "a.md", "body", &empty_fm());
+
+        // Assert: bool propagated, string kept, second script saw the flag.
+        assert_eq!(v["flag"], serde_json::json!(true));
+        assert_eq!(v["kept"], serde_json::json!("x"));
+        assert_eq!(v["saw"], serde_json::json!("yes"));
+    }
+}

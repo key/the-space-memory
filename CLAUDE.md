@@ -19,11 +19,11 @@ cargo test --lib frontmatter
 cargo llvm-cov --html
 cargo llvm-cov \
   --ignore-filename-regex \
-  '(embedder|main|cli|tsmd|tsm_watcher|status|logging|daemon_mode|embedder_mode|watcher_mode|child|backfill)\.rs' \
+  '(main|cli|_proc|model_loader)\.rs' \
   --fail-under-lines 90
 
-# Lint
-cargo clippy -- -D warnings
+# Lint (--all-targets also lints test/bench code)
+cargo clippy --all-targets -- -D warnings
 
 # Format
 cargo fmt --check
@@ -31,15 +31,31 @@ cargo fmt --check
 # Lint (Markdown / Shell / YAML / TOML)
 rumdl check <file>.md
 shellcheck <file>.sh
-yamllint <file>.yml
+ryl <file>.yml
 taplo check <file>.toml
 
 # Code metrics
 lizard src/ --language rust -Tcyclomatic_complexity=15 -w  # CCN warnings
 npx jscpd                                                  # Duplicate detection
+cargo test --test file_line_limits                         # per-file line-count gate (ADR-0018)
+
+# Git hooks (prek). Run once after cloning. Hooks live in the shared .git, so
+# they apply across all worktrees; a branch without .pre-commit-config.yaml is
+# blocked until it picks up the config. See .pre-commit-config.yaml for the
+# stage split (fast file-scoped checks pre-commit; CI-mirroring gates pre-push).
+prek install --hook-type pre-commit --hook-type pre-push
 
 # E2E tests (requires release build + model download)
 bash tests/e2e.sh
+
+# Benchmarks (requires live tsmd + indexed corpus; see README "Benchmarks")
+cargo bench --bench search_latency
+cargo test --features bench-counters   # counter-instrumented tests (off by default)
+
+# Search quality bench (Precision@5 / MRR / nDCG@5 vs tests/golden/baseline.json)
+bash tests/quality_bench.sh                    # builds an isolated env, indexes tests/golden/corpus/, gates
+bash tests/quality_bench.sh --update-baseline  # regenerate the baseline after an intentional quality change
+bash tests/quality_bench.sh --update-baseline --force  # required if this run failed the gate (a regression)
 ```
 
 ## Architecture
@@ -47,13 +63,32 @@ bash tests/e2e.sh
 ```text
 src/
 ├── lib.rs              — Crate root
-├── main.rs             — CLI entry point (clap)
-├── cli.rs              — CLI command implementations
+├── main.rs             — CLI entry point (clap); thin shell that dispatches to cli/render
+├── cli.rs              — CLI command dispatch + I/O shell (env/clock/FS/stdout); gate-excluded
+├── cli_format.rs       — Pure status/doctor/candidate text rendering (String-returning); gate-covered
+├── cli_dict_logic.rs   — Pure dict verdict→message + reindex-response classification; gate-covered
+├── cli_rebuild_logic.rs — Pure rebuild backfill-action decision + dry-run report text; gate-covered
+├── cli_args_logic.rs   — Pure path-filter / search-fallback / cache-placement decisions; gate-covered
+├── render.rs           — Daemon-response → terminal rendering (writer-based); gate-covered
 ├── config.rs           — Configuration (TSM_* env vars, config file, scoring params)
 ├── db.rs               — SQLite (rusqlite) DB init & connection management
-├── indexer.rs           — Indexer (diff detection, FTS5/vector registration)
-├── searcher.rs          — FTS5 + vector search, RRF fusion, scoring
-├── embedder.rs          — candle + ruri-v3-30m inference (pure library)
+├── indexer/             — Index pipeline (Prepare/Persist/Embed stages)
+│   ├── mod.rs           — Orchestration: index_file (prepare→persist→embed), index_all*, index_session
+│   ├── prepare.rs       — Prepare stage: file → PreparedFile (parse/chunk/metadata, no DB)
+│   ├── persist.rs       — Persist stage: one transaction (documents/chunks/FTS5/entity/links), diff, rebuild_fts
+│   ├── embed.rs         — Embed stage: async vector inference + writes (backfill)
+│   └── walker.rs        — File discovery + ingest policy
+├── searcher/            — Search pipeline (Plan/Retrieve/Rank/Format stages)
+│   ├── mod.rs           — Orchestration: search() (plan→retrieve→rank); SearchResult, SearchOutput
+│   ├── plan.rs          — Plan stage: keyword extraction, classify, expansion, query embedding → QueryPlan
+│   ├── retrieve.rs      — Retrieve stage: FTS5 + vector + entity candidate sets → CandidateSets
+│   ├── rank.rs          — Rank stage: metadata fetch (time/path filter), RRF fusion, score hook, sort
+│   └── format.rs        — Format stage: text / JSON output rendering
+├── embedder.rs          — Encode pipeline behind the `EmbeddingModel` trait; gate-covered via a mock model
+├── model_loader.rs      — Real ruri-v3-30m loader + ModernBert forward (model-coupled shell; gate-excluded)
+├── lua_hooks.rs         — Embedded Lua runtime for extract/score hooks
+├── hooks/extract/       — Embedded default extract hook (10-md_frontmatter.lua)
+├── hooks/score/         — Embedded default score hook (10-default.lua)
 ├── chunker.rs           — Markdown → H2/H3/paragraph chunking
 ├── session_chunker.rs   — Claude session JSONL → Q&A chunking
 ├── frontmatter.rs       — YAML frontmatter parser
@@ -61,7 +96,7 @@ src/
 ├── entity.rs            — Entity graph (link inference)
 ├── classifier.rs        — Query classification (entity extraction)
 ├── doc_links.rs         — Inter-document link analysis
-├── synonyms.rs          — Synonym expansion, WordNet import, user CSV sync
+├── synonyms.rs          — Synonym expansion, WordNet import, user CSV export/import
 ├── temporal.rs          — Temporal filter expression parsing
 ├── user_dict.rs         — Dictionary candidate collection & CSV export
 ├── daemon.rs            — Daemon request handler (server-side dispatch)
@@ -72,19 +107,33 @@ src/
 ├── test_utils.rs        — Shared test helpers
 └── bin/tsmd/
     ├── main.rs          — tsmd entry point, mode dispatch (--embedder / --fs-watcher)
-    ├── daemon_mode.rs   — Daemon mode (accept loop, client handling)
-    ├── embedder_mode.rs — Embedder child process (socket server, model inference)
-    ├── watcher_mode.rs  — FS watcher child process (file change → Index IPC)
-    ├── child.rs         — Child process management (spawn, reap, stop)
-    └── backfill.rs      — Vector backfill orchestration
+    ├── daemon_proc.rs   — Daemon process shell (accept loop, client dispatch I/O)
+    ├── daemon_logic.rs  — Pure daemon logic (embedder argv, reindex steps, reload, ReindexGuard, PID helpers); covered
+    ├── embedder_proc.rs — Embedder process shell (socket server loop, model load I/O)
+    ├── embedder_logic.rs — Pure embedder logic (parse texts, panic message, encode response, model-load plan); covered
+    ├── watcher_proc.rs  — FS watcher child process: notify event loop + watch registration (I/O shell)
+    ├── watch_logic.rs   — Pure fs-watcher logic (event relevance, debounce, watch targets); gate-covered
+    ├── child_proc.rs    — Child process management shell (spawn, reap, stop, stale-socket I/O)
+    ├── backfill_proc.rs — Backfill/reindex passes (embedder-socket + status I/O shell)
+    └── backfill_logic.rs — Pure backfill logic (write guard, yield, harvest, synonym cleanup); gate-covered
 ```
 
 - **FTS5**: lindera tokenization + unicode61 tokenizer
 - **Vector search**: ruri-v3-30m (256-dim) semantic search. Embedder child process (`tsmd --embedder`) runs on UNIX socket
-- **Scoring**: RRF (Reciprocal Rank Fusion) combining FTS5 and vector results. Time decay + status penalty applied
-- **DB schema changes require `rebuild --apply`** (e.g. FTS tokenizer changes)
+- **Extract hooks** (index time): Lua scripts in `.tsm/hooks/extract/` produce a scalar metadata map
+  stored in `documents.metadata` (JSON). `ctx.frontmatter` exposes top-level YAML keys
+  (scalars + sequences; nested mappings not passed). Embedded default reproduces `frontmatter.rs`
+  (status + effective\_date).
+- **Score hooks** (search time): Lua scripts in `.tsm/hooks/score/` each return a multiplier;
+  `final = rrf × weight × Π(score hooks)`. Embedded default reproduces time\_decay × status\_penalty.
+- **DB schema changes require `rebuild --apply`** (e.g. FTS tokenizer changes) — the `metadata`
+  column is added automatically on connect (idempotent migration) and does not require a rebuild
 - **Live re-indexing**: `tsm reindex {all|fts|vectors}` — daemon runs batched
   re-index in background, yielding to search between batches
+- **Build metadata**: `build.rs` injects `git describe` + build date as
+  compile-time env vars, surfaced by `tsm --version` and the `tsm doctor` Build
+  section (honors `SOURCE_DATE_EPOCH` for reproducible builds; falls back to the
+  crate version when git is unavailable)
 
 ## Data Flow
 
@@ -109,7 +158,9 @@ src/
 
 **Ownership:**
 
-- **tsmd (daemon)** — sole DB owner. All reads/writes go through here
+- **tsmd (daemon)** — sole DB owner. Holds one writer connection plus a `query_only` reader
+  pool (sized by `reader_pool_size`, default CPU cores). Read requests (status/doctor/search/ping)
+  are served from the pool concurrently with writes; all writes serialize on the single writer.
 - **tsmd --embedder** — stateless inference server. No DB access
 - **tsmd --fs-watcher** — stateless file monitor. Sends Index requests to daemon via daemon.sock
 
@@ -134,12 +185,76 @@ src/
   1. Write a failing test that defines the expected behavior
   2. Write minimal code to make the test pass
   3. Refactor while keeping tests green
-- **90%+ coverage** — Enforced via `cargo llvm-cov --fail-under-lines 90` in CI
+- **90%+ coverage** — Enforced via `cargo llvm-cov --fail-under-lines 90` in CI.
+  `--fail-under-lines` is a single GLOBAL aggregate over the included set (not a
+  per-file floor), so a file must reach ≈90% itself before leaving the
+  `--ignore-filename-regex`, or it dilutes the total. `llvm-cov` counts a file's
+  in-file `#[cfg(test)] mod tests` lines as covered, so a test-heavy file's % is
+  inflated — when un-excluding a file, read the tests to confirm the *production*
+  branches are covered, not just that the number crossed 90.
+- **Coverage exclusions & rationale** — the regex (see the commands above) is the
+  self-documenting final set `(main|cli|_proc|model_loader)\.rs`: the entry points
+  (`*main.rs`), `cli` (CLI dispatch), the daemon-side process/worker shells (the
+  `*_proc` files — `daemon_proc`, `child_proc`, `backfill_proc`, `embedder_proc`,
+  `watcher_proc`), and `model_loader` (the model-coupled loader: real model files +
+  candle inference, untestable without a GPU/model). The `_proc` term is
+  self-documenting (every excluded daemon shell is a process/worker loop) and
+  collision-safe: it does NOT match `daemon_protocol.rs` or any `*_logic.rs` (the
+  pure logic extracted out of those shells stays counted).
+- **`logging.rs` is INCLUDED (gate-counted), not excluded** — `tsm_log_format` is
+  unit-tested directly (`Record::builder` + `Vec<u8>` writer), so only the
+  `LogMode::Daemon` file-logger arm of `init_logger` stays uncovered: `init_logger`'s
+  `OnceLock` runs its mode-branch closure only once per process, so the file-logger
+  arm is unreachable once any test initializes the logger in another mode. That
+  residual is ≈20 lines (the `LogMode::Daemon` arm) — a negligible dilution (<0.2pt)
+  against the global total, so the file is counted rather than excluded. `status.rs`
+  is likewise gate-counted.
 - **Unit tests required** — All pub functions must have tests in `#[cfg(test)] mod tests`
 - **AAA pattern** — Arrange (setup + state cleanup like `clear_vectors`) → Act → Assert
 - DB tests use in-memory SQLite (`:memory:`) to prevent state leakage
 - Embedder tests should use mockable trait design
 - Tests must not depend on external daemon state (embedder, etc.)
+- **CLI ↔ docs structural sync is gated** — `tests/cli_docs.rs` walks `tsm --help`
+  and fails if a command/flag is undocumented in `docs/command-reference.md`, or
+  if a doc example names a command that no longer exists. Update the reference
+  when you change the CLI surface. (Semantic prose drift is the `verify-docs`
+  skill's job, not this test's.)
+- **E2E testdata の日付は placeholder 化必須** — `tests/e2e/testdata/**` 内で
+  日付を直書きしない。`__TODAY__` / `__1Y_AGO__` / `__3M_AGO__` 等を使い、
+  `tests/e2e.sh` の sed で実行時に置換する。直書きは time-decay スコアで
+  flake する（session half-life は 30 日）。CI の `testdata-lint` job が機械的に検出する
+
+### Isolated benchmark / perf-test environment
+
+Unit tests need no setup (`cargo test`, in-memory SQLite). Benches/perf tests
+need a live daemon + indexed corpus — run them in a **gitignored project-local
+`.bench/`** dir, never an external `/tmp` path. Reasons: a running daemon and
+the repo `.tsm/` are never touched, and UNIX socket paths stay under the
+`SUN_LEN` (~104 char) limit (deep temp paths fail to bind with
+`path must be shorter than SUN_LEN`).
+
+```bash
+# setup — pinned env isolates from any running daemon; CWD = the testdata project
+mkdir -p .bench/proj .bench/state/models
+cp -R tests/e2e/testdata/ .bench/proj/
+ln -sfn "$PWD/.tsm/models/ruri-v3-30m" .bench/state/models/ruri-v3-30m  # or `tsm setup`
+export TSM_STATE_DIR="$PWD/.bench/state" TSM_EMBEDDER_SOCKET="$PWD/.bench/e.sock" \
+       TSM_DAEMON_SOCKET="$PWD/.bench/d.sock" TSM_EMBEDDER_IDLE_TIMEOUT=0
+( cd .bench/proj && tsm init && tsm start && tsm index )   # .md notes only (sessions/*.jsonl skipped: ext=md)
+
+# wait for the async vector backfill before timing, else some chunks score zero-vector
+( cd .bench/proj && tsm status )   # proceed once it shows "Vectors N/N (100%)"
+
+# measure — `cargo bench` runs from the crate root, so config resolves via the pinned env
+cargo bench --bench search_latency
+
+# teardown — keep the pinned env on stop, else `tsm stop` hits the default daemon
+( cd .bench/proj && tsm stop ); rm -rf .bench
+```
+
+Verify isolation before measuring: `ps -axo pid,etime,command | grep "[t]smd"`
+(the bracket avoids self-matching the grep) — confirm the new daemon's PID and
+that other projects' daemons survive teardown.
 
 ## Branch Naming
 
@@ -153,36 +268,60 @@ The PR labeler workflow (`.github/labeler.yml`) maps prefixes to labels:
 | `docs/` | documentation |
 | `perf/` | performance |
 
-## Plugin Structure
+Mark **breaking changes** with a Conventional Commits `!` in the PR title
+(e.g. `feat!:`, `fix(scope)!:`) or a `BREAKING CHANGE` footer in the body. The
+labeler then applies the `breaking` label, which surfaces the PR under
+"💥 Breaking Changes" in the generated release notes (`.github/release.yml`).
 
-This project is a Claude Code plugin (`--plugin-dir` or marketplace install).
+## Claude Code Plugin
+
+The Claude Code plugin definition (skills/agents/hooks) for `tsm` lives in a
+separate repository:
+[`key/tsm-plugin-cc`](https://github.com/key/tsm-plugin-cc).
+
+This repo only ships the `tsm` / `tsmd` binaries. Install the plugin from its
+marketplace and ensure `tsm` is on `PATH`:
 
 ```text
-.claude-plugin/
-└── plugin.json            — Plugin manifest
-skills/
-├── search/SKILL.md        — /the-space-memory:search (knowledge search)
-├── doctor/SKILL.md        — /the-space-memory:doctor (health check)
-└── setup/SKILL.md         — /the-space-memory:setup (tsm.toml wizard)
-agents/
-└── deep-research.md       — Deep research sub-agent
-hooks/
-├── hooks.json             — Hook event definitions
-└── scripts/
-    ├── search.sh          — UserPromptSubmit: auto-search
-    ├── index-file.sh      — PostToolUse: auto-index edited .md
-    └── ingest.sh          — Stop: session JSONL ingest
+/plugin marketplace add key/tsm-plugin-cc
+/plugin install the-space-memory@tsm-plugin-cc
 ```
-
-Local testing: `claude --plugin-dir /workspaces/the-space-memory`
 
 ## Build & Deploy
 
-Build from a host container via Docker, then reference the binary from hooks/skills.
+End users install via mise from GitHub Releases:
+
+```toml
+# In consumer .mise.toml
+"github:key/the-space-memory" = { version = "latest", extract_all = true }
+```
+
+mise verifies SLSA provenance + GitHub artifact attestations during install.
+
+For local development (testing unreleased changes):
 
 ```bash
-docker build -t the-space-memory /path/to/the-space-memory
+cargo build --release   # Binaries land in ./target/release/{tsm,tsmd}
 ```
+
+Releases are published by CI on tagged commits as
+`tsm-v<version>-<os>-<arch>.tar.gz` (e.g. `tsm-v0.5.1-linux-x86_64.tar.gz`)
+containing `bin/{tsm,tsmd}` plus `LICENSE`, `README.md`, and `tsm.toml.example`.
+
+### Releasing
+
+1. Bump `version` in `Cargo.toml` (run `cargo check` to sync `Cargo.lock`).
+2. Open a `chore(release): vX.Y.Z` PR and merge to `main`.
+3. Tag the merged commit and push:
+   `git tag vX.Y.Z origin/main && git push origin vX.Y.Z`.
+   This fires `release.yml` (trigger: `tags: ["v*"]`), which builds every
+   target in the release matrix and creates the GitHub Release
+   (`generate_release_notes: true`).
+
+- semver while 0.x: breaking changes → minor bump (e.g. 0.5.x → 0.6.0).
+- The tag MUST point at a commit whose `Cargo.toml` version equals the tag.
+  Never tag without the bump — a dev build and a release sharing one version
+  string are indistinguishable by `tsm --version`.
 
 ## DevContainer
 
@@ -195,23 +334,58 @@ docker build -t the-space-memory /path/to/the-space-memory
 
 - Serena MCP via Docker (`ghcr.io/oraios/serena:latest`). Config in `.mcp.json`
 
+## Per-file line-count gate (ADR-0018)
+
+`tests/file_line_limits.rs` (CI job `file-lines`, also under `cargo test`) caps
+each `src/**/*.rs` file's **code** lines — physical lines excluding the trailing
+`#[cfg(test)] mod tests` block — at `max(800, baseline)`. The baseline lives in
+`tests/file-line-baseline.txt` (`path count`, only files over 800) and is a
+frozen ratchet: the gate fails if a file grows past its limit, if a baseline
+entry is stale (`<= 800`, or larger than the file's current count), or if any
+baseline value is raised/added relative to `origin/main` (invariant 3 — checked
+via `git show origin/main:tests/file-line-baseline.txt`; skipped when that ref or
+file is absent, i.e. locally or on the introducing PR).
+
+To **lower a baseline** after splitting/shrinking a file: re-measure and edit
+`tests/file-line-baseline.txt` down to the new count (the gate's failure message
+prints the exact number), or delete the line once the file is at/under 800.
+Baselines may only shrink; a new file over 800 must be split, not baselined.
+
 ## Definition of Done
 
 A change is merge-ready when **all** of the following hold:
 
 - [ ] `cargo test` passes (all existing + new tests)
-- [ ] `cargo clippy -- -D warnings` clean
+- [ ] `cargo clippy --all-targets -- -D warnings` clean (lints test/bench code too)
 - [ ] `cargo fmt --check` clean
 - [ ] Coverage ≥ 90% (on covered modules)
 - [ ] New pub functions have unit tests
 - [ ] `npx jscpd` duplication ≤ 5%
 - [ ] `lizard src/ --language rust -Tcyclomatic_complexity=15 -w` no new warnings
+- [ ] Per-file line-count gate green (`cargo test --test file_line_limits`; ADR-0018)
 - [ ] `bash tests/e2e.sh` passes (if search, index, or IPC changed)
 - [ ] CLAUDE.md updated if architecture or commands changed
 - [ ] README.md / README.ja.md updated in sync (if user-facing change)
 
 ## Gotchas
 
+- **e2e red on a HuggingFace HTTP 429** (model-download rate limit during `tsm
+  setup`) is an infra flake, not a code bug — re-run the `e2e` job. A non-search
+  change (status, coverage regex, docs) cannot affect e2e behavior, so a red e2e
+  there is almost always this.
+- **Lua hooks dir layout** — `.tsm/hooks/{extract,score}/NN-name.lua` (sorted by file name, `.lua` only).
+  Empty or absent dir → embedded defaults. Disable a hook by renaming away the `.lua` extension.
+- **Editing a hook requires `tsm restart`** — daemon validates and loads all hooks at startup
+  (fail-fast on broken script). CLI uses a lazy per-process cache. Neither reloads hooks at runtime.
+- **`metadata` column is added automatically** — `documents.metadata` (JSON) is added by an
+  idempotent `ALTER TABLE` migration on connect. Existing rows have NULL metadata; the searcher
+  synthesizes scoring from `status`/`updated` columns, so scoring is unaffected. To populate
+  metadata for existing documents after writing custom extract hooks, run `tsm reindex` — a full
+  destructive rebuild is not required.
+- **Lua VMs are sandboxed** — `StdLib::NONE` + 64 MiB memory ceiling per VM.
+  No `io`/`os`/`package` available; hooks cannot touch the filesystem, network, or spawn processes.
+  Infinite loops are NOT bounded (op-count/timeout limit is deferred); hooks are user-owned scripts,
+  not untrusted third-party code.
 - **Hook stdin JSON key is `prompt`** (not `user_prompt`).
   Hook output must wrap `additionalContext` in
   `hookSpecificOutput: { hookEventName, additionalContext }`
@@ -225,15 +399,64 @@ A change is merge-ready when **all** of the following hold:
 - **User dictionary POS is `名詞`** — simpledic format: `surface,名詞,reading`.
   Uses standard POS so existing noun filters work without special handling.
   `#` comment lines are stripped before passing to lindera
-- **`rebuild --apply` resets reject list** — DB is deleted and recreated,
-  so `dictionary_candidates` table (including rejected status) is lost.
-  Run `tsm dict reject --apply` after rebuild to re-sync from `reject_words.txt`
-- **`dict update --apply` uses daemon when available** — if daemon running,
-  sends `reindex fts` via IPC (daemon resets its own segmenter).
-  If daemon stopped, resets segmenter locally and rebuilds FTS directly
+- **`rebuild --apply` resets dictionary verdicts** — DB is deleted and recreated,
+  so the `dictionary_candidates` table (accepted + rejected verdicts) is lost.
+  Run `tsm dict import` after rebuild to restore from `user_dict.simpledic` /
+  `reject_words.txt` (DB is the authority, files are the portable record)
+- **Dict verdict changes reindex via `reindex_fts_after_dict_change`** — `dict add`
+  / `reject` / `rm` / `import` regenerate `user_dict.simpledic` when the accepted
+  set changes, then reindex FTS: if the daemon is running, send `reindex fts` via
+  IPC (it resets its own segmenter); if stopped, reset the segmenter locally and
+  rebuild FTS directly
 - **Segmenter is cached** — `tokenizer::get_segmenter()` caches the Segmenter
   (including user dict). Call `reset_segmenter()` after writing new simpledic
   if rebuilding FTS in the same process
+- **Daemon fail-fasts on an uninitialized DB — without creating `.tsm`** —
+  both `cmd_start` and `tsmd` call `db::probe_initialized` BEFORE the stderr log,
+  logger, startup lock, or socket touch the state directory. The probe returns
+  `Ok(false)` for an absent DB without opening anything (so nothing is
+  materialized), opens an existing DB read-write but with no `CREATE` flag (never
+  creates it, yet still recovers a hot WAL), and propagates genuine open failures
+  (permissions, corruption) as `Err` rather than misreporting "not initialized".
+  Starting in an unconfigured directory exits with "Run `tsm init` first" and
+  leaves no stray `.tsm` behind (init is explicit, never auto-created). The
+  daemon re-checks `is_initialized` once more after taking the
+  startup lock to close the probe→open race. `cmd_start` also surfaces the
+  spawned daemon's captured stderr via `try_wait`, so a daemon that dies after
+  spawn fails immediately instead of blocking on the 30s socket-wait timeout
+- **`tsm doctor` never auto-starts the daemon** — it is a read-only diagnostic.
+  Uses the daemon's report if already running, else falls back to a local
+  `doctor_check` (which reports an uninitialized/missing DB gracefully and does
+  not create a `tsm.db` file)
+- **Log files: two, not per-process** — the daemon (`tsmd`) writes a structured,
+  daily-rotated `tsmd.log` (kept 3 generations; holds all daemon info/warn).
+  Children (embedder, watcher) keep NO own files; they log to stderr, which
+  `cmd_start` captures into a single, unrotated `logs/tsmd-stderr.log`. That
+  capture replaces terminal inheritance (no shell spam) and `cmd_start` reads it
+  to surface startup failures. Shell spam is prevented structurally (stderr
+  capture + the daemon dropping `duplicate_to_stderr`), NOT by lowering log
+  levels — so child lifecycle/diagnostic logs stay visible in the file.
+  `tsmd-stderr.log` is truncated on each start (bounded across runs) but is NOT
+  rotated, so a single long-lived session can grow it (size cap is a follow-up).
+  A foreground `tsmd` still logs to the terminal
+- **All log modes default to `info`** (`logging::default_log_spec`). User-facing
+  command output is `println!`, not the logger, so it shows regardless of level.
+  Set `RUST_LOG=warn` to quiet the CLI terminal, or `debug` for more detail
+- **Read/write routing is exhaustive** — `DaemonRequest::is_read_only()` is an exhaustive
+  match. Adding a new request variant without classifying it causes a compile error.
+  Reads run on the `query_only` reader pool (sized by `reader_pool_size`, default CPU cores);
+  writes serialize on the single writer. `busy_timeout` (5 000 ms) is set on all connections.
+- **Write fairness / reindex preemption** — reindex and backfill yield the writer to a pending
+  `Index` request (`yield_to_pending_writes`) so a file or interactive index preempts an
+  in-progress reindex within one batch. The FTS reindex batch size is `reindex_fts_batch_size`
+  (default 200): smaller = finer preemption granularity but more fsync overhead; larger = better
+  reindex throughput but coarser preemption.
+- **macOS tempdir vs `current_dir()` symlinks** — `tempfile::tempdir()` returns
+  `/var/...` but after `set_current_dir`, `current_dir()` resolves the symlink to
+  `/private/var/...`. A test asserting `path == cwd` must canonicalize the tempdir
+  path up front and use it for both `set_current_dir` and the assertion (see
+  `config::tests::test_load_config_relative_path_resolves_against_cwd`); otherwise
+  it fails on macOS only while passing on Linux CI
 - **Embedder memory is O(batch × seq²)** — candle's ModernBert materializes
   the full attention matrix. All embed requests must stay within
   `BACKFILL_BATCH_SIZE` texts (indexer sub-batches `insert_vectors`) and the
@@ -244,13 +467,19 @@ A change is merge-ready when **all** of the following hold:
 
 Design decisions and rationale are recorded in the directory below.
 Review existing records before making architectural changes.
+The ADR format authority is `decisions/README.md` (target-state only; no
+`Follow-ups`/task-list sections, no review-process attribution). Get the next
+ADR number from `main`, not your branch (renumbering may be in flight).
 
 | Directory | Contents |
 |---|---|
 | `decisions/` | ADR (decision records and rationale) |
 
-For changes involving process architecture, IPC, or failure behavior,
-see ADR-0001.
+Several behaviors have dedicated records in `decisions/`: process roles, IPC,
+and failure behavior; uninitialized-DB fail-fast, daemon auto-start boundaries,
+and read-only `doctor`; and the output-channel model (user output → stdout,
+logs/errors → stderr/file, log-file consolidation). Review the relevant record
+before changing that behavior.
 
 ## Language Policy
 
@@ -267,6 +496,17 @@ see ADR-0001.
 3. Operations guide (How to use) — setup, maintenance, troubleshooting
 4. Internals (How it works) — collection logic, data flow
 5. Implementation reference (Code) — source files and roles
+
+### Referencing ADRs and issues
+
+ADR numbers (`ADR-XXXX`) and issue numbers (`#NNN`) MUST NOT appear in source
+code or type definitions. Explain the rationale directly in prose instead — a
+comment should stand on its own without the reader opening an ADR. In `docs/`
+and other Markdown, do not cite ADRs inline; when a source pointer is genuinely
+useful, use a Markdown footnote (`[^adr-xxxx]`) defined at the end of the file.
+PR titles, commit messages, and PR bodies may still reference ADRs/issues —
+those are traceability, not code/doc content. Existing inline references across
+the repo (including in this file) are being removed gradually.
 
 ## License Compatibility
 

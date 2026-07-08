@@ -1,23 +1,22 @@
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-use crate::chunker::chunk_markdown_default;
-use crate::config;
-use crate::db;
-use crate::doc_links;
-use crate::embedder;
-use crate::entity;
-use crate::frontmatter;
 use crate::session_chunker::parse_session_jsonl;
-use crate::tokenizer::wakachi;
 use crate::user_dict;
 
 pub mod walker;
 
 pub use walker::ContentWalker;
+
+mod embed;
+pub use embed::{backfill_next_batch, backfill_vectors, BackfillStats, EncodeFn};
+
+mod prepare;
+
+mod persist;
+pub use persist::{rebuild_fts, rebuild_fts_next_batch};
 
 /// Decides whether a single path is allowed through the ingest pipeline.
 ///
@@ -50,15 +49,6 @@ pub struct IndexStats {
     pub removed: usize,
 }
 
-#[derive(Debug, Default)]
-pub struct BackfillStats {
-    pub filled: usize,
-    pub errors: usize,
-    pub panics: usize,
-    /// Keyset pagination cursor (last processed chunk ID).
-    pub last_id: i64,
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -89,215 +79,41 @@ fn directory_from_rel_path(rel_path: &str) -> String {
     }
 }
 
-/// Delete FTS, vector, skip, and entity entries for specific chunk IDs.
-fn delete_chunk_side_tables(conn: &Connection, chunk_ids: &[i64]) -> anyhow::Result<()> {
-    if chunk_ids.is_empty() {
-        return Ok(());
-    }
-    let placeholders = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk_ids
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
-        .collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+use prepare::ChunkInput;
 
-    conn.execute(
-        &format!("DELETE FROM chunks_fts WHERE rowid IN ({placeholders})"),
-        param_refs.as_slice(),
-    )?;
-
-    // chunks_vec may not exist in older DBs
-    conn.execute(
-        &format!("DELETE FROM chunks_vec WHERE rowid IN ({placeholders})"),
-        param_refs.as_slice(),
-    )
-    .or_else(|e| {
-        if e.to_string().contains("no such table") {
-            Ok(0)
-        } else {
-            Err(e)
-        }
-    })?;
-
-    // chunks_vec_skip — may not exist in older DBs
-    conn.execute(
-        &format!("DELETE FROM chunks_vec_skip WHERE chunk_id IN ({placeholders})"),
-        param_refs.as_slice(),
-    )
-    .or_else(|e| {
-        if e.to_string().contains("no such table") {
-            Ok(0)
-        } else {
-            Err(e)
-        }
-    })?;
-
-    // chunk_entities — may not exist in older DBs
-    conn.execute(
-        &format!("DELETE FROM chunk_entities WHERE chunk_id IN ({placeholders})"),
-        param_refs.as_slice(),
-    )
-    .or_else(|e| {
-        if e.to_string().contains("no such table") {
-            Ok(0)
-        } else {
-            Err(e)
-        }
-    })?;
-
-    Ok(())
+/// Per-stage wall-clock timings for one [`index_file`] invocation.
+/// Collection cost is a handful of `Instant::now()` calls — negligible
+/// next to file I/O and socket I/O — so it is always measured; only the
+/// bench-facing accessor ([`index_file_timed`]) is feature-gated.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IndexTimings {
+    pub prepare: std::time::Duration,
+    pub persist: std::time::Duration,
+    pub embed: std::time::Duration,
 }
 
-fn delete_old_entries(conn: &Connection, doc_id: i64) -> anyhow::Result<()> {
-    let chunk_ids: Vec<i64> = conn
-        .prepare("SELECT id FROM chunks WHERE document_id = ?")?
-        .query_map([doc_id], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    delete_chunk_side_tables(conn, &chunk_ids)?;
-
-    // document_links
-    doc_links::delete_links(conn, doc_id);
-
-    // entity_edges reference doc_id directly
-    conn.execute("DELETE FROM entity_edges WHERE doc_id = ?", [doc_id])
-        .or_else(|e| {
-            if e.to_string().contains("no such table") {
-                Ok(0)
-            } else {
-                Err(e)
-            }
-        })?;
-
-    conn.execute("DELETE FROM documents WHERE id = ?", [doc_id])?;
-    Ok(())
-}
-
-struct ChunkInput {
-    chunk_index: usize,
-    section_path: String,
-    content: String,
-    content_hash: String,
-}
-
-struct DiffResult {
-    /// All chunk entries (new + existing) as (chunk_id, content) — for entity rebuild.
-    all_chunk_entries: Vec<(i64, String)>,
-    /// Chunks needing vector embedding (new + changed).
-    chunks_needing_vectors: Vec<(i64, String)>,
-    /// Whether any mutation occurred.
-    had_mutations: bool,
-}
-
-/// Compare freshly parsed chunks against stored chunks for a document.
-/// Inserts new chunks, updates changed chunks, deletes removed chunks, skips unchanged.
-///
-/// MUST be called within a transaction — the caller is responsible for wrapping
-/// this in `unchecked_transaction()` to ensure atomicity of the multi-statement diff.
-fn diff_chunks(
+fn index_file_inner(
     conn: &Connection,
-    doc_id: i64,
-    new_chunks: &[ChunkInput],
-) -> anyhow::Result<DiffResult> {
-    use std::collections::HashMap;
+    file_path: &Path,
+    project_root: &Path,
+) -> anyhow::Result<(bool, IndexTimings)> {
+    use std::time::Instant;
 
-    // Load existing chunks: chunk_index → (id, content_hash)
-    let mut existing: HashMap<usize, (i64, Option<String>)> = HashMap::new();
-    {
-        let mut stmt =
-            conn.prepare("SELECT id, chunk_index, content_hash FROM chunks WHERE document_id = ?")?;
-        let rows = stmt.query_map([doc_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)? as usize,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (id, idx, hash) = row?;
-            existing.insert(idx, (id, hash));
-        }
-    }
+    let mut timings = IndexTimings::default();
 
-    let mut all_chunk_entries: Vec<(i64, String)> = Vec::new();
-    let mut chunks_needing_vectors: Vec<(i64, String)> = Vec::new();
-    let mut had_mutations = false;
-
-    for chunk in new_chunks {
-        if let Some((existing_id, ref stored_hash)) = existing.remove(&chunk.chunk_index) {
-            // Chunk exists at this index
-            if stored_hash.as_deref() == Some(&chunk.content_hash) {
-                // Unchanged — skip
-                all_chunk_entries.push((existing_id, chunk.content.clone()));
-            } else {
-                // Content changed — update
-                had_mutations = true;
-                conn.execute(
-                    "UPDATE chunks SET content = ?, content_hash = ?, section_path = ? WHERE id = ?",
-                    rusqlite::params![chunk.content, chunk.content_hash, chunk.section_path, existing_id],
-                )?;
-                // FTS5 does not support UPDATE — delete + insert
-                delete_chunk_side_tables(conn, &[existing_id])?;
-                let wakachi_text = wakachi(&chunk.content);
-                conn.execute(
-                    "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
-                    rusqlite::params![existing_id, wakachi_text],
-                )?;
-                all_chunk_entries.push((existing_id, chunk.content.clone()));
-                chunks_needing_vectors.push((existing_id, chunk.content.clone()));
-            }
-        } else {
-            // New chunk — insert
-            had_mutations = true;
-            conn.execute(
-                "INSERT INTO chunks (document_id, chunk_index, section_path, content, content_hash)
-                 VALUES (?, ?, ?, ?, ?)",
-                rusqlite::params![
-                    doc_id,
-                    chunk.chunk_index as i64,
-                    chunk.section_path,
-                    chunk.content,
-                    chunk.content_hash,
-                ],
-            )?;
-            let chunk_id = conn.last_insert_rowid();
-            let wakachi_text = wakachi(&chunk.content);
-            conn.execute(
-                "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
-                rusqlite::params![chunk_id, wakachi_text],
-            )?;
-            all_chunk_entries.push((chunk_id, chunk.content.clone()));
-            chunks_needing_vectors.push((chunk_id, chunk.content.clone()));
-        }
-    }
-
-    // Delete chunks that no longer exist
-    if !existing.is_empty() {
-        had_mutations = true;
-        let removed_ids: Vec<i64> = existing.values().map(|(id, _)| *id).collect();
-        delete_chunk_side_tables(conn, &removed_ids)?;
-        for id in &removed_ids {
-            conn.execute("DELETE FROM chunks WHERE id = ?", [id])?;
-        }
-    }
-
-    Ok(DiffResult {
-        all_chunk_entries,
-        chunks_needing_vectors,
-        had_mutations,
-    })
-}
-
-/// Index a single file. Returns true if the file was (re-)indexed, false if skipped.
-pub fn index_file(conn: &Connection, file_path: &Path, index_root: &Path) -> anyhow::Result<bool> {
-    let rel_path = file_path
-        .strip_prefix(index_root)
+    // file_path is stored as a lexical absolute path. The directory
+    // label (used for source_type + chunking) is still derived from the
+    // project_root-relative path so source-type classification is unaffected.
+    let stored_path = crate::paths::absolutize(file_path, project_root)
+        .to_string_lossy()
+        .to_string();
+    let rel_for_label = file_path
+        .strip_prefix(project_root)
         .unwrap_or(file_path)
         .to_string_lossy()
         .to_string();
 
-    let directory = directory_from_rel_path(&rel_path);
+    let directory = directory_from_rel_path(&rel_for_label);
     let filename = file_path
         .file_stem()
         .unwrap_or_default()
@@ -310,100 +126,64 @@ pub fn index_file(conn: &Connection, file_path: &Path, index_root: &Path) -> any
     let existing: Option<(i64, String)> = conn
         .query_row(
             "SELECT id, file_hash FROM documents WHERE file_path = ?",
-            [&rel_path],
+            [&stored_path],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .ok();
 
     if let Some((_, ref old_hash)) = existing {
         if *old_hash == current_hash {
-            return Ok(false); // unchanged
+            return Ok((false, timings)); // unchanged
         }
     }
 
-    // Parse file
-    let text = std::fs::read_to_string(file_path)?;
-    let (fm, body) = frontmatter::parse(&text);
+    // Hook API contract: extract hooks see the project-relative path as
+    // `ctx.path`, unchanged by absolute-path storage. Only DB persistence uses
+    // the absolute `stored_path` (file identity). Keep these two separate.
+    let t0 = Instant::now();
+    let prepared = prepare::prepare(file_path, &rel_for_label, &directory, &filename)?;
+    timings.prepare = t0.elapsed();
 
-    let now = chrono::Utc::now().to_rfc3339();
-    let source_type = config::source_type_from_dir(&directory);
-    let tags_str = if fm.tags.is_empty() {
-        None
-    } else {
-        Some(format!("{:?}", fm.tags))
-    };
-
-    // Build chunk inputs with content hashes
-    let chunks = chunk_markdown_default(body, &directory, &filename);
-    let chunk_inputs: Vec<ChunkInput> = chunks
-        .iter()
-        .map(|c| ChunkInput {
-            chunk_index: c.chunk_index,
-            section_path: c.section_path.clone(),
-            content: c.content.clone(),
-            content_hash: chunk_hash(&c.content),
-        })
-        .collect();
-
-    let tx = conn.unchecked_transaction()?;
-
-    let doc_id = if let Some((doc_id, _)) = existing {
-        // Update existing document row (preserves doc_id for entity_edges/doc_links)
-        tx.execute(
-            "UPDATE documents SET source_type=?, title=?, status=?, created=?, updated=?, tags=?, file_hash=?, indexed_at=?
-             WHERE id=?",
-            rusqlite::params![
-                source_type, filename, fm.status, fm.created, fm.updated,
-                tags_str, current_hash, now, doc_id,
-            ],
-        )?;
-        doc_id
-    } else {
-        tx.execute(
-            "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            rusqlite::params![
-                rel_path, source_type, filename, fm.status, fm.created, fm.updated,
-                tags_str, current_hash, now,
-            ],
-        )?;
-        tx.last_insert_rowid()
-    };
-
-    let diff = diff_chunks(&tx, doc_id, &chunk_inputs)?;
-
-    if diff.had_mutations {
-        // Rebuild entity graph (document-level)
-        tx.execute("DELETE FROM entity_edges WHERE doc_id = ?", [doc_id])
-            .or_else(|e| {
-                if e.to_string().contains("no such table") {
-                    Ok(0)
-                } else {
-                    Err(e)
-                }
-            })?;
-        if let Err(e) = entity::insert_entities(&tx, doc_id, &diff.all_chunk_entries, &fm.tags) {
-            log::warn!("entity extraction warning: {e}");
-        }
-
-        // Rebuild document links
-        doc_links::delete_links(&tx, doc_id);
-        doc_links::build_links(&tx, doc_id, &text, &fm.tags);
-
-        // Collect dictionary candidates
-        for (_, content) in &diff.all_chunk_entries {
-            user_dict::collect_from_text(&tx, content, "document");
-        }
-    }
-
-    tx.commit()?;
+    let t1 = Instant::now();
+    let diff = persist::persist(
+        conn,
+        &stored_path,
+        &current_hash,
+        existing.map(|(id, _)| id),
+        &prepared,
+    )?;
+    timings.persist = t1.elapsed();
 
     // Vector embedding outside transaction (socket I/O)
     if !diff.chunks_needing_vectors.is_empty() {
-        insert_vectors(conn, &diff.chunks_needing_vectors);
+        let t2 = Instant::now();
+        embed::insert_vectors(conn, &diff.chunks_needing_vectors);
+        timings.embed = t2.elapsed();
     }
 
-    Ok(true)
+    Ok((true, timings))
+}
+
+/// Index a single file. Returns true if the file was (re-)indexed, false if skipped.
+pub fn index_file(
+    conn: &Connection,
+    file_path: &Path,
+    project_root: &Path,
+) -> anyhow::Result<bool> {
+    index_file_inner(conn, file_path, project_root).map(|(indexed, _)| indexed)
+}
+
+/// Bench-only entry point: same as [`index_file`] but also returns the
+/// per-stage [`IndexTimings`]. Used by the indexing throughput bench to
+/// report a Prepare/Persist/Embed breakdown without duplicating the
+/// pipeline logic (see `bench-counters` feature).
+#[cfg(feature = "bench-counters")]
+pub fn index_file_timed(
+    conn: &Connection,
+    file_path: &Path,
+    project_root: &Path,
+) -> anyhow::Result<(bool, IndexTimings)> {
+    index_file_inner(conn, file_path, project_root)
 }
 
 /// Index all given files under `policy`. Returns stats.
@@ -416,10 +196,10 @@ pub fn index_file(conn: &Connection, file_path: &Path, index_root: &Path) -> any
 pub fn index_all(
     conn: &Connection,
     file_paths: &[PathBuf],
-    index_root: &Path,
+    project_root: &Path,
     policy: &dyn IngestPolicy,
 ) -> anyhow::Result<IndexStats> {
-    index_all_with_progress(conn, file_paths, index_root, policy, None)
+    index_all_with_progress(conn, file_paths, project_root, policy, None)
 }
 
 /// Progress callback type for index_all_with_progress: (current, total, file_path).
@@ -428,7 +208,7 @@ pub type IndexProgressCb<'a> = &'a dyn Fn(usize, usize, &Path);
 pub fn index_all_with_progress(
     conn: &Connection,
     file_paths: &[PathBuf],
-    index_root: &Path,
+    project_root: &Path,
     policy: &dyn IngestPolicy,
     progress_cb: Option<IndexProgressCb<'_>>,
 ) -> anyhow::Result<IndexStats> {
@@ -451,26 +231,25 @@ pub fn index_all_with_progress(
         }
 
         if !fp.exists() {
-            let rel_path = fp
-                .strip_prefix(index_root)
-                .unwrap_or(fp)
+            // Match the absolute key written by index_file.
+            let stored_path = crate::paths::absolutize(fp, project_root)
                 .to_string_lossy()
                 .to_string();
             let existing: Option<i64> = conn
                 .query_row(
                     "SELECT id FROM documents WHERE file_path = ?",
-                    [&rel_path],
+                    [&stored_path],
                     |row| row.get(0),
                 )
                 .ok();
             if let Some(doc_id) = existing {
-                delete_old_entries(conn, doc_id)?;
+                persist::delete_old_entries(conn, doc_id)?;
                 stats.removed += 1;
             }
             continue;
         }
 
-        if index_file(conn, fp, index_root)? {
+        if index_file(conn, fp, project_root)? {
             stats.indexed += 1;
         } else {
             stats.skipped += 1;
@@ -540,6 +319,8 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
     let tx = conn.unchecked_transaction()?;
 
     let doc_id = if let Some((doc_id, _)) = existing {
+        // metadata intentionally omitted: sessions have no frontmatter;
+        // searcher synthesizes scoring from status/updated when metadata is NULL.
         tx.execute(
             "UPDATE documents SET source_type=?, title=?, status=?, created=?, updated=?, tags=?, file_hash=?, indexed_at=?
              WHERE id=?",
@@ -561,7 +342,7 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
         tx.last_insert_rowid()
     };
 
-    let diff = diff_chunks(&tx, doc_id, &chunk_inputs)?;
+    let diff = persist::diff_chunks(&tx, doc_id, &chunk_inputs)?;
 
     // Note: entity graph and doc_links are not rebuilt for sessions.
     // Sessions don't participate in entity co-occurrence or link graphs.
@@ -570,13 +351,127 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
 
     // Vector embedding outside transaction (socket I/O)
     if !diff.chunks_needing_vectors.is_empty() {
-        insert_vectors(conn, &diff.chunks_needing_vectors);
+        embed::insert_vectors(conn, &diff.chunks_needing_vectors);
     }
 
     // Learn synonyms from human messages in the session (wrapped in transaction)
     learn_from_session_jsonl(conn, jsonl_path);
 
     Ok(true)
+}
+
+/// A session document plus its chunks, captured from the DB so a destructive
+/// rebuild can carry it forward. Sessions are keyed `session:<stem>` — a
+/// non-filesystem document kind ingested only via `index_session`. The file
+/// walker only ever yields real paths under `project_root`, so it can never
+/// reproduce a `session:` document regardless of the extension allowlist;
+/// without this carry-forward they would be lost on `tsm rebuild --apply`.
+pub(crate) struct CapturedSession {
+    file_path: String,
+    title: Option<String>,
+    status: Option<String>,
+    created: Option<String>,
+    updated: Option<String>,
+    tags: Option<String>,
+    file_hash: String,
+    chunks: Vec<ChunkInput>,
+}
+
+/// Read every `session:*` document and its chunks from `conn`.
+///
+/// Called before a destructive rebuild deletes the DB. The chunk content is
+/// authoritative in the DB, so carry-forward needs neither the original JSONL
+/// (which may have been rotated out of `~/.claude/projects`) nor a schema change.
+pub(crate) fn capture_sessions(conn: &Connection) -> anyhow::Result<Vec<CapturedSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_path, title, status, created, updated, tags, file_hash
+         FROM documents WHERE file_path LIKE 'session:%' ORDER BY file_path",
+    )?;
+    // (doc_id, partial CapturedSession with chunks filled in below).
+    let partials = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, captured_session_from_row(row)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut sessions = Vec::with_capacity(partials.len());
+    for (doc_id, mut session) in partials {
+        session.chunks = read_session_chunks(conn, doc_id)?;
+        sessions.push(session);
+    }
+    Ok(sessions)
+}
+
+/// Map a `documents` row (sans chunks) into a `CapturedSession`.
+fn captured_session_from_row(row: &rusqlite::Row) -> rusqlite::Result<CapturedSession> {
+    Ok(CapturedSession {
+        file_path: row.get(1)?,
+        title: row.get(2)?,
+        status: row.get(3)?,
+        created: row.get(4)?,
+        updated: row.get(5)?,
+        tags: row.get(6)?,
+        file_hash: row.get(7)?,
+        chunks: Vec::new(),
+    })
+}
+
+/// Read the chunks of one document as `ChunkInput`s, ordered by chunk index.
+fn read_session_chunks(conn: &Connection, doc_id: i64) -> anyhow::Result<Vec<ChunkInput>> {
+    let mut stmt = conn.prepare(
+        "SELECT chunk_index, section_path, content, content_hash
+         FROM chunks WHERE document_id = ? ORDER BY chunk_index",
+    )?;
+    let chunks = stmt
+        .query_map([doc_id], |row| {
+            Ok(ChunkInput {
+                chunk_index: row.get::<_, i64>(0)? as usize,
+                section_path: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                content: row.get::<_, String>(2)?,
+                content_hash: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(chunks)
+}
+
+/// Re-persist captured sessions into a freshly-initialized DB. Mirrors the
+/// persist path of `index_session` (document row + `diff_chunks` for chunks and
+/// FTS) without touching the JSONL. Vectors are intentionally left to the
+/// post-rebuild backfill, which embeds every chunk lacking a vector. Returns the
+/// number of session documents restored.
+///
+/// All sessions are restored in a single transaction: a failure on any session
+/// rolls back the whole batch rather than leaving the DB partially populated.
+/// This matters because the rebuild has already deleted the old DB by this
+/// point — an all-or-nothing restore keeps the failure recoverable from the
+/// backup instead of silently dropping a subset of sessions.
+pub(crate) fn restore_sessions(
+    conn: &Connection,
+    sessions: &[CapturedSession],
+) -> anyhow::Result<usize> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let tx = conn.unchecked_transaction()?;
+    for session in sessions {
+        tx.execute(
+            "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
+             VALUES (?, 'session', ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                session.file_path,
+                session.title,
+                session.status,
+                session.created,
+                session.updated,
+                session.tags,
+                session.file_hash,
+                &now,
+            ],
+        )?;
+        let doc_id = tx.last_insert_rowid();
+        persist::diff_chunks(&tx, doc_id, &session.chunks)?;
+    }
+    tx.commit()?;
+    Ok(sessions.len())
 }
 
 /// Extract human messages from session JSONL and learn synonym pairs.
@@ -641,484 +536,13 @@ fn learn_from_session_jsonl(conn: &Connection, jsonl_path: &Path) {
     }
 }
 
-/// Insert vectors for chunks if embedder is running and vec table exists.
-/// Write a single embedding row to chunks_vec. Returns true on success.
-fn write_vec_row(conn: &Connection, chunk_id: i64, emb: &[f32]) -> bool {
-    let json = match serde_json::to_string(emb) {
-        Ok(j) => j,
-        Err(_) => return false,
-    };
-    conn.execute(
-        "INSERT OR IGNORE INTO chunks_vec(rowid, embedding) VALUES (?, ?)",
-        rusqlite::params![chunk_id, json],
-    )
-    .is_ok()
-}
-
-fn insert_vectors(conn: &Connection, chunk_entries: &[(i64, String)]) {
-    if chunk_entries.is_empty() {
-        return;
-    }
-    if !db::has_vec_table(conn) {
-        return;
-    }
-    // Skip socket I/O if embedder is not running
-    if !config::embedder_socket_path().exists() {
-        return;
-    }
-
-    let encode_fn = |texts: &[String]| {
-        embedder::embed_via_socket(texts).ok_or_else(|| anyhow::anyhow!("embedder not available"))
-    };
-    insert_vectors_batched(conn, chunk_entries, &encode_fn, BACKFILL_BATCH_SIZE);
-}
-
-/// Embed and store vectors in sub-batches so a document with many chunks
-/// (sessions have been observed with 350+) never lands in the embedder as
-/// one request — attention memory there grows with batch × seq².
-/// On encode failure, stop: the embedder is likely down and the periodic
-/// backfill will fill the remaining chunks.
-fn insert_vectors_batched(
-    conn: &Connection,
-    chunk_entries: &[(i64, String)],
-    encode_fn: EncodeFn,
-    batch_size: usize,
-) {
-    for batch in chunk_entries.chunks(batch_size.max(1)) {
-        let texts: Vec<String> = batch.iter().map(|(_, text)| text.clone()).collect();
-        let embeddings = match encode_fn(&texts) {
-            Ok(e) => e,
-            Err(e) => {
-                log::warn!(
-                    "insert_vectors_batched: encode failed ({e}); leaving remaining chunks to backfill"
-                );
-                return;
-            }
-        };
-        for ((chunk_id, _), emb) in batch.iter().zip(embeddings.iter()) {
-            write_vec_row(conn, *chunk_id, emb);
-        }
-    }
-}
-
 pub use crate::config::BACKFILL_BATCH_SIZE;
-
-/// Encode function type: takes texts, returns embedding vectors.
-pub type EncodeFn<'a> = &'a dyn Fn(&[String]) -> anyhow::Result<Vec<Vec<f32>>>;
-
-/// Extract a human-readable message from a panic payload.
-fn panic_message(info: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = info.downcast_ref::<String>() {
-        s.clone()
-    } else if let Some(&s) = info.downcast_ref::<&str>() {
-        s.to_string()
-    } else {
-        "unknown panic".to_string()
-    }
-}
-
-/// Record a chunk in the skip table so it is not retried on subsequent backfill runs.
-/// The skip record is automatically cleaned up when the parent document is re-indexed
-/// (chunks are deleted and re-created with new IDs).
-fn mark_chunk_skip(conn: &Connection, chunk_id: i64, reason: &str) -> bool {
-    match conn.execute(
-        "INSERT OR IGNORE INTO chunks_vec_skip(chunk_id, reason) VALUES (?, ?)",
-        rusqlite::params![chunk_id, reason],
-    ) {
-        Ok(_) => true,
-        Err(e) => {
-            log::warn!("failed to write skip record for chunk {chunk_id}: {e} — chunk will be retried next run");
-            false
-        }
-    }
-}
-
-/// Retry each chunk in the batch individually, skipping persistent failures.
-fn retry_individually(
-    batch: &[(i64, String, String)],
-    encode_fn: EncodeFn,
-    conn: &Connection,
-    stats: &mut BackfillStats,
-) {
-    for (chunk_id, content, file_path) in batch {
-        let single = vec![content.clone()];
-        let result = catch_unwind(AssertUnwindSafe(|| encode_fn(&single)));
-        match result {
-            Ok(Ok(ref embeddings)) if !embeddings.is_empty() => {
-                if write_vec_row(conn, *chunk_id, &embeddings[0]) {
-                    stats.filled += 1;
-                } else {
-                    log::warn!("chunk {chunk_id} ({file_path}): insert error — skipping");
-                    mark_chunk_skip(conn, *chunk_id, "insert_error");
-                    stats.errors += 1;
-                }
-            }
-            Ok(Ok(_)) => {
-                log::warn!("chunk {chunk_id} ({file_path}): empty embedding — skipping");
-                mark_chunk_skip(conn, *chunk_id, "empty_embedding");
-                stats.errors += 1;
-            }
-            Ok(Err(e)) => {
-                log::warn!("chunk {chunk_id} ({file_path}): error ({e}) — skipping");
-                mark_chunk_skip(conn, *chunk_id, "encode_error");
-                stats.errors += 1;
-            }
-            Err(panic_info) => {
-                let msg = panic_message(&panic_info);
-                log::error!("chunk {chunk_id} ({file_path}): PANIC ({msg}) — skipping");
-                mark_chunk_skip(conn, *chunk_id, "panic");
-                stats.panics += 1;
-                stats.errors += 1;
-            }
-        }
-    }
-}
-
-/// Process one batch of missing vectors. Returns (stats, has_more).
-/// `last_id` is the keyset pagination cursor — pass 0 for the first call,
-/// then pass the returned `stats.last_id` for subsequent calls.
-pub fn backfill_next_batch(
-    conn: &Connection,
-    encode_fn: EncodeFn,
-    batch_size: usize,
-    last_id: i64,
-) -> anyhow::Result<(BackfillStats, bool)> {
-    // Clamp the caller-supplied batch size: embedder memory is
-    // O(batch × seq²), so a page larger than BACKFILL_BATCH_SIZE sent whole
-    // to `encode_fn` (as this function does) can still exhaust memory even
-    // with the per-input token cap. Treat the caller's value as an upper
-    // hint only.
-    let batch_size = batch_size.clamp(1, BACKFILL_BATCH_SIZE);
-
-    if !db::has_vec_table(conn) {
-        return Ok((BackfillStats::default(), false));
-    }
-
-    let batch: Vec<(i64, String, String)> = conn
-        .prepare(
-            "SELECT c.id, c.content, d.file_path
-             FROM chunks c
-             LEFT JOIN chunks_vec v ON c.id = v.rowid
-             LEFT JOIN chunks_vec_skip s ON c.id = s.chunk_id
-             JOIN documents d ON c.document_id = d.id
-             WHERE v.rowid IS NULL AND s.chunk_id IS NULL AND c.id > ?
-             ORDER BY c.id
-             LIMIT ?",
-        )?
-        .query_map(rusqlite::params![last_id, batch_size as i64], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    if batch.is_empty() {
-        return Ok((BackfillStats::default(), false));
-    }
-
-    let mut stats = BackfillStats {
-        last_id: batch.last().unwrap().0,
-        ..BackfillStats::default()
-    };
-
-    let texts: Vec<String> = batch
-        .iter()
-        .map(|(_, content, _)| content.clone())
-        .collect();
-
-    match catch_unwind(AssertUnwindSafe(|| encode_fn(&texts))) {
-        Ok(Ok(embeddings)) if embeddings.len() == batch.len() => {
-            let tx = conn.unchecked_transaction()?;
-            for ((chunk_id, _, _), emb) in batch.iter().zip(embeddings.iter()) {
-                if write_vec_row(&tx, *chunk_id, emb) {
-                    stats.filled += 1;
-                } else {
-                    log::warn!("Insert error for chunk {chunk_id} — skipping");
-                    mark_chunk_skip(conn, *chunk_id, "insert_error");
-                    stats.errors += 1;
-                }
-            }
-            tx.commit()?;
-        }
-        Ok(Ok(embeddings)) => {
-            log::warn!(
-                "Embedding count mismatch (got {}, expected {})",
-                embeddings.len(),
-                batch.len()
-            );
-            if batch.len() > 1 {
-                retry_individually(&batch, encode_fn, conn, &mut stats);
-            } else {
-                let chunk_id = batch[0].0;
-                mark_chunk_skip(conn, chunk_id, "embedding_count_mismatch");
-                stats.errors += 1;
-            }
-        }
-        Ok(Err(e)) => {
-            log::warn!("Batch error: {e}");
-            if batch.len() > 1 {
-                retry_individually(&batch, encode_fn, conn, &mut stats);
-            } else {
-                mark_chunk_skip(conn, batch[0].0, "encode_error");
-                stats.errors += 1;
-            }
-        }
-        Err(panic_info) => {
-            let msg = panic_message(&panic_info);
-            log::error!("PANIC in encode: {msg}");
-            stats.panics += 1;
-            if batch.len() > 1 {
-                retry_individually(&batch, encode_fn, conn, &mut stats);
-            } else {
-                mark_chunk_skip(conn, batch[0].0, "panic");
-                stats.errors += 1;
-            }
-        }
-    }
-
-    Ok((stats, true))
-}
-
-/// Fill in missing vectors for chunks that have FTS5 entries but no vector entries.
-/// Uses keyset pagination to avoid loading all missing chunks into memory at once.
-/// Each INSERT auto-commits individually (rusqlite default autocommit mode).
-/// Failed batches are logged and skipped — the next run will retry them.
-pub fn backfill_vectors(
-    conn: &Connection,
-    encode_fn: EncodeFn,
-    batch_size: usize,
-    progress_cb: Option<&dyn Fn(i64, usize, usize)>,
-) -> anyhow::Result<BackfillStats> {
-    // Clamp the caller-supplied batch size (e.g. `tsm vector-fill
-    // --batch-size`): embedder memory is O(batch × seq²), and this function
-    // sends each SQL page whole to `encode_fn`, so an unclamped caller value
-    // can still exhaust memory even with the per-input token cap. Treat the
-    // caller's value as an upper hint only.
-    let batch_size = batch_size.clamp(1, BACKFILL_BATCH_SIZE);
-
-    if !db::has_vec_table(conn) {
-        return Ok(BackfillStats::default());
-    }
-
-    // Count total missing for progress reporting
-    let total: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM chunks c
-             LEFT JOIN chunks_vec v ON c.id = v.rowid
-             WHERE v.rowid IS NULL",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-
-    if total == 0 {
-        return Ok(BackfillStats::default());
-    }
-
-    log::info!("Backfilling {total} chunks...");
-    if let Some(cb) = &progress_cb {
-        cb(total, 0, 0);
-    }
-    let mut stats = BackfillStats::default();
-    let mut last_id: i64 = 0;
-
-    loop {
-        let batch: Vec<(i64, String, String)> = conn
-            .prepare(
-                "SELECT c.id, c.content, d.file_path
-                 FROM chunks c
-                 LEFT JOIN chunks_vec v ON c.id = v.rowid
-                 LEFT JOIN chunks_vec_skip s ON c.id = s.chunk_id
-                 JOIN documents d ON c.document_id = d.id
-                 WHERE v.rowid IS NULL AND s.chunk_id IS NULL AND c.id > ?
-                 ORDER BY c.id
-                 LIMIT ?",
-            )?
-            .query_map(rusqlite::params![last_id, batch_size as i64], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        if batch.is_empty() {
-            break;
-        }
-        last_id = batch.last().unwrap().0;
-
-        let files: Vec<&str> = batch.iter().map(|(_, _, f)| f.as_str()).collect();
-        let batch_start_id = batch.first().unwrap().0;
-        let batch_end_id = last_id;
-        log::debug!("batch {batch_start_id}..{batch_end_id}: {:?}", files);
-
-        let texts: Vec<String> = batch
-            .iter()
-            .map(|(_, content, _)| content.clone())
-            .collect();
-
-        match catch_unwind(AssertUnwindSafe(|| encode_fn(&texts))) {
-            Ok(Ok(embeddings)) if embeddings.len() == batch.len() => {
-                let tx = conn.unchecked_transaction()?;
-                for ((chunk_id, _, _), emb) in batch.iter().zip(embeddings.iter()) {
-                    if write_vec_row(&tx, *chunk_id, emb) {
-                        stats.filled += 1;
-                    } else {
-                        log::warn!("Insert error for chunk {chunk_id} — skipping");
-                        mark_chunk_skip(conn, *chunk_id, "insert_error");
-                        stats.errors += 1;
-                    }
-                }
-                tx.commit()?;
-            }
-            Ok(Ok(embeddings)) => {
-                log::warn!(
-                    "Embedding count mismatch (got {}, expected {}) for batch {batch_start_id}..{batch_end_id}",
-                    embeddings.len(),
-                    batch.len()
-                );
-                if batch.len() > 1 {
-                    log::warn!("Retrying {} chunks individually...", batch.len());
-                    retry_individually(&batch, encode_fn, conn, &mut stats);
-                } else {
-                    let chunk_id = batch[0].0;
-                    mark_chunk_skip(conn, chunk_id, "embedding_count_mismatch");
-                    stats.errors += 1;
-                }
-            }
-            Ok(Err(e)) => {
-                log::warn!("Batch error (chunks {batch_start_id}..{batch_end_id}): {e}");
-                if batch.len() > 1 {
-                    log::warn!("Retrying {} chunks individually...", batch.len());
-                    retry_individually(&batch, encode_fn, conn, &mut stats);
-                } else {
-                    let chunk_id = batch[0].0;
-                    log::warn!("chunk {chunk_id}: failed individually — skipping");
-                    mark_chunk_skip(conn, chunk_id, "encode_error");
-                    stats.errors += 1;
-                }
-            }
-            Err(panic_info) => {
-                let msg = panic_message(&panic_info);
-                log::error!("PANIC in encode (chunks {batch_start_id}..{batch_end_id}): {msg}");
-                stats.panics += 1;
-                if batch.len() > 1 {
-                    log::warn!("Retrying {} chunks individually...", batch.len());
-                    retry_individually(&batch, encode_fn, conn, &mut stats);
-                } else {
-                    let chunk_id = batch[0].0;
-                    log::warn!("chunk {chunk_id}: failed individually — skipping");
-                    mark_chunk_skip(conn, chunk_id, "panic");
-                    stats.errors += 1;
-                }
-            }
-        }
-
-        let processed = stats.filled + stats.errors;
-        log::debug!("{processed}/{total}");
-
-        if let Some(cb) = &progress_cb {
-            cb(total, stats.filled, stats.errors);
-        }
-    }
-
-    if stats.panics > 0 {
-        log::info!(
-            "Backfill complete: {} filled, {} errors, {} panics.",
-            stats.filled,
-            stats.errors,
-            stats.panics
-        );
-    } else {
-        log::info!(
-            "Backfill complete: {} filled, {} errors.",
-            stats.filled,
-            stats.errors
-        );
-    }
-    Ok(stats)
-}
-
-/// Rebuild only the FTS5 index by re-running wakachi on all chunks.
-/// Vectors, documents, entities, and other data are preserved.
-pub fn rebuild_fts(
-    conn: &Connection,
-    progress_cb: Option<&dyn Fn(usize, usize)>,
-) -> anyhow::Result<usize> {
-    let tx = conn.unchecked_transaction()?;
-
-    let total: i64 = tx.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
-    let total = total as usize;
-
-    let rows: Vec<(i64, String)> = {
-        let mut stmt = tx.prepare("SELECT id, content FROM chunks ORDER BY id")?;
-        let mapped = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        mapped
-    };
-
-    tx.execute("DELETE FROM chunks_fts", [])?;
-
-    for (i, (id, content)) in rows.iter().enumerate() {
-        let wakachi_text = wakachi(content);
-        tx.execute(
-            "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
-            rusqlite::params![id, wakachi_text],
-        )?;
-        if let Some(cb) = &progress_cb {
-            cb(i + 1, total);
-        }
-    }
-
-    tx.commit()?;
-    Ok(rows.len())
-}
-
-/// Re-tokenize one batch of chunks into the FTS5 index.
-///
-/// Uses keyset pagination (`WHERE id > last_id ORDER BY id LIMIT batch_size`).
-/// When `is_first_batch` is true, clears the entire FTS table before inserting.
-///
-/// Returns `(inserted_count, new_last_id, has_more)`.
-/// `has_more` is `true` when `batch.len() == batch_size`; callers should
-/// handle the case where the subsequent call returns `inserted_count == 0`.
-pub fn rebuild_fts_next_batch(
-    conn: &Connection,
-    last_id: i64,
-    batch_size: usize,
-    is_first_batch: bool,
-) -> anyhow::Result<(usize, i64, bool)> {
-    let batch: Vec<(i64, String)> = conn
-        .prepare("SELECT id, content FROM chunks WHERE id > ? ORDER BY id LIMIT ?")?
-        .query_map(rusqlite::params![last_id, batch_size as i64], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    if batch.is_empty() {
-        return Ok((0, last_id, false));
-    }
-
-    let new_last_id = batch.last().unwrap().0;
-
-    let tx = conn.unchecked_transaction()?;
-    if is_first_batch {
-        tx.execute("DELETE FROM chunks_fts", [])?;
-    }
-    for (id, content) in &batch {
-        let wakachi_text = wakachi(content);
-        tx.execute(
-            "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
-            rusqlite::params![id, wakachi_text],
-        )?;
-    }
-    tx.commit()?;
-
-    let has_more = batch.len() == batch_size;
-    Ok((batch.len(), new_last_id, has_more))
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
+    use crate::db;
 
     /// Test-only policy that accepts every path.
     /// Used by tests whose focus is indexer internals (chunking, FTS,
@@ -1151,6 +575,57 @@ mod tests {
         let mut f = std::fs::File::create(&full).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         full
+    }
+
+    #[test]
+    fn index_file_stores_absolute_path() {
+        let conn = crate::db::get_memory_connection().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("note.md");
+        std::fs::write(&f, "# Title\n\nbody").unwrap();
+        index_file(&conn, &f, dir.path()).unwrap();
+        let stored: String = conn
+            .query_row("SELECT file_path FROM documents LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, f.to_string_lossy());
+        assert!(std::path::Path::new(&stored).is_absolute());
+    }
+
+    #[cfg(feature = "bench-counters")]
+    #[test]
+    fn index_file_timed_reports_nonzero_prepare_and_persist() {
+        let conn = crate::db::get_memory_connection().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("note.md");
+        std::fs::write(&f, "# Title\n\nbody").unwrap();
+
+        let (indexed, timings) = index_file_timed(&conn, &f, dir.path()).unwrap();
+
+        assert!(indexed);
+        // All three stages run for a new file: `embed::insert_vectors` is
+        // still called (and its own socket-existence check still costs a
+        // few microseconds under the `Instant::now()` wrapper) even though
+        // no embedder is running in this test env, so `embed` is nonzero
+        // too, not exactly zero.
+        assert!(timings.prepare > std::time::Duration::ZERO);
+        assert!(timings.persist > std::time::Duration::ZERO);
+        assert!(timings.embed > std::time::Duration::ZERO);
+    }
+
+    #[cfg(feature = "bench-counters")]
+    #[test]
+    fn index_file_timed_reports_zero_for_unchanged_file() {
+        let conn = crate::db::get_memory_connection().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("note.md");
+        std::fs::write(&f, "# Title\n\nbody").unwrap();
+
+        index_file_timed(&conn, &f, dir.path()).unwrap();
+        let (indexed, timings) = index_file_timed(&conn, &f, dir.path()).unwrap();
+
+        assert!(!indexed);
+        assert_eq!(timings.prepare, std::time::Duration::ZERO);
+        assert_eq!(timings.persist, std::time::Duration::ZERO);
     }
 
     #[test]
@@ -1235,6 +710,189 @@ mod tests {
             .query_row("SELECT source_type FROM documents", [], |r| r.get(0))
             .unwrap();
         assert_eq!(source_type, "session");
+    }
+
+    /// Regression test for the rebuild data-loss bug: session documents are a
+    /// non-filesystem kind (`session:<stem>`) ingested only via `index_session`.
+    /// `cmd_rebuild` re-indexes via the file walker, which only yields real
+    /// filesystem paths and so never reproduces a `session:` document, so a
+    /// destructive rebuild used to drop them permanently. Carry-forward captures
+    /// them from the old DB before deletion and re-persists them into the fresh
+    /// DB without needing the original JSONL (which may be rotated).
+    /// Read a session document's scalar fields, used to assert that carry-forward
+    /// preserves every column by value (catching a positional `row.get` swap).
+    fn session_doc_fields(
+        conn: &Connection,
+        file_path: &str,
+    ) -> (String, String, String, String, String) {
+        conn.query_row(
+            "SELECT title, status, created, updated, file_hash FROM documents WHERE file_path = ?",
+            [file_path],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap()
+    }
+
+    /// Read a session's chunk contents ordered by chunk_index.
+    fn session_chunk_contents(conn: &Connection, file_path: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.content FROM chunks c JOIN documents d ON c.document_id = d.id \
+                 WHERE d.file_path = ? ORDER BY c.chunk_index",
+            )
+            .unwrap();
+        stmt.query_map([file_path], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_sessions_survive_rebuild_via_carry_forward() {
+        // Arrange: old DB with one session whose two Q&A pairs carry distinct
+        // timestamps, so created != updated and there are two ordered chunks —
+        // this lets the assertions catch a field transposition or chunk
+        // mis-alignment that a single-chunk, no-timestamp fixture would hide.
+        let (old_conn, dir) = setup();
+        let jsonl = r#"{"timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"最初の質問のテキスト。"}}
+{"timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"最初の回答のテキスト。"}}
+{"timestamp":"2026-02-02T00:00:00Z","message":{"role":"user","content":"次の質問のテキスト。"}}
+{"timestamp":"2026-02-02T00:00:01Z","message":{"role":"assistant","content":"次の回答のテキスト。"}}"#;
+        let path = dir.path().join("abc123.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        assert!(index_session(&old_conn, &path).unwrap());
+
+        let old_fields = session_doc_fields(&old_conn, "session:abc123");
+        let old_contents = session_chunk_contents(&old_conn, "session:abc123");
+        assert_eq!(old_contents.len(), 2, "two Q&A pairs yield two chunks");
+        assert_ne!(
+            old_fields.2, old_fields.3,
+            "fixture must have created != updated to detect a field swap"
+        );
+
+        let captured = capture_sessions(&old_conn).unwrap();
+        assert_eq!(captured.len(), 1, "one session should be captured");
+
+        // Act: a fresh DB stands in for rebuild's delete + reinit. Without
+        // carry-forward the session is gone; restore_sessions brings it back.
+        let new_conn = db::get_memory_connection().unwrap();
+        let before: i64 = new_conn
+            .query_row(
+                "SELECT COUNT(*) FROM documents WHERE file_path LIKE 'session:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, 0,
+            "fresh DB starts with no sessions (the data loss)"
+        );
+
+        let restored = restore_sessions(&new_conn, &captured).unwrap();
+        assert_eq!(restored, 1);
+
+        // Assert: the document survives with every field preserved by value...
+        let source_type: String = new_conn
+            .query_row(
+                "SELECT source_type FROM documents WHERE file_path = 'session:abc123'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_type, "session");
+        assert_eq!(
+            session_doc_fields(&new_conn, "session:abc123"),
+            old_fields,
+            "title/status/created/updated/file_hash all preserved (no column swap)"
+        );
+
+        // ...its chunks survive in order with content aligned to their index...
+        assert_eq!(
+            session_chunk_contents(&new_conn, "session:abc123"),
+            old_contents,
+            "chunk contents carried forward in chunk_index order"
+        );
+
+        // ...and the FTS index is repopulated for those chunks.
+        let fts_count: i64 = new_conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 2, "FTS rows re-created for both session chunks");
+    }
+
+    #[test]
+    fn test_restore_sessions_multiple_keeps_chunks_per_document() {
+        // Two distinct sessions must both restore, each owning only its chunks.
+        let (old_conn, dir) = setup();
+        for (stem, q) in [
+            ("alpha", "アルファセッションの質問テキストです。"),
+            ("beta", "ベータセッションの質問テキストです。"),
+        ] {
+            let jsonl = format!(
+                r#"{{"message":{{"role":"user","content":"{q}"}}}}
+{{"message":{{"role":"assistant","content":"対応する回答のテキストです。"}}}}"#
+            );
+            let path = dir.path().join(format!("{stem}.jsonl"));
+            std::fs::write(&path, &jsonl).unwrap();
+            index_session(&old_conn, &path).unwrap();
+        }
+
+        let captured = capture_sessions(&old_conn).unwrap();
+        assert_eq!(captured.len(), 2, "both sessions captured");
+
+        let new_conn = db::get_memory_connection().unwrap();
+        assert_eq!(restore_sessions(&new_conn, &captured).unwrap(), 2);
+
+        // Each restored session owns exactly its own chunk (no cross-attribution).
+        for stem in ["alpha", "beta"] {
+            let n: i64 = new_conn
+                .query_row(
+                    "SELECT COUNT(*) FROM chunks c JOIN documents d ON c.document_id = d.id \
+                     WHERE d.file_path = ?",
+                    [format!("session:{stem}")],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "session:{stem} keeps exactly its own chunk");
+        }
+    }
+
+    #[test]
+    fn test_capture_sessions_excludes_md_and_handles_empty() {
+        let (conn, dir) = setup();
+
+        // A markdown document must not be captured as a session.
+        let md = write_md(dir.path(), "daily/notes/test.md", "# Title\n\nBody text.\n");
+        index_file(&conn, &md, dir.path()).unwrap();
+
+        let captured = capture_sessions(&conn).unwrap();
+        assert!(captured.is_empty(), "md documents are not sessions");
+
+        // Restoring an empty capture is a no-op that restores nothing.
+        let fresh = db::get_memory_connection().unwrap();
+        assert_eq!(restore_sessions(&fresh, &captured).unwrap(), 0);
+        let docs: i64 = fresh
+            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(docs, 0);
+    }
+
+    #[test]
+    fn test_capture_sessions_captures_only_sessions_when_mixed() {
+        let (conn, dir) = setup();
+        let md = write_md(dir.path(), "daily/notes/test.md", "# Title\n\nBody text.\n");
+        index_file(&conn, &md, dir.path()).unwrap();
+
+        let jsonl = r#"{"message":{"role":"user","content":"混在テストの質問文です。"}}
+{"message":{"role":"assistant","content":"混在テストの回答文です。"}}"#;
+        let path = dir.path().join("mixed.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+        index_session(&conn, &path).unwrap();
+
+        let captured = capture_sessions(&conn).unwrap();
+        assert_eq!(captured.len(), 1, "only the session is captured");
+        assert_eq!(captured[0].file_path, "session:mixed");
+        assert!(!captured[0].chunks.is_empty());
     }
 
     #[test]
@@ -1534,6 +1192,37 @@ mod tests {
     }
 
     #[test]
+    fn test_backfill_count_excludes_skipped_chunks() {
+        let (conn, dir) = setup();
+        let path = write_md(
+            dir.path(),
+            "daily/notes/test.md",
+            "# Hello\n\nContent here.\n",
+        );
+        index_file(&conn, &path, dir.path()).unwrap();
+        clear_vectors(&conn);
+
+        // Mark all chunks as skipped via a persistently failing encode.
+        let stats = backfill_vectors(&conn, &mock_encode_fail, BACKFILL_BATCH_SIZE, None).unwrap();
+        assert!(stats.errors > 0);
+
+        // A subsequent healthy pass must NOT report skip-marked chunks as
+        // outstanding work: the progress total drives doctor/status display,
+        // so counting skipped chunks there produces a permanent phantom "missing".
+        let reported_totals = std::cell::RefCell::new(Vec::new());
+        let cb = |total: i64, _filled: usize, _errors: usize| {
+            reported_totals.borrow_mut().push(total);
+        };
+        backfill_vectors(&conn, &mock_encode, BACKFILL_BATCH_SIZE, Some(&cb)).unwrap();
+
+        assert!(
+            reported_totals.borrow().iter().all(|&t| t == 0),
+            "skip-marked chunks must not be counted as missing, got totals: {:?}",
+            reported_totals.borrow()
+        );
+    }
+
+    #[test]
     fn test_backfill_embedding_count_mismatch_triggers_retry() {
         let (conn, dir) = setup();
         for i in 0..3 {
@@ -1630,72 +1319,6 @@ mod tests {
         );
     }
 
-    // ─── insert_vectors_batched tests ─────────────────────────────
-
-    /// Index a markdown file with `n` H2 sections; return (chunk_id, content).
-    fn arrange_chunks(n: usize) -> (Connection, tempfile::TempDir, Vec<(i64, String)>) {
-        let (conn, dir) = setup();
-        // No leading H1 line: any non-blank text before the first H2 header
-        // becomes its own chunk (see chunker::split_by_header), which would
-        // throw off the exact chunk count asserted below.
-        let mut body = String::new();
-        for i in 0..n {
-            body.push_str(&format!("\n## Section {i}\n\nContent number {i} here.\n"));
-        }
-        let path = write_md(dir.path(), "daily/notes/many.md", &body);
-        index_file(&conn, &path, dir.path()).unwrap();
-        clear_vectors(&conn);
-        let entries: Vec<(i64, String)> = conn
-            .prepare("SELECT id, content FROM chunks ORDER BY id")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        assert_eq!(entries.len(), n);
-        (conn, dir, entries)
-    }
-
-    #[test]
-    fn test_insert_vectors_batched_caps_request_size() {
-        let (conn, _dir, entries) = arrange_chunks(20);
-        let batch_sizes = std::cell::RefCell::new(Vec::new());
-        let recording_encode = |texts: &[String]| {
-            batch_sizes.borrow_mut().push(texts.len());
-            mock_encode(texts)
-        };
-        insert_vectors_batched(&conn, &entries, &recording_encode, 8);
-
-        // Every request capped at 8; all 20 chunks embedded
-        assert_eq!(*batch_sizes.borrow(), vec![8, 8, 4]);
-        let vecs: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(vecs, 20);
-    }
-
-    #[test]
-    fn test_insert_vectors_batched_stops_on_failure() {
-        let (conn, _dir, entries) = arrange_chunks(10);
-        let calls = std::cell::Cell::new(0usize);
-        let flaky_encode = |texts: &[String]| {
-            calls.set(calls.get() + 1);
-            if calls.get() >= 2 {
-                mock_encode_fail(texts)
-            } else {
-                mock_encode(texts)
-            }
-        };
-        insert_vectors_batched(&conn, &entries, &flaky_encode, 8);
-
-        // First batch (8) written, second failed → stop, rest left for backfill
-        let vecs: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(vecs, 8);
-        assert_eq!(calls.get(), 2);
-    }
-
     // ─── backfill_next_batch tests ────────────────────────────
 
     #[test]
@@ -1728,7 +1351,7 @@ mod tests {
         assert!(stats1.last_id > 0);
 
         // Second batch: from last_id
-        let (stats2, has_more2) =
+        let (stats2, _has_more2) =
             backfill_next_batch(&conn, &mock_encode, 2, stats1.last_id).unwrap();
         assert!(stats2.filled > 0);
         assert!(stats2.last_id > stats1.last_id);
@@ -1810,39 +1433,6 @@ mod tests {
         let (stats, _) = backfill_next_batch(&conn, &mock_encode_panic, 8, 0).unwrap();
         assert!(stats.panics > 0);
         assert!(stats.errors > 0);
-    }
-
-    #[test]
-    fn test_next_batch_clamps_batch_size_to_backfill_cap() {
-        let (conn, _dir, entries) = arrange_chunks(20);
-        let batch_sizes = std::cell::RefCell::new(Vec::new());
-        let recording_encode = |texts: &[String]| {
-            batch_sizes.borrow_mut().push(texts.len());
-            mock_encode(texts)
-        };
-
-        // Caller passes 64 (e.g. tsm vector-fill --batch-size default) — must
-        // be clamped to BACKFILL_BATCH_SIZE so the SQL page (and thus the
-        // encode_fn call) never exceeds the attention-memory-safe size.
-        let mut last_id = 0i64;
-        loop {
-            let (stats, has_more) =
-                backfill_next_batch(&conn, &recording_encode, 64, last_id).unwrap();
-            if !has_more {
-                break;
-            }
-            last_id = stats.last_id;
-        }
-
-        assert_eq!(entries.len(), 20);
-        assert!(!batch_sizes.borrow().is_empty());
-        for size in batch_sizes.borrow().iter() {
-            assert!(*size <= BACKFILL_BATCH_SIZE);
-        }
-        let vecs: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(vecs, 20);
     }
 
     // ─── entity integration tests ────────────────────────────
@@ -2684,5 +2274,32 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(after, before);
+    }
+
+    // ─── metadata JSON integration test ──────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn test_index_file_stores_metadata_json() {
+        crate::lua_hooks::reset_hooks_cache();
+        let conn = db::get_memory_connection().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("doc.md");
+        std::fs::write(
+            &f,
+            "---\nstatus: outdated\nupdated: 2026-02-02\n---\n# T\n\nbody\n",
+        )
+        .unwrap();
+        index_file(&conn, &f, tmp.path()).unwrap();
+        let meta: Option<String> = conn
+            .query_row(
+                "SELECT metadata FROM documents WHERE source_type IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&meta.unwrap()).unwrap();
+        assert_eq!(v["status"], serde_json::json!("outdated"));
+        assert_eq!(v["effective_date"], serde_json::json!("2026-02-02"));
     }
 }

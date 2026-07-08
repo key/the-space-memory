@@ -14,12 +14,14 @@ use crate::indexer::IngestPolicy;
 pub fn handle_request(
     conn: &Connection,
     req: DaemonRequest,
-    index_root: &Path,
+    project_root: &Path,
     shutdown_flag: &AtomicBool,
 ) -> DaemonResponse {
     match req {
         DaemonRequest::Ping => DaemonResponse::success_empty(),
 
+        // Classified read-only (see DaemonRequest::is_read_only): reaches a
+        // query_only reader connection, so this arm must not write the DB.
         DaemonRequest::Shutdown => {
             shutdown_flag.store(true, Ordering::SeqCst);
             DaemonResponse::success_empty()
@@ -51,11 +53,11 @@ pub fn handle_request(
             };
             match cli::run_search(conn, &opts) {
                 Ok(output) => {
-                    let json_str = cli::format_json(
+                    let json_str = crate::searcher::format_json(
                         &output.results,
                         output.total_hits,
                         include_content,
-                        index_root,
+                        project_root,
                     );
                     match json_str {
                         Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
@@ -75,7 +77,7 @@ pub fn handle_request(
             // No explicit filter loop here — the indexer's entry point
             // enforces the policy for both the full-walk and
             // caller-supplied-paths cases.
-            let walker = crate::indexer::ContentWalker::from_env_with_index_root(index_root);
+            let walker = crate::indexer::ContentWalker::from_env_with_project_root(project_root);
             let file_paths: Vec<PathBuf> = if files.is_empty() {
                 walker.collect_files()
             } else {
@@ -87,7 +89,7 @@ pub fn handle_request(
                 // over stdin or through the fs-watcher. Surfacing at warn
                 // here preserves the observability that the pre-refactor
                 // call sites provided.
-                let joined: Vec<PathBuf> = files.iter().map(|f| index_root.join(f)).collect();
+                let joined: Vec<PathBuf> = files.iter().map(|f| project_root.join(f)).collect();
                 for p in &joined {
                     if !walker.accepts(p) {
                         log::warn!(
@@ -98,7 +100,7 @@ pub fn handle_request(
                 }
                 joined
             };
-            match cli::run_index(conn, &file_paths, index_root, &walker) {
+            match cli::run_index(conn, &file_paths, project_root, &walker) {
                 Ok(stats) => DaemonResponse::success(serde_json::json!({
                     "indexed": stats.indexed,
                     "skipped": stats.skipped,
@@ -137,7 +139,7 @@ pub fn handle_request(
         }
 
         DaemonRequest::VectorFill { batch_size } => match cli::run_vector_fill(conn, batch_size) {
-            Ok(()) => DaemonResponse::success_empty(),
+            Ok(summary) => DaemonResponse::success(serde_json::json!({ "summary": summary })),
             Err(e) => DaemonResponse::error(format!("{e}")),
         },
 
@@ -151,6 +153,8 @@ pub fn handle_request(
             }
         }
 
+        // Refused while the daemon is active, so write-free on this path —
+        // classified read-only and may reach a query_only reader connection.
         DaemonRequest::DictUpdate { .. } => DaemonResponse::error(
             "dict update --apply cannot run while tsmd is active. Run `tsm stop` first.",
         ),
@@ -159,6 +163,8 @@ pub fn handle_request(
             "reindex must be intercepted by daemon_mode. If you see this, it's a bug.",
         ),
 
+        // Refused while the daemon is active, so write-free on this path —
+        // classified read-only and may reach a query_only reader connection.
         DaemonRequest::Rebuild => {
             DaemonResponse::error("rebuild cannot run while tsmd is active. Run `tsm stop` first.")
         }
@@ -331,7 +337,7 @@ mod tests {
         std::fs::write(daily.join("ok.md"), "# OK\n\nbody").unwrap();
         std::fs::write(private.join("secret.md"), "# Secret\n\nbody").unwrap();
 
-        std::env::set_current_dir(dir.path()).unwrap();
+        let _cwd = crate::test_utils::CwdGuard::change_to(dir.path());
         let req = DaemonRequest::Index {
             files: vec!["daily/ok.md".into(), "private/secret.md".into()],
         };
@@ -356,7 +362,7 @@ mod tests {
         std::fs::write(notes.join("a.md"), "# A\n\nbody").unwrap();
         std::fs::write(notes.join("b.csv"), "x,y\n1,2\n").unwrap();
 
-        std::env::set_current_dir(dir.path()).unwrap();
+        let _cwd = crate::test_utils::CwdGuard::change_to(dir.path());
         let req = DaemonRequest::Index {
             files: vec!["notes/a.md".into(), "notes/b.csv".into()],
         };
@@ -384,7 +390,7 @@ mod tests {
         std::fs::write(daily.join("keep.md"), "# Keep\n\nbody").unwrap();
         std::fs::write(skip.join("drop.md"), "# Drop\n\nbody").unwrap();
 
-        std::env::set_current_dir(dir.path()).unwrap();
+        let _cwd = crate::test_utils::CwdGuard::change_to(dir.path());
         let req = DaemonRequest::Index { files: vec![] };
         let resp = handle_request(&conn, req, dir.path(), &flag);
         assert!(resp.ok);
@@ -493,6 +499,25 @@ mod tests {
         let resp = handle_request(&conn, req, dir.path(), &flag);
         // Empty DB has no chunks to backfill — should succeed or error gracefully
         assert!(resp.ok || resp.error.is_some());
+    }
+
+    #[test]
+    fn test_vector_fill_returns_summary_payload() {
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+        let req = DaemonRequest::VectorFill { batch_size: 8 };
+        let resp = handle_request(&conn, req, dir.path(), &flag);
+        assert!(resp.ok);
+        // The summary must travel back over IPC so the CLI can show it to the
+        // user; in daemon mode the worker's stdout goes to the daemon log, not
+        // the terminal.
+        let summary = resp
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("summary"))
+            .and_then(|v| v.as_str())
+            .expect("VectorFill response should carry a summary string");
+        assert_eq!(summary, "No missing vectors.");
     }
 
     #[test]

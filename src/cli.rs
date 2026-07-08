@@ -1,15 +1,21 @@
-use std::io::{BufRead, ErrorKind, Read, Write};
+use std::io::{BufRead, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+
+use anyhow::Context;
 
 use crate::config;
 use crate::db;
 use crate::embedder;
 use crate::indexer;
+use crate::manifest;
+use crate::placement;
+use crate::placement::LinkStatus;
 use crate::searcher;
+use crate::synonyms;
 use crate::user_dict;
 
 /// Default `.tsmignore` shipped by `tsm init`. Patterns are
-/// `.gitignore`-syntax and resolve relative to `index_root`.
+/// `.gitignore`-syntax and resolve relative to `project_root`.
 ///
 /// Hidden directories (`.*/`) and common build/dependency directories are
 /// excluded by default — the historical "fallback hidden-dir pattern"
@@ -33,50 +39,260 @@ dist/
 *.db
 ";
 
-/// Convenience wrapper that pulls `db_path` and `project_root` from the
-/// config singleton and forwards to `cmd_init_with`. Tests bypass this by
-/// calling `cmd_init_with` directly with a tempdir, so the dispatch from
-/// `main.rs` stays trivial here.
-pub fn cmd_init() -> anyhow::Result<()> {
-    cmd_init_with(&config::db_path(), &config::project_root())
+/// Default `tsm.toml` shipped by `tsm init`. Built from the canonical
+/// example template at the repo root so the scaffolded file always matches
+/// the documented options surface.
+const DEFAULT_TSM_TOML: &str = include_str!("../tsm.toml.example");
+
+/// Default header for `synonyms.csv`. The body is empty — users add pairs
+/// and `cmd_init` re-syncs idempotently.
+const DEFAULT_SYNONYMS_CSV: &str = "\
+# User-defined synonym pairs. One pair per line.
+#
+# Format: word_a,word_b
+# Example:
+#   ml,machine learning
+#   nlp,自然言語処理
+#
+# Pairs imported from WordNet are stored separately and are not affected
+# by edits to this file.
+";
+
+/// Default header for `custom_terms.toml`. The body is empty — users add
+/// terms by appending entries.
+const DEFAULT_CUSTOM_TERMS: &str = "\
+# Custom terminology overrides for the lindera tokenizer / scorer.
+#
+# Add an entry per term:
+#
+#   [[terms]]
+#   surface = \"自然言語処理\"
+#   reading = \"シゼンゲンゴショリ\"
+#   pos = \"名詞\"
+#   weight = 1.5
+";
+
+/// Inputs for `cmd_init_with`. All paths are explicit so init can be
+/// driven end-to-end from a tempdir in tests without touching the config
+/// singleton.
+pub struct InitPaths<'a> {
+    pub db_path: &'a Path,
+    pub project_root: &'a Path,
+    pub state_dir: &'a Path,
+    pub user_dict_path: &'a Path,
+    /// Upstream cache directory for the ruri model, materialized into
+    /// `state_dir/models/ruri-v3-30m` via `link_mode`. Passed explicitly so
+    /// tests can point it at a tempdir without the config singleton.
+    pub cache_models_src: &'a Path,
+    /// Upstream cache WordNet DB, materialized into `state_dir/wnjpn.db`.
+    pub cache_wordnet_src: &'a Path,
+    /// How workspace resources reference the cache (`symlink`/`copy`).
+    pub link_mode: config::LinkMode,
 }
 
-/// Initialize the DB and install the default `.tsmignore`. Both arguments
-/// are explicit so the function is testable end-to-end without touching the
-/// config singleton — the regression "someone removes the .tsmignore step
-/// from cmd_init" is caught by the integration test below.
-pub fn cmd_init_with(db_path: &Path, project_root: &Path) -> anyhow::Result<()> {
-    db::init_db(db_path)?;
-    log::info!("Database initialized at {}", db_path.display());
-    install_default_tsmignore(project_root)?;
+/// Convenience wrapper that builds `InitPaths` from the config singleton
+/// and forwards to `cmd_init_with`. Tests bypass this by calling
+/// `cmd_init_with` directly with a tempdir.
+///
+/// `link_mode_override` comes from the `--link-mode` CLI flag; when absent
+/// the configured `[init].link_mode` (default `symlink`) is used.
+pub fn cmd_init(link_mode_override: Option<config::LinkMode>) -> anyhow::Result<()> {
+    let db_path = config::db_path();
+    let project_root = config::project_root();
+    let state_dir = config::state_dir();
+    let user_dict_path = config::user_dict_path();
+    let cache_models_src = config::cache_models_dir();
+    let cache_wordnet_src = config::cache_wordnet_db_path();
+    let link_mode = link_mode_override.unwrap_or_else(config::init_link_mode);
+    cmd_init_with(&InitPaths {
+        db_path: &db_path,
+        project_root: &project_root,
+        state_dir: &state_dir,
+        user_dict_path: &user_dict_path,
+        cache_models_src: &cache_models_src,
+        cache_wordnet_src: &cache_wordnet_src,
+        link_mode,
+    })
+}
+
+/// Initialize the workspace: schema, scaffold files, WordNet import, user
+/// synonym import. All steps are idempotent — re-running `tsm init` after
+/// `tsm setup` is the supported recovery path when WordNet is downloaded
+/// after the initial init.
+///
+/// `project_root` and `state_dir` are passed explicitly (rather than
+/// derived from `db_path`) so the function is testable without the config
+/// singleton — the regression "someone removes the .tsmignore step from
+/// cmd_init" is caught by the integration tests below.
+pub fn cmd_init_with(paths: &InitPaths<'_>) -> anyhow::Result<()> {
+    db::init_db(paths.db_path)?;
+    println!("Database initialized at {}", paths.db_path.display());
+
+    // Scaffold default files. Each call is idempotent — pre-existing
+    // user-customized files are never overwritten.
+    install_default_tsmignore(paths.project_root)?;
+    install_default_file(
+        &paths.project_root.join("tsm.toml"),
+        DEFAULT_TSM_TOML,
+        "tsm.toml",
+    )?;
+    install_default_file(paths.user_dict_path, "", "user_dict.simpledic")?;
+    install_default_file(
+        &paths.state_dir.join("custom_terms.toml"),
+        DEFAULT_CUSTOM_TERMS,
+        "custom_terms.toml",
+    )?;
+    install_default_file(
+        &paths.state_dir.join("synonyms.csv"),
+        DEFAULT_SYNONYMS_CSV,
+        "synonyms.csv",
+    )?;
+    install_default_hooks(paths.state_dir)?;
+
+    // Materialize cache resources into the workspace via the configured
+    // link_mode. Both calls warn-and-continue when the cache is empty (the
+    // pre-`tsm setup` path), and rebuild any existing entry so a re-run with
+    // a different mode flips symlink↔copy.
+    place_directory_or_skip(
+        paths.cache_models_src,
+        &paths.state_dir.join("models/ruri-v3-30m"),
+        paths.link_mode,
+    )?;
+    place_file_or_skip(
+        paths.cache_wordnet_src,
+        &paths.state_dir.join("wnjpn.db"),
+        paths.link_mode,
+    )?;
+
+    // WordNet import — graceful skip when the resource is missing so
+    // offline `tsm init` and pre-`tsm setup` invocations both succeed.
+    let wordnet_db = paths.state_dir.join("wnjpn.db");
+    let synonyms_csv = paths.state_dir.join("synonyms.csv");
+    let conn = db::get_connection(paths.db_path)?;
+    if wordnet_db.is_file() {
+        println!(
+            "Importing WordNet synonyms from {}...",
+            wordnet_db.display()
+        );
+        synonyms::import_wordnet(&conn, &wordnet_db, None)?;
+    } else {
+        log::warn!(
+            "WordNet DB not found at {} — run `tsm setup` to download it, then re-run `tsm init`.",
+            wordnet_db.display()
+        );
+    }
+
+    // User-synonym import. The CSV always exists at this point because we
+    // just scaffolded it, but we still gate on `is_file` to keep the
+    // behavior obvious if a caller wires in a nonstandard path. Insert-only
+    // (mirror = false): re-running init must never delete pairs added via
+    // `tsm synonym add` that aren't in the file.
+    if synonyms_csv.is_file() {
+        let content = std::fs::read_to_string(&synonyms_csv)?;
+        let result = synonyms::import_user_synonyms(&conn, &content, false)?;
+        println!(
+            "User synonyms imported: {} pairs ({} skipped)",
+            result.total, result.skipped,
+        );
+    }
+
     Ok(())
 }
 
-/// Write `DEFAULT_TSMIGNORE` to `<project_root>/.tsmignore` if no file
-/// exists there. Idempotent — re-running `tsm init` never overwrites a
-/// user-customized file. Returns Ok in both the wrote-it and skipped-it
-/// cases; only unexpected filesystem errors propagate.
+/// Shared guard for the `place_*_or_skip` wrappers. Returns `true` when the
+/// caller should materialize `src` at `dst`, `false` (with a warning) when
+/// placement must be skipped:
 ///
-/// Uses `OpenOptions::create_new` rather than `exists()` + `write()` so the
-/// no-overwrite guarantee holds atomically — if `.tsmignore` is created by
-/// another process between the check and the write, `create_new` returns
-/// `AlreadyExists` and we treat that as the skip case rather than silently
-/// clobbering the file.
-fn install_default_tsmignore(project_root: &Path) -> anyhow::Result<()> {
-    let tsmignore_path = project_root.join(".tsmignore");
+/// - the cache entry is absent — the pre-`tsm setup` path; init still succeeds;
+/// - `src` and `dst` resolve to the same path (e.g. `cache_dir == state_dir`).
+///   Placement removes `dst` before recreating it, so in symlink mode that
+///   would delete the cache and leave a dangling self-symlink. Skipping
+///   leaves the existing resource in place.
+fn should_place_cache_resource(src: &Path, dst: &Path) -> bool {
+    use crate::cli_args_logic::{placement_decision, PlacementDecision};
+
+    match placement_decision(src.exists(), same_entry_location(src, dst)) {
+        PlacementDecision::Place => true,
+        PlacementDecision::SkipMissing => {
+            log::warn!(
+                "cache resource not found: {} — run `tsm setup` to populate it, then re-run `tsm init`.",
+                src.display()
+            );
+            false
+        }
+        PlacementDecision::SkipSameLocation => {
+            log::warn!(
+                "cache resource {} is also the workspace destination; skipping placement to avoid destroying it (cache_dir == state_dir).",
+                src.display()
+            );
+            false
+        }
+    }
+}
+
+/// Whether `a` and `b` name the same filesystem entry. The parent directory
+/// is canonicalized (resolving symlinked ancestors) but the final component
+/// is NOT dereferenced — so a symlink `b` that points at `a` is correctly
+/// seen as a *distinct* entry (the normal re-init case), while `a == b`
+/// (e.g. `cache_dir == state_dir`) is detected. Returns `false` when either
+/// parent cannot be resolved (e.g. `dst` not created yet), so placement
+/// proceeds normally.
+fn same_entry_location(a: &Path, b: &Path) -> bool {
+    let location = |p: &Path| -> Option<PathBuf> {
+        let parent = p.parent()?.canonicalize().ok()?;
+        Some(parent.join(p.file_name()?))
+    };
+    crate::cli_args_logic::same_resolved_location(location(a), location(b))
+}
+
+/// Materialize a cache directory into the workspace, or warn-and-continue
+/// when placement must be skipped (see [`should_place_cache_resource`]).
+fn place_directory_or_skip(src: &Path, dst: &Path, mode: config::LinkMode) -> anyhow::Result<()> {
+    if should_place_cache_resource(src, dst) {
+        placement::place_directory(src, dst, mode)
+    } else {
+        Ok(())
+    }
+}
+
+/// File counterpart of [`place_directory_or_skip`].
+fn place_file_or_skip(src: &Path, dst: &Path, mode: config::LinkMode) -> anyhow::Result<()> {
+    if should_place_cache_resource(src, dst) {
+        placement::place_file(src, dst, mode)
+    } else {
+        Ok(())
+    }
+}
+
+/// Write `content` to `path` if no file exists there. Idempotent —
+/// re-running `tsm init` never overwrites a user-customized file. The
+/// `display_name` is used in log messages so callers can render
+/// human-friendly names for paths whose `file_name()` is unhelpful (or to
+/// keep log output consistent across path variations).
+///
+/// Uses `OpenOptions::create_new` rather than `exists()` + `write()` so
+/// the no-overwrite guarantee holds atomically — if the file is created
+/// by another process between the check and the write, `create_new`
+/// returns `AlreadyExists` and we treat that as the skip case rather
+/// than silently clobbering the file.
+fn install_default_file(path: &Path, content: &str, display_name: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&tsmignore_path)
+        .open(path)
     {
         Ok(mut f) => {
-            f.write_all(DEFAULT_TSMIGNORE.as_bytes())?;
-            log::info!("Wrote default .tsmignore to {}", tsmignore_path.display());
+            f.write_all(content.as_bytes())?;
+            println!("Wrote default {} to {}", display_name, path.display());
         }
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-            log::info!(
-                ".tsmignore already exists at {} — leaving untouched",
-                tsmignore_path.display()
+            println!(
+                "{} already exists at {} — leaving untouched",
+                display_name,
+                path.display()
             );
         }
         Err(e) => return Err(e.into()),
@@ -84,47 +300,69 @@ fn install_default_tsmignore(project_root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn install_default_tsmignore(project_root: &Path) -> anyhow::Result<()> {
+    install_default_file(
+        &project_root.join(".tsmignore"),
+        DEFAULT_TSMIGNORE,
+        ".tsmignore",
+    )
+}
+
+/// Scaffold editable copies of the two default Lua hooks into
+/// `state_dir/hooks/{extract,score}/`. Existing files are never overwritten,
+/// so user customizations survive repeated `tsm init` invocations.
+fn install_default_hooks(state_dir: &Path) -> anyhow::Result<()> {
+    install_default_file(
+        &state_dir.join("hooks/extract/10-md_frontmatter.lua"),
+        crate::lua_hooks::DEFAULT_EXTRACT_HOOK,
+        "hooks/extract/10-md_frontmatter.lua",
+    )?;
+    install_default_file(
+        &state_dir.join("hooks/score/10-default.lua"),
+        crate::lua_hooks::DEFAULT_SCORE_HOOK,
+        "hooks/score/10-default.lua",
+    )
+}
+
 /// Run indexing on given file paths under a policy. Returns stats.
 ///
 /// The policy is the non-bypassable correctness gate applied by the
 /// indexer — no caller-side pre-filter is required (or permitted, per
-/// design: duplicated filter logic was a bug-magnet, see #134).
+/// design: duplicated filter logic was a bug-magnet).
 pub fn run_index(
     conn: &rusqlite::Connection,
     file_paths: &[PathBuf],
-    index_root: &Path,
+    project_root: &Path,
     policy: &dyn indexer::IngestPolicy,
 ) -> anyhow::Result<indexer::IndexStats> {
-    indexer::index_all(conn, file_paths, index_root, policy)
+    indexer::index_all(conn, file_paths, project_root, policy)
 }
 
 pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
-    let index_root = config::index_root();
+    let project_root = config::project_root();
 
     let walker = indexer::ContentWalker::from_env();
     let file_paths: Vec<PathBuf> = if files_from_stdin {
-        read_paths_from_stdin(&index_root)
+        read_paths_from_stdin(&project_root)
     } else {
         walker.collect_files()
     };
 
-    let stats = run_index(&conn, &file_paths, &index_root, &walker)?;
-    log::info!(
+    let stats = run_index(&conn, &file_paths, &project_root, &walker)?;
+    println!(
         "Indexed: {}, Skipped: {}, Removed: {}",
-        stats.indexed,
-        stats.skipped,
-        stats.removed
+        stats.indexed, stats.skipped, stats.removed
     );
     Ok(())
 }
 
-/// Read one-path-per-line from stdin and resolve each against `index_root`.
+/// Read one-path-per-line from stdin and resolve each against `project_root`.
 /// No ignore/extension filtering is performed here — the indexer applies
 /// the policy gate itself, so duplicating the check here would add code
 /// surface with no behavioral benefit.
-pub fn read_paths_from_stdin(index_root: &Path) -> Vec<PathBuf> {
+pub fn read_paths_from_stdin(project_root: &Path) -> Vec<PathBuf> {
     // `filter_map` (not `map_while`) so a transient stdin I/O error on one
     // line is logged and skipped rather than silently truncating the rest of
     // the input — matters when a post-save hook pipes many paths.
@@ -139,7 +377,7 @@ pub fn read_paths_from_stdin(index_root: &Path) -> Vec<PathBuf> {
             }
         })
         .filter(|line| !line.trim().is_empty())
-        .map(|line| index_root.join(line.trim()))
+        .map(|line| project_root.join(line.trim()))
         .collect()
 }
 
@@ -161,19 +399,14 @@ pub fn run_search(
     conn: &rusqlite::Connection,
     opts: &SearchOptions,
 ) -> anyhow::Result<searcher::SearchOutput> {
+    use crate::cli_args_logic::{require_vector, resolve_fallback};
     use crate::temporal;
 
     // Resolve fallback policy: CLI flag > config > default (Error)
-    let fallback = match opts.fallback {
-        Some(s) => s
-            .parse::<config::SearchFallback>()
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
-        None => config::search_fallback(),
-    };
+    let fallback = resolve_fallback(opts.fallback, config::search_fallback())?;
+    let needs_vector = require_vector(fallback);
 
-    let require_vector = fallback == config::SearchFallback::Error;
-
-    if !require_vector {
+    if !needs_vector {
         let embedder_socket = config::embedder_socket_path();
         if !embedder_socket.exists() {
             log::warn!("Embedder is not running. Falling back to FTS-only search.");
@@ -194,7 +427,7 @@ pub fn run_search(
         search_query,
         opts.top_k,
         filter.as_ref(),
-        require_vector,
+        needs_vector,
         opts.paths,
     )
 }
@@ -211,91 +444,10 @@ pub fn cmd_search(opts: SearchOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn format_text(results: &[searcher::SearchResult], total_hits: usize) -> String {
-    if results.is_empty() {
-        return "No results found.".to_string();
-    }
-    let mut out = format!("Showing {} of {} results\n\n", results.len(), total_hits);
-    for (i, r) in results.iter().enumerate() {
-        out.push_str(&format!(
-            "{}. [{}] {} — {} (score: {:.4})\n",
-            i + 1,
-            r.source_type,
-            r.source_file,
-            r.section_path,
-            r.score
-        ));
-        out.push_str(&format!("   {}\n", r.snippet));
-        if let Some(ref status) = r.status {
-            out.push_str(&format!("   status: {status}\n"));
-        }
-        if !r.related_docs.is_empty() {
-            out.push_str("   related:\n");
-            for rd in &r.related_docs {
-                out.push_str(&format!(
-                    "     - [{}] {} (strength: {:.2})\n",
-                    rd.link_type, rd.file_path, rd.strength
-                ));
-            }
-        }
-        out.push('\n');
-    }
-    out
-}
-
 fn print_text(results: &[searcher::SearchResult], total_hits: usize) {
-    print!("{}", format_text(results, total_hits));
-}
-
-pub fn format_json(
-    results: &[searcher::SearchResult],
-    total_hits: usize,
-    include_content: Option<usize>,
-    index_root: &Path,
-) -> anyhow::Result<String> {
-    let mut json_results: Vec<serde_json::Value> = Vec::new();
-
-    for (i, r) in results.iter().enumerate() {
-        let related: Vec<serde_json::Value> = r
-            .related_docs
-            .iter()
-            .map(|rd| {
-                serde_json::json!({
-                    "file_path": rd.file_path,
-                    "link_type": rd.link_type,
-                    "strength": rd.strength,
-                })
-            })
-            .collect();
-
-        let mut obj = serde_json::json!({
-            "source_file": r.source_file,
-            "source_type": r.source_type,
-            "section_path": r.section_path,
-            "snippet": r.snippet,
-            "score": r.score,
-            "status": r.status,
-            "related_docs": related,
-        });
-
-        if let Some(n) = include_content {
-            if i < n {
-                let full_path = index_root.join(&r.source_file);
-                if let Ok(content) = std::fs::read_to_string(&full_path) {
-                    obj["content"] = serde_json::Value::String(content);
-                }
-            }
-        }
-
-        json_results.push(obj);
-    }
-
-    let envelope = serde_json::json!({
-        "total_hits": total_hits,
-        "results": json_results,
-    });
-
-    Ok(serde_json::to_string_pretty(&envelope)?)
+    // Text output is relative to the caller's CWD.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    print!("{}", searcher::format_text(results, total_hits, &cwd));
 }
 
 fn print_json(
@@ -303,10 +455,10 @@ fn print_json(
     total_hits: usize,
     include_content: Option<usize>,
 ) -> anyhow::Result<()> {
-    let index_root = config::index_root();
+    let project_root = config::project_root();
     println!(
         "{}",
-        format_json(results, total_hits, include_content, &index_root)?
+        searcher::format_json(results, total_hits, include_content, &project_root)?
     );
     Ok(())
 }
@@ -331,9 +483,9 @@ pub fn cmd_ingest_session(session_file: &Path) -> anyhow::Result<()> {
         .unwrap_or_default()
         .to_string_lossy();
     if indexed {
-        log::info!("Session indexed: {name}");
+        println!("Session indexed: {name}");
     } else {
-        log::info!("Session unchanged: {name}");
+        println!("Session unchanged: {name}");
     }
     Ok(())
 }
@@ -347,16 +499,32 @@ pub fn cmd_vector_fill(batch_size: usize) -> anyhow::Result<()> {
         if !resp.ok {
             anyhow::bail!("{}", resp.error.unwrap_or_default());
         }
+        // The backfill ran daemon-side; its summary travels back in the
+        // payload so we can show it here rather than losing it to the log.
+        // Fall back to a generic line if an older daemon omits the field, so
+        // a successful run is never silent.
+        let summary = resp
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("summary"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Vector fill complete.");
+        println!("{summary}");
         return Ok(());
     }
     // tsmd not running — run directly
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
-    run_vector_fill(&conn, batch_size)
+    println!("{}", run_vector_fill(&conn, batch_size)?);
+    Ok(())
 }
 
 /// Run vector backfill via the embedder socket (daemon-safe).
-pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow::Result<()> {
+///
+/// Returns the user-facing summary line instead of printing it: when invoked
+/// daemon-side the worker's stdout goes to the daemon log, so the caller (the
+/// CLI directly, or via the IPC response payload) surfaces it to the user.
+pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow::Result<String> {
     use crate::status;
 
     let state_dir = config::state_dir();
@@ -389,11 +557,8 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
 
     let stats = indexer::backfill_vectors(conn, &encode_fn, batch_size, Some(&progress_cb))?;
 
-    if stats.filled > 0 {
-        log::info!("Backfilled {} vectors.", stats.filled);
-    } else {
-        log::info!("No missing vectors.");
-    }
+    let skipped: i64 = conn.query_row("SELECT COUNT(*) FROM chunks_vec_skip", [], |r| r.get(0))?;
+    let summary = vector_fill_summary(stats.filled, skipped);
     if stats.errors > 0 {
         log::warn!("{} errors during backfill.", stats.errors);
     }
@@ -403,7 +568,32 @@ pub fn run_vector_fill(conn: &rusqlite::Connection, batch_size: usize) -> anyhow
         s.backfill = None;
     });
 
-    Ok(())
+    Ok(summary)
+}
+
+/// Build the user-facing summary line for `vector-fill`.
+///
+/// Distinguishes "nothing to do" from "chunks are stuck on the skip list",
+/// so a `0 filled` result with skip-marked chunks is not silently reported as
+/// "No missing vectors." (skip-marked chunks are not retried by `vector-fill`;
+/// `tsm reindex vectors` clears the skip list and retries them).
+fn vector_fill_summary(filled: usize, skipped: i64) -> String {
+    if filled == 0 && skipped == 0 {
+        return "No missing vectors.".to_string();
+    }
+    let mut parts = Vec::new();
+    if filled > 0 {
+        parts.push(format!("Backfilled {filled} vectors."));
+    }
+    // Always surface the skip list when present, even alongside a successful
+    // fill — otherwise a partial run silently leaves chunks stuck.
+    if skipped > 0 {
+        parts.push(format!(
+            "{skipped} chunk(s) on the skip list after repeated embed failures. \
+             Run `tsm reindex vectors` to clear the skip list and retry."
+        ));
+    }
+    parts.join(" ")
 }
 
 pub fn cmd_import_wordnet(wordnet_db: &Path) -> anyhow::Result<()> {
@@ -417,124 +607,240 @@ pub fn cmd_import_wordnet(wordnet_db: &Path) -> anyhow::Result<()> {
     };
     let count = crate::synonyms::import_wordnet(&conn, wordnet_db, Some(&progress))?;
     eprint!("\r                              \r"); // clear progress line
-    log::info!("Imported {count} synonym pairs from WordNet.");
+    println!("Imported {count} synonym pairs from WordNet.");
 
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM synonyms", [], |r| r.get(0))
         .unwrap_or(0);
-    log::info!("Total synonyms: {total}");
+    println!("Total synonyms: {total}");
     Ok(())
 }
 
-pub fn cmd_synonym_sync() -> anyhow::Result<()> {
-    let csv_path = config::user_synonyms_path();
-    if !csv_path.is_file() {
-        log::info!(
-            "No user synonyms file found at {}. Create it to define custom synonym pairs.",
-            csv_path.display()
+pub fn cmd_synonym_add(a: &str, b: &str) -> anyhow::Result<()> {
+    let conn = db::get_connection(&config::db_path())?;
+    // Echo the normalized pair as actually stored, not the raw input.
+    let (lo, hi) = crate::synonyms::add_user_synonym(&conn, a, b)?;
+    println!("Added synonym: {lo} <-> {hi}");
+    Ok(())
+}
+
+pub fn cmd_synonym_rm(a: &str, b: Option<&str>) -> anyhow::Result<()> {
+    let conn = db::get_connection(&config::db_path())?;
+    let result = crate::synonyms::remove_user_synonym(&conn, a, b)?;
+    if result.removed > 0 {
+        println!("Removed {} synonym pair(s).", result.removed);
+    } else if result.skipped_non_user > 0 {
+        println!(
+            "No user synonym removed. {} matching pair(s) are not user-defined \
+             (e.g. WordNet) and were left intact.",
+            result.skipped_non_user
         );
-        return Ok(());
+    } else {
+        println!("No matching user synonym found.");
     }
-    let db_path = config::db_path();
-    let conn = db::get_connection(&db_path)?;
-    let result = crate::synonyms::sync_user_synonyms(&conn, &csv_path)?;
-    log::info!(
-        "User synonyms synced: {} pairs ({} deleted, {} skipped)",
-        result.total,
-        result.deleted,
-        result.skipped,
+    Ok(())
+}
+
+pub fn cmd_synonym_export(file: Option<&Path>) -> anyhow::Result<()> {
+    let conn = db::get_connection(&config::db_path())?;
+    match file {
+        Some(path) => {
+            // Write to a temp sibling then rename, so a mid-write failure cannot
+            // truncate an existing file (matches `download_wordnet`).
+            let tmp = path.with_extension("csv.tmp");
+            let mut f = std::fs::File::create(&tmp)?;
+            let count = synonyms::export_user_synonyms(&conn, &mut f)?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, path)?;
+            // File destination: CSV went to the file, so the count is user
+            // output on stdout.
+            println!(
+                "Exported {count} user synonym pair(s) to {}",
+                path.display()
+            );
+        }
+        None => {
+            // stdout destination: CSV is the user output, so the diagnostic
+            // count goes to stderr to keep the stream pipeable.
+            let stdout = std::io::stdout();
+            let mut w = stdout.lock();
+            let count = synonyms::export_user_synonyms(&conn, &mut w)?;
+            eprintln!("Exported {count} user synonym pair(s).");
+        }
+    }
+    Ok(())
+}
+
+pub fn cmd_synonym_import(file: Option<&Path>) -> anyhow::Result<()> {
+    let content = match file {
+        Some(path) => {
+            if !path.is_file() {
+                anyhow::bail!("synonyms CSV not found: {}", path.display());
+            }
+            std::fs::read_to_string(path)?
+        }
+        None => {
+            // Don't block on an interactive terminal waiting for input that isn't
+            // coming. (The empty-input mass-delete is guarded separately in
+            // `import_user_synonyms`.) Require a pipe/redirect or an explicit --file.
+            if std::io::stdin().is_terminal() {
+                anyhow::bail!(
+                    "no input: pipe CSV into `tsm synonym import` or pass `--file <PATH>`"
+                );
+            }
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            buf
+        }
+    };
+    let conn = db::get_connection(&config::db_path())?;
+    // `synonym import` mirrors: pairs absent from the input are deleted.
+    let result = synonyms::import_user_synonyms(&conn, &content, true)?;
+    println!(
+        "User synonyms imported: {} pairs ({} deleted, {} skipped)",
+        result.total, result.deleted, result.skipped,
     );
     Ok(())
 }
 
-pub fn cmd_setup() -> anyhow::Result<()> {
-    // Download model files from HuggingFace Hub
+/// HuggingFace model id for the embedding model.
+const RURI_MODEL_ID: &str = "cl-nagoya/ruri-v3-30m";
+/// WordNet release version mirrored into the cache as `sources/wnjpn-<ver>.db`.
+const WORDNET_VERSION: &str = "v1.1";
+/// Upstream WordNet archive URL.
+const WORDNET_URL: &str = "https://github.com/bond-lab/wnja/releases/download/v1.1/wnjpn.db.gz";
+
+/// `tsm setup`: populate the machine-wide cache (`$cache_dir`) only.
+///
+/// Fetches the ruri model (HuggingFace Hub) and the Japanese WordNet DB, places
+/// them under `$cache_dir` per `mode`, and writes `manifest.json`. Never touches
+/// a workspace `.tsm/` — wiring the cache into a workspace is `tsm init`'s job.
+/// `link_mode_override` (the `--link-mode` flag) wins over
+/// `[setup].link_mode` from config when `Some`.
+pub fn cmd_setup(link_mode_override: Option<config::LinkMode>) -> anyhow::Result<()> {
+    let mode = link_mode_override.unwrap_or_else(config::setup_link_mode);
+    let cache_dir = config::cache_dir();
+    std::fs::create_dir_all(&cache_dir)?;
+    std::fs::create_dir_all(config::cache_sources_dir())?;
+
+    let snapshot_dir = fetch_ruri_snapshot()?;
+
+    let sources_path = config::cache_sources_dir().join(format!("wnjpn-{WORDNET_VERSION}.db"));
+    ensure_wordnet_source(&sources_path)?;
+
+    write_cache_layout(&cache_dir, &snapshot_dir, &sources_path, mode)?;
+
+    println!(
+        "Setup complete ({mode} mode) at {}. Run `tsm init` in your workspace to finish.",
+        cache_dir.display()
+    );
+    Ok(())
+}
+
+/// Ensure the ruri model snapshot is present in the HuggingFace cache and return
+/// its snapshot directory. Network-touching; covered by E2E, not unit tests.
+fn fetch_ruri_snapshot() -> anyhow::Result<PathBuf> {
     let api = hf_hub::api::sync::Api::new()?;
     let repo = api.repo(hf_hub::Repo::new(
-        "cl-nagoya/ruri-v3-30m".to_string(),
+        RURI_MODEL_ID.to_string(),
         hf_hub::RepoType::Model,
     ));
-    let config_path = repo.get("config.json")?;
-    let tokenizer_path = repo.get("tokenizer.json")?;
-    let weights_path = repo.get("model.safetensors")?;
-    log::info!("Model files downloaded:");
-    log::info!("  config:    {}", config_path.display());
-    log::info!("  tokenizer: {}", tokenizer_path.display());
-    log::info!("  weights:   {}", weights_path.display());
-
-    // Copy to models_dir for local access
-    let dest = config::models_dir();
-    std::fs::create_dir_all(&dest)?;
-    let sources = [
-        (&config_path, "config.json"),
-        (&tokenizer_path, "tokenizer.json"),
-        (&weights_path, "model.safetensors"),
-    ];
-    let mut copied: Vec<std::path::PathBuf> = Vec::new();
-    let copy_result = (|| -> anyhow::Result<()> {
-        for (src, name) in &sources {
-            let dst = dest.join(name);
-            std::fs::copy(src, &dst)?;
-            copied.push(dst.clone());
-            log::info!("  copied: {}", dst.display());
-        }
-        Ok(())
-    })();
-    if let Err(e) = copy_result {
-        log::warn!("Setup failed; cleaning up partial files");
-        for f in &copied {
-            let _ = std::fs::remove_file(f);
-        }
-        return Err(e);
+    // Pull every required file so the snapshot dir is complete, then derive the
+    // snapshot directory from one of them.
+    let mut last: Option<PathBuf> = None;
+    for file in config::MODEL_FILES {
+        last = Some(repo.get(file)?);
     }
-    log::info!("Model files installed to {}", dest.display());
-
-    // Download and import Japanese WordNet
-    setup_wordnet()?;
-
-    // Sync user-defined synonyms (if file exists)
-    cmd_synonym_sync()?;
-
-    Ok(())
+    let any_path = last.context("MODEL_FILES is empty")?;
+    let snapshot_dir = any_path
+        .parent()
+        .context("model file has no parent snapshot dir")?
+        .to_path_buf();
+    Ok(snapshot_dir)
 }
 
-fn setup_wordnet() -> anyhow::Result<()> {
-    let wordnet_dest = config::wordnet_db_path();
-    if wordnet_dest.is_file() {
-        log::info!("WordNet DB already exists at {}", wordnet_dest.display());
-    } else {
-        download_wordnet(&wordnet_dest)?;
+/// Download + decompress the WordNet DB into `sources_path` if it is missing.
+/// Network-touching; covered by E2E. Uses tmp + rename for atomicity.
+fn ensure_wordnet_source(sources_path: &Path) -> anyhow::Result<()> {
+    if sources_path.is_file() {
+        return Ok(());
     }
-
-    // Import WordNet synonyms if DB is initialized
-    let db_path = config::db_path();
-    if db_path.is_file() {
-        log::info!("Importing WordNet synonyms...");
-        cmd_import_wordnet(&wordnet_dest)?;
-    } else {
-        log::info!(
-            "Database not initialized yet. Run `tsm init` then `tsm import-wordnet {}` to import synonyms.",
-            wordnet_dest.display()
-        );
-    }
-    Ok(())
-}
-
-fn download_wordnet(dest: &Path) -> anyhow::Result<()> {
-    const WORDNET_URL: &str = "https://github.com/bond-lab/wnja/releases/download/v1.1/wnjpn.db.gz";
-    log::info!("Downloading WordNet DB from {WORDNET_URL}...");
+    println!("Downloading WordNet DB from {WORDNET_URL}...");
     let resp = ureq::get(WORDNET_URL).call()?;
     let mut gz_data = Vec::new();
     resp.into_body().as_reader().read_to_end(&mut gz_data)?;
     let mut decoder = flate2::read::GzDecoder::new(&gz_data[..]);
-    let parent = dest.parent().expect("dest has parent");
+    let parent = sources_path
+        .parent()
+        .context("sources_path has no parent")?;
     std::fs::create_dir_all(parent)?;
-    let tmp_path = dest.with_extension("db.tmp");
+    let tmp_path = sources_path.with_extension("db.tmp");
     let mut out = std::fs::File::create(&tmp_path)?;
     std::io::copy(&mut decoder, &mut out)?;
-    std::fs::rename(&tmp_path, dest)?;
-    log::info!("WordNet DB installed to {}", dest.display());
+    std::fs::rename(&tmp_path, sources_path)?;
     Ok(())
+}
+
+/// Materialize the cache layout (model dir, `wnjpn.db`, `manifest.json`) from
+/// already-fetched sources, per `mode`. Pure filesystem — unit-tested. Idempotent
+/// via `placement::*` (existing entries are replaced).
+fn write_cache_layout(
+    cache_dir: &Path,
+    snapshot_dir: &Path,
+    sources_path: &Path,
+    mode: config::LinkMode,
+) -> anyhow::Result<()> {
+    let fetched_at = now_rfc3339();
+
+    let model_dst = cache_dir.join("models/ruri-v3-30m");
+    placement::place_directory(snapshot_dir, &model_dst, mode)?;
+
+    let wordnet_dst = cache_dir.join("wnjpn.db");
+    placement::place_file(sources_path, &wordnet_dst, mode)?;
+
+    let mut resources = std::collections::BTreeMap::new();
+    resources.insert(
+        "models/ruri-v3-30m".to_string(),
+        manifest::ManifestEntry {
+            mode,
+            target: snapshot_dir.to_path_buf(),
+            size: placement::tree_size(snapshot_dir)?,
+            fetched_at: fetched_at.clone(),
+            version: None,
+            model_id: Some(RURI_MODEL_ID.to_string()),
+            source_url: None,
+        },
+    );
+    resources.insert(
+        "wnjpn.db".to_string(),
+        manifest::ManifestEntry {
+            mode,
+            // Cache-relative: the WordNet source is
+            // tsm-owned under `$cache_dir/sources/`. The model target stays
+            // absolute (an external HF snapshot dir). doctor resolves a relative
+            // target against `cache_dir`.
+            target: PathBuf::from(format!("sources/wnjpn-{WORDNET_VERSION}.db")),
+            size: placement::tree_size(sources_path)?,
+            fetched_at,
+            version: Some(WORDNET_VERSION.to_string()),
+            model_id: None,
+            source_url: Some(WORDNET_URL.to_string()),
+        },
+    );
+
+    manifest::write(
+        &cache_dir.join("manifest.json"),
+        &manifest::Manifest {
+            version: 1,
+            resources,
+        },
+    )?;
+    Ok(())
+}
+
+fn now_rfc3339() -> String {
+    chrono::Local::now().to_rfc3339()
 }
 
 /// Doctor output as a structured result for testability.
@@ -606,6 +912,37 @@ impl DoctorReport {
     }
 }
 
+/// Build the "Build" doctor section from compile-time version metadata.
+///
+/// `TSM_GIT_DESCRIBE` / `TSM_BUILD_DATE` are injected by `build.rs`
+/// (`git describe` + build date). When unavailable (e.g. a build without the
+/// build script or git), fall back to the crate version and "unknown".
+pub fn build_section() -> DoctorSection {
+    let version = match option_env!("TSM_GIT_DESCRIBE") {
+        Some(d) if !d.is_empty() => d.to_string(),
+        _ => format!("v{}", env!("CARGO_PKG_VERSION")),
+    };
+    let built = match option_env!("TSM_BUILD_DATE") {
+        Some(d) if !d.is_empty() => d,
+        _ => "unknown",
+    };
+    DoctorSection {
+        name: "Build".to_string(),
+        items: vec![
+            CheckItem {
+                status: CheckStatus::Ok,
+                message: format!("Version: {version}"),
+                hint: None,
+            },
+            CheckItem {
+                status: CheckStatus::Ok,
+                message: format!("Built: {built}"),
+                hint: None,
+            },
+        ],
+    }
+}
+
 /// Run doctor check with an existing DB connection.
 pub fn run_doctor(conn: &rusqlite::Connection, db_path: &Path) -> DoctorReport {
     let mut report = DoctorReport::default();
@@ -626,6 +963,11 @@ pub fn run_doctor(conn: &rusqlite::Connection, db_path: &Path) -> DoctorReport {
     }
 
     doctor_check_with_conn(conn, &mut report, db_section);
+    // Resource layers (workspace links + machine-wide cache) are independent of
+    // the DB, so they always run as their own report sections.
+    append_resource_sections(&mut report);
+    // Build metadata first (matches the local `cmd_doctor` path).
+    report.sections.insert(0, build_section());
     report
 }
 
@@ -647,6 +989,11 @@ pub fn doctor_check(db_path: &Path) -> DoctorReport {
                 hint: None,
             });
         }
+        if let Ok(conn) = db::get_connection(db_path) {
+            doctor_check_with_conn(&conn, &mut report, db_section);
+        } else {
+            report.sections.push(db_section);
+        }
     } else {
         db_section.items.push(CheckItem {
             status: CheckStatus::Error,
@@ -654,16 +1001,193 @@ pub fn doctor_check(db_path: &Path) -> DoctorReport {
             hint: Some("Run `init`.".to_string()),
         });
         report.sections.push(db_section);
-        return report;
     }
 
-    if let Ok(conn) = db::get_connection(db_path) {
-        doctor_check_with_conn(&conn, &mut report, db_section);
-    } else {
-        report.sections.push(db_section);
-    }
-
+    // Workspace / System cache layers do not depend on the DB and must be
+    // reported even when the DB is absent (e.g. after `tsm setup` but before
+    // `tsm init`); doctor stays read-only and never starts the daemon.
+    append_resource_sections(&mut report);
     report
+}
+
+/// Append the two resource layers — `Workspace` (the workspace's links into the
+/// cache) and `System cache` (the machine-wide cache + manifest) — to a doctor
+/// report. Pure filesystem inspection; never starts the daemon.
+fn append_resource_sections(report: &mut DoctorReport) {
+    report.sections.push(workspace_section());
+    report.sections.push(system_cache_section());
+}
+
+/// Map a resource path's [`LinkStatus`] to a doctor [`CheckItem`]. `target_note`
+/// describes what the entry should point at (e.g. `cache`, `HF cache`); the
+/// hints guide recovery for the broken / missing cases.
+fn link_check_item(
+    label: &str,
+    target_note: &str,
+    path: &Path,
+    broken_hint: &str,
+    missing_hint: &str,
+) -> CheckItem {
+    match placement::link_status(path) {
+        LinkStatus::Alive => CheckItem {
+            status: CheckStatus::Ok,
+            message: format!("{label}  →  {target_note} (link alive)"),
+            hint: None,
+        },
+        LinkStatus::Broken => CheckItem {
+            status: CheckStatus::Error,
+            message: format!("{label}  →  {target_note} (link broken)"),
+            hint: Some(broken_hint.to_string()),
+        },
+        LinkStatus::Missing => CheckItem {
+            status: CheckStatus::Warning,
+            message: format!("{label}: not present"),
+            hint: Some(missing_hint.to_string()),
+        },
+    }
+}
+
+/// Build the `Workspace` doctor section: liveness of the workspace's links into
+/// the cache (`state_dir/models/ruri-v3-30m`, `state_dir/wnjpn.db`).
+fn workspace_section() -> DoctorSection {
+    let state_dir = config::state_dir();
+    // Workspace links are an optional override: when absent, the embedder falls
+    // back to the machine-wide cache, so a missing link is informational, not a
+    // fault. Keep the hint gentle and point at `tsm init`.
+    let missing_hint =
+        "Run `tsm init` to link this workspace to the cache (the embedder uses the cache meanwhile).";
+    let broken_hint = "Run `tsm init` to recreate the workspace link.";
+    DoctorSection {
+        name: "Workspace".to_string(),
+        items: vec![
+            link_check_item(
+                "models/ruri-v3-30m",
+                "cache",
+                &state_dir.join("models/ruri-v3-30m"),
+                broken_hint,
+                missing_hint,
+            ),
+            link_check_item(
+                "wnjpn.db",
+                "cache",
+                &state_dir.join("wnjpn.db"),
+                broken_hint,
+                missing_hint,
+            ),
+        ],
+    }
+}
+
+/// Build the `System cache` doctor section: liveness of the machine-wide cache
+/// entries plus manifest validity / size reconciliation.
+fn system_cache_section() -> DoctorSection {
+    let cache_dir = config::cache_dir();
+    let setup_hint = "Run `tsm setup`.";
+    let mut items = vec![
+        link_check_item(
+            "models/ruri-v3-30m",
+            "HF cache",
+            &config::cache_models_dir(),
+            setup_hint,
+            setup_hint,
+        ),
+        link_check_item(
+            "wnjpn.db",
+            "sources",
+            &config::cache_wordnet_db_path(),
+            setup_hint,
+            setup_hint,
+        ),
+    ];
+    items.extend(manifest_items(&cache_dir));
+    DoctorSection {
+        name: "System cache".to_string(),
+        items,
+    }
+}
+
+/// Build the manifest-related [`CheckItem`]s for the System cache section:
+/// graceful "not found" when setup has not run, an error on a malformed file,
+/// else a per-entry existence + size reconciliation.
+fn manifest_items(cache_dir: &Path) -> Vec<CheckItem> {
+    let manifest_path = config::cache_manifest_path();
+    if !manifest_path.exists() {
+        return vec![CheckItem {
+            status: CheckStatus::Warning,
+            message: "manifest.json: not found".to_string(),
+            hint: Some("Run `tsm setup` to build the cache.".to_string()),
+        }];
+    }
+    let manifest = match manifest::read(&manifest_path) {
+        Ok(m) => m,
+        Err(e) => {
+            return vec![CheckItem {
+                status: CheckStatus::Error,
+                message: format!("manifest.json invalid: {e}"),
+                hint: Some("Run `tsm setup` to regenerate the manifest.".to_string()),
+            }];
+        }
+    };
+    let mut items = vec![CheckItem {
+        status: CheckStatus::Ok,
+        message: format!("manifest.json: {} entries", manifest.resources.len()),
+        hint: None,
+    }];
+    for (key, entry) in &manifest.resources {
+        items.push(manifest_entry_item(cache_dir, key, entry));
+    }
+    items
+}
+
+/// Reconcile a single manifest entry against the filesystem. The size check
+/// targets the *placed cache entry* (`cache_dir/<key>`), not the upstream source
+/// the manifest records. This is correct in both link modes and, crucially,
+/// catches a corrupted physical copy: sizing the (intact) source instead would
+/// report "matches manifest" while the actual cache entry is damaged, and would
+/// also false-warn in copy mode once the upstream is garbage-collected (the
+/// self-contained copy is still healthy).
+fn manifest_entry_item(cache_dir: &Path, key: &str, entry: &manifest::ManifestEntry) -> CheckItem {
+    let placed = cache_dir.join(key);
+    // `exists()` follows symlinks, so a dangling cache link reports as missing.
+    if !placed.exists() {
+        return CheckItem {
+            status: CheckStatus::Warning,
+            message: format!("{key}: cache entry {} missing", placed.display()),
+            hint: Some("Run `tsm setup` to repopulate the cache.".to_string()),
+        };
+    }
+    match placement::tree_size(&placed) {
+        Ok(actual) if actual == entry.size => CheckItem {
+            status: CheckStatus::Ok,
+            message: format!("{key}: {} (matches manifest)", human_size(actual)),
+            hint: None,
+        },
+        Ok(actual) => CheckItem {
+            status: CheckStatus::Warning,
+            message: format!(
+                "{key}: {} on disk, manifest records {}",
+                human_size(actual),
+                human_size(entry.size)
+            ),
+            hint: Some("Run `tsm setup` to refresh the cache and manifest.".to_string()),
+        },
+        Err(e) => CheckItem {
+            status: CheckStatus::Warning,
+            message: format!("{key}: cannot size {}: {e}", placed.display()),
+            hint: Some("Run `tsm setup` to repopulate the cache.".to_string()),
+        },
+    }
+}
+
+/// Human-readable byte size for doctor messages (matches the DB section's MB
+/// style for larger artefacts, exact bytes for small ones).
+fn human_size(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}MB", bytes as f64 / MB)
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 fn doctor_check_with_conn(
@@ -783,7 +1307,12 @@ fn doctor_check_with_conn(
         };
         let processed = bf.filled + bf.errors;
         let eta = if processed > 0 && bf.total > 0 {
-            estimate_eta(&bf.started_at, processed, bf.total as usize)
+            crate::cli_format::estimate_eta(
+                &bf.started_at,
+                processed,
+                bf.total as usize,
+                chrono::Utc::now(),
+            )
         } else {
             "calculating...".to_string()
         };
@@ -795,26 +1324,39 @@ fn doctor_check_with_conn(
         None
     };
 
+    // Chunks on the skip list never get vectors and are not retried by
+    // `vector-fill`, so they are not part of the fillable target. Comparing
+    // `vecs` against the full chunk count would otherwise advise `vector-fill`
+    // for a gap only `reindex vectors` can close. Log (not swallow) a genuine
+    // query error rather than silently treating it as "0 skipped".
+    let skipped: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks_vec_skip", [], |r| r.get(0))
+        .unwrap_or_else(|e| {
+            log::warn!("doctor: could not query chunks_vec_skip: {e}");
+            0
+        });
+    let fillable = (chunks - skipped).max(0);
+
     if vecs < 0 {
         emb_section.items.push(CheckItem {
             status: CheckStatus::Error,
             message: "Vectors: chunks_vec unreadable".to_string(),
             hint: None,
         });
-    } else if vecs == 0 && chunks > 0 {
+    } else if vecs == 0 && fillable > 0 {
         emb_section.items.push(CheckItem {
             status: CheckStatus::Warning,
-            message: format!("Vectors: 0 / {chunks} chunks"),
+            message: format!("Vectors: 0 / {fillable} chunks"),
             hint: Some(
                 backfill_hint.unwrap_or_else(|| {
                     "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
                 }),
             ),
         });
-    } else if vecs < chunks {
+    } else if vecs < fillable {
         emb_section.items.push(CheckItem {
             status: CheckStatus::Warning,
-            message: format!("Vectors: {vecs} / {chunks} chunks (mismatch)"),
+            message: format!("Vectors: {vecs} / {fillable} chunks (mismatch)"),
             hint: Some(
                 backfill_hint.unwrap_or_else(|| {
                     "Run `vector-fill` (needs embedder) or `rebuild`.".to_string()
@@ -822,10 +1364,25 @@ fn doctor_check_with_conn(
             ),
         });
     } else {
+        let detail = if skipped > 0 {
+            "all fillable chunks have vectors"
+        } else {
+            "matches all chunks"
+        };
         emb_section.items.push(CheckItem {
             status: CheckStatus::Ok,
-            message: format!("Vectors: {vecs} (matches all chunks)"),
+            message: format!("Vectors: {vecs} ({detail})"),
             hint: None,
+        });
+    }
+
+    // Surface skip-listed chunks explicitly with their own recovery hint,
+    // otherwise they read as a permanent unexplained vector mismatch.
+    if skipped > 0 {
+        emb_section.items.push(CheckItem {
+            status: CheckStatus::Warning,
+            message: format!("Vectors: {skipped} chunk(s) on the skip list after embed failures"),
+            hint: Some("Run `tsm reindex vectors` to clear the skip list and retry.".to_string()),
         });
     }
 
@@ -872,7 +1429,12 @@ fn doctor_check_with_conn(
         };
         let processed = (ri.processed + ri.errors) as usize;
         let eta = if processed > 0 && ri.total > 0 {
-            estimate_eta(&ri.started_at, processed, ri.total as usize)
+            crate::cli_format::estimate_eta(
+                &ri.started_at,
+                processed,
+                ri.total as usize,
+                chrono::Utc::now(),
+            )
         } else {
             "calculating...".to_string()
         };
@@ -894,7 +1456,9 @@ fn doctor_check_with_conn(
 
 pub fn cmd_doctor(format: &str) -> anyhow::Result<()> {
     let db_path = config::db_path();
-    let report = doctor_check(&db_path);
+    let mut report = doctor_check(&db_path);
+    // Surface build metadata first so it is visible even when the DB is absent.
+    report.sections.insert(0, build_section());
     match format {
         "json" => {
             let json = report.to_json();
@@ -905,104 +1469,13 @@ pub fn cmd_doctor(format: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// I/O shell for the doctor box: resolve `NO_COLOR` and print the rendering
+/// produced by [`crate::cli_format::render_doctor_report`].
 pub fn render_doctor_report(report: &DoctorReport) {
     let use_color = std::env::var("NO_COLOR").is_err();
-
-    let (green, yellow, red, bold, dim, reset) = if use_color {
-        (
-            "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[1m", "\x1b[2m", "\x1b[0m",
-        )
-    } else {
-        ("", "", "", "", "", "")
-    };
-
-    // Collect all rendered lines to compute box width
-    let title = "Knowledge Search Doctor";
-    let mut body_lines: Vec<String> = Vec::new();
-
-    for (i, section) in report.sections.iter().enumerate() {
-        if i > 0 {
-            body_lines.push(String::new()); // blank separator
-        }
-        body_lines.push(format!("{bold}  {}{reset}", section.name));
-        for item in &section.items {
-            let (icon, color) = match item.status {
-                CheckStatus::Ok => ("\u{2714}", green),       // ✔
-                CheckStatus::Warning => ("\u{26a0}", yellow), // ⚠
-                CheckStatus::Error => ("\u{2718}", red),      // ✘
-            };
-            let line = match &item.hint {
-                Some(hint) => format!(
-                    "    {color}{icon}{reset} {}  {dim}{hint}{reset}",
-                    item.message
-                ),
-                None => format!("    {color}{icon}{reset} {}", item.message),
-            };
-            body_lines.push(line);
-        }
-    }
-
-    // Summary line
-    let issue_count = report.issue_count();
-    body_lines.push(String::new());
-    if issue_count > 0 {
-        body_lines.push(format!("  {yellow}{issue_count} issue(s) found.{reset}"));
-    } else {
-        body_lines.push(format!("  {green}All good.{reset}"));
-    }
-
-    // Strip ANSI for width calculation
-    let strip_ansi = |s: &str| -> String {
-        let mut out = String::new();
-        let mut in_escape = false;
-        for c in s.chars() {
-            if c == '\x1b' {
-                in_escape = true;
-            } else if in_escape {
-                if c.is_ascii_alphabetic() {
-                    in_escape = false;
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    };
-
-    let content_width = body_lines
-        .iter()
-        .map(|l| strip_ansi(l).chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(title.len() + 4);
-    let box_width = content_width + 2; // padding
-
-    // Render box
-    println!(
-        "{dim}\u{256d}\u{2500} {reset}{bold}{title}{reset} {dim}{}\u{256e}{reset}",
-        "\u{2500}".repeat(box_width - title.len() - 3)
-    );
-    println!(
-        "{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}",
-        " ".repeat(box_width)
-    );
-
-    for line in &body_lines {
-        let visible_len = strip_ansi(line).chars().count();
-        let pad = box_width.saturating_sub(visible_len);
-        println!(
-            "{dim}\u{2502}{reset}{line}{}{dim}\u{2502}{reset}",
-            " ".repeat(pad)
-        );
-    }
-
-    println!(
-        "{dim}\u{2502}{reset}{}{dim}\u{2502}{reset}",
-        " ".repeat(box_width)
-    );
-    println!(
-        "{dim}\u{2570}{}\u{256f}{reset}",
-        "\u{2500}".repeat(box_width)
+    print!(
+        "{}",
+        crate::cli_format::render_doctor_report(use_color, report)
     );
 }
 
@@ -1097,90 +1570,13 @@ pub fn run_status(conn: Option<&rusqlite::Connection>) -> StatusInfo {
     }
 }
 
+/// I/O shell for `tsm status`: sample the clock for the backfill ETA and print
+/// the block produced by [`crate::cli_format::render_status`].
 pub fn print_status_info(info: &StatusInfo) {
-    println!("=== The Space Memory Status ===\n");
-
-    // Daemon
-    if info.daemon_running {
-        if let Some(pid) = info.daemon_pid {
-            println!("  Daemon:    running (PID {pid})");
-        } else {
-            println!("  Daemon:    running");
-        }
-    } else {
-        println!("  Daemon:    stopped");
-    }
-
-    // Embedder
-    if info.embedder_running {
-        if let (Some(pid), Some(ref since)) = (info.embedder_pid, &info.embedder_since) {
-            let since_fmt = format_since(since);
-            println!("  Embedder:  running (since {since_fmt}, PID {pid})");
-        } else {
-            println!("  Embedder:  running");
-        }
-    } else {
-        println!("  Embedder:  stopped");
-    }
-
-    // Watcher
-    if info.watcher_running {
-        if let Some(ref since) = info.watcher_since {
-            let since_fmt = format_since(since);
-            println!("  Watcher:   running (since {since_fmt})");
-        } else {
-            println!("  Watcher:   running");
-        }
-    } else {
-        println!("  Watcher:   stopped");
-    }
-
-    // Backfill
-    if let Some(ref bf) = info.backfill {
-        let pct = if bf.total > 0 {
-            (bf.filled as f64 / bf.total as f64 * 100.0) as u32
-        } else {
-            0
-        };
-        let since = format_since(&bf.since);
-        let processed = bf.filled + bf.errors;
-        let eta = if processed > 0 && bf.total > 0 {
-            estimate_eta(&bf.since, processed, bf.total as usize)
-        } else {
-            "calculating...".to_string()
-        };
-        println!(
-            "  Backfill:  {}/{} ({pct}%) — running since {since}, ETA {eta}",
-            bf.filled, bf.total
-        );
-        if bf.errors > 0 {
-            println!("             {} errors", bf.errors);
-        }
-    } else {
-        println!("  Backfill:  idle");
-    }
-
-    // DB stats
-    if let (Some(docs), Some(chunks), Some(vecs)) = (info.documents, info.chunks, info.vectors) {
-        println!("  Documents: {docs}");
-        println!("  Chunks:    {chunks}");
-        if chunks > 0 {
-            let pct = (vecs as f64 / chunks as f64 * 100.0) as u32;
-            println!("  Vectors:   {vecs}/{chunks} ({pct}%)");
-        } else {
-            println!("  Vectors:   0");
-        }
-
-        if let Some(ready) = info.dict_candidates_ready {
-            if ready > 0 {
-                println!("  Dict:      {ready} candidates ready");
-            } else {
-                println!("  Dict:      no candidates ready");
-            }
-        }
-    } else {
-        println!("  DB:        not found");
-    }
+    print!(
+        "{}",
+        crate::cli_format::render_status(info, chrono::Utc::now())
+    );
 }
 
 pub fn cmd_status() -> anyhow::Result<()> {
@@ -1191,149 +1587,241 @@ pub fn cmd_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn format_since(rfc3339: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(rfc3339)
-        .map(|dt| dt.format("%H:%M:%S").to_string())
-        .unwrap_or_else(|_| rfc3339.to_string())
-}
-
-fn estimate_eta(started_at: &str, processed: usize, total: usize) -> String {
-    let Ok(start) = chrono::DateTime::parse_from_rfc3339(started_at) else {
-        return "unknown".to_string();
-    };
-    let elapsed = chrono::Utc::now().signed_duration_since(start);
-    let elapsed_secs = elapsed.num_seconds() as f64;
-    if elapsed_secs <= 0.0 || processed == 0 {
-        return "calculating...".to_string();
-    }
-    let remaining = total.saturating_sub(processed);
-    let rate = processed as f64 / elapsed_secs;
-    let eta_secs = (remaining as f64 / rate) as i64;
-    if eta_secs < 60 {
-        format!("~{eta_secs}s")
-    } else {
-        format!("~{}m", eta_secs / 60)
-    }
-}
-
-pub fn cmd_dict_update(threshold: i64, apply: bool) -> anyhow::Result<()> {
+/// `tsm dict update` — show frequent, un-judged candidate words.
+/// A read-only discovery view: it lists words seen often enough to be worth a
+/// verdict. Acceptance/rejection is per word via `dict add` / `dict reject`;
+/// bulk loading is `dict import`. This command only reads.
+pub fn cmd_dict_update(threshold: i64) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
 
     let candidates = user_dict::get_threshold_candidates(&conn, threshold);
     if candidates.is_empty() {
-        log::info!("No candidates meet the threshold (freq >= {threshold}).");
+        println!("No candidates meet the threshold (freq >= {threshold}).");
         return Ok(());
     }
 
     // Interactive TUI output — bypass log system for clean display
     eprintln!("=== Dictionary Update Candidates ===\n");
     for c in &candidates {
-        print_candidate(c);
+        eprint!("{}", crate::cli_format::render_candidate(c));
     }
     eprintln!(
-        "\n{} word(s) will be added to user dictionary.",
+        "\n{} candidate(s). Accept with `tsm dict add <word> [reading]` \
+         or reject with `tsm dict reject <word>`.",
         candidates.len()
     );
+    Ok(())
+}
 
-    if !apply {
-        log::info!("Dry run. Pass --apply to add words and rebuild FTS.");
-        return Ok(());
-    }
-
-    // Export to CSV
-    let csv_path = config::user_dict_path();
-    let exported = user_dict::export_candidates_to_csv(&conn, &csv_path, threshold)?;
-    let count = exported.len();
-    log::info!("Wrote {count} word(s) to {}", csv_path.display());
-
-    if count == 0 {
-        log::info!("All candidates were already in the dict file. Nothing to do.");
-        return Ok(());
-    }
-
-    drop(conn);
-
-    // Rebuild FTS: if daemon is running, send reindex via IPC (daemon resets
-    // its own segmenter). Otherwise, reset locally and rebuild directly.
+/// Rebuild the FTS index so the tokenizer picks up a user-dictionary change.
+/// A reachable daemon reindexes over IPC (it resets its own segmenter); with no
+/// daemon, rebuild locally. An IPC error or a daemon rejection is surfaced (not
+/// silently retried as a local rebuild that would race the daemon's writer):
+/// the search index is then stale until `tsm reindex fts` / `tsm restart`.
+fn reindex_fts_after_dict_change() -> anyhow::Result<()> {
     let daemon_socket = config::daemon_socket_path();
     let reindex_req = crate::daemon_protocol::DaemonRequest::Reindex {
         kind: crate::daemon_protocol::ReindexKind::Fts,
     };
-    let daemon_accepted = crate::daemon_protocol::try_send_request(&daemon_socket, &reindex_req)
-        .and_then(|r| r.ok())
-        .is_some_and(|r| r.ok);
+    let resp = crate::daemon_protocol::try_send_request(&daemon_socket, &reindex_req);
 
-    if daemon_accepted {
-        log::info!("\nFTS reindex started in background. Run `tsm doctor` to check progress.");
-    } else {
-        crate::tokenizer::reset_segmenter();
-        log::info!("\nRebuilding FTS index...");
-        cmd_rebuild_fts()?;
+    use crate::cli_dict_logic::{classify_reindex, ReindexPlan};
+    match classify_reindex(resp) {
+        ReindexPlan::BackgroundStarted => {
+            println!("\nFTS reindex started in background. Run `tsm doctor` to check progress.");
+            Ok(())
+        }
+        ReindexPlan::Local => {
+            crate::tokenizer::reset_segmenter();
+            println!("\nRebuilding FTS index...");
+            cmd_rebuild_fts()
+        }
+        ReindexPlan::Failed(msg) => anyhow::bail!(
+            "the dictionary changed but the daemon could not reindex FTS: {msg}. \
+             The search index is stale until you run `tsm reindex fts` (or `tsm restart` \
+             to reload the dictionary).",
+        ),
     }
+}
 
+/// Reconcile the on-disk verdict files into the DB and apply the user's verdict
+/// change in ONE transaction. The reconcile pulls
+/// terms present in `user_dict.simpledic` / `reject_words.txt` but absent from
+/// (or only `pending` in) the DB into it BEFORE the change, so the subsequent
+/// `user_dict.simpledic` rewrite cannot silently drop them. Any file conflict or
+/// malformed line is detected before the first write, so an abort leaves the DB
+/// completely unchanged (the transaction is never committed).
+fn mutate_verdict(
+    conn: &rusqlite::Connection,
+    surface: &str,
+    to: user_dict::Verdict,
+    reading: Option<&str>,
+) -> anyhow::Result<(user_dict::Transition, user_dict::ReconcileOutcome)> {
+    let tx = conn.unchecked_transaction()?;
+    let reconciled = user_dict::reconcile_files_into_db(
+        &tx,
+        &config::user_dict_path(),
+        &config::reject_words_path(),
+    )?;
+    let t = user_dict::set_verdict_in(&tx, surface, to, reading)?;
+    tx.commit()?;
+    Ok((t, reconciled))
+}
+
+/// Surface the implicit DB change when the reconcile recovered on-disk terms.
+fn report_reconcile(r: &user_dict::ReconcileOutcome) {
+    if let Some(msg) = crate::cli_dict_logic::reconcile_message(r) {
+        eprintln!("{msg}");
+    }
+}
+
+/// Materialize the DB's accepted set to `user_dict.simpledic` and reload the
+/// tokenizer when the file content changed. Always regenerates (cheap, atomic
+/// temp+rename) so a retry after a previously failed regenerate re-converges
+/// from the on-disk/DB divergence — no dirty marker needed. A regenerate failure
+/// is surfaced (the DB is already committed); the next mutation retries. (A
+/// reindex that fails *after* a successful regenerate is surfaced as an error but
+/// not auto-retried here, since the file then matches the DB.) Takes `conn` by
+/// value so it is dropped before any
+/// local FTS rebuild opens its own writer.
+fn materialize_dict(conn: rusqlite::Connection) -> anyhow::Result<()> {
+    let csv_path = config::user_dict_path();
+    let regen = user_dict::regenerate_user_dict(&conn, &csv_path).map_err(|e| {
+        anyhow::anyhow!(
+            "the database was updated, but regenerating {} failed: {e}. \
+             Re-run the command (or `tsm dict export`) to retry.",
+            csv_path.display()
+        )
+    })?;
+    if regen.changed {
+        println!(
+            "Regenerated {} ({} accepted term{}).",
+            csv_path.display(),
+            regen.written,
+            if regen.written == 1 { "" } else { "s" }
+        );
+        drop(conn);
+        reindex_fts_after_dict_change()?;
+    }
     Ok(())
 }
 
-pub fn cmd_dict_reject(apply: bool, all: bool) -> anyhow::Result<()> {
-    let db_path = config::db_path();
-    let conn = db::get_connection(&db_path)?;
+/// `tsm dict add <surface> [<yomi>]` — accept a term.
+pub fn cmd_dict_add(surface: &str, yomi: Option<&str>) -> anyhow::Result<()> {
+    user_dict::validate_surface(surface)?;
+    let conn = db::get_connection(&config::db_path())?;
+    let (reading, warned) = user_dict::resolve_reading(surface, yomi);
+    if warned {
+        eprintln!(
+            "warning: no reading for '{surface}'; storing the surface as a substitute. \
+             Provide one with `tsm dict add {surface} <yomi>`."
+        );
+    }
+    let (t, reconciled) =
+        mutate_verdict(&conn, surface, user_dict::Verdict::Accepted, Some(&reading))?;
+    report_reconcile(&reconciled);
+    println!("{}", crate::cli_dict_logic::accept_message(t.from, surface));
+    materialize_dict(conn)
+}
+
+/// `tsm dict rm <word>` — reset a term to pending.
+/// Errors when the term was never registered (nothing to reset).
+pub fn cmd_dict_rm(word: &str) -> anyhow::Result<()> {
+    let conn = db::get_connection(&config::db_path())?;
+    let (t, reconciled) = mutate_verdict(&conn, word, user_dict::Verdict::Pending, None)?;
+    report_reconcile(&reconciled);
+    println!("{}", crate::cli_dict_logic::reset_message(t.from, word));
+    materialize_dict(conn)
+}
+
+/// `tsm dict reject <word>` — move a word to the `rejected` verdict.
+/// Inserts a manual row when the word was never seen (preemptive reject). When
+/// the word was accepted, the accepted set shrinks, so `user_dict.simpledic` is
+/// regenerated and the tokenizer reloaded.
+pub fn cmd_dict_reject(word: &str) -> anyhow::Result<()> {
+    user_dict::validate_surface(word)?;
+    let conn = db::get_connection(&config::db_path())?;
+    let (t, reconciled) = mutate_verdict(&conn, word, user_dict::Verdict::Rejected, None)?;
+    report_reconcile(&reconciled);
+    println!("{}", crate::cli_dict_logic::reject_message(t.from, word));
+    materialize_dict(conn)
+}
+
+/// `tsm dict export` — write the DB's verdicts to disk: the
+/// accepted set to `user_dict.simpledic` and the rejected set to
+/// `reject_words.txt`. The DB is the authority; this materializes a portable,
+/// git-trackable snapshot. No reindex — the running tokenizer already reflects
+/// the DB. Diagnostics go to stderr so stdout stays a clean status line.
+pub fn cmd_dict_export() -> anyhow::Result<()> {
+    let conn = db::get_connection(&config::db_path())?;
+
+    let dict_path = config::user_dict_path();
+    let accepted = user_dict::regenerate_user_dict(&conn, &dict_path)?.written;
+    eprintln!(
+        "Wrote {accepted} accepted word(s) to {}",
+        dict_path.display()
+    );
+
+    let reject_path = config::reject_words_path();
+    let rejected = user_dict::export_reject_words_to_file(&conn, &reject_path)?;
+    eprintln!(
+        "Wrote {rejected} rejected word(s) to {}",
+        reject_path.display()
+    );
+
+    println!("Exported {accepted} accepted, {rejected} rejected word(s).");
+    Ok(())
+}
+
+/// `tsm dict import` — load verdicts from disk into the DB.
+/// Insert-only: accepted words from `user_dict.simpledic` and rejected words
+/// from `reject_words.txt` are upserted; verdicts absent from the files are left
+/// untouched (use `dict rm`/`reject` to remove). This recovers the DB after a
+/// rebuild and reflects hand-edits or another machine's files. When the imported
+/// verdicts changed the accepted set (a new accepted word, or a reject demoting a
+/// previously-accepted one), `user_dict.simpledic` is regenerated from the final
+/// DB state and the tokenizer reloaded — once. Counts go to stderr.
+pub fn cmd_dict_import() -> anyhow::Result<()> {
+    let conn = db::get_connection(&config::db_path())?;
+    let dict_path = config::user_dict_path();
     let reject_path = config::reject_words_path();
 
-    if all {
-        let rejected = user_dict::get_rejected_candidates(&conn);
-        if rejected.is_empty() {
-            log::info!("No rejected candidates.");
-            return Ok(());
-        }
-        eprintln!("=== Rejected Candidates ({} total) ===\n", rejected.len());
-        for c in &rejected {
-            print_candidate(c);
-        }
-        return Ok(());
-    }
+    // Fail closed before importing if a surface is in both files — otherwise the
+    // accepted-then-rejected pass would silently demote it.
+    user_dict::assert_no_cross_file_conflict(&dict_path, &reject_path)?;
 
-    let reject_words = user_dict::load_reject_words(&reject_path)?;
-
-    if reject_words.is_empty() {
-        log::info!(
-            "reject_words.txt is empty or not found at {}",
-            reject_path.display()
-        );
-        return Ok(());
-    }
-
-    let candidates = user_dict::get_pending_in_reject_list(&conn, &reject_words);
-
-    if candidates.is_empty() {
-        log::info!("No pending candidates match reject_words.txt.");
-        return Ok(());
-    }
-
-    eprintln!("=== Candidates to Reject ===\n");
-    for c in &candidates {
-        print_candidate(c);
-    }
-    eprintln!("\n{} word(s) will be marked rejected.", candidates.len());
-
-    if !apply {
-        log::info!("Dry run. Pass --apply to reject these words.");
-        return Ok(());
-    }
-
-    let newly_rejected = user_dict::apply_reject_list(&conn, &reject_words)?;
-    log::info!("Rejected {} word(s).", newly_rejected.len());
-    Ok(())
-}
-
-fn print_candidate(c: &user_dict::Candidate) {
+    // One transaction for the whole import: a mid-file failure rolls back rather
+    // than leaving a partial set of verdicts committed.
+    let (acc, rej) = {
+        let tx = conn.unchecked_transaction()?;
+        let acc = user_dict::import_user_dict_from_file(&tx, &dict_path)?;
+        let rej = user_dict::import_reject_words_from_file(&tx, &reject_path)?;
+        tx.commit()?;
+        (acc, rej)
+    };
     eprintln!(
-        "  {:<20} {:>3} hits  (first: {}, last: {})",
-        c.surface,
-        c.frequency,
-        &c.first_seen[..10.min(c.first_seen.len())],
-        &c.last_seen[..10.min(c.last_seen.len())]
+        "Imported {} accepted word(s) from {}",
+        acc.imported,
+        dict_path.display()
     );
+    eprintln!(
+        "Imported {} rejected word(s) from {}",
+        rej.imported,
+        reject_path.display()
+    );
+    println!(
+        "Imported {} accepted, {} rejected word(s).",
+        acc.imported, rej.imported
+    );
+
+    // Regenerate from the final DB state (not the input files) so an overlap
+    // between the two files, or a reject that demoted an accepted word, leaves
+    // simpledic consistent with the DB before the tokenizer reloads.
+    if acc.dict_affected + rej.dict_affected > 0 {
+        materialize_dict(conn)?;
+    }
+    Ok(())
 }
 
 /// Spawn `tsm vector-fill` as a detached child process in a new session.
@@ -1365,106 +1853,163 @@ fn spawn_background_backfill() {
     }
 }
 
+/// Print what `tsm rebuild --apply` would do, without deleting or rebuilding
+/// the DB. (Opening the DB may still apply idempotent schema migrations.)
+fn rebuild_dry_run(db_path: &Path) -> anyhow::Result<()> {
+    use crate::cli_rebuild_logic::{rebuild_dry_run_report, DryRunStats};
+
+    let stats = if db_path.exists() {
+        let size_mb = std::fs::metadata(db_path)
+            .ok()
+            .map(|meta| meta.len() as f64 / 1024.0 / 1024.0);
+        let conn = db::get_connection(db_path)?;
+        let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0);
+        Some(DryRunStats {
+            size_mb,
+            docs: count("SELECT COUNT(*) FROM documents"),
+            chunks: count("SELECT COUNT(*) FROM chunks"),
+            vecs: count("SELECT COUNT(*) FROM chunks_vec"),
+            sessions: count("SELECT COUNT(*) FROM documents WHERE file_path LIKE 'session:%'"),
+        })
+    } else {
+        None
+    };
+    eprint!(
+        "{}",
+        rebuild_dry_run_report(stats.as_ref(), &db_path.display().to_string())
+    );
+    Ok(())
+}
+
+/// Capture ingested session documents from the existing DB so a destructive
+/// rebuild can carry them forward. Returns an empty vec when the DB is absent.
+fn capture_sessions_for_rebuild(db_path: &Path) -> anyhow::Result<Vec<indexer::CapturedSession>> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let old_conn = db::get_connection(db_path)?;
+    let sessions = indexer::capture_sessions(&old_conn)?;
+    if !sessions.is_empty() {
+        println!("Carrying forward {} session document(s)", sessions.len());
+    }
+    Ok(sessions)
+}
+
 pub fn cmd_rebuild(apply: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
-    let index_root = config::index_root();
+    let project_root = config::project_root();
     let socket = config::embedder_socket_path();
 
     if !apply {
-        // Dry run: show what would happen
-        if db_path.exists() {
-            if let Ok(meta) = std::fs::metadata(&db_path) {
-                let size_mb = meta.len() as f64 / 1024.0 / 1024.0;
-                eprintln!("DB: {} ({size_mb:.1} MB)", db_path.display());
-            }
-            let conn = db::get_connection(&db_path)?;
-            let chunks: i64 = conn
-                .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
-                .unwrap_or(0);
-            let vecs: i64 = conn
-                .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
-                .unwrap_or(0);
-            let docs: i64 = conn
-                .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
-                .unwrap_or(0);
-            eprintln!("Documents: {docs}, Chunks: {chunks}, Vectors: {vecs}");
-        } else {
-            eprintln!("DB does not exist yet.");
-        }
-        eprintln!("\nThis will delete the DB and rebuild from scratch.");
-        eprintln!("Note: reject list (dictionary_candidates) will be lost.");
-        eprintln!("Run with --apply to proceed.");
+        rebuild_dry_run(&db_path)?;
         return Ok(());
     }
 
     if !socket.exists() {
         log::warn!("Embedder is not running. Rebuilding without vectors.");
     } else {
-        log::info!("Embedder: running");
+        println!("Embedder: running");
     }
+
+    // Carry forward ingested session documents (session:<stem>). They are a
+    // non-filesystem document kind ingested only via `index_session`; the file
+    // walker only yields real paths under project_root and so never reproduces a
+    // `session:` document, so a destructive rebuild would drop them permanently.
+    // Capture from the old DB before deletion; their chunk content is
+    // authoritative in the DB, so the original JSONL (which may have been rotated
+    // out of `~/.claude/projects`) is not needed.
+    let carried_sessions = capture_sessions_for_rebuild(&db_path)?;
 
     // Backup
     if db_path.exists() {
         let backup = db_path.with_extension("db.bak");
         std::fs::copy(&db_path, &backup)?;
-        log::info!("Backup: {}", backup.display());
+        println!("Backup: {}", backup.display());
         std::fs::remove_file(&db_path)?;
-        log::info!("Deleted: {}", db_path.display());
+        println!("Deleted: {}", db_path.display());
     }
 
+    // From here the old DB is gone. If any step fails, point the user at the
+    // backup so a half-built DB is not mistaken for a clean failure.
+    let recover_hint = || {
+        let backup = db_path.with_extension("db.bak");
+        format!(
+            "rebuild failed after the old DB was deleted; restore the backup with \
+             `cp {} {}`",
+            backup.display(),
+            db_path.display()
+        )
+    };
+
     // Init
-    db::init_db(&db_path)?;
-    log::info!("DB initialized");
+    db::init_db(&db_path).with_context(recover_hint)?;
+    println!("DB initialized");
 
     // Full index (synchronous, with progress)
-    let conn = db::get_connection(&db_path)?;
-    let walker = indexer::ContentWalker::from_env_with_index_root(&index_root);
+    let conn = db::get_connection(&db_path).with_context(recover_hint)?;
+    let walker = indexer::ContentWalker::from_env_with_project_root(&project_root);
     let file_paths = walker.collect_files();
     let total = file_paths.len();
-    log::info!("Indexing {total} files...");
+    println!("Indexing {total} files...");
 
     let progress = |current: usize, total: usize, path: &Path| {
-        let rel = path.strip_prefix(&index_root).unwrap_or(path).display();
+        let rel = path.strip_prefix(&project_root).unwrap_or(path).display();
         log::debug!("  [{current}/{total}] {rel}");
     };
     let stats = indexer::index_all_with_progress(
         &conn,
         &file_paths,
-        &index_root,
+        &project_root,
         &walker,
         Some(&progress),
-    )?;
-    log::info!(
+    )
+    .with_context(recover_hint)?;
+    println!(
         "Done: Indexed: {}, Skipped: {}, Removed: {}",
-        stats.indexed,
-        stats.skipped,
-        stats.removed
+        stats.indexed, stats.skipped, stats.removed
     );
 
-    // Report & async backfill
-    let chunks: i64 = conn
-        .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
-        .unwrap_or(0);
-    let vecs: i64 = conn
-        .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
-        .unwrap_or(0);
-    drop(conn);
-
-    if vecs >= chunks {
-        log::info!("Vectors: {vecs} (matches all chunks)");
-    } else if socket.exists() && chunks > 0 {
-        let current_status = crate::status::read(&config::state_dir());
-        if current_status.backfill.is_some() {
-            log::info!("Vectors: {vecs} / {chunks} — backfill already in progress");
-        } else {
-            log::info!("Vectors: {vecs} / {chunks} — starting backfill in background...");
-            spawn_background_backfill();
-        }
-        log::info!("Run `tsm doctor` to check progress.");
-    } else if chunks > 0 {
-        log::warn!("Vectors: {vecs} / {chunks} — embedder not running, skipping backfill");
+    // Re-persist carried-forward sessions into the fresh DB before the vector
+    // counts and backfill below, so session chunks are included in the backfill.
+    if !carried_sessions.is_empty() {
+        let restored =
+            indexer::restore_sessions(&conn, &carried_sessions).with_context(recover_hint)?;
+        println!("Restored {restored} session document(s)");
     }
 
+    report_vectors_and_backfill(conn, &socket)?;
+    Ok(())
+}
+
+/// Report vector coverage after a rebuild and start async backfill when chunks
+/// still lack vectors. Consumes `conn`, dropping it before any backfill spawns.
+fn report_vectors_and_backfill(conn: rusqlite::Connection, socket: &Path) -> anyhow::Result<()> {
+    use crate::cli_rebuild_logic::{decide_backfill_action, BackfillAction};
+
+    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+    let vecs: i64 = conn.query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))?;
+    drop(conn);
+
+    // Sampled for the decision; the read only matters when vectors are missing.
+    let socket_exists = socket.exists();
+    let backfill_in_progress =
+        socket_exists && chunks > 0 && crate::status::read(&config::state_dir()).backfill.is_some();
+
+    match decide_backfill_action(vecs, chunks, socket_exists, backfill_in_progress) {
+        BackfillAction::VectorsMatch => println!("Vectors: {vecs} (matches all chunks)"),
+        BackfillAction::AlreadyInProgress => {
+            println!("Vectors: {vecs} / {chunks} — backfill already in progress");
+            println!("Run `tsm doctor` to check progress.");
+        }
+        BackfillAction::StartBackfill => {
+            println!("Vectors: {vecs} / {chunks} — starting backfill in background...");
+            spawn_background_backfill();
+            println!("Run `tsm doctor` to check progress.");
+        }
+        BackfillAction::EmbedderDown => {
+            log::warn!("Vectors: {vecs} / {chunks} — embedder not running, skipping backfill")
+        }
+    }
     Ok(())
 }
 
@@ -1481,14 +2026,14 @@ pub fn cmd_rebuild_fts() -> anyhow::Result<()> {
         .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
         .unwrap_or(0);
     log::warn!("This will clear and repopulate the FTS index ({chunk_count} chunks).");
-    log::info!("Rebuilding FTS index...");
+    println!("Rebuilding FTS index...");
 
     let progress = |current: usize, total: usize| {
         log::debug!("  [{current}/{total}]");
     };
 
     let inserted = indexer::rebuild_fts(&conn, Some(&progress))?;
-    log::info!("FTS rebuild complete: {inserted} chunks re-indexed.");
+    println!("FTS rebuild complete: {inserted} chunks re-indexed.");
 
     Ok(())
 }
@@ -1496,100 +2041,41 @@ pub fn cmd_rebuild_fts() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::searcher::SearchResult;
 
     #[test]
-    fn test_format_text_empty() {
-        let result = format_text(&[], 0);
-        assert_eq!(result, "No results found.");
+    fn test_build_section_reports_version_and_date() {
+        let section = build_section();
+        assert_eq!(section.name, "Build");
+        assert_eq!(section.items.len(), 2);
+        // All build items are informational (never warnings/errors).
+        assert!(section.items.iter().all(|i| i.status == CheckStatus::Ok));
+        // Version line is always populated: a git describe at build time, or
+        // the crate version as a fallback when git info is unavailable.
+        let version = &section.items[0].message;
+        assert!(version.starts_with("Version: "), "got {version:?}");
+        assert!(
+            version.len() > "Version: ".len(),
+            "version must not be empty"
+        );
+        // Build date line is always present (real date or "unknown").
+        assert!(section.items[1].message.starts_with("Built: "));
     }
 
     #[test]
-    fn test_format_text_with_results() {
-        let results = vec![SearchResult {
-            source_file: "daily/notes/test.md".to_string(),
-            source_type: "note".to_string(),
-            section_path: "Test > Section".to_string(),
-            snippet: "Some content".to_string(),
-            score: 0.5,
-            status: Some("current".to_string()),
-            related_docs: vec![],
-        }];
-        let text = format_text(&results, results.len());
-        assert!(text.contains("1. [note]"));
-        assert!(text.contains("daily/notes/test.md"));
-        assert!(text.contains("0.5000"));
-        assert!(text.contains("status: current"));
-    }
-
-    #[test]
-    fn test_format_text_no_status() {
-        let results = vec![SearchResult {
-            source_file: "test.md".to_string(),
-            source_type: "note".to_string(),
-            section_path: "Section".to_string(),
-            snippet: "Content".to_string(),
-            score: 0.3,
-            status: None,
-            related_docs: vec![],
-        }];
-        let text = format_text(&results, results.len());
-        assert!(!text.contains("status:"));
-    }
-
-    #[test]
-    fn test_format_json_empty() {
-        let result = format_json(&[], 0, None, Path::new("/tmp")).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["total_hits"], 0);
-        assert_eq!(parsed["results"].as_array().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_format_json_with_results() {
-        let results = vec![SearchResult {
-            source_file: "test.md".to_string(),
-            source_type: "note".to_string(),
-            section_path: "Section".to_string(),
-            snippet: "Content".to_string(),
-            score: 0.5,
-            status: None,
-            related_docs: vec![],
-        }];
-        let json = format_json(&results, 10, None, Path::new("/tmp")).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["total_hits"], 10);
-        let arr = parsed["results"].as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["source_file"], "test.md");
-        assert_eq!(arr[0]["score"], 0.5);
-        // No content field when include_content is None
-        assert!(arr[0].get("content").is_none());
-    }
-
-    #[test]
-    fn test_format_json_with_include_content() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let file_path = dir.path().join("test.md");
-        std::fs::write(&file_path, "# Hello\n\nWorld.").unwrap();
-
-        let results = vec![SearchResult {
-            source_file: "test.md".to_string(),
-            source_type: "note".to_string(),
-            section_path: "Section".to_string(),
-            snippet: "Content".to_string(),
-            score: 0.5,
-            status: None,
-            related_docs: vec![],
-        }];
-        let json = format_json(&results, 1, Some(1), dir.path()).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["results"][0]["content"], "# Hello\n\nWorld.");
+    fn test_run_doctor_includes_build_section_first() {
+        // The daemon path renders `run_doctor`'s report; it must carry the
+        // same build metadata as the local `cmd_doctor` path, listed first.
+        let conn = crate::test_utils::setup_db();
+        let report = run_doctor(&conn, Path::new(":memory:"));
+        assert_eq!(
+            report.sections.first().map(|s| s.name.as_str()),
+            Some("Build")
+        );
     }
 
     // Walker behavior is covered by indexer::walker::tests. In this module
-    // `cmd_rebuild` constructs ContentWalker via from_env_with_index_root
-    // (explicit index_root override); other commands use from_env().
+    // `cmd_rebuild` constructs ContentWalker via from_env_with_project_root
+    // (explicit project_root override); other commands use from_env().
 
     #[test]
     fn install_default_tsmignore_writes_when_absent() {
@@ -1603,22 +2089,415 @@ mod tests {
         assert!(written.contains("*.parquet"));
     }
 
+    /// Minimal WordNet-schema fixture for the cli test path. Mirrors the
+    /// schema synonyms.rs depends on (word/sense/synset). Tiny pair set so
+    /// success is observable in `synonyms` table counts.
+    fn create_mock_wordnet_db(path: &Path, pairs: &[(&str, &str)]) {
+        let wn = rusqlite::Connection::open(path).unwrap();
+        wn.execute_batch(
+            "CREATE TABLE word (wordid INTEGER PRIMARY KEY, lemma TEXT, lang TEXT);
+             CREATE TABLE synset (synset TEXT PRIMARY KEY);
+             CREATE TABLE sense (synset TEXT, wordid INTEGER);",
+        )
+        .unwrap();
+        let mut word_id = 1i64;
+        for (i, (a, b)) in pairs.iter().enumerate() {
+            let sid = format!("syn{i:04}");
+            wn.execute(
+                "INSERT INTO synset (synset) VALUES (?)",
+                rusqlite::params![sid],
+            )
+            .unwrap();
+            wn.execute(
+                "INSERT INTO word (wordid, lemma, lang) VALUES (?, ?, 'jpn')",
+                rusqlite::params![word_id, a],
+            )
+            .unwrap();
+            wn.execute(
+                "INSERT INTO sense (synset, wordid) VALUES (?, ?)",
+                rusqlite::params![sid, word_id],
+            )
+            .unwrap();
+            word_id += 1;
+            wn.execute(
+                "INSERT INTO word (wordid, lemma, lang) VALUES (?, ?, 'jpn')",
+                rusqlite::params![word_id, b],
+            )
+            .unwrap();
+            wn.execute(
+                "INSERT INTO sense (synset, wordid) VALUES (?, ?)",
+                rusqlite::params![sid, word_id],
+            )
+            .unwrap();
+            word_id += 1;
+        }
+    }
+
+    /// Drive `cmd_init_with` against a fresh tempdir using the default
+    /// state_dir layout. Returns (project_root, state_dir) for
+    /// post-condition assertions.
+    fn run_init(dir: &Path) -> (PathBuf, PathBuf) {
+        // No cache sources: placement is skipped (warn-and-continue), so
+        // this exercises the pre-`tsm setup` path used by the scaffold /
+        // WordNet / idempotency tests.
+        let missing_cache = dir.join("no-such-cache");
+        run_init_with_cache(
+            dir,
+            &missing_cache.join("models/ruri-v3-30m"),
+            &missing_cache.join("wnjpn.db"),
+            super::config::LinkMode::Symlink,
+        )
+    }
+
+    /// `run_init` with explicit cache sources and link mode, for the
+    /// symlink/copy/mode-change tests.
+    fn run_init_with_cache(
+        dir: &Path,
+        cache_models_src: &Path,
+        cache_wordnet_src: &Path,
+        link_mode: super::config::LinkMode,
+    ) -> (PathBuf, PathBuf) {
+        let state_dir = dir.join(".tsm");
+        let db_path = state_dir.join("tsm.db");
+        let user_dict_path = state_dir.join("user_dict.simpledic");
+        super::cmd_init_with(&super::InitPaths {
+            db_path: &db_path,
+            project_root: dir,
+            state_dir: &state_dir,
+            user_dict_path: &user_dict_path,
+            cache_models_src,
+            cache_wordnet_src,
+            link_mode,
+        })
+        .unwrap();
+        (dir.to_path_buf(), state_dir)
+    }
+
     #[test]
-    fn cmd_init_with_creates_db_and_tsmignore() {
-        // End-to-end regression test: cmd_init_with must run BOTH steps
-        // (db init AND .tsmignore install). Without this test, removing the
-        // install_default_tsmignore call from cmd_init would still leave
-        // unit tests passing — silently shipping installs without the
-        // default ignore file.
+    fn cmd_init_with_creates_db_and_all_scaffold_files() {
+        // End-to-end regression test: cmd_init_with must produce the DB
+        // file plus every scaffold file. Without this test, dropping
+        // any one of the install_default_* calls would pass unit tests
+        // — silently shipping a partial init.
         let dir = tempfile::TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let project_root = dir.path();
-        super::cmd_init_with(&db_path, project_root).unwrap();
-        assert!(db_path.is_file(), "DB file was not created");
+        let (project_root, state_dir) = run_init(dir.path());
+
+        assert!(state_dir.join("tsm.db").is_file(), "DB was not created");
         assert!(
             project_root.join(".tsmignore").is_file(),
             ".tsmignore was not created"
         );
+        assert!(
+            project_root.join("tsm.toml").is_file(),
+            "tsm.toml was not created"
+        );
+        assert!(
+            state_dir.join("user_dict.simpledic").is_file(),
+            "user_dict.simpledic was not created"
+        );
+        assert!(
+            state_dir.join("custom_terms.toml").is_file(),
+            "custom_terms.toml was not created"
+        );
+        assert!(
+            state_dir.join("synonyms.csv").is_file(),
+            "synonyms.csv was not created"
+        );
+        assert!(
+            state_dir
+                .join("hooks/extract/10-md_frontmatter.lua")
+                .is_file(),
+            "hooks/extract/10-md_frontmatter.lua was not created"
+        );
+        assert!(
+            state_dir.join("hooks/score/10-default.lua").is_file(),
+            "hooks/score/10-default.lua was not created"
+        );
+    }
+
+    #[test]
+    fn cmd_init_with_does_not_overwrite_existing_scaffold_files() {
+        // Idempotency: pre-existing user customizations must survive a
+        // second `tsm init`. Asserts every scaffold file individually
+        // because adding a new one without no-overwrite is a footgun.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_dir = dir.path().join(".tsm");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let hook_extract_dir = state_dir.join("hooks/extract");
+        let hook_score_dir = state_dir.join("hooks/score");
+        std::fs::create_dir_all(&hook_extract_dir).unwrap();
+        std::fs::create_dir_all(&hook_score_dir).unwrap();
+
+        let user_files = [
+            (dir.path().join(".tsmignore"), "user_pattern/\n"),
+            (dir.path().join("tsm.toml"), "# user config\n"),
+            (state_dir.join("user_dict.simpledic"), "user word\n"),
+            (state_dir.join("custom_terms.toml"), "# user terms\n"),
+            (state_dir.join("synonyms.csv"), "# user synonyms\n"),
+            (
+                hook_extract_dir.join("10-md_frontmatter.lua"),
+                "-- user extract hook\n",
+            ),
+            (
+                hook_score_dir.join("10-default.lua"),
+                "-- user score hook\n",
+            ),
+        ];
+        for (path, content) in &user_files {
+            std::fs::write(path, content).unwrap();
+        }
+
+        run_init(dir.path());
+
+        for (path, content) in &user_files {
+            let after = std::fs::read_to_string(path).unwrap();
+            assert_eq!(
+                &after,
+                content,
+                "{} was overwritten by cmd_init_with",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_init_with_handles_missing_wordnet_gracefully() {
+        // No wnjpn.db in state_dir — init must succeed (warn-and-continue),
+        // not error. This is the new-user path where `tsm setup` hasn't
+        // run yet.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_, state_dir) = run_init(dir.path());
+
+        let conn = crate::db::get_connection(&state_dir.join("tsm.db")).unwrap();
+        let synonym_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM synonyms", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synonym_rows, 0, "no synonyms should be imported");
+    }
+
+    #[test]
+    fn cmd_init_with_imports_wordnet_when_present() {
+        // WordNet DB pre-staged in state_dir → init imports synonyms.
+        // Covers the post-`tsm setup` flow where the user re-runs `init`.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_dir = dir.path().join(".tsm");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        create_mock_wordnet_db(
+            &state_dir.join("wnjpn.db"),
+            &[("alpha", "beta"), ("gamma", "delta")],
+        );
+
+        run_init(dir.path());
+
+        let conn = crate::db::get_connection(&state_dir.join("tsm.db")).unwrap();
+        let synonym_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM synonyms WHERE source = 'wordnet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(synonym_rows, 2, "wordnet pairs should be imported");
+    }
+
+    #[test]
+    fn cmd_init_with_is_idempotent() {
+        // Running `init` twice — second invocation must succeed and leave
+        // DB / synonyms in the same state. Asserts the INSERT-OR-IGNORE /
+        // diff-sync semantics required for safe re-runs.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_dir = dir.path().join(".tsm");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        create_mock_wordnet_db(&state_dir.join("wnjpn.db"), &[("foo", "bar")]);
+
+        run_init(dir.path());
+        run_init(dir.path()); // second run — must not duplicate or fail
+
+        let conn = crate::db::get_connection(&state_dir.join("tsm.db")).unwrap();
+        let synonym_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM synonyms", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synonym_rows, 1, "second init should not duplicate rows");
+    }
+
+    /// Stage a fake machine cache: a `models/ruri-v3-30m/` directory holding
+    /// a placeholder file, and a valid (mock) `wnjpn.db` so the WordNet
+    /// import succeeds. Returns the two upstream source paths.
+    fn stage_fake_cache(cache_dir: &Path) -> (PathBuf, PathBuf) {
+        let models_src = cache_dir.join("models/ruri-v3-30m");
+        std::fs::create_dir_all(&models_src).unwrap();
+        std::fs::write(models_src.join("model.safetensors"), b"weights").unwrap();
+        let wnjpn_src = cache_dir.join("wnjpn.db");
+        create_mock_wordnet_db(&wnjpn_src, &[("alpha", "beta")]);
+        (models_src, wnjpn_src)
+    }
+
+    /// Assert the single WordNet pair staged by `stage_fake_cache` was
+    /// imported. This closes the cache→placed-link→import seam at the unit
+    /// level: the import reads `state_dir/wnjpn.db`, which is only populated
+    /// by the placement step having materialized the cache link/copy.
+    fn assert_wordnet_synonym_imported(state_dir: &Path) {
+        let conn = crate::db::get_connection(&state_dir.join("tsm.db")).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM synonyms WHERE source = 'wordnet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "WordNet synonym should be imported through the placed link"
+        );
+    }
+
+    #[test]
+    fn cmd_init_with_creates_workspace_symlinks_when_mode_is_symlink() {
+        // symlink mode: workspace entries point at the cache by symbolic
+        // link, leaving no duplicate bytes in the workspace.
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = tempfile::TempDir::new().unwrap();
+        let (models_src, wnjpn_src) = stage_fake_cache(cache.path());
+
+        let (_, state_dir) = run_init_with_cache(
+            dir.path(),
+            &models_src,
+            &wnjpn_src,
+            super::config::LinkMode::Symlink,
+        );
+
+        let models_dst = state_dir.join("models/ruri-v3-30m");
+        let wnjpn_dst = state_dir.join("wnjpn.db");
+        assert!(
+            std::fs::symlink_metadata(&models_dst)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "models/ruri-v3-30m should be a symlink"
+        );
+        assert!(
+            std::fs::symlink_metadata(&wnjpn_dst)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "wnjpn.db should be a symlink"
+        );
+        assert_wordnet_synonym_imported(&state_dir);
+    }
+
+    #[test]
+    fn cmd_init_with_creates_workspace_copies_when_mode_is_copy() {
+        // copy mode: workspace entries are physical, self-contained copies
+        // (no symlink), so the workspace survives the cache being removed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = tempfile::TempDir::new().unwrap();
+        let (models_src, wnjpn_src) = stage_fake_cache(cache.path());
+
+        let (_, state_dir) = run_init_with_cache(
+            dir.path(),
+            &models_src,
+            &wnjpn_src,
+            super::config::LinkMode::Copy,
+        );
+
+        let models_dst = state_dir.join("models/ruri-v3-30m");
+        let wnjpn_dst = state_dir.join("wnjpn.db");
+        let models_meta = std::fs::symlink_metadata(&models_dst).unwrap();
+        assert!(
+            !models_meta.file_type().is_symlink() && models_meta.is_dir(),
+            "models/ruri-v3-30m should be a physical directory"
+        );
+        assert!(
+            models_dst.join("model.safetensors").is_file(),
+            "copied model directory should contain its files"
+        );
+        let wnjpn_meta = std::fs::symlink_metadata(&wnjpn_dst).unwrap();
+        assert!(
+            !wnjpn_meta.file_type().is_symlink() && wnjpn_meta.is_file(),
+            "wnjpn.db should be a physical file"
+        );
+        assert_wordnet_synonym_imported(&state_dir);
+    }
+
+    #[test]
+    fn cmd_init_with_replaces_existing_workspace_links_on_mode_change() {
+        // Re-running init with a different mode rebuilds the workspace
+        // entries: symlink first, then copy → the symlink becomes physical.
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = tempfile::TempDir::new().unwrap();
+        let (models_src, wnjpn_src) = stage_fake_cache(cache.path());
+
+        run_init_with_cache(
+            dir.path(),
+            &models_src,
+            &wnjpn_src,
+            super::config::LinkMode::Symlink,
+        );
+        let wnjpn_dst = dir.path().join(".tsm/wnjpn.db");
+        assert!(
+            std::fs::symlink_metadata(&wnjpn_dst)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "first init should produce a symlink"
+        );
+
+        run_init_with_cache(
+            dir.path(),
+            &models_src,
+            &wnjpn_src,
+            super::config::LinkMode::Copy,
+        );
+        let models_dst = dir.path().join(".tsm/models/ruri-v3-30m");
+        assert!(
+            !std::fs::symlink_metadata(&models_dst)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "re-init with copy should replace the model symlink with a directory"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&wnjpn_dst)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "re-init with copy should replace the wnjpn.db symlink with a file"
+        );
+    }
+
+    #[test]
+    fn cmd_init_with_does_not_self_destruct_when_cache_equals_state_dir() {
+        // Degenerate config where the cache source and the workspace
+        // destination resolve to the same path (cache_dir == state_dir).
+        // Placement must NOT remove the source to "replace" it — in symlink
+        // mode that would delete the cache and leave a dangling self-symlink.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_dir = dir.path().join(".tsm");
+        let models = state_dir.join("models/ruri-v3-30m");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("model.safetensors"), b"weights").unwrap();
+        let wnjpn = state_dir.join("wnjpn.db");
+        create_mock_wordnet_db(&wnjpn, &[("alpha", "beta")]);
+
+        // src == dst for both resources.
+        run_init_with_cache(
+            dir.path(),
+            &models,
+            &wnjpn,
+            super::config::LinkMode::Symlink,
+        );
+
+        assert!(
+            models.join("model.safetensors").is_file(),
+            "the cache model must survive when cache_dir == state_dir"
+        );
+        assert!(
+            wnjpn.is_file(),
+            "the cache WordNet DB must survive when cache_dir == state_dir"
+        );
+        // The surviving wnjpn.db is still importable through the same path.
+        assert_wordnet_synonym_imported(&state_dir);
     }
 
     #[test]
@@ -1632,83 +2511,153 @@ mod tests {
     }
 
     #[test]
-    fn test_format_json_include_content_file_missing() {
-        let results = vec![SearchResult {
-            source_file: "nonexistent.md".to_string(),
-            source_type: "note".to_string(),
-            section_path: "Section".to_string(),
-            snippet: "Content".to_string(),
-            score: 0.5,
-            status: None,
-            related_docs: vec![],
-        }];
-        // File doesn't exist, so content field should not be present
-        let json = format_json(&results, 1, Some(1), Path::new("/tmp/empty")).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed["results"][0].get("content").is_none());
+    fn test_vector_fill_summary_reports_filled() {
+        let msg = vector_fill_summary(7, 0);
+        assert!(
+            msg.contains('7'),
+            "should report filled count, got: {msg:?}"
+        );
+        assert!(
+            msg.to_lowercase().contains("backfilled"),
+            "should announce backfilled vectors, got: {msg:?}"
+        );
     }
 
     #[test]
-    fn test_format_json_include_content_beyond_limit() {
+    fn test_vector_fill_summary_no_missing_when_nothing_skipped() {
+        let msg = vector_fill_summary(0, 0);
+        assert_eq!(msg, "No missing vectors.");
+    }
+
+    #[test]
+    fn test_vector_fill_summary_warns_when_skipped() {
+        let msg = vector_fill_summary(0, 3);
+        assert!(
+            msg.contains('3'),
+            "should report skipped count, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("reindex vectors"),
+            "should point to `reindex vectors` to retry skipped chunks, got: {msg:?}"
+        );
+        assert_ne!(
+            msg, "No missing vectors.",
+            "skip-blocked chunks must not be reported as no-op"
+        );
+    }
+
+    #[test]
+    fn test_vector_fill_summary_reports_both_filled_and_skipped() {
+        // A partial run fills some chunks while others stay stuck on the skip
+        // list. The skip warning must not be suppressed by the filled count —
+        // that is exactly the silent stuck-skip this change exists to prevent.
+        let msg = vector_fill_summary(7, 3);
+        assert!(
+            msg.contains('7'),
+            "should report filled count, got: {msg:?}"
+        );
+        assert!(
+            msg.contains('3'),
+            "should report skipped count, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("reindex vectors"),
+            "should still point to `reindex vectors`, got: {msg:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_surfaces_skipped_vectors() {
         let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("a.md"), "aaa").unwrap();
-        std::fs::write(dir.path().join("b.md"), "bbb").unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
+        let db_path = dir.path().join("test.db");
+        db::init_db(&db_path).unwrap();
+        {
+            let conn = db::get_connection(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO documents(id, file_path, source_type, file_hash, indexed_at)
+                 VALUES (1, 'daily/notes/a.md', 'note', 'h', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks(id, document_id, chunk_index, content)
+                 VALUES (1, 1, 0, 'one'), (2, 1, 1, 'two')",
+                [],
+            )
+            .unwrap();
+            // One chunk is stuck on the skip list (vector-fill will not retry it).
+            conn.execute(
+                "INSERT INTO chunks_vec_skip(chunk_id, reason) VALUES (1, 'encode_error')",
+                [],
+            )
+            .unwrap();
+        }
 
-        let results = vec![
-            SearchResult {
-                source_file: "a.md".to_string(),
-                source_type: "note".to_string(),
-                section_path: "A".to_string(),
-                snippet: "aaa".to_string(),
-                score: 0.5,
-                status: None,
-                related_docs: vec![],
-            },
-            SearchResult {
-                source_file: "b.md".to_string(),
-                source_type: "note".to_string(),
-                section_path: "B".to_string(),
-                snippet: "bbb".to_string(),
-                score: 0.4,
-                status: None,
-                related_docs: vec![],
-            },
-        ];
-        // include_content=1, so only first result gets content
-        let json = format_json(&results, 2, Some(1), dir.path()).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let arr = parsed["results"].as_array().unwrap();
-        assert_eq!(arr[0]["content"], "aaa");
-        assert!(arr[1].get("content").is_none());
+        let report = doctor_check(&db_path);
+        let issues = report.issues();
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("skip") && s.contains("reindex vectors")),
+            "doctor should surface skip-marked chunks with a `reindex vectors` hint, got: {issues:?}"
+        );
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
     }
 
     #[test]
-    fn test_format_text_multiple_results() {
-        let results = vec![
-            SearchResult {
-                source_file: "a.md".to_string(),
-                source_type: "note".to_string(),
-                section_path: "A".to_string(),
-                snippet: "aaa".to_string(),
-                score: 0.5,
-                status: None,
-                related_docs: vec![],
-            },
-            SearchResult {
-                source_file: "b.md".to_string(),
-                source_type: "research".to_string(),
-                section_path: "B".to_string(),
-                snippet: "bbb".to_string(),
-                score: 0.3,
-                status: Some("outdated".to_string()),
-                related_docs: vec![],
-            },
-        ];
-        let text = format_text(&results, results.len());
-        assert!(text.contains("1. [note]"));
-        assert!(text.contains("2. [research]"));
-        assert!(text.contains("status: outdated"));
-        assert!(!text.contains("No results found"));
+    #[serial_test::serial]
+    fn test_doctor_skip_only_gap_does_not_advise_vector_fill() {
+        // When every vector-less chunk is on the skip list, `vector-fill`
+        // cannot help — doctor must not advise it (only `reindex vectors`),
+        // otherwise the two hints contradict each other.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
+        let db_path = dir.path().join("test.db");
+        db::init_db(&db_path).unwrap();
+        {
+            let conn = db::get_connection(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO documents(id, file_path, source_type, file_hash, indexed_at)
+                 VALUES (1, 'daily/notes/a.md', 'note', 'h', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks(id, document_id, chunk_index, content)
+                 VALUES (1, 1, 0, 'one'), (2, 1, 1, 'two')",
+                [],
+            )
+            .unwrap();
+            // Both chunks are stuck on the skip list — nothing is fillable.
+            conn.execute(
+                "INSERT INTO chunks_vec_skip(chunk_id, reason)
+                 VALUES (1, 'encode_error'), (2, 'encode_error')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let report = doctor_check(&db_path);
+        let issues = report.issues();
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("skip") && s.contains("reindex vectors")),
+            "should surface the skip list, got: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|s| s.contains("vector-fill")),
+            "must not advise `vector-fill` when the whole gap is skip-listed, got: {issues:?}"
+        );
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
     }
 
     #[test]
@@ -1754,7 +2703,7 @@ mod tests {
         let conn = db::get_connection(&db_path).unwrap();
         let now = "2026-01-01T00:00:00Z";
         conn.execute(
-            "INSERT INTO dictionary_candidates VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
+            "INSERT INTO dictionary_candidates (surface, frequency, pos, source, first_seen, last_seen, status) VALUES ('candle', 10, 'ascii', 'document', ?, ?, 'pending')",
             rusqlite::params![now, now],
         ).unwrap();
         drop(conn);
@@ -1908,6 +2857,427 @@ mod tests {
             "expected missing file name, got: {issues:?}"
         );
         std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    fn test_init_scaffolds_default_hooks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join(".tsm");
+        std::fs::create_dir_all(&state).unwrap();
+        install_default_hooks(&state).unwrap();
+        let ex =
+            std::fs::read_to_string(state.join("hooks/extract/10-md_frontmatter.lua")).unwrap();
+        let sc = std::fs::read_to_string(state.join("hooks/score/10-default.lua")).unwrap();
+        assert!(ex.contains("function extract"));
+        assert!(sc.contains("function score"));
+    }
+
+    // ─── write_cache_layout (tsm setup, pure FS) ─────────────────────
+    //
+    // These exercise the cache-population logic with pre-staged sources so they
+    // need no network (HF Hub / GitHub). The full `cmd_setup` with real
+    // downloads is covered by E2E (`tests/e2e.sh`).
+
+    /// Stage a fake HF snapshot dir (with `MODEL_FILES`) and a fake WordNet
+    /// source file, returning their paths. The snapshot lives outside the cache
+    /// (as the real HF cache does); the source lives under `cache/sources/`.
+    fn stage_fake_sources(cache_dir: &Path, root: &Path) -> (PathBuf, PathBuf) {
+        let snapshot_dir = root.join("hf_snapshot");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        for f in config::MODEL_FILES {
+            std::fs::write(snapshot_dir.join(f), "dummy-model-bytes").unwrap();
+        }
+        let sources_path = cache_dir.join("sources").join("wnjpn-v1.1.db");
+        std::fs::create_dir_all(sources_path.parent().unwrap()).unwrap();
+        std::fs::write(&sources_path, "dummy-wnjpn-db").unwrap();
+        (snapshot_dir, sources_path)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_cache_layout_symlink_creates_full_layout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, tmp.path());
+
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Symlink).unwrap();
+
+        let model = cache_dir.join("models/ruri-v3-30m");
+        let wnjpn = cache_dir.join("wnjpn.db");
+        assert!(model.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(wnjpn.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&model).unwrap(), snapshot);
+        assert_eq!(std::fs::read_link(&wnjpn).unwrap(), sources);
+
+        let m = manifest::read(&cache_dir.join("manifest.json")).unwrap();
+        assert_eq!(m.version, 1);
+        assert_eq!(m.resources.len(), 2);
+        let model_entry = &m.resources["models/ruri-v3-30m"];
+        assert_eq!(model_entry.mode, config::LinkMode::Symlink);
+        assert_eq!(model_entry.target, snapshot);
+        assert!(model_entry.size > 0);
+        assert_eq!(
+            model_entry.model_id.as_deref(),
+            Some("cl-nagoya/ruri-v3-30m")
+        );
+        assert!(model_entry.source_url.is_none());
+        assert!(model_entry.version.is_none());
+        let wn_entry = &m.resources["wnjpn.db"];
+        assert_eq!(wn_entry.mode, config::LinkMode::Symlink);
+        // wnjpn target is cache-relative (S1); the symlink itself points at the
+        // real (absolute) source, verified via read_link above.
+        assert_eq!(wn_entry.target, PathBuf::from("sources/wnjpn-v1.1.db"));
+        assert!(!wn_entry.target.is_absolute());
+        assert!(wn_entry.size > 0);
+        assert!(wn_entry.source_url.is_some());
+        assert_eq!(wn_entry.version.as_deref(), Some("v1.1"));
+        assert!(wn_entry.model_id.is_none());
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_cache_layout_copy_creates_physical_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, tmp.path());
+
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Copy).unwrap();
+
+        let model = cache_dir.join("models/ruri-v3-30m");
+        let wnjpn = cache_dir.join("wnjpn.db");
+        let model_meta = model.symlink_metadata().unwrap();
+        let wnjpn_meta = wnjpn.symlink_metadata().unwrap();
+        assert!(model_meta.file_type().is_dir() && !model_meta.file_type().is_symlink());
+        assert!(wnjpn_meta.file_type().is_file() && !wnjpn_meta.file_type().is_symlink());
+        for f in config::MODEL_FILES {
+            assert!(model.join(f).is_file());
+        }
+        let m = manifest::read(&cache_dir.join("manifest.json")).unwrap();
+        assert_eq!(
+            m.resources["models/ruri-v3-30m"].mode,
+            config::LinkMode::Copy
+        );
+        assert_eq!(m.resources["wnjpn.db"].mode, config::LinkMode::Copy);
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_cache_layout_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, tmp.path());
+
+        // Run twice (and across modes) — must not error and stay valid.
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Symlink).unwrap();
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Copy).unwrap();
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Copy).unwrap();
+
+        let m = manifest::read(&cache_dir.join("manifest.json")).unwrap();
+        assert_eq!(m.resources.len(), 2);
+        // Final mode wins; the copy converged from the earlier symlink.
+        let model = cache_dir.join("models/ruri-v3-30m");
+        assert!(!model.symlink_metadata().unwrap().file_type().is_symlink());
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_cache_layout_does_not_touch_workspace() {
+        let cache_tmp = tempfile::TempDir::new().unwrap();
+        let state_tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", cache_tmp.path());
+        std::env::set_var("TSM_STATE_DIR", state_tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, cache_tmp.path());
+
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Symlink).unwrap();
+
+        // Workspace state paths must be untouched by `setup`.
+        assert!(
+            !config::models_dir().exists(),
+            "setup must not create workspace models dir"
+        );
+        assert!(
+            !config::wordnet_db_path().exists(),
+            "setup must not create workspace wnjpn.db"
+        );
+        // The only thing under state_tmp should be nothing setup created: the
+        // dir stays empty of model/wnjpn artefacts.
+        assert!(!state_tmp.path().join("models").exists());
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    // ─── doctor two-layer integrity (Workspace / System cache) ───────
+    //
+    // Section builders read global config (state_dir / cache_dir), so these are
+    // `#[serial]` and pin TSM_STATE_DIR / TSM_CACHE_DIR to tempdirs.
+
+    fn item<'a>(section: &'a DoctorSection, needle: &str) -> &'a CheckItem {
+        section
+            .items
+            .iter()
+            .find(|i| i.message.contains(needle))
+            .unwrap_or_else(|| panic!("no item matching {needle:?} in {:?}", section.items))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_workspace_section_reports_alive_links() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        config::reload();
+        // Stage live symlinks for both workspace resources.
+        let target_dir = tmp.path().join("cache-model");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target_db = tmp.path().join("cache-wnjpn.db");
+        std::fs::write(&target_db, "db").unwrap();
+        std::fs::create_dir_all(tmp.path().join("models")).unwrap();
+        std::os::unix::fs::symlink(&target_dir, tmp.path().join("models/ruri-v3-30m")).unwrap();
+        std::os::unix::fs::symlink(&target_db, tmp.path().join("wnjpn.db")).unwrap();
+
+        let section = workspace_section();
+        assert_eq!(section.name, "Workspace");
+        assert_eq!(item(&section, "models/ruri-v3-30m").status, CheckStatus::Ok);
+        assert!(item(&section, "models/ruri-v3-30m")
+            .message
+            .contains("link alive"));
+        assert_eq!(item(&section, "wnjpn.db").status, CheckStatus::Ok);
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_workspace_section_reports_broken_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        config::reload();
+        // Symlink to a target that does not exist → broken.
+        std::fs::create_dir_all(tmp.path().join("models")).unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("gone"),
+            tmp.path().join("models/ruri-v3-30m"),
+        )
+        .unwrap();
+
+        let section = workspace_section();
+        let it = item(&section, "models/ruri-v3-30m");
+        assert_eq!(it.status, CheckStatus::Error);
+        assert!(it.message.contains("link broken"));
+        assert!(it.hint.as_deref().unwrap().contains("tsm init"));
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_workspace_section_reports_missing_when_no_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path());
+        config::reload();
+
+        let section = workspace_section();
+        let it = item(&section, "models/ruri-v3-30m");
+        assert_eq!(it.status, CheckStatus::Warning);
+        assert!(it.message.contains("not present"));
+        let hint = it.hint.as_deref().unwrap();
+        // Graceful: a missing workspace link points at `tsm init` and notes the
+        // embedder still works via the cache (it is an optional override).
+        assert!(hint.contains("tsm init") && hint.contains("cache"));
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_cache_section_reports_alive_when_cache_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, tmp.path());
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Symlink).unwrap();
+
+        let section = system_cache_section();
+        assert_eq!(section.name, "System cache");
+        assert_eq!(item(&section, "models/ruri-v3-30m").status, CheckStatus::Ok);
+        assert_eq!(item(&section, "wnjpn.db").status, CheckStatus::Ok);
+        assert_eq!(item(&section, "manifest.json").status, CheckStatus::Ok);
+        assert!(item(&section, "manifest.json")
+            .message
+            .contains("2 entries"));
+        // Per-entry reconciliation reports a size match.
+        assert!(section
+            .items
+            .iter()
+            .any(|i| i.message.contains("matches manifest") && i.status == CheckStatus::Ok));
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_cache_section_reports_broken_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        // A dangling cache wnjpn.db symlink (no manifest, no model).
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone.db"), config::cache_wordnet_db_path())
+            .unwrap();
+
+        let section = system_cache_section();
+        let it = item(&section, "wnjpn.db");
+        assert_eq!(it.status, CheckStatus::Error);
+        assert!(it.message.contains("link broken"));
+        // No manifest yet → graceful "not found", not a crash.
+        let mf = item(&section, "manifest.json");
+        assert_eq!(mf.status, CheckStatus::Warning);
+        assert!(mf.message.contains("not found"));
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_cache_section_warns_on_size_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, tmp.path());
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Symlink).unwrap();
+        // Grow the source after the manifest recorded its size → mismatch.
+        std::fs::write(&sources, "dummy-wnjpn-db-now-much-longer-than-before").unwrap();
+
+        let section = system_cache_section();
+        assert!(
+            section
+                .items
+                .iter()
+                .any(|i| i.status == CheckStatus::Warning
+                    && i.message.contains("wnjpn.db")
+                    && i.message.contains("manifest records")),
+            "expected a size-mismatch warning, got: {:?}",
+            section.items
+        );
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_cache_section_copy_mode_detects_corrupted_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        let cache_dir = config::cache_dir();
+        let (snapshot, sources) = stage_fake_sources(&cache_dir, tmp.path());
+        write_cache_layout(&cache_dir, &snapshot, &sources, config::LinkMode::Copy).unwrap();
+        // Corrupt the PLACED physical copy while the source stays intact. Sizing
+        // the source would falsely report "matches manifest"; sizing the placed
+        // entry must catch the corruption.
+        std::fs::write(
+            cache_dir.join("wnjpn.db"),
+            "corrupted-and-a-different-length",
+        )
+        .unwrap();
+
+        let section = system_cache_section();
+        // The reconciliation line ("wnjpn.db: ..."), not the link line.
+        let it = item(&section, "wnjpn.db: ");
+        assert_eq!(it.status, CheckStatus::Warning);
+        assert!(it.message.contains("manifest records"));
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_cache_section_errors_on_malformed_manifest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        config::reload();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::fs::write(config::cache_manifest_path(), "{ not valid json").unwrap();
+
+        let section = system_cache_section();
+        let it = item(&section, "manifest.json");
+        assert_eq!(it.status, CheckStatus::Error);
+        assert!(it.message.contains("invalid"));
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_json_output_includes_workspace_and_cache_sections() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path().join("state"));
+        std::env::set_var("TSM_CACHE_DIR", tmp.path().join("cache"));
+        config::reload();
+
+        let mut report = DoctorReport::default();
+        append_resource_sections(&mut report);
+        let json = report.to_json();
+        assert!(json.contains("Workspace"), "json: {json}");
+        assert!(json.contains("System cache"), "json: {json}");
+
+        std::env::remove_var("TSM_STATE_DIR");
+        std::env::remove_var("TSM_CACHE_DIR");
+        config::reload();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_doctor_text_output_includes_two_sections_with_hints() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", tmp.path().join("state"));
+        std::env::set_var("TSM_CACHE_DIR", tmp.path().join("cache"));
+        config::reload();
+
+        let mut report = DoctorReport::default();
+        append_resource_sections(&mut report);
+        // Both layers present as distinct sections.
+        let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Workspace"));
+        assert!(names.contains(&"System cache"));
+        // An un-set-up environment yields recovery hints on the issues.
+        let issues = report.issues();
+        assert!(
+            issues.iter().any(|s| s.contains("tsm setup")),
+            "expected recovery hints, got: {issues:?}"
+        );
+
+        std::env::remove_var("TSM_STATE_DIR");
+        std::env::remove_var("TSM_CACHE_DIR");
         config::reload();
     }
 }

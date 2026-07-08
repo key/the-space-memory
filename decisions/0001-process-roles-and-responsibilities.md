@@ -1,7 +1,12 @@
+---
+status: deprecated
+created: 2026-04-01
+updated: 2026-04-01
+superseded_by: 0002-watcher-thread-integration.md
+---
+
 # ADR-0001: プロセスの役割と責務分担
 
-- **Status**: **Deprecated（廃止）** — [ADR-0002](./0002-watcher-thread-integration.md) で置換
-- **Date**: 2026-04-01
 - **Deciders**: key
 - **Related**:
   [company ADR-0010](https://github.com/key/company/blob/main/decisions/0010-tsmd-process-separation.md),

@@ -2,13 +2,28 @@
 
 ![The Space Memory](docs/assets/cover.png)
 
-[English](README.md)
+[English](README.md) · [ドキュメント](https://key.github.io/the-space-memory/)
 
 ## 概要
 
 Rustで構築されたクロスワークスペース・ナレッジ検索エンジン。
 複数ワークスペースのMarkdownドキュメントをインデックス化し、
 FTS5全文検索とベクトルセマンティック検索（ruri-v3-30m, 256次元）のハイブリッド検索を提供する。
+
+## Claude Code プラグイン
+
+本リポジトリが提供するのは `tsm` / `tsmd` バイナリのみ。Claude Code プラグイン
+（スキル・エージェント・hook）は別リポジトリ
+[`key/tsm-plugin-cc`](https://github.com/key/tsm-plugin-cc) にある
+（リポジトリ単体がマーケットプレイスを兼ねる）。
+
+```bash
+/plugin marketplace add key/tsm-plugin-cc
+/plugin install the-space-memory@tsm-plugin-cc
+```
+
+プラグインは `tsm` CLI を呼び出すため、`tsm` は別途インストールし（下記）、
+`PATH` に通すこと。
 
 ## コンセプト
 
@@ -45,14 +60,16 @@ FTS5全文検索とベクトルセマンティック検索（ruri-v3-30m, 256次
 # 1. ビルド
 cargo build --release
 
-# 2. ruri-v3-30m モデルのダウンロード
+# 2. 外部リソースのダウンロード（ruri モデル + 日本語 WordNet DB）。
+#    マシン共有のためセットアップは 1 回だけでよい。
 tsm setup
 
-# 3. ドキュメントのルートディレクトリを設定
-export TSM_INDEX_ROOT=~/my-notes
-
-# 4. データベースの初期化（プロジェクトルートに default .tsmignore を
-#    同時に配置する。既存ファイルがある場合は上書きしない）
+# 3. ノートのディレクトリでワークスペース初期化：DB スキーマ、デフォルト設定ファイル
+#    （tsm.toml、.tsmignore、.tsm/{user_dict.simpledic,custom_terms.toml,
+#    synonyms.csv, hooks/extract/10-md_frontmatter.lua,
+#    hooks/score/10-default.lua}）の配置、WordNet/シノニムのインポートまで実施。
+#    冪等で、ユーザがカスタマイズしたファイルは絶対に上書きしない。
+cd ~/my-notes
 tsm init
 
 # 5. デーモンの起動（embedder + ファイル監視）
@@ -63,15 +80,26 @@ tsm index
 
 # 7. 検索
 tsm search -q "クエリ" -k 5
+
+# ディレクトリで絞り込む（絶対パスまたはカレントディレクトリ相対）
+tsm search -q "クエリ" --path notes/
 ```
+
+`tsm setup` は `HF_HUB_CACHE` を自動設定する。Hugging Face のモデルキャッシュを
+別の場所に向けたい場合は明示的に上書きする。
+
+`tsm setup` はマシン共有のキャッシュ（`~/.cache/tsm`）をマシンごとに 1 回だけ
+構築し、`tsm init` がそのモデルと WordNet DB をワークスペースの `.tsm/` に
+symlink（既定）または copy で展開する。詳細は
+[Resource Layers and `link_mode`](docs/configuration.md#resource-layers-and-link_mode) を参照。
 
 ### インデックス対象
 
-tsmは `TSM_INDEX_ROOT` 配下の `.md` ファイルを再帰的にスキャンする。
+tsmはプロジェクトルート（`tsm.toml` があるディレクトリ）配下の `.md` ファイルを再帰的にスキャンする。
 典型的なディレクトリ構成：
 
 ```text
-~/my-notes/              ← TSM_INDEX_ROOT
+~/my-notes/              ← プロジェクトルート（tsm.toml を含む）
 ├── projects/
 │   ├── project-a.md
 │   └── project-b.md
@@ -81,7 +109,9 @@ tsmは `TSM_INDEX_ROOT` 配下の `.md` ファイルを再帰的にスキャン�
     └── 2026-04.md
 ```
 
-`TSM_INDEX_ROOT` 配下のすべてのMarkdownファイルが自動的にインデックスされる。
+既定では（`content_dirs` 未設定）プロジェクトルート配下のすべての Markdown ファイルがインデックスされる。
+`tsm.toml` に `content_dirs` を設定すると、対象を特定のディレクトリに絞り込める。
+列挙した各ディレクトリは再帰的にスキャンされるが、その外側にあるものはインデックスされない。
 ファイル監視により、追加・変更・削除をリアルタイムに検知する。
 
 ### メンテナンス
@@ -99,6 +129,127 @@ tsm rebuild --apply   # DB削除して再構築
 
 `tsm doctor` でシステムの状態とデーモンのステータスを確認できる。
 
+## Lua フック
+
+tsm は組み込み Lua（mlua, lua54）によるユーザー編集可能なメタデータ抽出と
+結果スコアリングをサポートする。フックは `.tsm/hooks/` に配置し、`tsm init` で
+雛形が生成される。
+
+### フックディレクトリ構成
+
+```text
+.tsm/hooks/
+├── extract/
+│   └── 10-md_frontmatter.lua   ← extract フック（インデックス時）
+└── score/
+    └── 10-default.lua          ← score フック（検索時）
+```
+
+- `.lua` ファイルのみ読み込まれる。それ以外のファイルは無視される。
+- 同一ディレクトリ内のフックはファイル名のソート順に実行される。
+- フックを削除せず無効化するには `.lua` 以外に拡張子を変更する
+  （例: `10-default.lua.disabled`）。
+- ディレクトリが空または存在しない場合は組み込みデフォルトにフォールバックする。
+
+### Extract フック
+
+インデックス時に各ドキュメントチャンクへ呼び出される。受け取るコンテキスト：
+
+```lua
+-- ctx のフィールド: path, body, frontmatter（トップレベル YAML キー）, metadata（累積済み）
+function extract(ctx)
+  local fm = ctx.frontmatter or {}
+  return { status = fm.status, effective_date = fm.updated }
+end
+```
+
+`ctx.frontmatter` はトップレベルの YAML キーを公開する：スカラー（string/number/bool）と
+シーケンス（`tags` など。Lua 配列として渡る）。ネストしたマップは渡されない。
+
+スカラー値（string、number、boolean）のフラットなテーブルを返す。
+全 extract フックの結果は浅くマージ（同一キーは後勝ち）され、
+`documents.metadata`（JSON カラム）に保存される。
+
+### Score フック
+
+検索時に各結果へ呼び出される。受け取るコンテキスト：
+
+```lua
+-- ctx のフィールド: metadata（extract 結果）, rrf, source_type, path, half_life_days
+-- 組み込み関数: decay(date, half_life_days), today()
+function score(ctx)
+  local m = ctx.metadata or {}
+  local penalty = ({ outdated = 0.4 })[m.status] or 1.0
+  return penalty * decay(m.effective_date, ctx.half_life_days)
+end
+```
+
+上記は最小例。同梱デフォルト（`score/10-default.lua`）は完全な status→ペナルティ表を使う：
+`superseded=0.2`、`rejected=0.3`、`dropped=0.3`、`deprecated=0.3`、
+`outdated=0.4`、`proposed=0.7`、その他は `1.0`。
+
+各フックは乗数（`>= 0`）を返す。最終スコアは
+`rrf × weight × Π(score フック)` となる。無効な戻り値（負値、NaN、±Inf）は
+警告を出して `1.0` として扱われる。
+
+### サンドボックスとライフサイクル
+
+- Lua VM はサンドボックス化されている。標準ライブラリ（`io`/`os`/`package`）なし、
+  メモリ上限 64 MiB。フックはファイルシステム・ネットワーク・プロセスにアクセスできない。
+- デーモンはすべてのフックを起動時に検証・ロードする（構文エラーやエントリポイント不在は fail-fast）。
+  CLI は遅延プロセス内キャッシュを使用する。
+- **フック編集後は `tsm restart` が必要** — フックは実行中に再読み込みされない。
+- **`metadata` カラムは接続時に自動追加される**（冪等マイグレーション）。既存行は metadata が NULL のまま
+  となり、スコアラーは `status`/`updated` カラムから合成するため、スコアリングへの影響はない。
+  カスタム extract フック作成後に既存ドキュメントへ metadata を反映したい場合は `tsm reindex` を
+  実行する — 破壊的な全再構築は不要。
+
+## 環境変数
+
+以下の設定はいずれも `tsm.toml`（`tsm.toml キー` 列）でも指定でき、環境変数が
+優先される。全変数の詳細は [docs/configuration.md](docs/configuration.md) を参照。
+
+| 変数 | デフォルト | `tsm.toml` キー | 説明 |
+|---|---|---|---|
+| `TSM_CONFIG` | _(自動探索)_ | _(なし)_ | 設定ファイルのパス。それが置かれているディレクトリがプロジェクトルートになる |
+| `TSM_STATE_DIR` | `.tsm` | `state_dir` | tsm の状態一式（DB・ソケット・PID・ログ・ユーザー辞書）のルートディレクトリ |
+| `TSM_CACHE_DIR` | `$XDG_CACHE_HOME/tsm`（無ければ `$HOME/.cache/tsm`） | `cache_dir` | モデルと WordNet DB のキャッシュディレクトリ |
+| `TSM_EMBEDDER_SOCKET` | `{state_dir}/embedder.sock` | `embedder_socket_path` | embedder 子プロセスの UNIX ソケット |
+| `TSM_DAEMON_SOCKET` | `{state_dir}/daemon.sock` | `daemon_socket_path` | `tsmd` デーモンの UNIX ソケット |
+| `TSM_LOG_DIR` | `{state_dir}/logs` | `log_dir` | デーモンログの出力ディレクトリ |
+| `TSM_EMBEDDER_IDLE_TIMEOUT` | `600` | `embedder_idle_timeout_secs` | embedder が自動停止するまでのアイドル秒数（`0` = 無効）。`tsmd` は `--no-idle-timeout` で起動するため、これは単体起動時のみ有効 |
+| `TSM_EMBEDDER_BACKFILL_INTERVAL` | `300` | `embedder_backfill_interval_secs` | ベクター backfill の定期チェック間隔（秒、`0` = 無効） |
+| `TSM_SEARCH_FALLBACK` | `error` | `search_fallback` | embedder 停止時の挙動: `error` または `fts_only` |
+| `TSM_USER_DICT` | `{state_dir}/user_dict.simpledic` | `user_dict_path` | lindera ユーザー辞書のパス |
+| `TSM_SETUP_LINK_MODE` | `symlink` | `[setup].link_mode` | `tsm setup` がキャッシュ資源を配置する方式: `symlink` または `copy` |
+| `TSM_INIT_LINK_MODE` | `symlink` | `[init].link_mode` | `tsm init` がワークスペース資源をキャッシュへ紐付ける方式: `symlink` または `copy` |
+| `TSM_READER_POOL_SIZE` | CPU コア数 | `reader_pool_size` | デーモンの `query_only` リーダープールの接続数。同時読み取り数の上限 |
+| `TSM_REINDEX_FTS_BATCH_SIZE` | `200` | `reindex_fts_batch_size` | FTS reindex の 1 バッチあたりのドキュメント数。小さいほど割り込み粒度が細かく fsync が増加、大きいほど reindex スループットが向上 |
+
+このほか `RUST_LOG`（ログレベル、デフォルト `info`）と `NO_COLOR`（カラー出力の
+無効化）を尊重する。
+
+## ベンチマーク
+
+検索・インデックスパイプラインの性能ベンチと、`src/`・`benches/`・`Cargo.toml`
+を変更する全 PR で走る CI リグレッションゲート。リグレッションゲートの対象は
+embedder 呼び出し回数のみ（決定的な値のため完全一致判定）で、インデックス
+スループットと検索レイテンシは記録のみでゲート対象外。設計の背景、ローカルでの
+実行方法、CI ワークフローの内部構造は
+[docs/benchmarks.md](docs/benchmarks.md)（英語）を参照。
+
+## 検索品質
+
+手動で正解付けした golden コーパスに対して Precision@5 / MRR / nDCG@5 を
+計測し、コミット済みのベースラインに対して CI で gate する。辞書・
+スコアリング・フックの変更など、既存テストは壊さないが検索品質を静かに
+劣化させる類の変更を検知するのが目的。ローカルでは
+`bash tests/quality_bench.sh` で実行できる。
+
+設計方針、golden コーパス/クエリのフォーマット、ベースラインの実行・更新
+方法、gate の仕組みの詳細は [Search Quality](docs/search-quality.md)
+（英語）を参照。
+
 ## ドキュメント
 
 - [コマンドリファレンス](docs/command-reference.md) — CLIコマンド、フラグ、使用例
@@ -106,6 +257,8 @@ tsm rebuild --apply   # DB削除して再構築
 - [データフロー](docs/data-flow.md) — インデックスと検索のフロー図
 - [設定リファレンス](docs/configuration.md) — 環境変数と設定ファイルのリファレンス
 - [ユーザー辞書](docs/user-dictionary.md) — カスタム辞書の管理
+- [ベンチマーク](docs/benchmarks.md) — 性能ベンチ、CI リグレッションゲート、ベースラインのライフサイクル
+- [Search Quality](docs/search-quality.md)（英語） — Precision/MRR/nDCG 回帰 gate: golden コーパス、gate 設計、ベースライン更新
 - [設計判断](decisions/) — ADR（アーキテクチャ決定記録）
 
 ## 背景

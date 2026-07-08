@@ -1,2 +1,5 @@
 [global]
 line_length = 120
+# superpowers working docs (specs / plans) are code-block-heavy and don't suit
+# prose-oriented Markdown lint; exclude them.
+exclude = ["docs/superpowers/**"]

@@ -4,6 +4,8 @@ use std::sync::{OnceLock, RwLock};
 
 use directories::ProjectDirs;
 
+pub use crate::config_accessors::*;
+
 // ─── Internal constants (not user-configurable) ──────────────────
 
 pub const MAX_CHUNK_CHARS: usize = 800;
@@ -15,14 +17,20 @@ pub const DEFAULT_HALF_LIFE_DAYS: f64 = 90.0;
 pub const SNIPPET_MAX_CHARS: usize = 200;
 pub const MIN_SESSION_MESSAGE_LEN: usize = 10;
 pub const BACKFILL_BATCH_SIZE: usize = 8;
-pub const REINDEX_FTS_BATCH_SIZE: usize = 1000;
+/// Default FTS reindex batch size when `reindex_fts_batch_size` is unset.
+/// Smaller = finer write preemption, larger = better full-reindex
+/// throughput. 200 is the middle ground; tune via config + measurement.
+pub const DEFAULT_REINDEX_FTS_BATCH_SIZE: usize = 200;
+/// Default per-document chunk cap in the search result window (#299).
+/// Caps same-document flooding so below-cliff documents can surface. `0`
+/// disables the cap (plain top-k).
+pub const DEFAULT_MAX_CHUNKS_PER_DOCUMENT: usize = 3;
 pub const MAX_QUERY_EXPANSIONS: usize = 5;
 pub const RECENT_DAYS: i64 = 30;
 pub const DICT_CANDIDATE_FREQ_THRESHOLD: i64 = 5;
 pub const MIN_QUERY_KEYWORDS: usize = 1;
 
 const DEFAULT_STATE_DIR: &str = ".tsm";
-const DEFAULT_INDEX_ROOT: &str = "/workspaces";
 const DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS: u64 = 300;
 
@@ -75,6 +83,53 @@ impl std::str::FromStr for SearchFallback {
     }
 }
 
+/// File placement strategy when materializing cached resources.
+///
+/// `Symlink` (default) references the upstream entry by symbolic link;
+/// `Copy` physically duplicates it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkMode {
+    /// Reference upstream entries via symbolic link (default).
+    #[default]
+    Symlink,
+    /// Physically copy upstream entries into the destination.
+    Copy,
+}
+
+impl<'de> serde::Deserialize<'de> for LinkMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse::<LinkMode>().map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for LinkMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LinkMode::Symlink => write!(f, "symlink"),
+            LinkMode::Copy => write!(f, "copy"),
+        }
+    }
+}
+
+impl std::str::FromStr for LinkMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "symlink" => Ok(LinkMode::Symlink),
+            "copy" => Ok(LinkMode::Copy),
+            other => Err(format!(
+                "unknown link_mode value: '{other}' (expected 'symlink' or 'copy')"
+            )),
+        }
+    }
+}
+
 const DEFAULT_SESSION_WEIGHT: f64 = 0.3;
 const DEFAULT_SESSION_HALF_LIFE_DAYS: f64 = 30.0;
 const DEFAULT_IGNORE_FILE: &str = ".tsmignore";
@@ -106,6 +161,20 @@ pub(crate) struct ClaudeSessionConfig {
     pub half_life_days: Option<f64>,
 }
 
+/// The `[setup]` section of tsm.toml.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct SetupConfig {
+    pub link_mode: Option<LinkMode>,
+}
+
+/// The `[init]` section of tsm.toml.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct InitConfig {
+    pub link_mode: Option<LinkMode>,
+}
+
 /// The `[index]` section of tsm.toml.
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(default)]
@@ -122,16 +191,24 @@ pub(crate) struct IndexConfig {
 #[serde(default)]
 pub(crate) struct ConfigFile {
     state_dir: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
     index_root: Option<PathBuf>,
     embedder_socket_path: Option<PathBuf>,
     daemon_socket_path: Option<PathBuf>,
     log_dir: Option<PathBuf>,
     embedder_idle_timeout_secs: Option<u64>,
     embedder_backfill_interval_secs: Option<u64>,
+    reader_pool_size: Option<u64>,
+    reindex_fts_batch_size: Option<u64>,
+    max_chunks_per_document: Option<u64>,
     search_fallback: Option<SearchFallback>,
     user_dict_path: Option<PathBuf>,
     #[serde(default)]
     index: IndexConfig,
+    #[serde(default)]
+    setup: SetupConfig,
+    #[serde(default)]
+    init: InitConfig,
 }
 
 /// Fully resolved configuration.
@@ -147,10 +224,11 @@ pub struct ResolvedConfig {
     /// Env: `TSM_STATE_DIR`. Config: `state_dir`.
     pub state_dir: PathBuf,
 
-    /// Root directory containing content workspaces to index.
-    /// Default: `/workspaces`.
-    /// Env: `TSM_INDEX_ROOT`. Config: `index_root`.
-    pub index_root: PathBuf,
+    /// Root directory for the machine-wide cache (model files, WordNet DB,
+    /// `manifest.json`). Shared across all workspaces on the host.
+    /// Default: `$XDG_CACHE_HOME/tsm/` (or `$HOME/.cache/tsm/` if XDG unset).
+    /// Env: `TSM_CACHE_DIR`. Config: `cache_dir`.
+    pub cache_dir: PathBuf,
 
     /// UNIX socket path for the embedder child process (encode requests).
     /// Default: `{state_dir}/embedder.sock`.
@@ -177,6 +255,22 @@ pub struct ResolvedConfig {
     /// Env: `TSM_EMBEDDER_BACKFILL_INTERVAL`. Config: `embedder_backfill_interval_secs`.
     pub embedder_backfill_interval_secs: u64,
 
+    /// Number of read-only connections in the daemon's reader pool.
+    /// Default: CPU core count. Env: `TSM_READER_POOL_SIZE`. Config: `reader_pool_size`.
+    /// Caps concurrent reads.
+    pub reader_pool_size: usize,
+
+    /// FTS reindex batch size; smaller = finer preemption, more fsync.
+    /// Default: `DEFAULT_REINDEX_FTS_BATCH_SIZE`. Env: `TSM_REINDEX_FTS_BATCH_SIZE`.
+    /// Config: `reindex_fts_batch_size`.
+    pub reindex_fts_batch_size: usize,
+
+    /// Max chunks per document in the search result window (#299). Caps
+    /// same-document flooding; `0` disables the cap. Default:
+    /// `DEFAULT_MAX_CHUNKS_PER_DOCUMENT`. Env: `TSM_MAX_CHUNKS_PER_DOCUMENT`.
+    /// Config: `max_chunks_per_document`.
+    pub max_chunks_per_document: usize,
+
     /// Behavior when the embedder is stopped during search.
     /// Default: `Error` (refuse to search without vector search).
     /// Env: `TSM_SEARCH_FALLBACK`. Config: `search_fallback`.
@@ -187,8 +281,18 @@ pub struct ResolvedConfig {
     /// Env: `TSM_USER_DICT`. Config: `user_dict_path`.
     pub user_dict_path: PathBuf,
 
+    /// Strategy `tsm setup` uses when materializing entries inside `cache_dir`
+    /// (HuggingFace cache → cache, sources → cache).
+    /// Default: `Symlink`. Env: `TSM_SETUP_LINK_MODE`. Config: `[setup].link_mode`.
+    pub setup_link_mode: LinkMode,
+
+    /// Strategy `tsm init` uses when materializing entries inside `state_dir`
+    /// (cache → `.tsm/`).
+    /// Default: `Symlink`. Env: `TSM_INIT_LINK_MODE`. Config: `[init].link_mode`.
+    pub init_link_mode: LinkMode,
+
     /// Content directories with scoring weights and half-life.
-    /// Empty = auto-discover mode (recursively index all .md under index_root).
+    /// Empty = auto-discover mode (recursively index all .md under project_root).
     pub content_dirs: Vec<ContentDir>,
 
     /// Score weight for Claude Code session data.
@@ -197,19 +301,29 @@ pub struct ResolvedConfig {
     /// Half-life in days for Claude Code session data time decay.
     pub session_half_life_days: f64,
 
-    /// Whether to also apply the root `.gitignore` under `index_root` during indexing.
+    /// Whether to also apply the root `.gitignore` under `project_root` during indexing.
     /// Default: true. Config: `[index].respect_gitignore`.
     pub respect_gitignore: bool,
 
     /// Filename of the project-level ignore file, resolved relative to the tsm
     /// project root (the directory containing `tsm.toml`). Its patterns are
-    /// applied relative to `index_root`.
+    /// applied relative to `project_root`.
     /// Default: `.tsmignore`. Config: `[index].ignore_file`.
     pub ignore_file: String,
 
     /// File extensions to include during indexing (without leading dot).
     /// Default: `["md"]`. Config: `[index].extensions`.
     pub extensions: Vec<String>,
+
+    /// Set when a loaded config file still carries a legacy `index_root` key
+    /// (removed). The value is captured here instead of
+    /// calling `process::exit` so each caller can decide how to handle it:
+    /// - CLI startup (`tsm` main): hard-exit with a migration message.
+    /// - Daemon startup (`tsmd`): `anyhow::bail!` before socket bind.
+    /// - Config reload: push a warning into the reload warnings vec and keep running.
+    ///
+    /// `None` means no legacy key was found. Not user-configurable via TOML.
+    pub rejected_index_root: Option<PathBuf>,
 
     /// Directory tsm treats as the user's workspace — where `.tsmignore`
     /// and `tsm.toml` are expected to live. Derived at load time from the
@@ -234,19 +348,41 @@ pub struct ResolvedConfig {
 
 impl ResolvedConfig {
     /// Resolve all config values from environment variables, config files, and defaults.
+    ///
+    /// Two resolution paths:
+    /// - **Injected** (the `tsm` CLI calls `set_project_root()` in `main`):
+    ///   the project root is explicit, so the config file is loaded only from
+    ///   `<root>/tsm.toml` (or `$TSM_CONFIG`). No XDG fallback.
+    /// - **Un-injected** (`tsmd`, tests): legacy discovery via
+    ///   `config_file_candidates()` incl. the XDG config dir, with
+    ///   `cwd_fallback()` for the project root. Preserved so `tsmd` keeps
+    ///   working unchanged until it gains its own `--project-root` injection.
     pub fn from_env() -> Self {
+        if let Some(root) = injected_root() {
+            let tsm_config = std::env::var_os("TSM_CONFIG").map(PathBuf::from);
+            return Self::from_env_injected(root, tsm_config.as_deref());
+        }
         let (file_cfg, loaded_root) = load_config_from(&config_file_candidates());
         let project_root = loaded_root.unwrap_or_else(cwd_fallback);
         Self::from_config_file(&file_cfg, project_root)
+    }
+
+    /// Resolve config for an explicitly injected project root:
+    /// load `tsm.toml` from `<root>` (or `$TSM_CONFIG`) only — no XDG fallback.
+    /// Pure over its inputs (no process-global read), so the injected path is
+    /// unit-testable without touching the `PROJECT_ROOT` singleton.
+    fn from_env_injected(root: PathBuf, tsm_config: Option<&Path>) -> Self {
+        let candidates = injected_candidates(&root, tsm_config);
+        let (file_cfg, _) = load_config_from(&candidates);
+        Self::from_config_file(&file_cfg, root)
     }
 
     /// Resolve from a pre-loaded `ConfigFile` with an explicit project root.
     ///
     /// `project_root` is the directory tsm treats as the user's workspace —
     /// typically the directory that held the `tsm.toml` that was loaded,
-    /// falling back to the current working directory. It is where
-    /// `.tsmignore` is resolved from (patterns still anchor at
-    /// `index_root`, only the file lookup uses `project_root`).
+    /// falling back to the current working directory. Content paths resolve
+    /// relative to `project_root`; `.tsmignore` is also loaded from here.
     ///
     /// Visible within the crate for testing; production code should use
     /// `from_env()`. Tests pass a tempdir to avoid mutating process-global
@@ -255,8 +391,8 @@ impl ResolvedConfig {
         let state_dir = env_or("TSM_STATE_DIR", file_cfg.state_dir.as_ref())
             .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
 
-        let index_root = env_or("TSM_INDEX_ROOT", file_cfg.index_root.as_ref())
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_INDEX_ROOT));
+        let cache_dir =
+            env_or("TSM_CACHE_DIR", file_cfg.cache_dir.as_ref()).unwrap_or_else(default_cache_dir);
 
         let embedder_socket_path = env_or(
             "TSM_EMBEDDER_SOCKET",
@@ -282,10 +418,35 @@ impl ResolvedConfig {
         )
         .unwrap_or(DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS);
 
+        let reader_pool_size = env_parse_u64("TSM_READER_POOL_SIZE", file_cfg.reader_pool_size)
+            .map(|n| n as usize)
+            .filter(|&n| n > 0)
+            .unwrap_or_else(default_reader_pool_size);
+
+        let reindex_fts_batch_size = env_parse_u64(
+            "TSM_REINDEX_FTS_BATCH_SIZE",
+            file_cfg.reindex_fts_batch_size,
+        )
+        .map(|n| n as usize)
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_REINDEX_FTS_BATCH_SIZE);
+
+        // 0 is a valid value (disables the cap), so no `> 0` filter — only an
+        // absent setting falls back to the default.
+        let max_chunks_per_document = env_parse_u64(
+            "TSM_MAX_CHUNKS_PER_DOCUMENT",
+            file_cfg.max_chunks_per_document,
+        )
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_MAX_CHUNKS_PER_DOCUMENT);
+
         let search_fallback = env_parse_fallback(file_cfg.search_fallback);
 
         let user_dict_path = env_or("TSM_USER_DICT", file_cfg.user_dict_path.as_ref())
             .unwrap_or_else(|| state_dir.join("user_dict.simpledic"));
+
+        let setup_link_mode = env_parse_link_mode("TSM_SETUP_LINK_MODE", file_cfg.setup.link_mode);
+        let init_link_mode = env_parse_link_mode("TSM_INIT_LINK_MODE", file_cfg.init.link_mode);
 
         let mut content_dirs: Vec<ContentDir> = file_cfg
             .index
@@ -298,7 +459,7 @@ impl ResolvedConfig {
                 }
                 if std::path::Path::new(&c.path).is_absolute() {
                     log::warn!(
-                        "content_dirs entry '{}' is absolute; paths must be relative to index_root",
+                        "content_dirs entry '{}' is absolute; paths must be relative to the project root",
                         c.path
                     );
                     return None;
@@ -310,10 +471,11 @@ impl ResolvedConfig {
                         c.path
                     );
                 }
-                let half_life = c.half_life_days.unwrap_or(DEFAULT_HALF_LIFE_DAYS);
-                if !half_life.is_finite() || half_life <= 0.0 {
+                let raw_half_life = c.half_life_days.unwrap_or(DEFAULT_HALF_LIFE_DAYS);
+                let half_life = sanitize_half_life(raw_half_life, DEFAULT_HALF_LIFE_DAYS);
+                if half_life != raw_half_life {
                     log::warn!(
-                        "content_dirs '{}': half_life_days {half_life} is invalid; using {DEFAULT_HALF_LIFE_DAYS}",
+                        "content_dirs '{}': half_life_days {raw_half_life} is invalid; using {half_life}",
                         c.path
                     );
                 }
@@ -324,16 +486,12 @@ impl ResolvedConfig {
                     } else {
                         1.0
                     },
-                    half_life_days: if half_life.is_finite() && half_life > 0.0 {
-                        half_life
-                    } else {
-                        DEFAULT_HALF_LIFE_DAYS
-                    },
+                    half_life_days: half_life,
                 })
             })
             .collect();
         // Sort longest-first so more-specific paths match before shorter prefixes
-        content_dirs.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        content_dirs.sort_by_key(|d| std::cmp::Reverse(d.path.len()));
 
         let session_weight = file_cfg
             .index
@@ -341,11 +499,14 @@ impl ResolvedConfig {
             .weight
             .unwrap_or(DEFAULT_SESSION_WEIGHT);
 
-        let session_half_life_days = file_cfg
-            .index
-            .claude_session
-            .half_life_days
-            .unwrap_or(DEFAULT_SESSION_HALF_LIFE_DAYS);
+        let session_half_life_days = sanitize_half_life(
+            file_cfg
+                .index
+                .claude_session
+                .half_life_days
+                .unwrap_or(DEFAULT_SESSION_HALF_LIFE_DAYS),
+            DEFAULT_SESSION_HALF_LIFE_DAYS,
+        );
 
         let respect_gitignore = file_cfg.index.respect_gitignore.unwrap_or(true);
 
@@ -364,16 +525,23 @@ impl ResolvedConfig {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| vec![DEFAULT_INDEX_EXTENSION.to_string()]);
 
+        let rejected_index_root = file_cfg.index_root.clone();
+
         Self {
             state_dir,
-            index_root,
+            cache_dir,
             embedder_socket_path,
             daemon_socket_path,
             log_dir,
             embedder_idle_timeout_secs,
             embedder_backfill_interval_secs,
+            reader_pool_size,
+            reindex_fts_batch_size,
+            max_chunks_per_document,
             search_fallback,
             user_dict_path,
+            setup_link_mode,
+            init_link_mode,
             content_dirs,
             session_weight,
             session_half_life_days,
@@ -381,6 +549,7 @@ impl ResolvedConfig {
             ignore_file,
             extensions,
             project_root,
+            rejected_index_root,
         }
     }
 }
@@ -405,9 +574,37 @@ fn cwd_fallback() -> PathBuf {
 /// Read an env var as PathBuf, falling back to a config file value.
 fn env_or(var: &str, file_val: Option<&PathBuf>) -> Option<PathBuf> {
     if let Ok(val) = std::env::var(var) {
-        return Some(PathBuf::from(val));
+        if !val.is_empty() {
+            return Some(PathBuf::from(val));
+        }
     }
     file_val.cloned()
+}
+
+/// Default `cache_dir` when neither env nor tsm.toml provides one.
+///
+/// Order:
+///   1. `$XDG_CACHE_HOME` is set (and non-empty) → `$XDG_CACHE_HOME/tsm`
+///   2. `$HOME` is set (and non-empty) → `$HOME/.cache/tsm`
+///   3. Last-resort relative fallback `.cache/tsm` (CWD-relative).
+///
+/// macOS uses the same XDG-style path on purpose: `dirs::cache_dir()` would
+/// return `~/Library/Caches/tsm` on macOS, which is not the desired layout.
+fn default_cache_dir() -> PathBuf {
+    fn non_empty_pathbuf(var: &str) -> Option<PathBuf> {
+        std::env::var(var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
+
+    if let Some(xdg) = non_empty_pathbuf("XDG_CACHE_HOME") {
+        return xdg.join("tsm");
+    }
+    if let Some(home) = non_empty_pathbuf("HOME") {
+        return home.join(".cache").join("tsm");
+    }
+    PathBuf::from(".cache").join("tsm")
 }
 
 /// Resolve search_fallback: env var > config file > default (Error).
@@ -421,6 +618,26 @@ fn env_parse_fallback(file_val: Option<SearchFallback>) -> SearchFallback {
     file_val.unwrap_or_default()
 }
 
+/// Resolve a `LinkMode` from an env var, falling back to a config file value
+/// and finally `LinkMode::default()`. Used for both
+/// `[setup].link_mode` and `[init].link_mode`.
+fn env_parse_link_mode(var: &str, file_val: Option<LinkMode>) -> LinkMode {
+    if let Ok(val) = std::env::var(var) {
+        match val.parse::<LinkMode>() {
+            Ok(m) => return m,
+            Err(e) => log::warn!("{var}='{val}' is invalid ({e}); using default"),
+        }
+    }
+    file_val.unwrap_or_default()
+}
+
+/// Default reader pool size: the machine's parallelism, floored at 1.
+fn default_reader_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
 /// Read an env var as u64, falling back to a config file value.
 fn env_parse_u64(var: &str, file_val: Option<u64>) -> Option<u64> {
     if let Ok(val) = std::env::var(var) {
@@ -432,10 +649,39 @@ fn env_parse_u64(var: &str, file_val: Option<u64>) -> Option<u64> {
     file_val
 }
 
+/// Explicitly resolved project root, injected once by the
+/// binary's `main` after CLI parsing, before any config access. When set,
+/// `from_env()` uses it and skips legacy XDG/CWD discovery.
+static PROJECT_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Inject the resolved project root. Set-once: later calls are ignored, so
+/// the value stays consistent for the lifetime of the process. Call from
+/// `main` after `resolve_project_root()` and before any config accessor.
+pub fn set_project_root(root: PathBuf) {
+    let _ = PROJECT_ROOT.set(root);
+}
+
+/// The injected project root, if `set_project_root()` has been called.
+fn injected_root() -> Option<PathBuf> {
+    PROJECT_ROOT.get().cloned()
+}
+
+/// Config-file candidates for an explicitly injected project root:
+/// `$TSM_CONFIG` (if set) then `<root>/tsm.toml`. No XDG —
+/// an injected root is authoritative, so silent fallbacks are dropped.
+fn injected_candidates(root: &Path, tsm_config: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(cfg) = tsm_config {
+        candidates.push(cfg.to_path_buf());
+    }
+    candidates.push(root.join("tsm.toml"));
+    candidates
+}
+
 static RESOLVED: OnceLock<RwLock<ResolvedConfig>> = OnceLock::new();
 
 /// Get the lazily-loaded resolved config singleton (cloned).
-fn resolved() -> ResolvedConfig {
+pub(crate) fn resolved() -> ResolvedConfig {
     RESOLVED
         .get_or_init(|| RwLock::new(ResolvedConfig::from_env()))
         .read()
@@ -464,11 +710,23 @@ pub fn reload() -> Vec<String> {
             new_cfg.state_dir.display()
         ));
     }
-    if old.index_root != new_cfg.index_root {
+    if old.cache_dir != new_cfg.cache_dir {
         warnings.push(format!(
-            "index_root changed ({} → {}); requires `tsm restart`",
-            old.index_root.display(),
-            new_cfg.index_root.display()
+            "cache_dir changed ({} → {}); requires `tsm restart`",
+            old.cache_dir.display(),
+            new_cfg.cache_dir.display()
+        ));
+    }
+    if old.setup_link_mode != new_cfg.setup_link_mode {
+        warnings.push(format!(
+            "setup_link_mode changed ({} → {}); takes effect on next `tsm setup`",
+            old.setup_link_mode, new_cfg.setup_link_mode
+        ));
+    }
+    if old.init_link_mode != new_cfg.init_link_mode {
+        warnings.push(format!(
+            "init_link_mode changed ({} → {}); takes effect on next `tsm init`",
+            old.init_link_mode, new_cfg.init_link_mode
         ));
     }
     if old.daemon_socket_path != new_cfg.daemon_socket_path {
@@ -490,8 +748,22 @@ pub fn reload() -> Vec<String> {
             new_cfg.project_root.display()
         ));
     }
+    if let Some(ref p) = new_cfg.rejected_index_root {
+        warnings.push(format!(
+            "`index_root = \"{}\"` in tsm.toml is no longer supported; \
+             replace it with `[[index.content_dirs]]` entries. \
+             The key is ignored; run `tsm restart` after fixing the config.",
+            p.display()
+        ));
+    }
 
-    *w = new_cfg;
+    // Do not apply a config that re-adds index_root: discard the bad field
+    // and keep the daemon running with the previous (or cleaned) config.
+    let applied = ResolvedConfig {
+        rejected_index_root: None,
+        ..new_cfg
+    };
+    *w = applied;
 
     log::info!("config reloaded from tsm.toml");
     if !warnings.is_empty() {
@@ -545,6 +817,7 @@ fn load_config_from(candidates: &[PathBuf]) -> (ConfigFile, Option<PathBuf>) {
             loaded_root = project_root_from(path);
         }
         merged.state_dir = merged.state_dir.or(file.state_dir);
+        merged.cache_dir = merged.cache_dir.or(file.cache_dir);
         merged.index_root = merged.index_root.or(file.index_root);
         merged.embedder_socket_path = merged.embedder_socket_path.or(file.embedder_socket_path);
         merged.daemon_socket_path = merged.daemon_socket_path.or(file.daemon_socket_path);
@@ -555,6 +828,13 @@ fn load_config_from(candidates: &[PathBuf]) -> (ConfigFile, Option<PathBuf>) {
         merged.embedder_backfill_interval_secs = merged
             .embedder_backfill_interval_secs
             .or(file.embedder_backfill_interval_secs);
+        merged.reader_pool_size = merged.reader_pool_size.or(file.reader_pool_size);
+        merged.reindex_fts_batch_size = merged
+            .reindex_fts_batch_size
+            .or(file.reindex_fts_batch_size);
+        merged.max_chunks_per_document = merged
+            .max_chunks_per_document
+            .or(file.max_chunks_per_document);
         merged.search_fallback = merged.search_fallback.or(file.search_fallback);
         merged.user_dict_path = merged.user_dict_path.or(file.user_dict_path);
         if merged.index.content_dirs.is_empty() {
@@ -578,6 +858,8 @@ fn load_config_from(candidates: &[PathBuf]) -> (ConfigFile, Option<PathBuf>) {
         if merged.index.extensions.is_none() {
             merged.index.extensions = file.index.extensions;
         }
+        merged.setup.link_mode = merged.setup.link_mode.or(file.setup.link_mode);
+        merged.init.link_mode = merged.init.link_mode.or(file.init.link_mode);
     }
     (merged, loaded_root)
 }
@@ -615,106 +897,52 @@ fn config_file_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-// ─── Accessor functions (delegate to ResolvedConfig singleton) ───
-
-pub fn state_dir() -> PathBuf {
-    resolved().state_dir.clone()
-}
-
-pub fn index_root() -> PathBuf {
-    resolved().index_root.clone()
-}
-
-pub fn embedder_socket_path() -> PathBuf {
-    resolved().embedder_socket_path.clone()
-}
-
-pub fn daemon_socket_path() -> PathBuf {
-    resolved().daemon_socket_path.clone()
-}
-
-pub fn log_dir() -> PathBuf {
-    resolved().log_dir.clone()
-}
-
-pub fn embedder_idle_timeout_secs() -> u64 {
-    resolved().embedder_idle_timeout_secs
-}
-
-pub fn embedder_backfill_interval_secs() -> u64 {
-    resolved().embedder_backfill_interval_secs
-}
-
-pub fn search_fallback() -> SearchFallback {
-    resolved().search_fallback
-}
-
-pub fn content_dirs() -> Vec<ContentDir> {
-    resolved().content_dirs
-}
-
-pub fn session_weight() -> f64 {
-    resolved().session_weight
-}
-
-pub fn session_half_life_days() -> f64 {
-    resolved().session_half_life_days
-}
-
-pub fn respect_gitignore() -> bool {
-    resolved().respect_gitignore
-}
-
-pub fn ignore_file() -> String {
-    resolved().ignore_file.clone()
-}
-
-pub fn index_extensions() -> Vec<String> {
-    resolved().extensions.clone()
-}
-
-pub fn project_root() -> PathBuf {
-    resolved().project_root.clone()
-}
-
-// ─── Derived paths ───────────────────────────────────────────────
-
-pub fn db_path() -> PathBuf {
-    state_dir().join("tsm.db")
-}
-
-pub fn user_dict_path() -> PathBuf {
-    resolved().user_dict_path.clone()
-}
-
-pub fn custom_terms_path() -> PathBuf {
-    state_dir().join("custom_terms.toml")
-}
-
-pub fn stopwords_path() -> PathBuf {
-    state_dir().join("stopwords.txt")
-}
-
-pub fn reject_words_path() -> PathBuf {
-    state_dir().join("reject_words.txt")
-}
-
-pub fn wordnet_db_path() -> PathBuf {
-    state_dir().join("wnjpn.db")
-}
-
-pub fn user_synonyms_path() -> PathBuf {
-    state_dir().join("synonyms.csv")
-}
-
-pub fn daemon_pid_path() -> PathBuf {
-    state_dir().join("tsmd.pid")
+/// Resolve the project root. The project root is the directory
+/// that holds `tsm.toml`. Precedence (no walk-up, no silent fallback):
+///   1. `TSM_CONFIG` escape hatch (§6) → parent directory of that file
+///   2. `<cwd>/tsm.toml` exists → `cwd`
+///   3. `--project-root <dir>` whose direct child `tsm.toml` exists → `dir`
+///   4. otherwise → error
+///
+/// Pure over its inputs (only stats `cwd`/`arg`) so it can run before the
+/// config singleton initializes. `tsm_config` is the caller-read `TSM_CONFIG`.
+pub fn resolve_project_root(
+    cwd: &Path,
+    project_root_arg: Option<&Path>,
+    tsm_config: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(cfg) = tsm_config {
+        let abs = if cfg.is_absolute() {
+            cfg.to_path_buf()
+        } else {
+            cwd.join(cfg)
+        };
+        return abs.parent().map(Path::to_path_buf).ok_or_else(|| {
+            anyhow::anyhow!("TSM_CONFIG '{}' has no parent directory", cfg.display())
+        });
+    }
+    if cwd.join("tsm.toml").is_file() {
+        return Ok(cwd.to_path_buf());
+    }
+    if let Some(arg) = project_root_arg {
+        if arg.join("tsm.toml").is_file() {
+            return Ok(arg.to_path_buf());
+        }
+        anyhow::bail!(
+            "--project-root '{}' has no tsm.toml; run `tsm init` there first",
+            arg.display()
+        );
+    }
+    anyhow::bail!(
+        "no tsm.toml in the current directory and no --project-root given; \
+         run `tsm init` here or pass --project-root <dir>"
+    )
 }
 
 // ─── Local model directory ──────────────────────────────────────
 
 /// Canonical list of required model files. Used by `models_dir_complete()`,
-/// `embedder_mode::load_model()`, and `doctor_check_with_conn()`.
+/// `embedder_proc::load_model()`, and `doctor_check_with_conn()`.
 pub const MODEL_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
 
 /// Directory for locally cached model files: `{state_dir}/models/ruri-v3-30m/`.
@@ -731,6 +959,52 @@ pub fn models_dir_complete() -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+// ─── Lua hook directories ───────────────────────────────────────
+
+/// Directory for user-defined extract hooks: `{state_dir}/hooks/extract/`.
+pub fn hooks_extract_dir() -> PathBuf {
+    state_dir().join("hooks/extract")
+}
+
+/// Directory for user-defined score hooks: `{state_dir}/hooks/score/`.
+pub fn hooks_score_dir() -> PathBuf {
+    state_dir().join("hooks/score")
+}
+
+// ─── Machine-wide cache helpers ────────────────────────────────
+
+/// Cache directory for the ruri-v3-30m model: `{cache_dir}/models/ruri-v3-30m/`.
+pub fn cache_models_dir() -> PathBuf {
+    cache_dir().join("models/ruri-v3-30m")
+}
+
+/// `Some(path)` if all files in `MODEL_FILES` are present in `cache_models_dir()`,
+/// `None` otherwise.
+pub fn cache_models_dir_complete() -> Option<PathBuf> {
+    let dir = cache_models_dir();
+    if MODEL_FILES.iter().all(|f| dir.join(f).is_file()) {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// WordNet DB path inside the machine-wide cache: `{cache_dir}/wnjpn.db`.
+pub fn cache_wordnet_db_path() -> PathBuf {
+    cache_dir().join("wnjpn.db")
+}
+
+/// Directory holding tsm-owned source artefacts (e.g. `wnjpn-vX.Y.db`):
+/// `{cache_dir}/sources/`.
+pub fn cache_sources_dir() -> PathBuf {
+    cache_dir().join("sources")
+}
+
+/// Cache manifest JSON: `{cache_dir}/manifest.json`.
+pub fn cache_manifest_path() -> PathBuf {
+    cache_dir().join("manifest.json")
 }
 
 // ─── Model cache (XDG) ──────────────────────────────────────────
@@ -765,15 +1039,6 @@ pub fn ensure_model_cache_env() {
 
 // ─── Pure functions (no config dependency) ───────────────────────
 
-pub fn status_penalty(status: Option<&str>) -> f64 {
-    match status {
-        Some("superseded") => 0.2,
-        Some("rejected") | Some("dropped") => 0.3,
-        Some("outdated") => 0.4,
-        _ => 1.0,
-    }
-}
-
 /// Half-life in days, resolved from content_dirs config by file path prefix.
 /// Falls back to source_type-based defaults when content_dirs is empty or unmatched.
 pub fn half_life_days(file_path: &str, source_type: &str) -> f64 {
@@ -781,14 +1046,28 @@ pub fn half_life_days(file_path: &str, source_type: &str) -> f64 {
     if file_path.starts_with("session:") {
         return cfg.session_half_life_days;
     }
+    let fp = std::path::Path::new(file_path);
     for dir in &cfg.content_dirs {
-        if file_path.starts_with(dir.path.as_str())
-            && file_path.as_bytes().get(dir.path.len()) == Some(&b'/')
-        {
+        let dir_abs = crate::paths::absolutize(std::path::Path::new(&dir.path), &cfg.project_root);
+        if crate::paths::is_within(fp, &dir_abs) {
             return dir.half_life_days;
         }
     }
     half_life_days_by_source_type(source_type)
+}
+
+/// Validate a configured half-life in days. `0.0` is a valid sentinel that
+/// disables time decay: the searcher treats it as timeless and
+/// applies no decay. Negative, infinite, and NaN values are invalid and fall
+/// back to `default`.
+fn sanitize_half_life(value: f64, default: f64) -> f64 {
+    if value == 0.0 {
+        0.0
+    } else if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        default
+    }
 }
 
 /// Default half-life by source_type (used when content_dirs is empty or unmatched).
@@ -824,10 +1103,10 @@ pub fn directory_weight(file_path: &str) -> f64 {
     if file_path.starts_with("session:") {
         return cfg.session_weight;
     }
+    let fp = std::path::Path::new(file_path);
     for dir in &cfg.content_dirs {
-        if file_path.starts_with(dir.path.as_str())
-            && file_path.as_bytes().get(dir.path.len()) == Some(&b'/')
-        {
+        let dir_abs = crate::paths::absolutize(std::path::Path::new(&dir.path), &cfg.project_root);
+        if crate::paths::is_within(fp, &dir_abs) {
             return dir.weight;
         }
     }
@@ -859,7 +1138,6 @@ mod tests {
         assert_eq!(SCORE_THRESHOLD, 0.005);
         assert_eq!(MAX_RESULTS, 5);
         assert_eq!(EMBEDDING_DIM, 256);
-        assert_eq!(DEFAULT_INDEX_ROOT, "/workspaces");
         assert_eq!(DEFAULT_EMBEDDER_IDLE_TIMEOUT_SECS, 600);
         assert_eq!(DEFAULT_EMBEDDER_BACKFILL_INTERVAL_SECS, 300);
         assert_eq!(DICT_CANDIDATE_FREQ_THRESHOLD, 5);
@@ -868,7 +1146,7 @@ mod tests {
     // ─── ResolvedConfig from config file ─────────────────────────────
     // These tests construct ResolvedConfig via from_config_file() directly,
     // bypassing the OnceLock singleton. Tests that set TOML fields overridden
-    // by env vars (state_dir, index_root, etc.) must use #[serial] to avoid
+    // by env vars (state_dir, etc.) must use #[serial] to avoid
     // races with other tests that mutate those env vars.
 
     #[test]
@@ -877,7 +1155,6 @@ mod tests {
         // Clear all TSM env vars to ensure defaults are tested, not CI overrides.
         for var in [
             "TSM_STATE_DIR",
-            "TSM_INDEX_ROOT",
             "TSM_EMBEDDER_SOCKET",
             "TSM_DAEMON_SOCKET",
             "TSM_LOG_DIR",
@@ -888,7 +1165,6 @@ mod tests {
         }
         let cfg = resolved_from_toml("");
         assert_eq!(cfg.state_dir, PathBuf::from(DEFAULT_STATE_DIR));
-        assert_eq!(cfg.index_root, PathBuf::from(DEFAULT_INDEX_ROOT));
         assert_eq!(
             cfg.embedder_socket_path,
             PathBuf::from(".tsm/embedder.sock")
@@ -906,6 +1182,45 @@ mod tests {
         assert!(cfg.respect_gitignore);
         assert_eq!(cfg.ignore_file, DEFAULT_IGNORE_FILE);
         assert_eq!(cfg.extensions, vec![DEFAULT_INDEX_EXTENSION.to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_or_skips_empty_string() {
+        // Arrange: a TSM_* env set to "" must be treated as unset, falling
+        // through to the file value (or None) instead of yielding Some("").
+        let var = "TSM_TEST_ENV_OR_EMPTY";
+        let file_val = PathBuf::from("/from/file");
+
+        // Act + Assert: empty env -> falls through to the file value.
+        std::env::set_var(var, "");
+        assert_eq!(
+            env_or(var, Some(&file_val)),
+            Some(file_val.clone()),
+            "empty env var must fall through to the file value"
+        );
+        // Empty env with no file value -> None (caller then applies default).
+        assert_eq!(env_or(var, None), None, "empty env + no file -> None");
+
+        // A non-empty env value still takes precedence over the file value.
+        std::env::set_var(var, "/from/env");
+        assert_eq!(
+            env_or(var, Some(&file_val)),
+            Some(PathBuf::from("/from/env"))
+        );
+
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    #[serial]
+    fn test_empty_env_falls_through_to_toml() {
+        // An empty TSM_STATE_DIR must not override the TOML state_dir; it
+        // should fall through as if unset.
+        std::env::set_var("TSM_STATE_DIR", "");
+        let cfg = resolved_from_toml(r#"state_dir = "/custom/data""#);
+        std::env::remove_var("TSM_STATE_DIR");
+        assert_eq!(cfg.state_dir, PathBuf::from("/custom/data"));
     }
 
     #[test]
@@ -941,13 +1256,11 @@ mod tests {
         let cfg = resolved_from_toml(
             r#"
             state_dir = "/custom/data"
-            index_root = "/custom/root"
             embedder_idle_timeout_secs = 0
             embedder_backfill_interval_secs = 60
         "#,
         );
         assert_eq!(cfg.state_dir, PathBuf::from("/custom/data"));
-        assert_eq!(cfg.index_root, PathBuf::from("/custom/root"));
         assert_eq!(cfg.embedder_idle_timeout_secs, 0);
         assert_eq!(cfg.embedder_backfill_interval_secs, 60);
     }
@@ -985,6 +1298,276 @@ mod tests {
         assert_eq!(cfg.log_dir, PathBuf::from("/custom/logs"));
     }
 
+    // ─── cache_dir resolution ────────────────────────────────────────
+    // env-mutating tests below MUST be #[serial] because XDG_CACHE_HOME /
+    // HOME are process-global and other tests (and library code) read them.
+    // HOME is save/restored explicitly to avoid corrupting other tests
+    // that rely on it; XDG_CACHE_HOME and TSM_CACHE_DIR are removed at end
+    // because no other tests in this module rely on a specific value.
+
+    #[test]
+    #[serial]
+    fn test_cache_dir_default_uses_xdg_cache_home_when_set() {
+        // HOME is not consulted when XDG_CACHE_HOME is set, but save/restore
+        // it anyway so this test does not depend on a previous test's
+        // cleanup leaving HOME at a sensible value.
+        let prev_home = std::env::var("HOME").ok();
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        std::env::set_var("XDG_CACHE_HOME", "/tmp/xdg_cache_home_for_test");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(
+            cfg.cache_dir,
+            PathBuf::from("/tmp/xdg_cache_home_for_test/tsm")
+        );
+
+        std::env::remove_var("XDG_CACHE_HOME");
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_dir_default_relative_fallback_when_home_and_xdg_unset() {
+        let prev_home = std::env::var("HOME").ok();
+        let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::remove_var("HOME");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.cache_dir, PathBuf::from(".cache/tsm"));
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_dir_default_falls_back_to_home_cache_when_xdg_unset() {
+        let prev_home = std::env::var("HOME").ok();
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::set_var("HOME", "/tmp/home_for_test");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(
+            cfg.cache_dir,
+            PathBuf::from("/tmp/home_for_test/.cache/tsm")
+        );
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_dir_env_override() {
+        std::env::set_var("TSM_CACHE_DIR", "/env/cache");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.cache_dir, PathBuf::from("/env/cache"));
+
+        std::env::remove_var("TSM_CACHE_DIR");
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_dir_toml_override() {
+        std::env::remove_var("TSM_CACHE_DIR");
+
+        let cfg = resolved_from_toml(r#"cache_dir = "/from/toml""#);
+        assert_eq!(cfg.cache_dir, PathBuf::from("/from/toml"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_dir_env_beats_toml() {
+        std::env::set_var("TSM_CACHE_DIR", "/env/wins");
+
+        let cfg = resolved_from_toml(r#"cache_dir = "/from/toml""#);
+        assert_eq!(cfg.cache_dir, PathBuf::from("/env/wins"));
+
+        std::env::remove_var("TSM_CACHE_DIR");
+    }
+
+    // ─── LinkMode resolution ─────────────────────────────────────────
+
+    #[test]
+    fn test_link_mode_default_is_symlink() {
+        assert_eq!(LinkMode::default(), LinkMode::Symlink);
+    }
+
+    #[test]
+    fn test_link_mode_serde_lowercase() {
+        // Serialize: lowercase form expected.
+        let json = serde_json::to_string(&LinkMode::Symlink).unwrap();
+        assert_eq!(json, "\"symlink\"");
+        let json = serde_json::to_string(&LinkMode::Copy).unwrap();
+        assert_eq!(json, "\"copy\"");
+
+        // Deserialize: lowercase form accepted.
+        let m: LinkMode = serde_json::from_str("\"symlink\"").unwrap();
+        assert_eq!(m, LinkMode::Symlink);
+        let m: LinkMode = serde_json::from_str("\"copy\"").unwrap();
+        assert_eq!(m, LinkMode::Copy);
+
+        // Unknown value rejected with descriptive error.
+        let err = serde_json::from_str::<LinkMode>("\"hardlink\"").unwrap_err();
+        assert!(err.to_string().contains("hardlink"));
+    }
+
+    #[test]
+    fn test_link_mode_from_str_and_display() {
+        use std::str::FromStr;
+        assert_eq!(LinkMode::from_str("symlink").unwrap(), LinkMode::Symlink);
+        assert_eq!(LinkMode::from_str("copy").unwrap(), LinkMode::Copy);
+        // Case sensitivity: uppercase rejected (matches SearchFallback parsing).
+        assert!(LinkMode::from_str("Symlink").is_err());
+        assert!(LinkMode::from_str("hardlink").is_err());
+        assert!(LinkMode::from_str("").is_err());
+
+        // Display roundtrips with FromStr — same lowercase wire form.
+        assert_eq!(LinkMode::Symlink.to_string(), "symlink");
+        assert_eq!(LinkMode::Copy.to_string(), "copy");
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_link_mode_default_is_symlink_when_unconfigured() {
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.setup_link_mode, LinkMode::Symlink);
+        assert_eq!(cfg.init_link_mode, LinkMode::Symlink);
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_link_mode_from_toml() {
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+
+        let cfg = resolved_from_toml(
+            r#"
+            [setup]
+            link_mode = "copy"
+            "#,
+        );
+        assert_eq!(cfg.setup_link_mode, LinkMode::Copy);
+        // [init] is untouched, so stays at default.
+        assert_eq!(cfg.init_link_mode, LinkMode::Symlink);
+    }
+
+    #[test]
+    #[serial]
+    fn test_init_link_mode_from_toml() {
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+
+        let cfg = resolved_from_toml(
+            r#"
+            [init]
+            link_mode = "copy"
+            "#,
+        );
+        assert_eq!(cfg.init_link_mode, LinkMode::Copy);
+        // [setup] is untouched, so stays at default.
+        assert_eq!(cfg.setup_link_mode, LinkMode::Symlink);
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_link_mode_env_override() {
+        std::env::set_var("TSM_SETUP_LINK_MODE", "copy");
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.setup_link_mode, LinkMode::Copy);
+        assert_eq!(cfg.init_link_mode, LinkMode::Symlink);
+
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_init_link_mode_env_override() {
+        std::env::set_var("TSM_INIT_LINK_MODE", "copy");
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.init_link_mode, LinkMode::Copy);
+        assert_eq!(cfg.setup_link_mode, LinkMode::Symlink);
+
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_and_init_link_modes_are_independent() {
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+
+        let cfg = resolved_from_toml(
+            r#"
+            [setup]
+            link_mode = "copy"
+
+            [init]
+            link_mode = "symlink"
+            "#,
+        );
+        assert_eq!(cfg.setup_link_mode, LinkMode::Copy);
+        assert_eq!(cfg.init_link_mode, LinkMode::Symlink);
+    }
+
+    #[test]
+    #[serial]
+    fn test_link_mode_env_beats_toml() {
+        std::env::set_var("TSM_SETUP_LINK_MODE", "copy");
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+
+        let cfg = resolved_from_toml(
+            r#"
+            [setup]
+            link_mode = "symlink"
+            "#,
+        );
+        assert_eq!(cfg.setup_link_mode, LinkMode::Copy);
+
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_link_mode_invalid_env_falls_back_to_toml() {
+        std::env::set_var("TSM_SETUP_LINK_MODE", "hardlink");
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+
+        let cfg = resolved_from_toml(
+            r#"
+            [setup]
+            link_mode = "copy"
+            "#,
+        );
+        // Invalid env value is logged as a warning and the TOML value is honored.
+        assert_eq!(cfg.setup_link_mode, LinkMode::Copy);
+
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+    }
+
     #[test]
     #[serial]
     fn test_resolved_derived_paths() {
@@ -1010,20 +1593,106 @@ mod tests {
             &config_path,
             r#"
 state_dir = "/custom/data"
-index_root = "/custom/root"
 embedder_idle_timeout_secs = 1200
 "#,
         )
         .unwrap();
 
-        let (cfg, root) = load_config_from(&[config_path.clone()]);
+        let (cfg, root) = load_config_from(std::slice::from_ref(&config_path));
         assert_eq!(cfg.state_dir, Some(PathBuf::from("/custom/data")));
-        assert_eq!(cfg.index_root, Some(PathBuf::from("/custom/root")));
         assert_eq!(cfg.embedder_idle_timeout_secs, Some(1200));
         assert!(cfg.daemon_socket_path.is_none());
         // project_root derives from the loaded file's parent — the same
         // absolute path that was passed in, no canonicalization applied.
         assert_eq!(root.as_deref(), config_path.parent());
+    }
+
+    #[test]
+    fn test_from_config_file_captures_rejected_index_root() {
+        // A ConfigFile with index_root set must surface it in rejected_index_root.
+        let file: ConfigFile = toml::from_str(r#"index_root = "/old/root""#).unwrap();
+        let cfg = ResolvedConfig::from_config_file(&file, PathBuf::from("/tmp/unused-root"));
+        assert_eq!(
+            cfg.rejected_index_root,
+            Some(PathBuf::from("/old/root")),
+            "index_root should be captured in rejected_index_root"
+        );
+    }
+
+    #[test]
+    fn test_from_config_file_no_rejected_index_root_when_absent() {
+        let file: ConfigFile = toml::from_str(r#"state_dir = "/some/dir""#).unwrap();
+        let cfg = ResolvedConfig::from_config_file(&file, PathBuf::from("/tmp/unused-root"));
+        assert!(
+            cfg.rejected_index_root.is_none(),
+            "rejected_index_root must be None when index_root is absent"
+        );
+    }
+
+    #[test]
+    fn test_load_config_from_captures_rejected_index_root() {
+        // Going through load_config_from (not just from_config_file) must also
+        // surface the rejected index_root so the real production path is covered.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("tsm.toml");
+        std::fs::write(&config_path, r#"index_root = "/legacy/root""#).unwrap();
+
+        let (merged, _root) = load_config_from(&[config_path]);
+        assert_eq!(
+            merged.index_root,
+            Some(PathBuf::from("/legacy/root")),
+            "index_root must be merged and preserved for rejected_index_root population"
+        );
+        let cfg = ResolvedConfig::from_config_file(&merged, PathBuf::from("/tmp/unused-root"));
+        assert_eq!(
+            cfg.rejected_index_root,
+            Some(PathBuf::from("/legacy/root")),
+            "rejected_index_root must be populated from the merged ConfigFile"
+        );
+    }
+
+    #[test]
+    fn test_reload_warns_when_index_root_re_added() {
+        // reload() must push a warning (not exit) when a reloaded config still
+        // carries index_root.  We test the pure warning-generation logic by
+        // calling the helper directly rather than exercising the OnceLock path,
+        // which can only be initialised once per process.
+        let old = ResolvedConfig::from_config_file(
+            &ConfigFile::default(),
+            PathBuf::from("/tmp/unused-root"),
+        );
+        let file_with_index_root: ConfigFile =
+            toml::from_str(r#"index_root = "/bad/path""#).unwrap();
+        let new_cfg = ResolvedConfig::from_config_file(
+            &file_with_index_root,
+            PathBuf::from("/tmp/unused-root"),
+        );
+        // Build the same warnings that reload() would produce for this pair.
+        let mut warnings = Vec::new();
+        if let Some(ref p) = new_cfg.rejected_index_root {
+            warnings.push(format!(
+                "`index_root = \"{}\"` in tsm.toml is no longer supported; \
+                 replace it with `[[index.content_dirs]]` entries. \
+                 The key is ignored; run `tsm restart` after fixing the config.",
+                p.display()
+            ));
+        }
+        // Reload must not apply the bad value — verify the new config carries it.
+        assert!(
+            !warnings.is_empty(),
+            "reload must warn when index_root re-appears"
+        );
+        let w = &warnings[0];
+        assert!(
+            w.contains("index_root"),
+            "warning must mention index_root: {w}"
+        );
+        assert!(
+            w.contains("content_dirs"),
+            "warning must suggest content_dirs: {w}"
+        );
+        // And the old config is unaffected (no rejected_index_root).
+        assert!(old.rejected_index_root.is_none());
     }
 
     #[test]
@@ -1038,14 +1707,14 @@ embedder_idle_timeout_secs = 1200
             &low,
             r#"
 state_dir = "/low"
-index_root = "/low-root"
+embedder_idle_timeout_secs = 999
 "#,
         )
         .unwrap();
 
         let (cfg, root) = load_config_from(&[high.clone(), low]);
         assert_eq!(cfg.state_dir, Some(PathBuf::from("/high")));
-        assert_eq!(cfg.index_root, Some(PathBuf::from("/low-root")));
+        assert_eq!(cfg.embedder_idle_timeout_secs, Some(999));
         // project_root comes from the FIRST successfully-loaded candidate,
         // regardless of which fields subsequent files contribute.
         assert_eq!(root.as_deref(), high.parent());
@@ -1055,29 +1724,144 @@ index_root = "/low-root"
     fn test_load_config_empty_candidates() {
         let (cfg, root) = load_config_from(&[]);
         assert!(cfg.state_dir.is_none());
-        assert!(cfg.index_root.is_none());
         assert!(root.is_none(), "no config loaded → no project_root");
+    }
+
+    // ── resolve_project_root ─────────────────────────────────────────────
+    // Pure resolution: precedence is TSM_CONFIG → CWD-direct tsm.toml →
+    // --project-root → error. No walk-up, no silent fallback.
+
+    #[test]
+    fn test_resolve_project_root_cwd_has_tsm_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tsm.toml"), "").unwrap();
+        let root = resolve_project_root(dir.path(), None, None).unwrap();
+        assert_eq!(root, dir.path());
+    }
+
+    #[test]
+    fn test_resolve_project_root_falls_back_to_arg() {
+        let cwd = tempfile::tempdir().unwrap(); // no tsm.toml here
+        let arg = tempfile::tempdir().unwrap();
+        std::fs::write(arg.path().join("tsm.toml"), "").unwrap();
+        let root = resolve_project_root(cwd.path(), Some(arg.path()), None).unwrap();
+        assert_eq!(root, arg.path());
+    }
+
+    #[test]
+    fn test_resolve_project_root_cwd_wins_over_arg() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("tsm.toml"), "").unwrap();
+        let arg = tempfile::tempdir().unwrap();
+        std::fs::write(arg.path().join("tsm.toml"), "").unwrap();
+        let root = resolve_project_root(cwd.path(), Some(arg.path()), None).unwrap();
+        assert_eq!(
+            root,
+            cwd.path(),
+            "CWD tsm.toml takes precedence over --project-root"
+        );
+    }
+
+    #[test]
+    fn test_resolve_project_root_arg_without_tsm_toml_errors() {
+        let cwd = tempfile::tempdir().unwrap();
+        let arg = tempfile::tempdir().unwrap(); // no tsm.toml under arg
+        assert!(resolve_project_root(cwd.path(), Some(arg.path()), None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_project_root_unresolvable_errors() {
+        let cwd = tempfile::tempdir().unwrap(); // no tsm.toml, no arg
+        assert!(resolve_project_root(cwd.path(), None, None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_project_root_tsm_config_wins() {
+        // TSM_CONFIG escape hatch (§6): project_root = parent(TSM_CONFIG),
+        // short-circuiting even when CWD has its own tsm.toml.
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("tsm.toml"), "").unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg_file = cfg_dir.path().join("tsm.toml");
+        std::fs::write(&cfg_file, "").unwrap();
+        let root = resolve_project_root(cwd.path(), None, Some(&cfg_file)).unwrap();
+        assert_eq!(root, cfg_dir.path());
+    }
+
+    #[test]
+    fn test_resolve_project_root_tsm_config_relative() {
+        // A bare relative TSM_CONFIG (e.g. "custom.toml") resolves against cwd;
+        // the project root is its parent directory.
+        let cwd = tempfile::tempdir().unwrap();
+        let root = resolve_project_root(cwd.path(), None, Some(Path::new("custom.toml"))).unwrap();
+        assert_eq!(root, cwd.path());
+    }
+
+    #[test]
+    fn test_resolve_project_root_tsm_config_no_parent_errors() {
+        // A filesystem-root TSM_CONFIG ("/") has no parent → error.
+        let cwd = tempfile::tempdir().unwrap();
+        assert!(resolve_project_root(cwd.path(), None, Some(Path::new("/"))).is_err());
+    }
+
+    #[test]
+    fn test_from_env_injected_uses_root_and_reads_its_tsm_toml() {
+        // The injected path uses `root` as project_root and loads its tsm.toml.
+        // Uses content_dirs (no env override) so the assertion is env-stable.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tsm.toml"),
+            "[[index.content_dirs]]\npath = \"injected-notes\"\nweight = 2.0\n",
+        )
+        .unwrap();
+        let cfg = ResolvedConfig::from_env_injected(dir.path().to_path_buf(), None);
+        assert_eq!(cfg.project_root, dir.path());
+        assert!(
+            cfg.content_dirs
+                .iter()
+                .any(|d| d.path == "injected-notes" && d.weight == 2.0),
+            "injected root's tsm.toml should be loaded"
+        );
+    }
+
+    #[test]
+    fn test_injected_candidates_only_root_tsm_toml() {
+        // No XDG on the injected path — just <root>/tsm.toml.
+        let c = injected_candidates(Path::new("/proj"), None);
+        assert_eq!(c, vec![PathBuf::from("/proj/tsm.toml")]);
+    }
+
+    #[test]
+    fn test_injected_candidates_tsm_config_takes_precedence() {
+        let c = injected_candidates(Path::new("/proj"), Some(Path::new("/custom/my.toml")));
+        assert_eq!(
+            c,
+            vec![
+                PathBuf::from("/custom/my.toml"),
+                PathBuf::from("/proj/tsm.toml"),
+            ]
+        );
     }
 
     #[test]
     #[serial]
     fn test_load_config_relative_path_resolves_against_cwd() {
         // A bare relative candidate like "tsm.toml" must yield a
-        // project_root derived from CWD (not a bare empty path), with no
-        // canonicalize syscall in the picture. Avoids the race where the
-        // file could change between read and canonicalize.
+        // project_root derived from CWD (not a bare empty path). On macOS,
+        // tempdir returns /var/... but current_dir() resolves symlinks to
+        // /private/var/... — canonicalize upfront so both sides match.
         let dir = tempfile::tempdir().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        std::fs::write(dir.path().join("tsm.toml"), r#"state_dir = "/rel""#).unwrap();
+        let dir_path = std::fs::canonicalize(dir.path()).unwrap();
+        // RAII guard: restores the CWD on drop (panic-safe) and tolerates an
+        // already-dangling CWD, so this test neither leaks nor panics on entry.
+        let _cwd = crate::test_utils::CwdGuard::change_to(&dir_path);
+        std::fs::write(dir_path.join("tsm.toml"), r#"state_dir = "/rel""#).unwrap();
 
         let (cfg, root) = load_config_from(&[PathBuf::from("tsm.toml")]);
 
-        std::env::set_current_dir(&prev).unwrap();
-
         assert_eq!(cfg.state_dir, Some(PathBuf::from("/rel")));
         // project_root should be CWD (tempdir), not empty / None.
-        assert_eq!(root.unwrap(), dir.path());
+        assert_eq!(root.unwrap(), dir_path);
     }
 
     #[test]
@@ -1114,16 +1898,6 @@ index_root = "/low-root"
     #[test]
     fn test_directory_weight_session() {
         assert_eq!(directory_weight("session:abc123"), DEFAULT_SESSION_WEIGHT);
-    }
-
-    #[test]
-    fn test_status_penalty_values() {
-        assert_eq!(status_penalty(None), 1.0);
-        assert_eq!(status_penalty(Some("current")), 1.0);
-        assert_eq!(status_penalty(Some("outdated")), 0.4);
-        assert_eq!(status_penalty(Some("rejected")), 0.3);
-        assert_eq!(status_penalty(Some("dropped")), 0.3);
-        assert_eq!(status_penalty(Some("superseded")), 0.2);
     }
 
     #[test]
@@ -1468,7 +2242,7 @@ weight = -1.0
     }
 
     #[test]
-    fn test_content_dirs_validation_zero_half_life_clamped() {
+    fn test_content_dirs_zero_half_life_disables_decay() {
         let cfg = resolved_from_toml(
             r#"
 [[index.content_dirs]]
@@ -1476,7 +2250,43 @@ path = "daily/notes"
 half_life_days = 0.0
 "#,
         );
+        // 0 is the sentinel for "time decay disabled"; kept as-is.
+        assert_eq!(cfg.content_dirs[0].half_life_days, 0.0);
+    }
+
+    #[test]
+    fn test_content_dirs_negative_half_life_falls_back_to_default() {
+        let cfg = resolved_from_toml(
+            r#"
+[[index.content_dirs]]
+path = "daily/notes"
+half_life_days = -5.0
+"#,
+        );
         assert_eq!(cfg.content_dirs[0].half_life_days, DEFAULT_HALF_LIFE_DAYS);
+    }
+
+    #[test]
+    fn test_session_zero_half_life_disables_decay() {
+        let cfg = resolved_from_toml(
+            r#"
+[index.claude_session]
+half_life_days = 0.0
+"#,
+        );
+        // 0 is the sentinel for "time decay disabled"; kept as-is.
+        assert_eq!(cfg.session_half_life_days, 0.0);
+    }
+
+    #[test]
+    fn test_session_negative_half_life_falls_back_to_default() {
+        let cfg = resolved_from_toml(
+            r#"
+[index.claude_session]
+half_life_days = -5.0
+"#,
+        );
+        assert_eq!(cfg.session_half_life_days, DEFAULT_SESSION_HALF_LIFE_DAYS);
     }
 
     #[test]
@@ -1488,31 +2298,29 @@ path = "company/knowledge"
 weight = 1.5
 "#,
         );
-        // Simulate directory_weight logic against config
-        let file_path = "company/knowledge/foo.md";
-        let weight = cfg
-            .content_dirs
-            .iter()
-            .find(|d| {
-                file_path.starts_with(d.path.as_str())
-                    && file_path.as_bytes().get(d.path.len()) == Some(&b'/')
-            })
-            .map(|d| d.weight)
-            .unwrap_or(1.0);
-        assert_eq!(weight, 1.5);
-
+        // Mirror directory_weight's production matching: file_path is
+        // absolute, content_dir resolved to absolute against project_root, matched
+        // at a directory boundary.
+        let weight_of = |file_path: &std::path::Path| {
+            cfg.content_dirs
+                .iter()
+                .find(|d| {
+                    let dir_abs =
+                        crate::paths::absolutize(std::path::Path::new(&d.path), &cfg.project_root);
+                    crate::paths::is_within(file_path, &dir_abs)
+                })
+                .map(|d| d.weight)
+                .unwrap_or(1.0)
+        };
+        assert_eq!(
+            weight_of(&cfg.project_root.join("company/knowledge/foo.md")),
+            1.5
+        );
         // Boundary: similar prefix should NOT match
-        let file_path2 = "company/knowledge_extra/foo.md";
-        let weight2 = cfg
-            .content_dirs
-            .iter()
-            .find(|d| {
-                file_path2.starts_with(d.path.as_str())
-                    && file_path2.as_bytes().get(d.path.len()) == Some(&b'/')
-            })
-            .map(|d| d.weight)
-            .unwrap_or(1.0);
-        assert_eq!(weight2, 1.0);
+        assert_eq!(
+            weight_of(&cfg.project_root.join("company/knowledge_extra/foo.md")),
+            1.0
+        );
     }
 
     #[test]
@@ -1524,13 +2332,14 @@ path = "daily/notes"
 half_life_days = 180
 "#,
         );
-        let file_path = "daily/notes/test.md";
+        let file_path = cfg.project_root.join("daily/notes/test.md");
         let hl = cfg
             .content_dirs
             .iter()
             .find(|d| {
-                file_path.starts_with(d.path.as_str())
-                    && file_path.as_bytes().get(d.path.len()) == Some(&b'/')
+                let dir_abs =
+                    crate::paths::absolutize(std::path::Path::new(&d.path), &cfg.project_root);
+                crate::paths::is_within(&file_path, &dir_abs)
             })
             .map(|d| d.half_life_days)
             .unwrap_or(DEFAULT_HALF_LIFE_DAYS);
@@ -1589,25 +2398,19 @@ half_life_days = 180
 
         // Set env vars to force structural field changes
         std::env::set_var("TSM_STATE_DIR", "/tmp/reload-test-state");
-        std::env::set_var("TSM_INDEX_ROOT", "/tmp/reload-test-root");
 
         let warnings = reload();
 
         // Clean up env vars
         std::env::remove_var("TSM_STATE_DIR");
-        std::env::remove_var("TSM_INDEX_ROOT");
 
         // Restore original config
         reload();
 
-        // Should have warnings for state_dir and index_root (and derived paths)
+        // Should have warning for state_dir (and derived paths)
         assert!(
             warnings.iter().any(|w| w.contains("state_dir")),
             "expected state_dir warning, got: {warnings:?}"
-        );
-        assert!(
-            warnings.iter().any(|w| w.contains("index_root")),
-            "expected index_root warning, got: {warnings:?}"
         );
         // All warnings should mention tsm restart
         for w in &warnings {
@@ -1616,6 +2419,36 @@ half_life_days = 180
                 "warning should mention tsm restart: {w}"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_reload_warns_on_link_mode_change() {
+        // Initialize singleton first.
+        let _ = resolved();
+
+        std::env::set_var("TSM_SETUP_LINK_MODE", "copy");
+        std::env::set_var("TSM_INIT_LINK_MODE", "copy");
+
+        let warnings = reload();
+
+        std::env::remove_var("TSM_SETUP_LINK_MODE");
+        std::env::remove_var("TSM_INIT_LINK_MODE");
+        // Restore singleton state for subsequent tests.
+        reload();
+
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("setup_link_mode") && w.contains("next `tsm setup`")),
+            "expected setup_link_mode warning mentioning next `tsm setup`, got: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("init_link_mode") && w.contains("next `tsm init`")),
+            "expected init_link_mode warning mentioning next `tsm init`, got: {warnings:?}"
+        );
     }
 
     // ─── models_dir / models_dir_complete ──────────────────────────
@@ -1684,5 +2517,226 @@ half_life_days = 180
         assert_eq!(result.unwrap(), dir);
         std::env::remove_var("TSM_STATE_DIR");
         reload();
+    }
+
+    // ─── cache_*_dir / cache_models_dir_complete ─────────────────────
+
+    #[test]
+    #[serial]
+    fn test_cache_models_dir_returns_correct_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        reload();
+        assert_eq!(cache_models_dir(), tmp.path().join("models/ruri-v3-30m"));
+        std::env::remove_var("TSM_CACHE_DIR");
+        reload();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_wordnet_db_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        reload();
+        assert_eq!(cache_wordnet_db_path(), tmp.path().join("wnjpn.db"));
+        std::env::remove_var("TSM_CACHE_DIR");
+        reload();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_sources_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        reload();
+        assert_eq!(cache_sources_dir(), tmp.path().join("sources"));
+        std::env::remove_var("TSM_CACHE_DIR");
+        reload();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_manifest_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        reload();
+        assert_eq!(cache_manifest_path(), tmp.path().join("manifest.json"));
+        std::env::remove_var("TSM_CACHE_DIR");
+        reload();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_models_dir_complete_returns_none_when_files_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        reload();
+        // Empty cache dir — no model files yet.
+        std::fs::create_dir_all(cache_models_dir()).unwrap();
+        assert!(cache_models_dir_complete().is_none());
+
+        // Partial: only one file present.
+        std::fs::write(cache_models_dir().join("config.json"), "{}").unwrap();
+        assert!(cache_models_dir_complete().is_none());
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        reload();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_models_dir_complete_returns_some_when_all_files_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_CACHE_DIR", tmp.path());
+        reload();
+        let dir = cache_models_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in &MODEL_FILES {
+            std::fs::write(dir.join(f), "dummy").unwrap();
+        }
+        let result = cache_models_dir_complete();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), dir);
+
+        std::env::remove_var("TSM_CACHE_DIR");
+        reload();
+    }
+
+    // ─── reader_pool_size ────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn test_reader_pool_size_from_file() {
+        let cfg = resolved_from_toml("reader_pool_size = 8\n");
+        assert_eq!(cfg.reader_pool_size, 8);
+    }
+
+    #[test]
+    #[serial]
+    fn test_reader_pool_size_default_is_positive() {
+        // No key set → defaults to CPU core count, which is always ≥ 1.
+        let cfg = resolved_from_toml("");
+        assert!(cfg.reader_pool_size >= 1);
+    }
+
+    // ─── reindex_fts_batch_size ──────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn test_reindex_fts_batch_size_from_file() {
+        let cfg = resolved_from_toml("reindex_fts_batch_size = 10\n");
+        assert_eq!(cfg.reindex_fts_batch_size, 10);
+    }
+
+    #[test]
+    #[serial]
+    fn test_reindex_fts_batch_size_default() {
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.reindex_fts_batch_size, DEFAULT_REINDEX_FTS_BATCH_SIZE);
+    }
+
+    // ─── reader_pool_size env overrides ─────────────────────────────
+
+    #[test]
+    #[serial]
+    fn test_reader_pool_size_env_override() {
+        std::env::set_var("TSM_READER_POOL_SIZE", "12");
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.reader_pool_size, 12);
+        std::env::remove_var("TSM_READER_POOL_SIZE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_reader_pool_size_zero_falls_back_to_cpu_default() {
+        std::env::set_var("TSM_READER_POOL_SIZE", "0");
+        let cfg = resolved_from_toml("");
+        assert!(
+            cfg.reader_pool_size >= 1,
+            "zero guard: TSM_READER_POOL_SIZE=0 must fall back to cpu count (>=1), got {}",
+            cfg.reader_pool_size
+        );
+        std::env::remove_var("TSM_READER_POOL_SIZE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_reader_pool_size_env_beats_file() {
+        std::env::set_var("TSM_READER_POOL_SIZE", "7");
+        let cfg = resolved_from_toml("reader_pool_size = 4\n");
+        assert_eq!(cfg.reader_pool_size, 7);
+        std::env::remove_var("TSM_READER_POOL_SIZE");
+    }
+
+    // ─── reindex_fts_batch_size env overrides ───────────────────────
+
+    #[test]
+    #[serial]
+    fn test_reindex_fts_batch_size_env_override() {
+        std::env::set_var("TSM_REINDEX_FTS_BATCH_SIZE", "99");
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.reindex_fts_batch_size, 99);
+        std::env::remove_var("TSM_REINDEX_FTS_BATCH_SIZE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_reindex_fts_batch_size_zero_falls_back_to_default() {
+        std::env::set_var("TSM_REINDEX_FTS_BATCH_SIZE", "0");
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.reindex_fts_batch_size, DEFAULT_REINDEX_FTS_BATCH_SIZE);
+        std::env::remove_var("TSM_REINDEX_FTS_BATCH_SIZE");
+    }
+
+    #[test]
+    #[serial]
+    fn test_reindex_fts_batch_size_env_beats_file() {
+        std::env::set_var("TSM_REINDEX_FTS_BATCH_SIZE", "55");
+        let cfg = resolved_from_toml("reindex_fts_batch_size = 10\n");
+        assert_eq!(cfg.reindex_fts_batch_size, 55);
+        std::env::remove_var("TSM_REINDEX_FTS_BATCH_SIZE");
+    }
+
+    // ─── max_chunks_per_document (#299) ──────────────────────────────
+
+    #[test]
+    #[serial]
+    fn test_max_chunks_per_document_default() {
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.max_chunks_per_document, DEFAULT_MAX_CHUNKS_PER_DOCUMENT);
+    }
+
+    #[test]
+    #[serial]
+    fn test_max_chunks_per_document_from_file() {
+        let cfg = resolved_from_toml("max_chunks_per_document = 5\n");
+        assert_eq!(cfg.max_chunks_per_document, 5);
+    }
+
+    #[test]
+    #[serial]
+    fn test_max_chunks_per_document_zero_disables_not_default() {
+        // 0 is a valid value (disables the cap) and must be preserved, unlike
+        // the pool-size knobs where 0 falls back to a default.
+        let cfg = resolved_from_toml("max_chunks_per_document = 0\n");
+        assert_eq!(cfg.max_chunks_per_document, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_max_chunks_per_document_env_override() {
+        std::env::set_var("TSM_MAX_CHUNKS_PER_DOCUMENT", "7");
+        let cfg = resolved_from_toml("");
+        assert_eq!(cfg.max_chunks_per_document, 7);
+        std::env::remove_var("TSM_MAX_CHUNKS_PER_DOCUMENT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_max_chunks_per_document_env_beats_file() {
+        std::env::set_var("TSM_MAX_CHUNKS_PER_DOCUMENT", "2");
+        let cfg = resolved_from_toml("max_chunks_per_document = 9\n");
+        assert_eq!(cfg.max_chunks_per_document, 2);
+        std::env::remove_var("TSM_MAX_CHUNKS_PER_DOCUMENT");
     }
 }

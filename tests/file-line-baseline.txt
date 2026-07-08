@@ -1,0 +1,13 @@
+# Per-file code-line baselines for the ADR-0018 line-count gate.
+#
+# Format: `<path> <code_line_count>`, one per line, where the count excludes the
+# trailing `#[cfg(test)] mod tests` block. Only files whose code-line count
+# exceeds 800 appear here; every other file is held to the flat 800 limit.
+#
+# This is a frozen ratchet (CI-enforced): an entry may only be LOWERED or
+# REMOVED, never raised or added (the gate checks it against origin/main). When a
+# file shrinks, lower its number to the new count; once at/under 800, delete the
+# line. See CLAUDE.md ("Per-file line-count gate") for how to regenerate.
+src/cli.rs 2040
+src/config.rs 1115
+src/user_dict.rs 953

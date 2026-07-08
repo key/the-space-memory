@@ -1,6 +1,6 @@
 [package]
 name = "the-space-memory"
-version = "0.4.0"
+version = "0.9.0"
 edition = "2021"
 
 [[bin]]
@@ -11,12 +11,17 @@ path = "src/main.rs"
 name = "tsmd"
 path = "src/bin/tsmd/main.rs"
 
+[[bin]]
+name = "tsm-bench-check"
+path = "src/bin/tsm-bench-check/main.rs"
+
 [dependencies]
-rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }
+rusqlite = { version = "0.40", features = ["bundled", "load_extension"] }
+mlua = { version = "0.11", features = ["lua54", "vendored", "anyhow"] }
 lindera = { version = "2.3", features = ["embed-ipadic"] }
-candle-core = "0.10"
-candle-nn = "0.10"
-candle-transformers = "0.10"
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
 hf-hub = { version = "0.5", default-features = false, features = [
   "tokio",
   "ureq",
@@ -38,7 +43,7 @@ sha2 = "0.11"
 libc = "0.2"
 log = "0.4"
 flexi_logger = { version = "0.31", features = ["colors"] }
-notify-debouncer-mini = "0.7"
+notify = "8"
 ignore = "0.4"
 ureq = "3"
 flate2 = "1"
@@ -46,3 +51,19 @@ flate2 = "1"
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3"
+criterion = { version = "0.8", default-features = false }
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
+
+[features]
+# Enables atomic counters in production code (e.g. embedder client) for bench instrumentation.
+# Off by default; release builds compile the counters out entirely.
+bench-counters = []
+
+[[bench]]
+name = "search_latency"
+harness = false
+
+[[bench]]
+name = "record_metrics"
+harness = false
+required-features = ["bench-counters"]

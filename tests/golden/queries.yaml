@@ -1,0 +1,157 @@
+# Golden query set for search quality benchmarking (tests/quality_bench.rs).
+#
+# Each query carries hand-authored relevance judgments against the corpus
+# under tests/golden/corpus/. `doc` paths are relative to the corpus root
+# (and to the indexed project root, since the harness copies the corpus
+# directory as-is). Grade is 0-2: 2 = highly relevant (the document's
+# primary topic matches the query), 1 = relevant (same topic area but a
+# secondary match), and any document NOT listed for a query is implicitly
+# grade 0 (irrelevant).
+#
+# Category taxonomy loosely follows tests/search-test-patterns.md, but this
+# corpus and these queries are purpose-built for automated grading and are
+# independent of that document's illustrative (unindexed) examples:
+#   entity          (E)  — proper-noun / tag-driven keyword search
+#   fts-basic       (F)  — plain multi-term FTS5 AND search
+#   vector-semantic (V)  — paraphrase queries with low lexical overlap,
+#                          intended to only be findable via vector search
+#   mixed           (R)  — combined FTS + entity signal
+#   temporal        (T)  — natural-language time expressions + filtering
+#   distractor      (G)  — control query confirming the unrelated garden
+#                          cluster doesn't leak into other topics' results
+queries:
+  - id: E1
+    category: entity
+    query: "lindera"
+    relevant:
+      - doc: search-engine/lindera-tokenizer.md
+        grade: 2
+      - doc: search-engine/sqlite-fts5.md
+        grade: 1
+
+  - id: E2
+    category: entity
+    query: "赤道儀"
+    relevant:
+      - doc: astro-photo/mount-select.md
+        grade: 2
+      - doc: astro-photo/observation-report.md
+        grade: 2
+      - doc: astro-photo/guiding-troubleshooting.md
+        grade: 1
+      - doc: astro-photo/stacking-software.md
+        grade: 1
+
+  - id: E3
+    category: entity
+    query: "candle"
+    relevant:
+      - doc: search-engine/candle-embedding.md
+        grade: 2
+
+  - id: F1
+    category: fts-basic
+    query: "猟銃 メンテナンス"
+    relevant:
+      - doc: hunting/shotgun-maintenance.md
+        grade: 2
+      - doc: hunting/handload-safety.md
+        grade: 1
+
+  - id: F2
+    category: fts-basic
+    query: "自家焙煎"
+    relevant:
+      - doc: coffee-roast/concept-overview.md
+        grade: 2
+      - doc: coffee-roast/roaster-equipment.md
+        grade: 2
+      - doc: coffee-roast/cost-notes.md
+        grade: 2
+
+  - id: F3
+    category: fts-basic
+    query: "SQLite 全文検索"
+    relevant:
+      - doc: search-engine/sqlite-fts5.md
+        grade: 2
+      - doc: search-engine/rust-search-arch.md
+        grade: 1
+
+  - id: V1
+    category: vector-semantic
+    query: "夜間に望遠鏡を天体に向けたまま長時間ずれないように保つには"
+    relevant:
+      - doc: astro-photo/mount-select.md
+        grade: 2
+      - doc: astro-photo/observation-report.md
+        grade: 2
+      - doc: astro-photo/guiding-troubleshooting.md
+        grade: 1
+      - doc: astro-photo/stacking-software.md
+        grade: 1
+
+  - id: V2
+    category: vector-semantic
+    query: "検索エンジンの日本語の分かち書き処理"
+    relevant:
+      - doc: search-engine/lindera-tokenizer.md
+        grade: 2
+      - doc: search-engine/sqlite-fts5.md
+        grade: 1
+
+  - id: V3
+    category: vector-semantic
+    query: "銃の手入れと保管方法"
+    relevant:
+      - doc: hunting/shotgun-maintenance.md
+        grade: 2
+      - doc: hunting/handload-safety.md
+        grade: 1
+
+  - id: R1
+    category: mixed
+    query: "rust sqlite"
+    relevant:
+      - doc: search-engine/sqlite-fts5.md
+        grade: 2
+      - doc: search-engine/rust-search-arch.md
+        grade: 1
+      - doc: search-engine/candle-embedding.md
+        grade: 1
+      - doc: search-engine/lindera-tokenizer.md
+        grade: 1
+
+  - id: R2
+    category: mixed
+    query: "狩猟 装備"
+    relevant:
+      - doc: hunting/gear-review.md
+        grade: 2
+      - doc: hunting/shotgun-maintenance.md
+        grade: 1
+      - doc: hunting/handload-safety.md
+        grade: 1
+
+  - id: T1
+    category: temporal
+    query: "最近の調査"
+    relevant:
+      - doc: hunting/season-report-recent.md
+        grade: 2
+
+  - id: T2
+    category: temporal
+    query: "去年の調査"
+    relevant:
+      - doc: hunting/season-report-old.md
+        grade: 2
+
+  - id: G1
+    category: distractor
+    query: "堆肥"
+    relevant:
+      - doc: garden/compost-tips.md
+        grade: 2
+      - doc: garden/tomato-growing.md
+        grade: 1

@@ -1,14 +1,34 @@
 # The Space Memory
 
+[![CI](https://github.com/key/the-space-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/key/the-space-memory/actions/workflows/ci.yml)
+[![E2E](https://github.com/key/the-space-memory/actions/workflows/e2e.yml/badge.svg)](https://github.com/key/the-space-memory/actions/workflows/e2e.yml)
+[![Code Metrics](https://github.com/key/the-space-memory/actions/workflows/metrics.yml/badge.svg)](https://github.com/key/the-space-memory/actions/workflows/metrics.yml)
+[![Lint](https://github.com/key/the-space-memory/actions/workflows/lint.yml/badge.svg)](https://github.com/key/the-space-memory/actions/workflows/lint.yml)
+
 ![The Space Memory](docs/assets/cover.png)
 
-[日本語](README.ja.md)
+[日本語](README.ja.md) · [Documentation](https://key.github.io/the-space-memory/)
 
 ## Overview
 
 A cross-workspace knowledge search engine built in Rust.
 Indexes Markdown documents across multiple workspaces and provides hybrid search
 combining FTS5 full-text search with vector semantic search (ruri-v3-30m, 256-dim).
+
+## Claude Code Plugin
+
+This repository ships only the `tsm` / `tsmd` binaries. The Claude Code plugin
+(skills, agents, hooks) lives in a separate repository,
+[`key/tsm-plugin-cc`](https://github.com/key/tsm-plugin-cc), which doubles as
+its own plugin marketplace:
+
+```bash
+/plugin marketplace add key/tsm-plugin-cc
+/plugin install the-space-memory@tsm-plugin-cc
+```
+
+The plugin calls the `tsm` CLI, so install `tsm` separately (see below) and
+ensure it is on your `PATH`.
 
 ## Concept
 
@@ -48,14 +68,17 @@ File watching uses inotify (Linux) / FSEvents (macOS).
 # 1. Build
 cargo build --release
 
-# 2. Download the ruri-v3-30m model
+# 2. Download external resources (ruri model + Japanese WordNet DB).
+#    System-wide; run once per machine.
 tsm setup
 
-# 3. Set the document root directory
-export TSM_INDEX_ROOT=~/my-notes
-
-# 4. Initialize the database (also writes a default .tsmignore at the
-#    project root if one does not already exist — edit to taste)
+# 3. Initialize the workspace from your notes directory:
+#    DB schema, default scaffold files (tsm.toml, .tsmignore,
+#    .tsm/{user_dict.simpledic,custom_terms.toml, synonyms.csv,
+#    hooks/extract/10-md_frontmatter.lua, hooks/score/10-default.lua}),
+#    and WordNet/synonym imports. Idempotent — existing
+#    user-customized files are never overwritten.
+cd ~/my-notes
 tsm init
 
 # 5. Start the daemon (embedder + file watcher)
@@ -66,15 +89,26 @@ tsm index
 
 # 7. Search
 tsm search -q "query" -k 5
+
+# Scope to a directory (absolute or relative to the current directory)
+tsm search -q "query" --path notes/
 ```
+
+`tsm setup` sets `HF_HUB_CACHE` automatically; override it to redirect the
+Hugging Face model cache.
+
+`tsm setup` populates a machine-wide cache (`~/.cache/tsm`) once per machine;
+`tsm init` then materializes the model and WordNet DB into the workspace's
+`.tsm/` as a symlink (default) or copy. See
+[Resource Layers and `link_mode`](docs/configuration.md#resource-layers-and-link_mode).
 
 ### What gets indexed
 
-tsm recursively scans `TSM_INDEX_ROOT` for `.md` files.
+tsm recursively scans the project root (directory containing `tsm.toml`) for `.md` files.
 A typical directory layout:
 
 ```text
-~/my-notes/              ← TSM_INDEX_ROOT
+~/my-notes/              ← project root (contains tsm.toml)
 ├── projects/
 │   ├── project-a.md
 │   └── project-b.md
@@ -84,8 +118,11 @@ A typical directory layout:
     └── 2026-04.md
 ```
 
-All Markdown files under `TSM_INDEX_ROOT` are indexed automatically.
-The file watcher detects additions, modifications, and deletions in real time.
+By default (no `content_dirs` configured) every Markdown file under the project
+root is indexed. Set `content_dirs` in `tsm.toml` to scope indexing to specific
+directories — each listed directory is still scanned recursively, but anything
+outside them is skipped. The file watcher detects additions, modifications, and
+deletions in real time.
 
 ### Maintenance
 
@@ -102,6 +139,129 @@ tsm rebuild --apply   # Delete DB and rebuild
 
 Use `tsm doctor` to check system health and daemon status.
 
+## Lua Hooks
+
+tsm uses embedded Lua (mlua, lua54) for user-editable metadata extraction and
+result scoring. Hooks live in `.tsm/hooks/` and are scaffolded by `tsm init`.
+
+### Hook directory layout
+
+```text
+.tsm/hooks/
+├── extract/
+│   └── 10-md_frontmatter.lua   ← extract hook (index time)
+└── score/
+    └── 10-default.lua          ← score hook (search time)
+```
+
+- Only `.lua` files are loaded; non-`.lua` files are ignored.
+- Multiple hooks in the same directory are executed in sorted file-name order.
+- To disable a hook without deleting it, rename it away from `.lua`
+  (e.g. `10-default.lua.disabled`).
+- An empty or absent directory falls back to the embedded default hook.
+
+### Extract hooks
+
+Called at index time for each document chunk. Receive a context table:
+
+```lua
+-- ctx fields: path, body, frontmatter (top-level YAML keys), metadata (accumulated so far)
+function extract(ctx)
+  local fm = ctx.frontmatter or {}
+  return { status = fm.status, effective_date = fm.updated }
+end
+```
+
+`ctx.frontmatter` exposes the top-level YAML keys: scalars (string/number/bool)
+and sequences (e.g. `tags`, as a Lua array). Nested mappings are not passed.
+
+Return a flat table of scalar values (string, number, boolean). The results of
+all extract hooks are shallow-merged (last-wins for duplicate keys) and stored
+in `documents.metadata` (JSON column).
+
+### Score hooks
+
+Called at search time for each result. Receive a context table:
+
+```lua
+-- ctx fields: metadata (from extract), rrf, source_type, path, half_life_days
+-- builtins: decay(date, half_life_days), today()
+function score(ctx)
+  local m = ctx.metadata or {}
+  local penalty = ({ outdated = 0.4 })[m.status] or 1.0
+  return penalty * decay(m.effective_date, ctx.half_life_days)
+end
+```
+
+The snippet above is a minimal example. The shipped default
+(`score/10-default.lua`) uses the full status→penalty table:
+`superseded=0.2`, `rejected=0.3`, `dropped=0.3`, `deprecated=0.3`,
+`outdated=0.4`, `proposed=0.7`, everything else `1.0`.
+
+Each hook returns a multiplier (`>= 0`). The final score is
+`rrf × weight × Π(score hooks)`. Invalid returns (negative, NaN, ±Inf) are
+treated as `1.0` with a warning.
+
+### Sandboxing and lifecycle
+
+- Lua VMs are sandboxed: no standard library (`io`/`os`/`package` absent),
+  64 MiB memory ceiling. Hooks cannot touch the filesystem, network, or processes.
+- The daemon validates and loads all hooks at startup (fail-fast on syntax error
+  or missing entrypoint). The CLI uses a lazy per-process cache.
+- **Editing a hook requires `tsm restart`** — hooks are not reloaded at runtime.
+- **The `metadata` column is added automatically** (idempotent migration on connect); existing rows
+  have NULL metadata and the searcher synthesizes scoring from `status`/`updated`, so scoring is
+  unaffected. To populate `metadata` for existing documents after writing custom extract hooks, run
+  `tsm reindex` — a full destructive rebuild is not required.
+
+## Environment Variables
+
+Every setting below can also be set in `tsm.toml` (the `tsm.toml key` column);
+the environment variable takes precedence. See
+[docs/configuration.md](docs/configuration.md) for the full reference.
+
+| Variable | Default | `tsm.toml` key | Description |
+|---|---|---|---|
+| `TSM_CONFIG` | *(discovered)* | *(n/a)* | Path to the config file; the directory containing it becomes the project root |
+| `TSM_STATE_DIR` | `.tsm` | `state_dir` | Root directory for all tsm state (DB, sockets, PID, logs, user dict) |
+| `TSM_CACHE_DIR` | `$XDG_CACHE_HOME/tsm` (else `$HOME/.cache/tsm`) | `cache_dir` | Cache directory for the model and WordNet DB |
+| `TSM_EMBEDDER_SOCKET` | `{state_dir}/embedder.sock` | `embedder_socket_path` | UNIX socket for the embedder child process |
+| `TSM_DAEMON_SOCKET` | `{state_dir}/daemon.sock` | `daemon_socket_path` | UNIX socket for the `tsmd` daemon |
+| `TSM_LOG_DIR` | `{state_dir}/logs` | `log_dir` | Directory for daemon log files |
+| `TSM_EMBEDDER_IDLE_TIMEOUT` | `600` | `embedder_idle_timeout_secs` | Idle seconds before the embedder auto-stops (`0` = never). `tsmd` spawns it with `--no-idle-timeout`, so this applies only to standalone runs |
+| `TSM_EMBEDDER_BACKFILL_INTERVAL` | `300` | `embedder_backfill_interval_secs` | Seconds between periodic vector backfill checks (`0` = disable) |
+| `TSM_SEARCH_FALLBACK` | `error` | `search_fallback` | Behavior when the embedder is down: `error` or `fts_only` |
+| `TSM_USER_DICT` | `{state_dir}/user_dict.simpledic` | `user_dict_path` | Path to the lindera user dictionary |
+| `TSM_SETUP_LINK_MODE` | `symlink` | `[setup].link_mode` | How `tsm setup` materializes cached resources: `symlink` or `copy` |
+| `TSM_INIT_LINK_MODE` | `symlink` | `[init].link_mode` | How `tsm init` links workspace resources to the cache: `symlink` or `copy` |
+| `TSM_READER_POOL_SIZE` | CPU cores | `reader_pool_size` | Number of `query_only` reader connections in the daemon's reader pool; caps concurrent reads |
+| `TSM_REINDEX_FTS_BATCH_SIZE` | `200` | `reindex_fts_batch_size` | Documents per FTS reindex batch; smaller = finer preemption granularity and more fsync, larger = better reindex throughput |
+
+tsm also honors `RUST_LOG` (log level, default `info`) and `NO_COLOR`
+(disable colored output).
+
+## Benchmarks
+
+Performance benches for the search/index pipeline, plus a CI regression
+gate that runs on every PR touching `src/`, `benches/`, or `Cargo.toml`.
+Only embedder call counts are regression-gated (deterministic, exact
+equality); indexing throughput and search latency are recorded for trend
+visibility only. See [docs/benchmarks.md](docs/benchmarks.md) for the
+full design rationale, how to run the benches locally, and the CI
+workflow internals.
+
+## Search Quality
+
+Precision@5 / MRR / nDCG@5 measured against a hand-graded golden corpus,
+gated in CI against a committed baseline — catches quality regressions from
+dictionary, scoring, or hook changes that don't break any existing test but
+silently make search worse. Run it locally with
+`bash tests/quality_bench.sh`.
+
+See [Search Quality](docs/search-quality.md) for the full guide: design
+rationale, the golden corpus/query format, running and updating the
+baseline, and how the regression gate works.
+
 ## Documentation
 
 - [Command Reference](docs/command-reference.md) — CLI commands, flags, and usage examples
@@ -109,6 +269,8 @@ Use `tsm doctor` to check system health and daemon status.
 - [Data Flow](docs/data-flow.md) — Indexing and search flow diagrams
 - [Configuration](docs/configuration.md) — Environment variables and config file reference
 - [User Dictionary](docs/user-dictionary.md) — Custom dictionary management
+- [Benchmarks](docs/benchmarks.md) — Perf benches, CI regression gate, baseline lifecycle
+- [Search Quality](docs/search-quality.md) — Precision/MRR/nDCG regression gate: golden corpus, gate design, updating the baseline
 - [Design Decisions](decisions/) — ADR (Architecture Decision Records)
 
 ## Background

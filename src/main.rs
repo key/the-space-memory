@@ -4,8 +4,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use the_space_memory::cli;
+use the_space_memory::cli_args_logic;
 use the_space_memory::config;
 use the_space_memory::daemon_protocol::{self, DaemonRequest, DaemonResponse, ReindexKind};
+use the_space_memory::render;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SearchFallbackArg {
@@ -18,6 +20,24 @@ impl fmt::Display for SearchFallbackArg {
         match self {
             SearchFallbackArg::Error => write!(f, "error"),
             SearchFallbackArg::FtsOnly => write!(f, "fts_only"),
+        }
+    }
+}
+
+/// CLI surface for `config::LinkMode`. Kept as a thin wrapper so `config`
+/// stays decoupled from clap (mirrors `SearchFallbackArg` / `ReindexKindArg`).
+/// Shared by `setup --link-mode` and `init --link-mode`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LinkModeArg {
+    Symlink,
+    Copy,
+}
+
+impl From<LinkModeArg> for config::LinkMode {
+    fn from(arg: LinkModeArg) -> Self {
+        match arg {
+            LinkModeArg::Symlink => config::LinkMode::Symlink,
+            LinkModeArg::Copy => config::LinkMode::Copy,
         }
     }
 }
@@ -39,54 +59,100 @@ impl From<ReindexKindArg> for ReindexKind {
     }
 }
 
+/// `git describe` + build date injected by `build.rs`, falling back to the
+/// crate version when the build script did not run.
+const LONG_VERSION: &str = match option_env!("TSM_VERSION_LONG") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
 #[command(
     name = "tsm",
-    version,
+    version = LONG_VERSION,
     about = "The Space Memory — knowledge search engine"
 )]
 struct Cli {
+    /// Project root: the directory holding `tsm.toml`.
+    /// Used when the current directory has no `tsm.toml`. Without either,
+    /// commands fail (except `tsm init`, which scaffolds in the CWD).
+    #[arg(long, global = true, value_name = "DIR")]
+    project_root: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum DictCommands {
-    /// Show dictionary update candidates (dry run) / apply to add words
+    /// Show frequent, un-judged dictionary candidate words (read-only)
     Update {
         /// Minimum frequency threshold
         #[arg(long, default_value = "5")]
         threshold: i64,
-        /// Add words to dict and rebuild FTS
-        #[arg(long)]
-        apply: bool,
     },
-    /// Manage reject list (reject_words.txt)
+    /// Reject a word: mark it rejected so it is never added to the dictionary
     Reject {
-        /// Sync reject_words.txt to DB
-        #[arg(long)]
-        apply: bool,
-        /// Show all rejected words in DB
-        #[arg(long, conflicts_with = "apply")]
-        all: bool,
+        /// The word to reject
+        word: String,
     },
-    /// Manage user-defined synonyms (.tsm/synonyms.csv)
-    Synonym {
-        #[command(subcommand)]
-        command: SynonymCommands,
+    /// Accept a word into the user dictionary (one word; optional reading)
+    Add {
+        /// Surface form to add (e.g. a compound lindera mis-splits)
+        surface: String,
+        /// Reading (yomi). Omit for all-kana surfaces; a kanji surface warns
+        yomi: Option<String>,
     },
+    /// Reset a word to pending, removing it from the dict or reject list
+    Rm {
+        /// Word to reset
+        word: String,
+    },
+    /// Export DB verdicts to user_dict.simpledic / reject_words.txt
+    Export,
+    /// Import verdicts from user_dict.simpledic / reject_words.txt into the DB
+    Import,
 }
 
 #[derive(Subcommand)]
 enum SynonymCommands {
-    /// Sync synonyms.csv to database
-    Sync,
+    /// Add a synonym pair to the DB
+    Add {
+        /// First word of the pair
+        a: String,
+        /// Second word of the pair
+        b: String,
+    },
+    /// Remove synonym pair(s) from the DB
+    Rm {
+        /// Word to remove
+        a: String,
+        /// Optional partner; omit to remove every pair involving `a`
+        b: Option<String>,
+    },
+    /// Export user synonyms as CSV (DB -> stdout, or --file)
+    Export {
+        /// Write to this file instead of stdout
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
+    /// Import user synonyms from CSV (stdin -> DB, or --file)
+    Import {
+        /// Read from this file instead of stdin
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize the database
-    Init,
+    Init {
+        /// How workspace resources reference the machine cache.
+        /// Defaults to `[init].link_mode` from tsm.toml, or `symlink`.
+        #[arg(long, value_enum)]
+        link_mode: Option<LinkModeArg>,
+    },
     /// Start the daemon (tsmd)
     Start {
         /// Skip watcher startup
@@ -139,8 +205,14 @@ enum Commands {
         /// Path to the JSONL file
         session_file: PathBuf,
     },
-    /// Download model files from HuggingFace Hub
-    Setup,
+    /// Download the model + WordNet into the machine-wide cache (`$cache_dir`).
+    /// Run once per machine; does not touch a workspace `.tsm/`.
+    Setup {
+        /// How cache entries reference upstream sources (symlink | copy).
+        /// Defaults to `[setup].link_mode` from tsm.toml, else `symlink`.
+        #[arg(long, value_enum)]
+        link_mode: Option<LinkModeArg>,
+    },
     /// Fill missing vectors for chunks (needs running embedder)
     VectorFill {
         /// Batch size for processing
@@ -152,10 +224,17 @@ enum Commands {
         /// Path to wnjpn.db
         wordnet_db: PathBuf,
     },
-    /// Manage user dictionary
+    /// Manage the lindera user dictionary (tokenization). For query-expansion
+    /// synonyms, see `tsm synonym`.
     Dict {
         #[command(subcommand)]
         command: DictCommands,
+    },
+    /// Manage query-expansion synonyms (search). For the lindera user
+    /// dictionary, see `tsm dict`.
+    Synonym {
+        #[command(subcommand)]
+        command: SynonymCommands,
     },
     /// Show current system status
     Status,
@@ -184,19 +263,81 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Restore the default SIGPIPE disposition. Rust's runtime sets SIGPIPE to
+    // SIG_IGN at startup, which turns a write to a closed pipe into a panic
+    // (`failed printing to stdout`) when results are piped into `head`, `pbcopy`,
+    // etc. Resetting to SIG_DFL makes the CLI terminate quietly on a broken pipe,
+    // matching standard Unix tools. tsmd is a separate binary and re-establishes
+    // SIG_IGN at its own startup, so this does not affect the daemon.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     config::ensure_model_cache_env();
-    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Stderr)?;
     let args = Cli::parse();
+
+    // Resolve the project root (the dir holding `tsm.toml`) from
+    // the CWD, `--project-root`, or `$TSM_CONFIG`, and inject it before any
+    // config access. `init` and `setup` are project-independent (they run
+    // before a project exists — scaffolding and model-cache download), so they
+    // tolerate an unresolved root and fall back to the CWD. Every other command
+    // fails fast with a guiding error.
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!(
+                "warning: cannot determine the current directory ({e}); \
+                 project-root resolution may be incorrect"
+            );
+            PathBuf::from(".")
+        }
+    };
+    let tsm_config = std::env::var_os("TSM_CONFIG").map(PathBuf::from);
+    let resolved_root =
+        config::resolve_project_root(&cwd, args.project_root.as_deref(), tsm_config.as_deref());
+    let project_root = match &args.command {
+        Commands::Init { .. } | Commands::Setup { .. } => {
+            resolved_root.unwrap_or_else(|_| cwd.clone())
+        }
+        _ => resolved_root?,
+    };
+    // Surface a `--project-root` that lost to the CWD's `tsm.toml` or
+    // `$TSM_CONFIG` — otherwise the explicit flag is silently ineffective.
+    if let Some(arg) = args.project_root.as_deref() {
+        if project_root.as_path() != arg {
+            eprintln!(
+                "warning: --project-root '{}' overridden; using project root '{}'",
+                arg.display(),
+                project_root.display()
+            );
+        }
+    }
+    config::set_project_root(project_root);
+
+    // Reject a config that still has the removed `index_root` key.
+    // This is the only place a hard exit is permitted for this condition; the
+    // daemon uses `anyhow::bail!` and reload uses a warning (mirrors the
+    // uninitialized-DB startup behaviour).
+    if let Some(path) = config::legacy_index_root() {
+        eprintln!(
+            "error: `index_root = \"{}\"` in tsm.toml is no longer supported.\n\
+             Replace it with `[[index.content_dirs]]` entries with paths relative to the \
+             project root.\nAborting.",
+            path.display()
+        );
+        std::process::exit(1);
+    }
+
+    the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Stderr)?;
     match args.command {
         // ── Always direct ──
-        Commands::Init => cli::cmd_init()?,
-        Commands::Start { no_watcher } => cmd_start(no_watcher)?,
+        Commands::Init { link_mode } => cli::cmd_init(link_mode.map(config::LinkMode::from))?,
+        Commands::Start { no_watcher } => cmd_start(no_watcher, true)?,
         Commands::Stop => cmd_stop()?,
         Commands::Restart => {
             cmd_stop()?;
-            cmd_start(false)?;
+            cmd_start(false, true)?;
         }
-        Commands::Setup => cli::cmd_setup()?,
+        Commands::Setup { link_mode } => cli::cmd_setup(link_mode.map(Into::into))?,
         Commands::VectorFill { batch_size } => cli::cmd_vector_fill(batch_size)?,
 
         // ── Direct-only with daemon guard ──
@@ -207,23 +348,36 @@ fn main() -> anyhow::Result<()> {
             cli::cmd_rebuild(apply)?;
         }
         Commands::Dict { command } => match command {
-            DictCommands::Update { threshold, apply } => {
-                cli::cmd_dict_update(threshold, apply)?;
+            DictCommands::Update { threshold } => {
+                cli::cmd_dict_update(threshold)?;
             }
-            DictCommands::Reject { apply, all } => {
-                cli::cmd_dict_reject(apply, all)?;
+            DictCommands::Reject { word } => {
+                cli::cmd_dict_reject(&word)?;
             }
-            DictCommands::Synonym { command } => match command {
-                SynonymCommands::Sync => {
-                    cli::cmd_synonym_sync()?;
-                }
-            },
+            DictCommands::Export => {
+                cli::cmd_dict_export()?;
+            }
+            DictCommands::Import => {
+                cli::cmd_dict_import()?;
+            }
+            DictCommands::Add { surface, yomi } => {
+                cli::cmd_dict_add(&surface, yomi.as_deref())?;
+            }
+            DictCommands::Rm { word } => {
+                cli::cmd_dict_rm(&word)?;
+            }
+        },
+        Commands::Synonym { command } => match command {
+            SynonymCommands::Add { a, b } => cli::cmd_synonym_add(&a, &b)?,
+            SynonymCommands::Rm { a, b } => cli::cmd_synonym_rm(&a, b.as_deref())?,
+            SynonymCommands::Export { file } => cli::cmd_synonym_export(file.as_deref())?,
+            SynonymCommands::Import { file } => cli::cmd_synonym_import(file.as_deref())?,
         },
 
         // ── Daemon-routed (auto-starts tsmd if needed) ──
         Commands::Reindex { kind } => {
             let req = DaemonRequest::Reindex { kind: kind.into() };
-            render_reindex(send_to_daemon(&req)?)?;
+            render::render_reindex(&mut std::io::stdout(), send_to_daemon(&req)?)?;
         }
 
         Commands::Search {
@@ -244,17 +398,10 @@ fn main() -> anyhow::Result<()> {
                     .map(|f| f.to_string())
                     .unwrap_or_else(|| config::search_fallback().to_string()),
             );
-            for p in &paths {
-                if p.is_empty() {
-                    anyhow::bail!("--path cannot be empty");
-                }
-                if std::path::Path::new(p).is_absolute() {
-                    anyhow::bail!(
-                        "--path must be a relative path (e.g. 'daily/'), got absolute: {p}"
-                    );
-                }
-            }
-            let paths = if paths.is_empty() { None } else { Some(paths) };
+            // --path accepts absolute or CWD-relative; normalized to
+            // deduped absolute paths anchored at the caller's CWD.
+            let cwd = std::env::current_dir()?;
+            let paths = cli_args_logic::normalize_path_filters(&paths, &cwd)?;
             let req = DaemonRequest::Search {
                 query,
                 top_k,
@@ -267,52 +414,77 @@ fn main() -> anyhow::Result<()> {
                 fallback,
                 paths,
             };
-            render_search(send_to_daemon(&req)?, &format)?;
+            render::render_search(&mut std::io::stdout(), send_to_daemon(&req)?, &format)?;
         }
 
         Commands::Index { files_from_stdin } => {
             let req = if files_from_stdin {
-                let index_root = config::index_root();
-                let paths = cli::read_paths_from_stdin(&index_root);
-                let rel_paths: Vec<String> = paths
+                let project_root = config::project_root();
+                let paths = cli::read_paths_from_stdin(&project_root);
+                // Send absolute paths. The daemon's project_root.join
+                // passes absolute paths through unchanged, and index_file stores
+                // the absolutized path, so the wire value stays stable.
+                let abs_paths: Vec<String> = paths
                     .iter()
-                    .filter_map(|p| p.strip_prefix(&index_root).ok())
-                    .map(|p| p.to_string_lossy().to_string())
+                    .map(|p| {
+                        the_space_memory::paths::absolutize(p, &project_root)
+                            .to_string_lossy()
+                            .to_string()
+                    })
                     .collect();
-                DaemonRequest::Index { files: rel_paths }
+                DaemonRequest::Index { files: abs_paths }
             } else {
                 DaemonRequest::Index { files: vec![] }
             };
-            render_index(send_to_daemon(&req)?)?;
+            render::render_index(&mut std::io::stdout(), send_to_daemon(&req)?)?;
         }
 
         Commands::IngestSession { session_file } => {
             let req = DaemonRequest::IngestSession {
                 session_file: session_file.to_string_lossy().to_string(),
             };
-            render_ingest(send_to_daemon(&req)?, &session_file)?;
+            render::render_ingest(&mut std::io::stdout(), send_to_daemon(&req)?, &session_file)?;
         }
 
         Commands::Status => {
-            render_status(send_to_daemon(&DaemonRequest::Status)?)?;
+            render::render_status(send_to_daemon(&DaemonRequest::Status)?)?;
         }
 
         Commands::Doctor { format } => {
+            // Doctor is a read-only diagnostic: never auto-start the daemon.
+            // Use the daemon's in-process report if it is already running,
+            // otherwise fall back to a local check (handles uninitialized DBs).
+            let socket = config::daemon_socket_path();
             let req = DaemonRequest::Doctor {
                 format: format.clone(),
             };
-            render_doctor(send_to_daemon(&req)?, &format)?;
+            match daemon_protocol::try_send_request(&socket, &req) {
+                Some(Ok(resp)) => render::render_doctor(resp, &format)?,
+                // Socket present but unresponsive (broken or shutting-down
+                // daemon): surface the error so it is not silently hidden, but
+                // still produce a local report — a diagnostic must never hard-fail.
+                Some(Err(e)) => {
+                    eprintln!("warning: daemon socket present but did not respond: {e}");
+                    cli::cmd_doctor(&format)?;
+                }
+                // No daemon running: local read-only check.
+                None => cli::cmd_doctor(&format)?,
+            }
         }
 
         Commands::ImportWordnet { wordnet_db } => {
             let req = DaemonRequest::ImportWordnet {
                 wordnet_db: wordnet_db.to_string_lossy().to_string(),
             };
-            render_import_wordnet(send_to_daemon(&req)?)?;
+            render::render_import_wordnet(&mut std::io::stdout(), send_to_daemon(&req)?)?;
         }
 
         Commands::Reload => {
-            render_reload(send_to_daemon(&DaemonRequest::Reload)?)?;
+            render::render_reload(
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+                send_to_daemon(&DaemonRequest::Reload)?,
+            )?;
         }
     }
     Ok(())
@@ -333,8 +505,8 @@ fn send_to_daemon(req: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
         None => {} // daemon not running, auto-start below
     }
 
-    // Auto-start tsmd
-    cmd_start(false)?;
+    // Auto-start tsmd (quiet: this is implicit, not an explicit `tsm start`)
+    cmd_start(false, false)?;
 
     // Retry after start
     daemon_protocol::send_request(&socket, req)
@@ -356,145 +528,39 @@ fn guard_daemon_not_running(command: &str) -> anyhow::Result<()> {
     }
 }
 
-// ─── Render helpers (daemon response → terminal output) ───────────
-
-fn print_json(value: &serde_json::Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).unwrap_or_default()
-    );
-}
-
-fn check_resp(resp: &DaemonResponse) -> anyhow::Result<()> {
-    if !resp.ok {
-        anyhow::bail!(
-            "{}",
-            resp.error
-                .clone()
-                .unwrap_or_else(|| "(daemon returned error with no message)".into())
-        );
-    }
-    Ok(())
-}
-
-fn render_search(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    let payload = resp.payload.unwrap_or_default();
-    match format {
-        "json" => print_json(&payload),
-        _ => {
-            let total_hits = payload["total_hits"].as_u64().unwrap_or(0) as usize;
-            let results: Vec<the_space_memory::searcher::SearchResult> =
-                serde_json::from_value(payload["results"].clone())
-                    .map_err(|e| anyhow::anyhow!("Failed to parse search results: {e}"))?;
-            print!("{}", cli::format_text(&results, total_hits));
-        }
-    }
-    Ok(())
-}
-
-fn render_index(resp: DaemonResponse) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    if let Some(payload) = resp.payload {
-        let indexed = payload["indexed"].as_i64().unwrap_or(0);
-        let skipped = payload["skipped"].as_i64().unwrap_or(0);
-        let removed = payload["removed"].as_i64().unwrap_or(0);
-        log::info!("indexed: {indexed}, skipped: {skipped}, removed: {removed}");
-    }
-    Ok(())
-}
-
-fn render_ingest(resp: DaemonResponse, session_file: &std::path::Path) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    let name = session_file
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
-    if let Some(payload) = resp.payload {
-        if payload["indexed"].as_bool().unwrap_or(false) {
-            log::info!("session indexed: {name}");
-        } else {
-            log::info!("session unchanged: {name}");
-        }
-    }
-    Ok(())
-}
-
-fn render_status(resp: DaemonResponse) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    if let Some(payload) = resp.payload {
-        let info: cli::StatusInfo = serde_json::from_value(payload).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse daemon status: {e}\nTry `tsm stop && tsm start` to refresh."
-            )
-        })?;
-        cli::print_status_info(&info);
-    }
-    Ok(())
-}
-
-fn render_doctor(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    let payload = resp.payload.unwrap_or_default();
-    if format == "json" {
-        print_json(&payload);
-        return Ok(());
-    }
-    let report: cli::DoctorReport = serde_json::from_value(payload).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse daemon doctor report: {e}\nTry `tsm stop && tsm start` to refresh."
-        )
-    })?;
-    cli::render_doctor_report(&report);
-    Ok(())
-}
-
-fn render_reload(resp: DaemonResponse) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    if let Some(payload) = &resp.payload {
-        if let Some(warnings) = payload.get("warnings").and_then(|w| w.as_array()) {
-            for w in warnings {
-                if let Some(s) = w.as_str() {
-                    eprintln!("warning: {s}");
-                }
-            }
-        }
-    }
-    println!("config reloaded");
-    Ok(())
-}
-
-fn render_reindex(resp: DaemonResponse) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    println!("reindex started. Run `tsm doctor` to check progress.");
-    Ok(())
-}
-
-fn render_import_wordnet(resp: DaemonResponse) -> anyhow::Result<()> {
-    check_resp(&resp)?;
-    if let Some(payload) = resp.payload {
-        let count = payload["imported"].as_i64().unwrap_or(0);
-        log::info!("imported {count} synonym pairs from WordNet");
-    }
-    Ok(())
-}
-
 /// Start the tsmd daemon as a background process.
-fn cmd_start(no_watcher: bool) -> anyhow::Result<()> {
+///
+/// `verbose` controls success feedback: an explicit `tsm start`/`restart` prints
+/// a confirmation, while an implicit auto-start (from a daemon-routed command)
+/// stays quiet so it does not prepend noise to that command's output.
+fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
 
     let socket_path = config::daemon_socket_path();
 
-    // Check if already running
+    // If a daemon is already serving this socket, we're done. Do NOT remove a
+    // non-responding socket here: a hung-but-live daemon still holds the startup
+    // lock, and deleting its socket before tsmd's lock check would reintroduce
+    // the silent clobber. tsmd reclaims a genuinely stale socket itself,
+    // gated by the per-project lock.
     if socket_path.exists() {
         if let Ok(resp) = daemon_protocol::send_request(&socket_path, &DaemonRequest::Ping) {
             if resp.ok {
-                log::info!("tsmd is already running");
+                report_daemon_state(verbose, "tsmd is already running");
                 return Ok(());
             }
         }
-        // Stale socket — remove it
-        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    // Fail fast on an uninitialized DB BEFORE creating the stderr log file (which
+    // would materialize the state directory) or spawning tsmd. `init` is an
+    // explicit, separate step; starting in an unconfigured directory
+    // must not leave a stray `.tsm` behind. The probe never creates the DB; a
+    // genuine open failure propagates instead of being misreported as "not
+    // initialized".
+    let db_path = config::db_path();
+    if !the_space_memory::db::probe_initialized(&db_path)? {
+        return Err(the_space_memory::db::uninitialized_error(&db_path));
     }
 
     // Find the tsmd binary (same directory as tsm)
@@ -511,12 +577,41 @@ fn cmd_start(no_watcher: bool) -> anyhow::Result<()> {
         );
     }
 
+    // Capture the detached daemon tree's stderr to a single file instead of
+    // inheriting the terminal: a long-lived background process must not spew
+    // warnings into the user's shell. Children (embedder, watcher) inherit this
+    // fd and log to it too (they keep no separate files), so this is the daemon
+    // tree's combined stderr. It is also read back below to surface startup
+    // failures. Truncated each start, so it does not accumulate across runs.
+    let stderr_path = config::log_dir().join("tsmd-stderr.log");
+    if let Some(parent) = stderr_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stderr_file = std::fs::File::create(&stderr_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open daemon log {}: {e}", stderr_path.display()))?;
+
+    // Pass the project root explicitly so tsmd chdir()s there and `ps`/`pgrep`
+    // reveal the owning project.
+    //
+    // We pass `canonical(CWD)`, not `config::project_root()`. Today `state_dir`
+    // (and thus the socket path) is resolved CWD-relative — `.tsm/…` — and is
+    // NOT derived from `project_root` (config.rs DEFAULT_STATE_DIR). So the
+    // socket tsm waits on lives under the *CWD*; tsmd must chdir to that same
+    // directory or the two would bind/connect different files. `config::
+    // project_root()` can diverge from CWD via escape hatches (e.g. $TSM_CONFIG
+    // pointing elsewhere), which would break that agreement. In the normal case
+    // (a `tsm.toml` in CWD) `canonical(CWD)` equals the project root (the dir
+    // holding `tsm.toml`). Once `state_dir` derives from `project_root`, this converges
+    // on `config::project_root()`.
+    let project_root = std::fs::canonicalize(std::env::current_dir()?)?;
+
     // Spawn tsmd in a new session (detached)
-    // Keep stderr inherited so pre-logger startup errors are visible
     let mut cmd = std::process::Command::new(&tsmd_path);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit());
+        .stderr(std::process::Stdio::from(stderr_file))
+        .arg("--project-root")
+        .arg(&project_root);
     if no_watcher {
         cmd.arg("--no-watcher");
     }
@@ -527,20 +622,40 @@ fn cmd_start(no_watcher: bool) -> anyhow::Result<()> {
         });
     }
 
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to start tsmd: {e}"))?;
 
-    // Wait for socket to appear (max 30 seconds)
+    wait_for_daemon_ready(&mut child, &socket_path, &stderr_path, verbose)
+}
+
+/// Wait for the spawned daemon to bind its socket (max 30s), failing fast if it
+/// exits before binding (e.g. uninitialized DB) instead of polling the full
+/// timeout. The captured stderr is surfaced so the reason is visible.
+fn wait_for_daemon_ready(
+    child: &mut std::process::Child,
+    socket_path: &std::path::Path,
+    stderr_path: &std::path::Path,
+    verbose: bool,
+) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(30);
     loop {
         if socket_path.exists() {
-            if let Ok(resp) = daemon_protocol::send_request(&socket_path, &DaemonRequest::Ping) {
+            if let Ok(resp) = daemon_protocol::send_request(socket_path, &DaemonRequest::Ping) {
                 if resp.ok {
-                    log::info!("tsmd started");
+                    report_daemon_state(verbose, "tsmd started");
                     return Ok(());
                 }
             }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let detail = read_daemon_failure(stderr_path);
+                anyhow::bail!("tsmd exited before starting ({status}).{detail}");
+            }
+            Err(e) => anyhow::bail!("failed to poll tsmd startup status: {e}"),
+            Ok(None) => {}
         }
         if start.elapsed() > timeout {
             anyhow::bail!("Timeout waiting for tsmd to start.");
@@ -549,19 +664,103 @@ fn cmd_start(no_watcher: bool) -> anyhow::Result<()> {
     }
 }
 
+/// Report a daemon lifecycle state: print it for explicit commands (`verbose`),
+/// otherwise log at info so an implicit auto-start stays quiet by default.
+fn report_daemon_state(verbose: bool, message: &str) {
+    if verbose {
+        println!("{message}");
+    } else {
+        log::info!("{message}");
+    }
+}
+
+/// Read a captured daemon stderr log and format its tail for an error message.
+fn read_daemon_failure(stderr_path: &std::path::Path) -> String {
+    match std::fs::read_to_string(stderr_path) {
+        Ok(s) => format_daemon_failure(&s),
+        Err(_) => String::new(),
+    }
+}
+
+/// Format the tail of captured daemon stderr as an indented detail block.
+/// Returns an empty string when there is nothing useful to show.
+fn format_daemon_failure(stderr: &str) -> String {
+    let tail: Vec<&str> = stderr
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .rev()
+        .take(5)
+        .collect();
+    if tail.is_empty() {
+        return String::new();
+    }
+    let body = tail
+        .into_iter()
+        .rev()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("\n{body}")
+}
+
+/// Read the running daemon's PID from its (diagnostic) PID file, if present.
+fn read_daemon_pid() -> Option<u32> {
+    std::fs::read_to_string(config::daemon_pid_path())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Poll until process `pid` has exited, or `timeout` elapses.
+///
+/// Returns `true` if the process is gone, `false` on timeout. Used so `tsm stop`
+/// does not return until the daemon has actually terminated and released its
+/// startup lock — otherwise `tsm restart` would race the dying daemon and the
+/// new tsmd would bail with "another tsmd already owns this project".
+fn wait_for_pid_exit(pid: u32, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        // kill(pid, 0) sends no signal, only probes existence. Treat the process
+        // as gone ONLY on ESRCH; rc == 0 (alive) or EPERM (alive but not ours)
+        // both mean keep waiting, so a permission quirk can't be misread as exit.
+        let rc = unsafe { libc::kill(pid as i32, 0) };
+        if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Stop the tsmd daemon by sending a Shutdown request.
 fn cmd_stop() -> anyhow::Result<()> {
     let socket_path = config::daemon_socket_path();
 
     if !socket_path.exists() {
-        log::info!("tsmd is not running");
+        println!("tsmd is not running");
         return Ok(());
     }
+
+    // Capture the PID before shutdown so we can wait for the process to fully
+    // exit below; the daemon removes its PID file during cleanup.
+    let pid = read_daemon_pid();
 
     match daemon_protocol::send_request(&socket_path, &DaemonRequest::Shutdown) {
         Ok(resp) => {
             if resp.ok {
-                log::info!("tsmd stopped");
+                // Wait for the daemon to actually exit (releasing its startup
+                // lock) before returning, so `tsm restart` can start a fresh
+                // tsmd without colliding with the still-dying one. The daemon
+                // ACKs Shutdown before tearing down its accept loop and reaping
+                // children, so the process outlives this reply briefly.
+                if let Some(pid) = pid {
+                    if !wait_for_pid_exit(pid, std::time::Duration::from_secs(10)) {
+                        log::warn!("tsmd (pid {pid}) did not exit within 10s of shutdown");
+                    }
+                }
+                println!("tsmd stopped");
             } else {
                 log::warn!("tsmd reported error: {}", resp.error.unwrap_or_default());
             }
@@ -569,9 +768,65 @@ fn cmd_stop() -> anyhow::Result<()> {
         Err(e) => {
             log::warn!("could not connect to tsmd: {e}");
             let _ = std::fs::remove_file(&socket_path);
-            log::info!("removed stale socket");
+            println!("removed stale socket");
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_daemon_failure_empty() {
+        assert_eq!(format_daemon_failure(""), "");
+        assert_eq!(format_daemon_failure("\n  \n"), "");
+    }
+
+    #[test]
+    fn test_format_daemon_failure_indents_tail() {
+        let out =
+            format_daemon_failure("warming up\nError: Database not initialized. Run `tsm init`.\n");
+        assert_eq!(
+            out,
+            "\n  warming up\n  Error: Database not initialized. Run `tsm init`."
+        );
+    }
+
+    #[test]
+    fn test_format_daemon_failure_keeps_last_five_lines() {
+        let input = (1..=8)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = format_daemon_failure(&input);
+        assert!(out.starts_with("\n  line4"));
+        assert!(out.ends_with("  line8"));
+        assert!(!out.contains("line3"));
+    }
+
+    #[test]
+    fn test_wait_for_pid_exit_returns_true_for_dead_process() {
+        // Spawn a process that exits immediately, reap it, then confirm the
+        // wait observes it as gone.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true`");
+        let pid = child.id();
+        child.wait().expect("reap child");
+
+        assert!(wait_for_pid_exit(pid, std::time::Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn test_wait_for_pid_exit_times_out_for_live_process() {
+        // Our own process is alive, so the wait must hit the (short) timeout.
+        let me = std::process::id();
+        assert!(!wait_for_pid_exit(
+            me,
+            std::time::Duration::from_millis(100)
+        ));
+    }
 }

@@ -79,6 +79,46 @@ pub enum DaemonRequest {
     Ping,
 }
 
+impl DaemonRequest {
+    /// Whether the daemon serves this request without writing to the DB.
+    ///
+    /// Drives connection routing in `tsmd`: `true` → read-only pool, `false` →
+    /// writer. The match is exhaustive (no wildcard) on purpose: adding a new
+    /// variant fails to compile until it is explicitly classified, so a new
+    /// read request can never silently route onto the writer and freeze again.
+    ///
+    /// INVARIANT: a `true` classification means the daemon's handler for this
+    /// request issues NO DB write on the serving connection — reads run on a
+    /// `query_only` reader connection, so any write would fail `SQLITE_READONLY`.
+    /// If a handler classified `true` ever needs to write (including indirect
+    /// side effects like dictionary-candidate harvesting), route that write onto
+    /// the daemon's shared writer after the response (as the search path does via
+    /// `tsmd::backfill_logic::harvest_query_candidates`) rather than reclassifying the
+    /// request as a write.
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            // Genuine reads.
+            DaemonRequest::Search { .. }
+            | DaemonRequest::Doctor { .. }
+            | DaemonRequest::Status
+            | DaemonRequest::Ping => true,
+            // No DB access on the daemon path (flag flip / refused-while-active).
+            // These reach a pooled `query_only` reader: their handlers must stay
+            // write-free (see the INVARIANT above) or be routed to a writer.
+            DaemonRequest::Shutdown | DaemonRequest::Rebuild | DaemonRequest::DictUpdate { .. } => {
+                true
+            }
+            // Writes.
+            DaemonRequest::Index { .. }
+            | DaemonRequest::IngestSession { .. }
+            | DaemonRequest::VectorFill { .. }
+            | DaemonRequest::ImportWordnet { .. } => false,
+            // Intercepted by handle_client before classification; write/control class.
+            DaemonRequest::Reindex { .. } | DaemonRequest::Reload => false,
+        }
+    }
+}
+
 /// Response from tsmd daemon to tsm CLI.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DaemonResponse {
@@ -564,5 +604,56 @@ mod tests {
         std::fs::write(&sock_path, "stale").unwrap();
         let result = try_send_request(&sock_path, &DaemonRequest::Ping);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_only_requests() {
+        assert!(DaemonRequest::Status.is_read_only());
+        assert!(DaemonRequest::Ping.is_read_only());
+        assert!(DaemonRequest::Shutdown.is_read_only());
+        assert!(DaemonRequest::Doctor {
+            format: "text".into()
+        }
+        .is_read_only());
+        assert!(DaemonRequest::Search {
+            query: "q".into(),
+            top_k: 5,
+            format: "text".into(),
+            include_content: None,
+            after: None,
+            before: None,
+            recent: None,
+            year: None,
+            fallback: None,
+            paths: None,
+        }
+        .is_read_only());
+        // Refused-while-active control requests touch no DB on the daemon path.
+        assert!(DaemonRequest::Rebuild.is_read_only());
+        assert!(DaemonRequest::DictUpdate {
+            threshold: 0,
+            apply: true
+        }
+        .is_read_only());
+    }
+
+    #[test]
+    fn test_write_requests() {
+        assert!(!DaemonRequest::Index { files: vec![] }.is_read_only());
+        assert!(!DaemonRequest::IngestSession {
+            session_file: "s".into()
+        }
+        .is_read_only());
+        assert!(!DaemonRequest::VectorFill { batch_size: 1 }.is_read_only());
+        assert!(!DaemonRequest::ImportWordnet {
+            wordnet_db: "w".into()
+        }
+        .is_read_only());
+        // Intercepted before classification; classified write/control.
+        assert!(!DaemonRequest::Reindex {
+            kind: ReindexKind::All
+        }
+        .is_read_only());
+        assert!(!DaemonRequest::Reload.is_read_only());
     }
 }

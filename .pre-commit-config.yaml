@@ -1,0 +1,106 @@
+# prek / pre-commit hooks. Activate once after cloning:
+#   prek install --hook-type pre-commit --hook-type pre-push
+# prek and the linters come from mise; run `mise install` first.
+#
+# Stage split: fast, file-scoped, auto-fixable checks run at pre-commit; slow,
+# whole-repo "would CI fail" gates run at pre-push. Local hooks resolve their
+# mise-managed tool via scripts/hook-run.sh, so they work from a bare git
+# command where mise's shims are not on PATH.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        stages: [pre-commit]
+      - id: end-of-file-fixer
+        stages: [pre-commit]
+      - id: check-merge-conflict
+        stages: [pre-commit]
+
+  - repo: local
+    hooks:
+      # --- pre-commit: fast, file-scoped, auto-fixable ---
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: scripts/hook-run.sh cargo fmt
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rumdl
+        name: rumdl (markdown)
+        entry: scripts/hook-run.sh rumdl check
+        language: system
+        types: [markdown]
+        stages: [pre-commit]
+
+      - id: shellcheck
+        name: shellcheck
+        entry: scripts/hook-run.sh shellcheck
+        language: system
+        types: [shell]
+        stages: [pre-commit]
+
+      - id: ryl
+        name: ryl (yaml)
+        entry: scripts/hook-run.sh ryl
+        language: system
+        types: [yaml]
+        stages: [pre-commit]
+
+      - id: taplo
+        name: taplo (toml)
+        entry: scripts/hook-run.sh taplo check
+        language: system
+        types: [toml]
+        stages: [pre-commit]
+
+      - id: testdata-dates
+        name: testdata date placeholders
+        entry: scripts/lint-testdata-dates.sh
+        language: script
+        files: ^tests/e2e/testdata/
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: gitleaks
+        name: gitleaks (secret scan)
+        entry: scripts/hook-run.sh gitleaks git --pre-commit --staged --redact --no-banner
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      # --- pre-push: slow, whole-repo, mirrors CI ---
+      - id: lizard-complexity
+        name: Cyclomatic complexity (baseline 13)
+        entry: scripts/check-complexity.sh
+        language: script
+        files: ^src/.*\.rs$
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: cargo-clippy
+        name: cargo clippy --all-targets -D warnings
+        entry: scripts/hook-run.sh cargo clippy --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: cargo-test
+        name: cargo test
+        entry: scripts/hook-run.sh cargo test
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: jscpd
+        name: jscpd (duplication <=5%)
+        # Ignore local-only build artifacts; CI runs on a fresh checkout without
+        # them, so the set of scanned files matches CI.
+        entry: scripts/hook-run.sh npx jscpd --ignore **/target/**,**/node_modules/**,**/.git/**
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

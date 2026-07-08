@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Once;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use crate::config;
 
@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS documents (
     updated TEXT,
     tags TEXT,
     file_hash TEXT NOT NULL,
-    indexed_at TEXT NOT NULL
+    indexed_at TEXT NOT NULL,
+    metadata TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -91,7 +92,8 @@ CREATE TABLE IF NOT EXISTS dictionary_candidates (
     first_seen  TEXT NOT NULL,
     last_seen   TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(status IN ('pending', 'rejected', 'accepted'))
+                    CHECK(status IN ('pending', 'rejected', 'accepted')),
+    reading     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_dict_candidates_status_freq
@@ -133,11 +135,16 @@ fn create_vec_table(conn: &Connection) {
     let _ = conn.execute_batch(&sql);
 }
 
+/// Busy timeout (ms) applied to every connection. Turns the rare SQLITE_BUSY
+/// (WAL checkpoint, writer-vs-writer) into a bounded retry instead of an error.
+pub const BUSY_TIMEOUT_MS: u64 = 5000;
+
 fn apply_pragmas(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "PRAGMA journal_mode=WAL;
-         PRAGMA foreign_keys=ON;",
-    )?;
+         PRAGMA foreign_keys=ON;
+         PRAGMA busy_timeout={BUSY_TIMEOUT_MS};",
+    ))?;
     Ok(())
 }
 
@@ -154,8 +161,71 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Check whether a table with the given name exists.
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+        > 0
+}
+
+/// Check whether the database has been initialized with the core schema.
+///
+/// A freshly created (empty) DB file has no tables; `init` must be run before
+/// the daemon can serve requests against it. Requires the core operational
+/// tables `init_db` always creates: `documents`, `chunks`, and the FTS5
+/// `chunks_fts` (so a DB that merely happens to have the first two is rejected).
+/// `chunks_vec` is intentionally NOT required — it is created best-effort and may
+/// be legitimately absent when the sqlite-vec extension is unavailable. Column-
+/// and index-level identity is not checked here; schema drift is `rebuild`'s job.
+pub fn is_initialized(conn: &Connection) -> bool {
+    table_exists(conn, "documents")
+        && table_exists(conn, "chunks")
+        && table_exists(conn, "chunks_fts")
+}
+
+/// Whether the DB at `path` exists and carries the core schema, WITHOUT
+/// creating it.
+///
+/// A missing file reports `Ok(false)` without opening anything, so starting an
+/// uninitialized project never materializes the state directory (`init` is an
+/// explicit, separate step). An existing file is opened read-write
+/// but **without** the `CREATE` flag: this never creates a new DB, yet still
+/// lets SQLite recover a hot WAL left by an unclean shutdown (a read-only open
+/// would fail with `SQLITE_READONLY_RECOVERY` and falsely block startup).
+/// Genuine open failures (permission denied, not-a-database) propagate as `Err`
+/// so callers surface the real problem instead of misreporting "not
+/// initialized". Used as a side-effect-free pre-flight gate before the daemon
+/// creates its logger, lock, and socket.
+pub fn probe_initialized(path: &Path) -> anyhow::Result<bool> {
+    if !path.try_exists().unwrap_or(false) {
+        return Ok(false);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| anyhow::anyhow!("Failed to open DB at {}: {e}", path.display()))?;
+    Ok(is_initialized(&conn))
+}
+
+/// The canonical "the DB has no schema yet" error, shared by the CLI and daemon
+/// fail-fast guards so the user-facing wording stays identical in one place.
+pub fn uninitialized_error(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Database not initialized at {}. Run `tsm init` first.",
+        path.display()
+    )
+}
+
 /// Ensure the `content_hash` column exists on the `chunks` table (migration for older DBs).
+///
+/// No-op when the `chunks` table is absent: a freshly initialized DB already has
+/// the column via `SCHEMA_SQL`, and an uninitialized DB has no table to migrate.
 pub fn ensure_chunk_hash_column(conn: &Connection) -> anyhow::Result<()> {
+    if !table_exists(conn, "chunks") {
+        return Ok(());
+    }
     let has: bool = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('chunks') WHERE name='content_hash'",
         [],
@@ -167,12 +237,70 @@ pub fn ensure_chunk_hash_column(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Add the `documents.metadata` column to pre-existing DBs (no-op if present).
+///
+/// No-op when the `documents` table is absent: a freshly initialized DB already has
+/// the column via `SCHEMA_SQL`, and an uninitialized DB has no table to migrate.
+fn ensure_metadata_column(conn: &Connection) -> anyhow::Result<()> {
+    if !table_exists(conn, "documents") {
+        return Ok(());
+    }
+    let exists: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('documents') WHERE name = 'metadata'")?
+        .exists([])?;
+    if !exists {
+        conn.execute("ALTER TABLE documents ADD COLUMN metadata TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Add the `dictionary_candidates.reading` column to pre-existing DBs (no-op if present).
+///
+/// No-op when the `dictionary_candidates` table is absent: a freshly initialized DB
+/// already has the column via `SCHEMA_SQL`, and an uninitialized DB has no table to
+/// migrate. Existing rows keep a NULL reading until set by an explicit `dict add`.
+fn ensure_reading_column(conn: &Connection) -> anyhow::Result<()> {
+    if !table_exists(conn, "dictionary_candidates") {
+        return Ok(());
+    }
+    let exists: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('dictionary_candidates') WHERE name = 'reading'")?
+        .exists([])?;
+    if !exists {
+        conn.execute(
+            "ALTER TABLE dictionary_candidates ADD COLUMN reading TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Get a connection to the database at the given path.
 pub fn get_connection(db_path: &Path) -> anyhow::Result<Connection> {
     ensure_vec_extension();
     let conn = Connection::open(db_path)?;
     apply_pragmas(&conn)?;
     ensure_chunk_hash_column(&conn)?;
+    ensure_metadata_column(&conn)?;
+    ensure_reading_column(&conn)?;
+    Ok(conn)
+}
+
+/// Open a read-only connection for the daemon's reader pool.
+///
+/// Opened READ_WRITE (not READ_ONLY: a read-only handle on a WAL DB can fail to
+/// recover a hot WAL with SQLITE_READONLY_RECOVERY), then constrained with
+/// `PRAGMA query_only=ON` so writes are rejected. Runs the same idempotent
+/// column migrations as `get_connection` so a reader opened before the writer
+/// still sees `content_hash` / `metadata`.
+pub fn get_read_connection(db_path: &Path) -> anyhow::Result<Connection> {
+    ensure_vec_extension();
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    apply_pragmas(&conn)?;
+    ensure_chunk_hash_column(&conn)?;
+    ensure_metadata_column(&conn)?;
+    ensure_reading_column(&conn)?;
+    conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
 }
 
@@ -239,6 +367,31 @@ pub fn has_vec_table(conn: &Connection) -> bool {
     )
     .unwrap_or(0)
         > 0
+}
+
+/// Reject a DB created before absolute-path storage. The `file_path` column
+/// changed meaning (relative → absolute); a stored relative path
+/// would silently mis-match every `--path`. The check is data-driven: it fails
+/// iff a legacy relative `file_path` row exists, so empty and fully-migrated DBs
+/// pass and the check self-heals after a rebuild.
+///
+/// Filesystem documents are absolute (start with `/`). Session documents are a
+/// non-filesystem kind keyed `session:<stem>` and are exempt — they were never
+/// path-based and are unaffected by the storage change.
+pub fn check_path_schema(conn: &Connection) -> anyhow::Result<()> {
+    let has_legacy_relative: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM documents \
+         WHERE file_path NOT LIKE '/%' AND file_path NOT LIKE 'session:%')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_legacy_relative {
+        anyhow::bail!(
+            "This index predates absolute-path storage and must be rebuilt. \
+             Run `tsm rebuild --apply`."
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -392,5 +545,282 @@ mod tests {
         init_db(&db_path).unwrap();
         let conn = get_connection(&db_path).unwrap();
         assert!(has_vec_table(&conn));
+    }
+
+    #[test]
+    fn test_is_initialized_true_for_schema() {
+        let conn = get_memory_connection().unwrap();
+        assert!(is_initialized(&conn));
+    }
+
+    #[test]
+    fn test_is_initialized_false_for_bare_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(!is_initialized(&conn));
+    }
+
+    #[test]
+    fn test_is_initialized_false_without_fts_table() {
+        // documents + chunks alone is not our schema: a real init also creates
+        // chunks_fts. Reject a DB that merely happens to have those two tables.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE documents (id INTEGER PRIMARY KEY);
+             CREATE TABLE chunks (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+        assert!(!is_initialized(&conn));
+    }
+
+    #[test]
+    fn test_ensure_chunk_hash_column_noop_without_chunks_table() {
+        // A bare DB has no `chunks` table; the migration must be a no-op, not an error.
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_chunk_hash_column(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_get_connection_succeeds_on_uninitialized_db() {
+        // An empty (uninitialized) DB file must open cleanly; init is a separate step.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("uninit.db");
+        let conn = get_connection(&db_path).unwrap();
+        assert!(!is_initialized(&conn));
+    }
+
+    #[test]
+    fn test_probe_initialized_false_for_missing_file_without_creating_it() {
+        // The whole point of the probe: report "not initialized" for an absent DB
+        // WITHOUT materializing the file (which would leave a stray `.tsm`).
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing.db");
+        assert!(!probe_initialized(&db_path).unwrap());
+        assert!(!db_path.exists(), "probe must not create the DB file");
+    }
+
+    #[test]
+    fn test_probe_initialized_false_for_bare_db() {
+        // An existing-but-schemaless DB file is not initialized.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bare.db");
+        Connection::open(&db_path).unwrap(); // creates an empty file, no schema
+        assert!(!probe_initialized(&db_path).unwrap());
+    }
+
+    #[test]
+    fn test_probe_initialized_true_for_initialized_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ready.db");
+        init_db(&db_path).unwrap();
+        assert!(probe_initialized(&db_path).unwrap());
+    }
+
+    #[test]
+    fn test_probe_initialized_errors_when_path_is_unopenable() {
+        // An existing path that cannot be opened as a DB (here: a directory) must
+        // propagate the real error, NOT be misreported as "not initialized".
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("not-a-db");
+        std::fs::create_dir(&db_path).unwrap();
+        assert!(probe_initialized(&db_path).is_err());
+    }
+
+    #[test]
+    fn test_uninitialized_error_mentions_init() {
+        let err = uninitialized_error(Path::new("/x/.tsm/tsm.db"));
+        let msg = err.to_string();
+        assert!(msg.contains("/x/.tsm/tsm.db"));
+        assert!(msg.contains("Run `tsm init` first"));
+    }
+
+    #[test]
+    fn test_memory_db_has_metadata_column() {
+        let conn = get_memory_connection().unwrap();
+        // Column exists and accepts JSON text.
+        conn.execute(
+            "INSERT INTO documents (file_path, source_type, file_hash, indexed_at, metadata)
+             VALUES ('a.md', 'note', 'h', '2026-01-01', '{\"status\":\"current\"}')",
+            [],
+        )
+        .unwrap();
+        let got: Option<String> = conn
+            .query_row(
+                "SELECT metadata FROM documents WHERE file_path='a.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("{\"status\":\"current\"}"));
+    }
+
+    #[test]
+    fn test_memory_db_has_reading_column() {
+        let conn = get_memory_connection().unwrap();
+        let has: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('dictionary_candidates') WHERE name='reading'",
+            )
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has, "fresh schema must include the reading column");
+    }
+
+    #[test]
+    fn test_ensure_reading_column_adds_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Pre-migration schema: dictionary_candidates without `reading`.
+        conn.execute_batch(
+            "CREATE TABLE dictionary_candidates (
+                surface TEXT PRIMARY KEY,
+                frequency INTEGER NOT NULL DEFAULT 1,
+                pos TEXT NOT NULL,
+                source TEXT NOT NULL,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending');
+             INSERT INTO dictionary_candidates
+                VALUES ('w', 1, 'ascii', 'doc', 't', 't', 'pending');",
+        )
+        .unwrap();
+
+        ensure_reading_column(&conn).unwrap();
+        // Second call is a no-op (idempotent).
+        ensure_reading_column(&conn).unwrap();
+
+        let has: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('dictionary_candidates') WHERE name='reading'",
+            )
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has);
+
+        // Pre-existing rows carry a NULL reading.
+        let reading: Option<String> = conn
+            .query_row(
+                "SELECT reading FROM dictionary_candidates WHERE surface='w'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(reading.is_none());
+    }
+
+    #[test]
+    fn test_ensure_reading_column_noop_without_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        // No dictionary_candidates table at all → no-op, no error.
+        ensure_reading_column(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_busy_timeout_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        init_db(&path).unwrap();
+        let conn = get_connection(&path).unwrap();
+        let ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, BUSY_TIMEOUT_MS as i64);
+    }
+
+    #[test]
+    fn test_read_connection_busy_timeout_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        init_db(&path).unwrap();
+        let reader = get_read_connection(&path).unwrap();
+        let ms: i64 = reader
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, BUSY_TIMEOUT_MS as i64);
+    }
+
+    #[test]
+    fn test_read_connection_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        init_db(&path).unwrap();
+        let reader = get_read_connection(&path).unwrap();
+        let err = reader
+            .execute(
+                "INSERT INTO documents (file_path, source_type, file_hash, indexed_at) VALUES ('x', 'note', 'h', '2026-01-01')",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("readonly") || err.to_string().to_lowercase().contains("read"),
+            "expected a read-only rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_read_connection_sees_snapshot_during_writer_delete() {
+        // Reader must read chunks_vec without error while the writer holds a
+        // transaction that has DELETEd from it (WAL snapshot isolation across the
+        // vec0 virtual table's shadow tables).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        init_db(&path).unwrap();
+
+        let writer = get_connection(&path).unwrap();
+        writer
+            .execute_batch("BEGIN; DELETE FROM chunks_vec; ")
+            .unwrap(); // open write txn, not yet committed
+
+        let reader = get_read_connection(&path).unwrap();
+        let n: i64 = reader
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .expect("reader should read a snapshot, not error");
+        assert_eq!(n, 0); // empty DB; the point is it returns, not the value
+
+        writer.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn check_path_schema_ok_for_empty_db() {
+        let conn = get_memory_connection().unwrap(); // schema, no rows
+        assert!(check_path_schema(&conn).is_ok());
+    }
+
+    #[test]
+    fn check_path_schema_ok_for_absolute_rows() {
+        let conn = get_memory_connection().unwrap();
+        conn.execute(
+            "INSERT INTO documents (file_path, source_type, file_hash, indexed_at) \
+             VALUES ('/r/daily/x.md', 'note', 'h', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        assert!(check_path_schema(&conn).is_ok());
+    }
+
+    #[test]
+    fn check_path_schema_rejects_relative_rows() {
+        let conn = get_memory_connection().unwrap();
+        conn.execute(
+            "INSERT INTO documents (file_path, source_type, file_hash, indexed_at) \
+             VALUES ('daily/x.md', 'note', 'h', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        assert!(check_path_schema(&conn).is_err());
+    }
+
+    #[test]
+    fn check_path_schema_ok_for_session_rows() {
+        // Session documents are keyed `session:<stem>` (not filesystem paths)
+        // and must NOT be mistaken for legacy relative paths.
+        let conn = get_memory_connection().unwrap();
+        conn.execute(
+            "INSERT INTO documents (file_path, source_type, file_hash, indexed_at) \
+             VALUES ('session:abc', 'session', 'h', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        assert!(check_path_schema(&conn).is_ok());
     }
 }

@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -117,6 +116,19 @@ pub fn expand_query_synonyms(
     expansions
 }
 
+/// Normalize and order a word pair: trim, lowercase, then sort so the result is
+/// `(lo, hi)` with `lo <= hi`. Shared by every site that stores or looks up a
+/// pair so the normalization rule lives in one place.
+fn normalize_pair(a: &str, b: &str) -> (String, String) {
+    let a = a.trim().to_lowercase();
+    let b = b.trim().to_lowercase();
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
 /// Upsert a synonym pair into the table.
 /// Words are normalized (lowercase, trimmed) and ordered (word_a < word_b).
 pub fn upsert_synonym(
@@ -130,13 +142,12 @@ pub fn upsert_synonym(
         return Ok(());
     }
 
-    let a = word_a.trim().to_lowercase();
-    let b = word_b.trim().to_lowercase();
-    if a == b || a.is_empty() || b.is_empty() {
+    // `lo` is the smaller of the two, so an empty input always lands in `lo`.
+    let (lo, hi) = normalize_pair(word_a, word_b);
+    if lo == hi || lo.is_empty() {
         return Ok(());
     }
 
-    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
     let score = score.min(SCORE_CAP);
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -216,8 +227,9 @@ pub fn import_wordnet(
 
 const USER_SCORE: f64 = 0.7;
 
-/// Result of a user synonym sync operation.
-pub struct SyncResult {
+/// Result of a user synonym import operation.
+#[derive(Debug)]
+pub struct ImportResult {
     pub upserted: usize,
     pub deleted: usize,
     pub skipped: usize,
@@ -260,27 +272,47 @@ fn parse_synonym_csv(content: &str) -> (HashSet<(String, String)>, usize) {
     (pairs, skipped)
 }
 
-/// Sync user-defined synonym pairs from a CSV file.
-/// Inserts pairs that only exist in the file, then deletes any `source = 'user'`
-/// pairs not present in the file. The CSV file is the source of truth.
-/// Pairs that already exist with a different source (e.g. wordnet) are not overwritten.
-pub fn sync_user_synonyms(
+/// Import user-defined synonym pairs from CSV text (source -> DB).
+/// Always inserts pairs present in the input (`INSERT OR IGNORE`, so pairs from
+/// other sources like wordnet are left untouched). When `mirror` is true, also
+/// deletes any `source = 'user'` pairs absent from the input — making the user
+/// subset exactly match the input, the inverse of [`export_user_synonyms`].
+///
+/// `mirror` callers (`tsm synonym import`) get the exact round-trip but risk a
+/// mass delete: if the input parses to zero pairs (empty or all-malformed) while
+/// user pairs exist, this bails instead of wiping them. `mirror = false`
+/// callers (`tsm init`) are insert-only and never delete, so re-running them is
+/// non-destructive. The caller owns reading from stdin or a file.
+pub fn import_user_synonyms(
     conn: &Connection,
-    csv_path: &std::path::Path,
-) -> anyhow::Result<SyncResult> {
+    content: &str,
+    mirror: bool,
+) -> anyhow::Result<ImportResult> {
     if !db::has_synonyms_table(conn) {
         anyhow::bail!("synonyms table not found");
     }
-    if !csv_path.is_file() {
-        anyhow::bail!("synonyms CSV not found: {}", csv_path.display());
-    }
 
-    let content = std::fs::read_to_string(csv_path)?;
-    let (file_pairs, skipped) = parse_synonym_csv(&content);
+    let (file_pairs, skipped) = parse_synonym_csv(content);
+
+    // Guard the destructive case: an empty/all-malformed input under mirror would
+    // delete every user pair. Refuse rather than silently wipe.
+    if mirror && file_pairs.is_empty() {
+        let existing: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM synonyms WHERE source = 'user'",
+            [],
+            |r| r.get(0),
+        )?;
+        if existing > 0 {
+            anyhow::bail!(
+                "input has no synonym pairs; refusing to delete all {existing} user \
+                 synonym(s). Provide pairs, or remove them explicitly with `tsm synonym rm`."
+            );
+        }
+    }
 
     let tx = conn.unchecked_transaction()?;
 
-    // Insert pairs from the file. Use INSERT OR IGNORE to avoid overwriting
+    // Insert pairs from the input. Use INSERT OR IGNORE to avoid overwriting
     // existing pairs from other sources (e.g. wordnet).
     let now = chrono::Utc::now().to_rfc3339();
     let mut upserted = 0;
@@ -292,11 +324,15 @@ pub fn sync_user_synonyms(
         )?;
     }
 
-    let deleted = delete_stale_user_pairs(conn, &file_pairs)?;
+    let deleted = if mirror {
+        delete_stale_user_pairs(conn, &file_pairs)?
+    } else {
+        0
+    };
 
     tx.commit()?;
 
-    Ok(SyncResult {
+    Ok(ImportResult {
         upserted,
         deleted,
         skipped,
@@ -327,11 +363,139 @@ fn delete_stale_user_pairs(
     Ok(deleted)
 }
 
+/// Add a single user-defined synonym pair (source = 'user', [`USER_SCORE`]).
+/// Normalizes and orders the words like [`upsert_synonym`]. Bails on empty or
+/// identical words so the CLI can surface the error. Returns the normalized
+/// `(lo, hi)` pair as actually stored, so the caller can echo what it persisted.
+///
+/// `add` asserts user ownership: if the pair already exists under another source
+/// (e.g. wordnet), it is claimed as `source = 'user'` while keeping the higher
+/// score. Without this, a non-user pair scored at or above `USER_SCORE` would
+/// stay non-user and become invisible to `export` / `rm`.
+pub fn add_user_synonym(conn: &Connection, a: &str, b: &str) -> anyhow::Result<(String, String)> {
+    if !db::has_synonyms_table(conn) {
+        anyhow::bail!("synonyms table not found");
+    }
+    let (lo, hi) = normalize_pair(a, b);
+    if lo.is_empty() {
+        anyhow::bail!("synonym words must not be empty");
+    }
+    if lo == hi {
+        anyhow::bail!("cannot add a word as its own synonym: {lo}");
+    }
+    upsert_synonym(conn, &lo, &hi, USER_SCORE, "user")?;
+    conn.execute(
+        "UPDATE synonyms SET source = 'user' WHERE word_a = ? AND word_b = ?",
+        rusqlite::params![lo, hi],
+    )?;
+    Ok((lo, hi))
+}
+
+/// Outcome of [`remove_user_synonym`].
+pub struct RemoveResult {
+    /// Number of `source = 'user'` rows deleted.
+    pub removed: usize,
+    /// Matching rows left intact because they are not `source = 'user'`
+    /// (e.g. wordnet/learned). Only meaningful when `removed == 0`.
+    pub skipped_non_user: usize,
+}
+
+/// Remove user-defined synonym pair(s) from the DB.
+/// With `b = Some`, deletes the single normalized pair `(a, b)`; with `b = None`,
+/// deletes every user pair involving `a`. Only `source = 'user'` rows are
+/// deleted; wordnet/learned rows are reported via `skipped_non_user` and left
+/// intact. Bails on empty input.
+pub fn remove_user_synonym(
+    conn: &Connection,
+    a: &str,
+    b: Option<&str>,
+) -> anyhow::Result<RemoveResult> {
+    if !db::has_synonyms_table(conn) {
+        anyhow::bail!("synonyms table not found");
+    }
+    let na = a.trim().to_lowercase();
+    if na.is_empty() {
+        anyhow::bail!("synonym word must not be empty");
+    }
+
+    // Each arm picks the DELETE/COUNT pair that matches its scope; both bind two
+    // string params, so the delete-then-count-on-miss tail is shared below.
+    let (del_sql, count_sql, p1, p2) = match b {
+        Some(b) => {
+            let nb = b.trim().to_lowercase();
+            if nb.is_empty() {
+                anyhow::bail!("synonym word must not be empty");
+            }
+            let (lo, hi) = normalize_pair(&na, &nb);
+            (
+                "DELETE FROM synonyms WHERE word_a = ? AND word_b = ? AND source = 'user'",
+                "SELECT COUNT(*) FROM synonyms WHERE word_a = ? AND word_b = ? AND source != 'user'",
+                lo,
+                hi,
+            )
+        }
+        None => (
+            "DELETE FROM synonyms WHERE (word_a = ? OR word_b = ?) AND source = 'user'",
+            "SELECT COUNT(*) FROM synonyms WHERE (word_a = ? OR word_b = ?) AND source != 'user'",
+            na.clone(),
+            na,
+        ),
+    };
+
+    let removed = conn.execute(del_sql, rusqlite::params![p1, p2])?;
+    let skipped_non_user = if removed == 0 {
+        count_non_user(conn, count_sql, &p1, &p2)?
+    } else {
+        0
+    };
+
+    Ok(RemoveResult {
+        removed,
+        skipped_non_user,
+    })
+}
+
+/// Count rows matching a two-param predicate whose `source` is not `'user'`.
+/// `sql` must be a `SELECT COUNT(*)` with two `?` placeholders. Propagates query
+/// errors so a failed count is not misreported as "no match".
+fn count_non_user(conn: &Connection, sql: &str, p1: &str, p2: &str) -> anyhow::Result<usize> {
+    let n: i64 = conn.query_row(sql, rusqlite::params![p1, p2], |r| r.get(0))?;
+    Ok(n as usize)
+}
+
+/// Export user-defined synonym pairs as CSV to a writer (DB -> sink).
+/// Writes only `source = 'user'` pairs as `a,b` lines (already normalized and
+/// ordered), sorted for stable, diffable output, under a header comment.
+/// Inverse of [`import_user_synonyms`]. The caller owns the sink (stdout or a
+/// file). Returns the number of pairs written.
+pub fn export_user_synonyms(
+    conn: &Connection,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<usize> {
+    if !db::has_synonyms_table(conn) {
+        anyhow::bail!("synonyms table not found");
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT word_a, word_b FROM synonyms WHERE source = 'user' ORDER BY word_a, word_b",
+    )?;
+    let pairs: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    writeln!(
+        out,
+        "# User-defined synonym pairs (a,b). Managed by `tsm synonym`."
+    )?;
+    for (a, b) in &pairs {
+        writeln!(out, "{a},{b}")?;
+    }
+    Ok(pairs.len())
+}
+
 /// Record a hit on a synonym pair (increments hits, updates last_hit).
 pub fn record_hit(conn: &Connection, word_a: &str, word_b: &str) {
-    let a = word_a.trim().to_lowercase();
-    let b = word_b.trim().to_lowercase();
-    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let (lo, hi) = normalize_pair(word_a, word_b);
     let now = chrono::Utc::now().to_rfc3339();
 
     let _ = conn.execute(
@@ -419,22 +583,6 @@ pub fn cleanup_stale(conn: &Connection) {
     }
 }
 
-/// Global flag to ensure cleanup runs at most once per process.
-static CLEANUP_SPAWNED: AtomicBool = AtomicBool::new(false);
-
-/// Spawn a background cleanup thread (runs at most once per process).
-pub fn maybe_spawn_cleanup(db_path: std::path::PathBuf) {
-    if CLEANUP_SPAWNED.swap(true, Ordering::SeqCst) {
-        return; // Already spawned
-    }
-
-    std::thread::spawn(move || {
-        if let Ok(conn) = db::get_connection(&db_path) {
-            cleanup_stale(&conn);
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +645,20 @@ mod tests {
             .unwrap();
         assert_eq!(a, "rust");
         assert_eq!(b, "sqlite");
+    }
+
+    #[test]
+    fn test_upsert_synonym_empty_arg_ignored() {
+        let conn = setup();
+        // An empty arg always sorts into `lo`, so the `lo.is_empty()` guard
+        // rejects it. Verifies the normalize_pair refactor preserved the guard.
+        upsert_synonym(&conn, "", "word", 0.5, "feedback").unwrap();
+        upsert_synonym(&conn, "word", "  ", 0.5, "feedback").unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM synonyms", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "empty-arg pairs must not be inserted");
     }
 
     #[test]
@@ -731,9 +893,8 @@ mod tests {
         )
         .unwrap();
         let mut word_id = 1i64;
-        let mut synset_id = 1;
-        for (a, b) in pairs {
-            let sid = format!("syn{synset_id:04}");
+        for (idx, (a, b)) in pairs.iter().enumerate() {
+            let sid = format!("syn{:04}", idx + 1);
             wn.execute(
                 "INSERT INTO synset (synset) VALUES (?)",
                 rusqlite::params![sid],
@@ -761,7 +922,6 @@ mod tests {
             )
             .unwrap();
             word_id += 1;
-            synset_id += 1;
         }
         file
     }
@@ -805,107 +965,109 @@ mod tests {
         assert_eq!(stored, 1);
     }
 
-    fn create_csv(content: &str) -> tempfile::NamedTempFile {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), content).unwrap();
-        file
-    }
-
     #[test]
-    fn test_sync_user_synonyms_basic() {
+    fn test_import_user_synonyms_basic() {
         let conn = setup();
-        let csv = create_csv("猟銃,散弾銃\nLoRa,LPWAN\n");
 
-        let result = sync_user_synonyms(&conn, csv.path()).unwrap();
+        let result = import_user_synonyms(&conn, "猟銃,散弾銃\nLoRa,LPWAN\n", true).unwrap();
         assert_eq!(result.total, 2);
         assert_eq!(result.deleted, 0);
 
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM synonyms WHERE source = 'user'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(user_count(&conn), 2);
     }
 
     #[test]
-    fn test_sync_user_synonyms_idempotent() {
+    fn test_import_user_synonyms_idempotent() {
         let conn = setup();
-        let csv = create_csv("猟銃,散弾銃\n");
 
-        sync_user_synonyms(&conn, csv.path()).unwrap();
-        let result = sync_user_synonyms(&conn, csv.path()).unwrap();
+        import_user_synonyms(&conn, "猟銃,散弾銃\n", true).unwrap();
+        let result = import_user_synonyms(&conn, "猟銃,散弾銃\n", true).unwrap();
         assert_eq!(result.total, 1);
         assert_eq!(result.deleted, 0);
 
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM synonyms WHERE source = 'user'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(user_count(&conn), 1);
     }
 
     #[test]
-    fn test_sync_user_synonyms_deletes_removed_pairs() {
+    fn test_import_user_synonyms_deletes_removed_pairs() {
         let conn = setup();
 
-        // First sync with two pairs
-        let csv1 = create_csv("猟銃,散弾銃\nLoRa,LPWAN\n");
-        sync_user_synonyms(&conn, csv1.path()).unwrap();
+        // First import with two pairs
+        import_user_synonyms(&conn, "猟銃,散弾銃\nLoRa,LPWAN\n", true).unwrap();
 
-        // Second sync with only one pair — the other should be deleted
-        let csv2 = create_csv("猟銃,散弾銃\n");
-        let result = sync_user_synonyms(&conn, csv2.path()).unwrap();
+        // Second import with only one pair — the other should be deleted
+        let result = import_user_synonyms(&conn, "猟銃,散弾銃\n", true).unwrap();
         assert_eq!(result.total, 1);
         assert_eq!(result.deleted, 1);
 
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM synonyms WHERE source = 'user'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(user_count(&conn), 1);
     }
 
     #[test]
-    fn test_sync_user_synonyms_empty_file() {
+    fn test_import_mirror_empty_input_is_guarded() {
         let conn = setup();
+        import_user_synonyms(&conn, "猟銃,散弾銃\n", true).unwrap();
 
-        // Insert one pair first
-        let csv1 = create_csv("猟銃,散弾銃\n");
-        sync_user_synonyms(&conn, csv1.path()).unwrap();
+        // Empty mirror input would wipe all user pairs — must bail, not delete.
+        let err = import_user_synonyms(&conn, "", true).unwrap_err();
+        assert!(err.to_string().contains("refusing to delete"));
+        assert_eq!(user_count(&conn), 1, "the existing pair must survive");
+    }
 
-        // Sync with empty file — should delete the pair
-        let csv2 = create_csv("");
-        let result = sync_user_synonyms(&conn, csv2.path()).unwrap();
+    #[test]
+    fn test_import_mirror_all_malformed_is_guarded() {
+        let conn = setup();
+        import_user_synonyms(&conn, "猟銃,散弾銃\n", true).unwrap();
+
+        // An all-garbage file parses to zero pairs — same wipe risk, same guard.
+        let err = import_user_synonyms(&conn, "# just a comment\nbadline\n", true).unwrap_err();
+        assert!(err.to_string().contains("refusing to delete"));
+        assert_eq!(user_count(&conn), 1);
+    }
+
+    #[test]
+    fn test_import_empty_input_ok_when_no_user_pairs() {
+        let conn = setup();
+        // No user pairs to lose → empty mirror input is a harmless no-op.
+        let result = import_user_synonyms(&conn, "", true).unwrap();
         assert_eq!(result.total, 0);
-        assert_eq!(result.deleted, 1);
+        assert_eq!(result.deleted, 0);
     }
 
     #[test]
-    fn test_sync_user_synonyms_skips_comments_and_bad_lines() {
+    fn test_import_non_mirror_is_insert_only() {
         let conn = setup();
-        let csv = create_csv("# comment\n猟銃,散弾銃\nbadline\n,empty\nself,self\n");
+        // A user pair that only lives in the DB (e.g. added via `synonym add`).
+        add_user_synonym(&conn, "猟銃", "散弾銃").unwrap();
 
-        let result = sync_user_synonyms(&conn, csv.path()).unwrap();
+        // init-style import (mirror = false) of a different pair must ADD it
+        // without deleting the DB-only pair absent from the input.
+        let result = import_user_synonyms(&conn, "lora,lpwan\n", false).unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.deleted, 0);
+        assert_eq!(user_count(&conn), 2, "the add-ed pair must not be deleted");
+    }
+
+    #[test]
+    fn test_import_user_synonyms_skips_comments_and_bad_lines() {
+        let conn = setup();
+
+        let result = import_user_synonyms(
+            &conn,
+            "# comment\n猟銃,散弾銃\nbadline\n,empty\nself,self\n",
+            true,
+        )
+        .unwrap();
         assert_eq!(result.total, 1);
         assert_eq!(result.skipped, 3);
     }
 
     #[test]
-    fn test_sync_user_synonyms_does_not_affect_wordnet() {
+    fn test_import_user_synonyms_does_not_affect_wordnet() {
         let conn = setup();
         upsert_synonym(&conn, "猟", "狩猟", 0.5, "wordnet").unwrap();
 
-        let csv = create_csv("猟銃,散弾銃\n");
-        sync_user_synonyms(&conn, csv.path()).unwrap();
+        import_user_synonyms(&conn, "猟銃,散弾銃\n", true).unwrap();
 
         // Wordnet pair should still exist
         let wn_count: i64 = conn
@@ -919,18 +1081,16 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_user_synonyms_overlapping_wordnet_not_destroyed() {
+    fn test_import_user_synonyms_overlapping_wordnet_not_destroyed() {
         let conn = setup();
         // Pre-populate wordnet with a pair
         upsert_synonym(&conn, "猟", "狩猟", 0.5, "wordnet").unwrap();
 
         // User CSV includes the same pair — should NOT overwrite wordnet
-        let csv1 = create_csv("猟,狩猟\n");
-        sync_user_synonyms(&conn, csv1.path()).unwrap();
+        import_user_synonyms(&conn, "猟,狩猟\n", true).unwrap();
 
         // Remove from CSV — wordnet pair must survive
-        let csv2 = create_csv("");
-        sync_user_synonyms(&conn, csv2.path()).unwrap();
+        import_user_synonyms(&conn, "", true).unwrap();
 
         let (source, score): (String, f64) = conn
             .query_row(
@@ -947,30 +1107,247 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_user_synonyms_reversed_order() {
+    fn test_import_user_synonyms_reversed_order() {
         let conn = setup();
         // CSV with reversed order — should normalize
-        let csv = create_csv("散弾銃,猟銃\n");
-        let result = sync_user_synonyms(&conn, csv.path()).unwrap();
+        let result = import_user_synonyms(&conn, "散弾銃,猟銃\n", true).unwrap();
         assert_eq!(result.total, 1);
 
-        let count: i64 = conn
+        assert_eq!(user_count(&conn), 1);
+    }
+
+    #[test]
+    fn test_import_user_synonyms_duplicate_lines() {
+        let conn = setup();
+        // Same pair in both orders — should deduplicate
+        let result = import_user_synonyms(&conn, "猟銃,散弾銃\n散弾銃,猟銃\n", true).unwrap();
+        assert_eq!(result.total, 1);
+    }
+
+    fn user_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM synonyms WHERE source = 'user'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_add_user_synonym_basic() {
+        let conn = setup();
+        add_user_synonym(&conn, "猟銃", "散弾銃").unwrap();
+
+        let (a, b, score, source): (String, String, f64, String) = conn
             .query_row(
-                "SELECT COUNT(*) FROM synonyms WHERE source = 'user'",
+                "SELECT word_a, word_b, score, source FROM synonyms",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert!(a < b, "words must be ordered");
+        assert_eq!(source, "user");
+        assert!((score - USER_SCORE).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_add_user_synonym_normalizes_and_orders() {
+        let conn = setup();
+        add_user_synonym(&conn, "  LoRa ", "LPWAN").unwrap();
+
+        let (a, b): (String, String) = conn
+            .query_row("SELECT word_a, word_b FROM synonyms", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(a, "lora");
+        assert_eq!(b, "lpwan");
+    }
+
+    #[test]
+    fn test_add_user_synonym_rejects_self_and_empty() {
+        let conn = setup();
+        assert!(add_user_synonym(&conn, "猟", "猟").is_err());
+        assert!(add_user_synonym(&conn, "", "猟").is_err());
+        assert!(add_user_synonym(&conn, "猟", "  ").is_err());
+        assert_eq!(user_count(&conn), 0);
+    }
+
+    #[test]
+    fn test_add_user_synonym_upgrades_wordnet() {
+        let conn = setup();
+        upsert_synonym(&conn, "猟", "狩猟", 0.5, "wordnet").unwrap();
+        add_user_synonym(&conn, "猟", "狩猟").unwrap();
+
+        let (score, source): (f64, String) = conn
+            .query_row("SELECT score, source FROM synonyms", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert!((score - USER_SCORE).abs() < f64::EPSILON);
+        assert_eq!(source, "user");
+    }
+
+    #[test]
+    fn test_add_user_synonym_claims_higher_scored_non_user() {
+        let conn = setup();
+        // A non-user pair scored at/above USER_SCORE: the generic upsert's
+        // score-tied source rule would leave it non-user. `add` must still claim it.
+        upsert_synonym(&conn, "猟", "狩猟", 0.9, "feedback").unwrap();
+        add_user_synonym(&conn, "猟", "狩猟").unwrap();
+
+        let (score, source): (f64, String) = conn
+            .query_row("SELECT score, source FROM synonyms", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(source, "user", "add must claim ownership");
+        assert!(
+            (score - 0.9).abs() < f64::EPSILON,
+            "the higher existing score is kept"
+        );
+    }
+
+    #[test]
+    fn test_add_user_synonym_returns_normalized_pair() {
+        let conn = setup();
+        let (lo, hi) = add_user_synonym(&conn, "  LoRa ", "LPWAN").unwrap();
+        assert_eq!(lo, "lora");
+        assert_eq!(hi, "lpwan");
+    }
+
+    #[test]
+    fn test_remove_user_synonym_exact_pair() {
+        let conn = setup();
+        add_user_synonym(&conn, "猟銃", "散弾銃").unwrap();
+        add_user_synonym(&conn, "lora", "lpwan").unwrap();
+
+        // Reversed order still matches via normalization.
+        let res = remove_user_synonym(&conn, "散弾銃", Some("猟銃")).unwrap();
+        assert_eq!(res.removed, 1);
+        assert_eq!(res.skipped_non_user, 0);
+        assert_eq!(user_count(&conn), 1);
+    }
+
+    #[test]
+    fn test_remove_user_synonym_all_involving() {
+        let conn = setup();
+        add_user_synonym(&conn, "猟", "狩猟").unwrap();
+        add_user_synonym(&conn, "猟", "銃猟").unwrap();
+        add_user_synonym(&conn, "lora", "lpwan").unwrap();
+
+        let res = remove_user_synonym(&conn, "猟", None).unwrap();
+        assert_eq!(res.removed, 2, "both pairs involving 猟 removed");
+        assert_eq!(user_count(&conn), 1, "unrelated pair survives");
+    }
+
+    #[test]
+    fn test_remove_user_synonym_leaves_wordnet() {
+        let conn = setup();
+        upsert_synonym(&conn, "猟", "狩猟", 0.5, "wordnet").unwrap();
+
+        let res = remove_user_synonym(&conn, "猟", Some("狩猟")).unwrap();
+        assert_eq!(res.removed, 0, "wordnet pair not deleted");
+        assert_eq!(res.skipped_non_user, 1, "reported as skipped");
+
+        let wn: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM synonyms WHERE source = 'wordnet'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(wn, 1);
     }
 
     #[test]
-    fn test_sync_user_synonyms_duplicate_lines() {
+    fn test_remove_user_synonym_all_involving_leaves_wordnet() {
         let conn = setup();
-        // Same pair in both orders — should deduplicate
-        let csv = create_csv("猟銃,散弾銃\n散弾銃,猟銃\n");
-        let result = sync_user_synonyms(&conn, csv.path()).unwrap();
-        assert_eq!(result.total, 1);
+        upsert_synonym(&conn, "猟", "狩猟", 0.5, "wordnet").unwrap();
+
+        // Single-word remove with no user pairs: nothing deleted, the wordnet
+        // pair involving 猟 is reported as skipped.
+        let res = remove_user_synonym(&conn, "猟", None).unwrap();
+        assert_eq!(res.removed, 0);
+        assert_eq!(res.skipped_non_user, 1);
+
+        let wn: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM synonyms WHERE source = 'wordnet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wn, 1);
+    }
+
+    #[test]
+    fn test_remove_user_synonym_absent_pair() {
+        let conn = setup();
+        let res = remove_user_synonym(&conn, "猟", Some("狩猟")).unwrap();
+        assert_eq!(res.removed, 0);
+        assert_eq!(res.skipped_non_user, 0);
+    }
+
+    #[test]
+    fn test_remove_user_synonym_rejects_empty() {
+        let conn = setup();
+        assert!(remove_user_synonym(&conn, "  ", None).is_err());
+        assert!(remove_user_synonym(&conn, "猟", Some("")).is_err());
+    }
+
+    #[test]
+    fn test_export_user_synonyms_only_user() {
+        let conn = setup();
+        add_user_synonym(&conn, "猟銃", "散弾銃").unwrap();
+        upsert_synonym(&conn, "猟", "狩猟", 0.5, "wordnet").unwrap();
+
+        let mut buf = Vec::new();
+        let written = export_user_synonyms(&conn, &mut buf).unwrap();
+        assert_eq!(written, 1, "only the user pair is exported");
+
+        let content = String::from_utf8(buf).unwrap();
+        assert!(content.contains("散弾銃,猟銃") || content.contains("猟銃,散弾銃"));
+        assert!(
+            !content.contains("狩猟"),
+            "wordnet pair must not be exported"
+        );
+    }
+
+    #[test]
+    fn test_export_user_synonyms_sorted() {
+        let conn = setup();
+        // Insert out of order; export must emit ascending `word_a,word_b` lines.
+        add_user_synonym(&conn, "ccc", "ddd").unwrap();
+        add_user_synonym(&conn, "aaa", "bbb").unwrap();
+
+        let mut buf = Vec::new();
+        export_user_synonyms(&conn, &mut buf).unwrap();
+        let content = String::from_utf8(buf).unwrap();
+
+        // Skip the leading header comment; pairs must be lexicographically sorted.
+        let lines: Vec<&str> = content.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(lines, vec!["aaa,bbb", "ccc,ddd"]);
+    }
+
+    #[test]
+    fn test_export_import_round_trip() {
+        let conn = setup();
+        add_user_synonym(&conn, "猟銃", "散弾銃").unwrap();
+        add_user_synonym(&conn, "lora", "lpwan").unwrap();
+
+        let mut buf = Vec::new();
+        export_user_synonyms(&conn, &mut buf).unwrap();
+        let exported = String::from_utf8(buf).unwrap();
+
+        // Wipe user pairs, then import the exported text back.
+        conn.execute("DELETE FROM synonyms WHERE source = 'user'", [])
+            .unwrap();
+        assert_eq!(user_count(&conn), 0);
+
+        let result = import_user_synonyms(&conn, &exported, true).unwrap();
+        assert_eq!(result.total, 2);
+        assert_eq!(user_count(&conn), 2, "round-trip restores both pairs");
     }
 
     #[test]

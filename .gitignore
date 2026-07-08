@@ -1,5 +1,6 @@
 .env
 .claude/settings.local.json
+.claude/worktrees/
 tsm.toml
 
 # Rust
@@ -11,6 +12,10 @@ tsm.toml
 
 # Runtime directory (workspace-local)
 .tsm/
+
+# Isolated benchmark / perf-test environment (see CLAUDE.md "Testing")
+.bench/
+.qbench/
 
 # Legacy data directory
 /data/

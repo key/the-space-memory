@@ -15,9 +15,17 @@ jobs:
     strategy:
       matrix:
         include:
+          # Both Linux targets build via `cross` (Docker, Ubuntu 20.04
+          # base, glibc 2.31). Building x86_64 natively on
+          # ubuntu-latest pulls in the runner's glibc (currently 2.39),
+          # which produces binaries that fail to start on Debian 11 /
+          # Ubuntu 20.04 / RHEL 8 with `version 'GLIBC_2.34' not found`.
+          # The cross image stays pinned to glibc 2.31, so the same
+          # archive runs on the older long-term-support distros.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive_name: linux-x86_64
+            use_cross: true
           - os: macos-latest
             target: aarch64-apple-darwin
             archive_name: darwin-arm64
@@ -27,9 +35,9 @@ jobs:
             use_cross: true
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # stable
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # stable
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -42,7 +50,7 @@ jobs:
 
       - name: Install cross
         if: matrix.use_cross
-        uses: taiki-e/install-action@5f57d6cb7cd20b14a8a27f522884c4bc8a187458  # v2.75.19
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419  # v2.82.7
         with:
           tool: cross
 
@@ -69,10 +77,6 @@ jobs:
           cp README.md LICENSE tsm.toml.example "${DIR}/"
           cp data/stopwords.txt "${DIR}/data/"
           cp docs/user-dictionary.md "${DIR}/docs/"
-          cp -r hooks "${DIR}/"
-          cp -r .claude-plugin "${DIR}/"
-          cp -r skills "${DIR}/"
-          cp -r agents "${DIR}/"
           tar czf "${DIR}.tar.gz" "${DIR}"
 
       - name: Upload archive
@@ -89,8 +93,16 @@ jobs:
         with:
           merge-multiple: true
 
+      - name: Generate checksums
+        run: |
+          for f in tsm-*.tar.gz; do
+            sha256sum "${f}" > "${f}.sha256"
+          done
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3.0.1
         with:
           generate_release_notes: true
-          files: tsm-*.tar.gz
+          files: |
+            tsm-*.tar.gz
+            tsm-*.tar.gz.sha256

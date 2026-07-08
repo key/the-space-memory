@@ -8,10 +8,11 @@
 # Env: TSM_STATE_DIR
 # state_dir = ".tsm"
 
-# Root directory containing content workspaces to index.
-# Default: "/workspaces"
-# Env: TSM_INDEX_ROOT
-# index_root = "/workspaces"
+# Machine-wide cache directory for the embedding model and WordNet DB,
+# shared across all workspaces and populated once per machine by `tsm setup`.
+# Default: "{XDG_CACHE_HOME}/tsm" (else "$HOME/.cache/tsm")
+# Env: TSM_CACHE_DIR
+# cache_dir = "/custom/cache"
 
 # UNIX socket path for the embedder child process (encode requests).
 # Default: "{state_dir}/embedder.sock"
@@ -38,6 +39,19 @@
 # Env: TSM_EMBEDDER_BACKFILL_INTERVAL
 # embedder_backfill_interval_secs = 300
 
+# Number of read-only DB connections the daemon keeps for status/doctor/search.
+# Caps concurrent reads. Default: CPU core count.
+# reader_pool_size = 4
+
+# FTS reindex batch size. Smaller = a file/interactive `index` preempts an
+# in-progress reindex sooner; larger = better full-reindex throughput. Default: 200.
+# reindex_fts_batch_size = 200
+
+# Max chunks per document in the search result window. Caps same-document
+# flooding so distinct documents below the score cliff can surface. 0 disables
+# the cap. Default: 3. Env: TSM_MAX_CHUNKS_PER_DOCUMENT
+# max_chunks_per_document = 3
+
 # Behavior when the embedder is stopped during search.
 # Options: "error" (refuse to search) | "fts_only" (FTS5 fallback with warning)
 # Default: "error"
@@ -49,6 +63,27 @@
 # Env: TSM_USER_DICT
 # user_dict_path = ".tsm/user_dict.simpledic"
 
+# ─── Resource placement ───────────────────────────────────────────
+#
+# How the model and WordNet DB are materialized at each layer. "symlink"
+# references the upstream entry without duplicating bytes; "copy" makes a
+# physical, self-contained duplicate. Pick "copy" for the workspace layer
+# when the workspace must survive without the cache (e.g. moving between a
+# host and a DevContainer whose cache path differs).
+
+[setup]
+# Strategy `tsm setup` uses to materialize entries inside the cache.
+# Options: "symlink" | "copy". Default: "symlink".
+# Env: TSM_SETUP_LINK_MODE
+# link_mode = "symlink"
+
+[init]
+# Strategy `tsm init` uses to materialize the workspace's references to the
+# cache (.tsm/models/ruri-v3-30m, .tsm/wnjpn.db).
+# Options: "symlink" | "copy". Default: "symlink".
+# Env: TSM_INIT_LINK_MODE
+# link_mode = "symlink"
+
 # ─── Index settings ───────────────────────────────────────────────
 
 [index]
@@ -56,13 +91,14 @@
 # Content directories to index. Each entry has:
 #   path           — directory path (required)
 #   weight         — scoring weight (default: 1.0)
-#   half_life_days — time decay half-life in days (default: 90.0)
+#   half_life_days — time decay half-life in days (default: 90.0).
+#                    Set to 0 to disable time decay (treat as timeless).
 #
-# Empty = auto-discover mode (recursively index all .md under index_root).
+# Empty = auto-discover mode (recursively index all .md under the project root).
 #
 # content_dirs = [
-#     { path = "/workspaces/notes", weight = 1.0, half_life_days = 90.0 },
-#     { path = "/workspaces/docs",  weight = 0.8, half_life_days = 180.0 },
+#     { path = "notes", weight = 1.0, half_life_days = 90.0 },
+#     { path = "docs",  weight = 0.8, half_life_days = 180.0 },
 # ]
 
 [index.claude_session]
@@ -72,5 +108,5 @@
 # weight = 0.3
 
 # Half-life in days for Claude Code session data time decay.
-# Default: 30.0
+# Default: 30.0. Set to 0 to disable time decay (treat as timeless).
 # half_life_days = 30.0

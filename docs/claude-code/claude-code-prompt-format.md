@@ -3,7 +3,7 @@
 XML format specification for knowledge search results injected by the
 Claude Code plugin's UserPromptSubmit hook.
 
-Related: [ADR-0011](https://github.com/KenosInc/company/blob/main/decisions/0011-tsm-output-layer-separation.md), [Issue #128](https://github.com/key/the-space-memory/issues/128)
+Related: the tsm output-layer-separation decision[^adr-0011] and [Issue #128](https://github.com/key/the-space-memory/issues/128).
 
 ## Design Principles
 
@@ -122,9 +122,11 @@ TSM_SNIPPET_BUDGET=1000  # Default: 1000 characters
 
 ## Separation of Concerns with tsm CLI
 
-tsm CLI is responsible for human-readable text and structured JSON output (ADR-0011).
+tsm CLI is responsible for human-readable text and structured JSON output.[^adr-0011]
 The format conversion defined here is handled by the Claude Code plugin (`hooks/scripts/search.sh`).
 
 - No LLM-specific options (e.g., `--format claude`) will be added to tsm
 - search.sh receives `tsm search --format json` output and converts it to this XML format
 - Plugin must track tsm JSON schema changes
+
+[^adr-0011]: [ADR-0011: tsm output layer separation](https://github.com/KenosInc/company/blob/main/decisions/0011-tsm-output-layer-separation.md)

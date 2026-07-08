@@ -1,7 +1,11 @@
+---
+status: accepted
+created: 2026-04-07
+updated: 2026-04-07
+---
+
 # ADR-0005: tsm-embedder 統合と 2 バイナリ構成
 
-- **Status**: **Accepted（確定）**
-- **Date**: 2026-04-07
 - **Deciders**: key
 - **Supersedes**: [ADR-0002](./0002-watcher-thread-integration.md)（watcher 部分のみ）
 - **Related**:
@@ -73,11 +77,13 @@ tsmd → watcher: `SIGHUP` で config reload を通知。
 | ファイル | 責務 |
 |---|---|
 | `main.rs` | Args 定義、モード分岐 |
-| `daemon_mode.rs` | デーモンモード（accept loop, handle_client） |
-| `embedder_mode.rs` | embedder モード（ソケットサーバー、推論） |
-| `watcher_mode.rs` | watcher モード（ファイル監視、Index IPC） |
-| `child.rs` | 子プロセス管理（spawn, reap, stop） |
-| `backfill.rs` | バックフィルオーケストレーション |
+| `daemon_proc.rs` | デーモンプロセスシェル（accept loop, handle_client の I/O） |
+| `daemon_logic.rs` | 純粋なデーモンロジック（embedder argv, reindex steps, reload response, ReindexGuard, PID helpers） |
+| `embedder_proc.rs` | embedder プロセスシェル（ソケットサーバーループ、モデルロード I/O） |
+| `embedder_logic.rs` | 純粋な embedder ロジック（parse texts, panic message, encode response, model-load plan） |
+| `watcher_proc.rs` | watcher プロセスシェル（notify イベントループ、watch 登録、Index IPC） |
+| `child_proc.rs` | 子プロセス管理シェル（spawn, reap, stop） |
+| `backfill_proc.rs` | バックフィル/再インデックスのワーカーループ（I/O シェル） |
 
 `src/embedder.rs` は純粋な推論ライブラリ（`Embedder` struct +
 クライアント関数）に整理。デーモンコードは `embedder_mode.rs` に移動。

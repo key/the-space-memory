@@ -1,0 +1,322 @@
+name: Bench
+
+# Only `embedder_calls` (full-index and single-query-hybrid call counts) is
+# regression-gated on PRs — it's deterministic for a fixed corpus and
+# batching strategy. Indexing throughput and search latency are recorded
+# into the job summary for trend visibility only: on the current 5-file
+# testdata corpus, hybrid search latency swung 15-49% between two
+# back-to-back runs on an idle machine with zero code changes, and
+# incremental single-file reindex latency showed a ~3.4x warm-up transient
+# across 5 identical runs — no percentage threshold at this corpus size
+# would separate a real regression from noise.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/bench.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/bench.yml"
+
+# Explicit `bash` (not the platform default) so every `run:` step gets
+# `-o pipefail`: a `cmd | tee file` step must fail when `cmd` fails, not
+# report `tee`'s always-zero exit code.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gate:
+    # Compares the current run against the last committed baseline, so it
+    # only makes sense on a PR (or a manual dispatch to test the workflow
+    # itself) — a push to main has nothing to compare against that
+    # `update-baseline` doesn't already handle, and running both would
+    # double the ~20-minute CI cost on every merge.
+    #
+    # A PR may legitimately move the recorded numbers (e.g. a deliberate
+    # perf trade-off for a new feature) without regressing embedder call
+    # counts, or may need to adjust the call counts themselves on purpose;
+    # `bench-baseline-bump` skips the gate so the next `update-baseline`
+    # run picks up the new numbers as the baseline.
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') &&
+      !contains(github.event.pull_request.labels.*.name, 'bench-baseline-bump')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: Build release binaries (bench-counters)
+        run: cargo build --release --features bench-counters
+
+      # Compiled ahead of `tsm start`, not after: `cargo bench` pulls in
+      # criterion and its dependency tree (not part of the release build
+      # above, since they're dev-dependencies), and that compile is CPU-
+      # heavy enough to starve the live embedder daemon's scheduling for
+      # several seconds — observed in CI as "Embedder not reachable"
+      # immediately after `tsm status` had just reported a genuine 100%
+      # vector backfill moments earlier. Compiling here, before the daemon
+      # exists, removes the contention window entirely.
+      - name: Pre-build record_metrics bench
+        run: cargo bench --features bench-counters --bench record_metrics --no-run
+
+      - name: Cache ruri-v3-30m model
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ runner.temp }}/tsm-models
+          key: ruri-v3-30m-model
+
+      - name: Add binaries to PATH
+        run: echo "${{ github.workspace }}/target/release" >> "$GITHUB_PATH"
+
+      - name: Download model
+        run: tsm setup
+        env:
+          HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
+          TSM_CACHE_DIR: ${{ github.workspace }}/.tsm
+          TSM_STATE_DIR: ${{ github.workspace }}/.tsm
+
+      - name: Index testdata corpus
+        working-directory: tests/e2e/testdata
+        run: |
+          tsm init
+          tsm start
+          tsm index
+        env:
+          HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
+          TSM_CACHE_DIR: ${{ github.workspace }}/.tsm
+
+      - name: Wait for vector backfill
+        working-directory: tests/e2e/testdata
+        run: |
+          # `Vectors:   0/0 (100%)` is a trivial (and, on a freshly booted
+          # embedder, common) false positive: the ratio is 100% before the
+          # embedder has finished loading and before any chunk has actually
+          # been embedded, simply because the "needs vectors" denominator
+          # hasn't been counted yet. Require non-zero counts on both sides,
+          # not just the percentage, and give the CPU model load real time
+          # (cold fp32 load on a CI runner is much slower than a warm
+          # daemon on a dev machine). Also require `Embedder:  running`
+          # explicitly — on a rerun against an already-populated DB, a
+          # non-trivial 100% can be leftover state from a previous backfill
+          # while the embedder child is still mid-boot for *this* run.
+          for _ in $(seq 1 90); do
+            out=$(tsm status)
+            echo "$out"
+            if echo "$out" | grep -qE "Embedder:\s+running" &&
+               echo "$out" | grep -qE "Vectors:\s+[1-9][0-9]*/[1-9][0-9]*\s+\(100%\)"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::vector backfill did not reach a non-trivial 100% in time"
+          exit 1
+
+      - name: Record current-run metrics
+        # `cargo bench --manifest-path <elsewhere>` runs the compiled
+        # binary with CWD = the manifest's directory, not this step's
+        # `working-directory` — it silently breaks record_metrics.rs's
+        # CWD-relative embedder/DB discovery (same convention `tsmd`
+        # itself relies on), reporting "not reachable" against the wrong
+        # directory rather than a build error. Invoke the already-built
+        # binary (from "Pre-build record_metrics bench") directly instead,
+        # so cargo never touches CWD for this step. See the CWD note atop
+        # benches/record_metrics.rs.
+        working-directory: tests/e2e/testdata
+        run: |
+          DEPS="${{ github.workspace }}/target/release/deps"
+          BIN=$(ls -t "$DEPS"/record_metrics-* 2>/dev/null | grep -v '\.d$' | head -1)
+          if [ -z "$BIN" ]; then
+            echo "::error::record_metrics binary not found — did the pre-build step run?"
+            exit 1
+          fi
+          "$BIN" > "${{ runner.temp }}/current.json"
+        env:
+          TSM_BENCH_ENV: ubuntu-latest-cpu
+
+      - name: Stop daemon
+        if: always()
+        working-directory: tests/e2e/testdata
+        run: tsm stop || true
+
+      - name: Regression gate
+        run: |
+          cargo run --quiet --bin tsm-bench-check -- \
+            benches/baseline.json "${{ runner.temp }}/current.json" \
+            | tee "${{ runner.temp }}/gate-report.txt"
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Bench gate result"
+            echo ""
+            echo "Only \`embedder_calls\` is regression-gated (exact equality)."
+            echo "Indexing throughput and search latency below are **recorded,"
+            echo "not gated** — see the workflow file header for why."
+            echo ""
+            echo '```'
+            cat "${{ runner.temp }}/gate-report.txt" 2>/dev/null || echo "(no report produced)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  update-baseline:
+    # Runs after every merge to main rather than on a separate cron schedule
+    # — main only accepts squash-merged PRs, so this already fires at most
+    # once per landed change, which is the granularity a "nightly" baseline
+    # update is trying to approximate.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    # Two merges landing close together must not race to open competing
+    # baseline-update PRs — queue them instead of cancelling either.
+    concurrency:
+      group: bench-baseline-update
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: Build release binaries (bench-counters)
+        run: cargo build --release --features bench-counters
+
+      # Compiled ahead of `tsm start`, not after: `cargo bench` pulls in
+      # criterion and its dependency tree (not part of the release build
+      # above, since they're dev-dependencies), and that compile is CPU-
+      # heavy enough to starve the live embedder daemon's scheduling for
+      # several seconds — observed in CI as "Embedder not reachable"
+      # immediately after `tsm status` had just reported a genuine 100%
+      # vector backfill moments earlier. Compiling here, before the daemon
+      # exists, removes the contention window entirely.
+      - name: Pre-build record_metrics bench
+        run: cargo bench --features bench-counters --bench record_metrics --no-run
+
+      - name: Cache ruri-v3-30m model
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ runner.temp }}/tsm-models
+          key: ruri-v3-30m-model
+
+      - name: Add binaries to PATH
+        run: echo "${{ github.workspace }}/target/release" >> "$GITHUB_PATH"
+
+      - name: Download model
+        run: tsm setup
+        env:
+          HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
+          TSM_CACHE_DIR: ${{ github.workspace }}/.tsm
+          TSM_STATE_DIR: ${{ github.workspace }}/.tsm
+
+      - name: Index testdata corpus
+        working-directory: tests/e2e/testdata
+        run: |
+          tsm init
+          tsm start
+          tsm index
+        env:
+          HF_HUB_CACHE: ${{ runner.temp }}/tsm-models
+          TSM_CACHE_DIR: ${{ github.workspace }}/.tsm
+
+      - name: Wait for vector backfill
+        working-directory: tests/e2e/testdata
+        run: |
+          # `Vectors:   0/0 (100%)` is a trivial (and, on a freshly booted
+          # embedder, common) false positive: the ratio is 100% before the
+          # embedder has finished loading and before any chunk has actually
+          # been embedded, simply because the "needs vectors" denominator
+          # hasn't been counted yet. Require non-zero counts on both sides,
+          # not just the percentage, and give the CPU model load real time
+          # (cold fp32 load on a CI runner is much slower than a warm
+          # daemon on a dev machine). Also require `Embedder:  running`
+          # explicitly — on a rerun against an already-populated DB, a
+          # non-trivial 100% can be leftover state from a previous backfill
+          # while the embedder child is still mid-boot for *this* run.
+          for _ in $(seq 1 90); do
+            out=$(tsm status)
+            echo "$out"
+            if echo "$out" | grep -qE "Embedder:\s+running" &&
+               echo "$out" | grep -qE "Vectors:\s+[1-9][0-9]*/[1-9][0-9]*\s+\(100%\)"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::vector backfill did not reach a non-trivial 100% in time"
+          exit 1
+
+      - name: Record metrics
+        # See the "Record current-run metrics" step in the `gate` job for
+        # why this invokes the pre-built binary directly instead of
+        # `cargo bench --manifest-path <elsewhere>`.
+        working-directory: tests/e2e/testdata
+        run: |
+          DEPS="${{ github.workspace }}/target/release/deps"
+          BIN=$(ls -t "$DEPS"/record_metrics-* 2>/dev/null | grep -v '\.d$' | head -1)
+          if [ -z "$BIN" ]; then
+            echo "::error::record_metrics binary not found — did the pre-build step run?"
+            exit 1
+          fi
+          "$BIN" > "${{ github.workspace }}/benches/baseline.json"
+        env:
+          TSM_BENCH_ENV: ubuntu-latest-cpu
+
+      - name: Stop daemon
+        if: always()
+        working-directory: tests/e2e/testdata
+        run: tsm stop || true
+
+      - name: Open baseline update PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # `git diff --quiet` only compares tracked files against the
+          # index/HEAD — on the first bootstrap run, benches/baseline.json
+          # is untracked, so `git diff` reports nothing and this always
+          # took the "unchanged" branch, silently skipping the PR forever.
+          # Stage first, then diff the index against HEAD (`--cached`),
+          # which correctly reports a new untracked file as a change while
+          # still reporting no change once the file exists with identical
+          # content (the steady-state case) — verified locally for both.
+          git add benches/baseline.json
+          if git diff --cached --quiet -- benches/baseline.json; then
+            echo "benches/baseline.json unchanged, nothing to do."
+            exit 0
+          fi
+          gh label create bench-baseline-bump \
+            --description "Skips the bench regression gate for this PR" \
+            --color BFD4F2 2>/dev/null || true
+          BRANCH="chore/bench-baseline-update-$(date -u +%Y%m%d-%H%M%S)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -m "chore(bench): update performance baseline"
+          git push origin "$BRANCH"
+          BODY="Automated update of \`benches/baseline.json\` from the post-merge run on \`main\`."
+          BODY="$BODY Only \`embedder_calls\` is regression-gated; indexing and"
+          BODY="$BODY search numbers are recorded for trend visibility only."
+          gh pr create \
+            --title "chore(bench): update performance baseline" \
+            --body "$BODY" \
+            --label bench-baseline-bump
