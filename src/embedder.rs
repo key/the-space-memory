@@ -7,12 +7,35 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::VarBuilder;
 use candle_transformers::models::modernbert::{Config, ModernBert};
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use crate::config;
 use crate::ipc::{read_message, write_message};
 
 const MODEL_ID: &str = "cl-nagoya/ruri-v3-30m";
+
+/// Hard cap on tokens per input. candle's ModernBert materializes the full
+/// (batch, heads, seq, seq) attention matrix, so memory grows with seq².
+/// Chunks target ~800 chars (see config::MAX_CHUNK_CHARS); 2048 tokens is
+/// ample headroom while bounding a batch of 8 to ~0.5GB of attention.
+const MAX_TOKENS: usize = 2048;
+
+/// Apply padding and truncation settings shared by all load paths.
+fn configure_tokenizer(tokenizer: &mut Tokenizer, pad_token_id: u32) -> Result<()> {
+    tokenizer.with_padding(Some(PaddingParams {
+        strategy: PaddingStrategy::BatchLongest,
+        pad_id: pad_token_id,
+        pad_token: "[PAD]".to_string(),
+        ..Default::default()
+    }));
+    tokenizer
+        .with_truncation(Some(TruncationParams {
+            max_length: MAX_TOKENS,
+            ..Default::default()
+        }))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
 
 /// The embedder engine: loads model and produces embeddings.
 pub struct Embedder {
@@ -74,12 +97,7 @@ impl Embedder {
 
         let mut tokenizer =
             Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        tokenizer.with_padding(Some(PaddingParams {
-            strategy: PaddingStrategy::BatchLongest,
-            pad_id: pad_token_id,
-            pad_token: "[PAD]".to_string(),
-            ..Default::default()
-        }));
+        configure_tokenizer(&mut tokenizer, pad_token_id)?;
 
         let tensors = load_tensors_with_prefix(weights_path, device)?;
         let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
@@ -98,9 +116,9 @@ impl Embedder {
             return Ok(Vec::new());
         }
 
-        // Truncate texts to avoid OOM/crash on very long inputs.
-        // ruri-v3-30m supports up to 8192 tokens; we limit input chars
-        // conservatively (Japanese averages ~1.5 chars/token).
+        // Cheap pre-filter measured in BYTES (str::len). Real bound is the
+        // tokenizer's MAX_TOKENS truncation; this only avoids tokenizing
+        // pathologically large inputs.
         const MAX_CHARS: usize = 8192;
         let truncated: Vec<String> = texts
             .iter()
@@ -289,6 +307,31 @@ mod tests {
     fn test_embed_via_socket_nonexistent_path() {
         let result = embed_via_socket_at(Path::new("/tmp/nonexistent.sock"), &[]);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_configure_tokenizer_truncates_and_pads() {
+        // Minimal word-level tokenizer built from inline JSON (no model files)
+        let tok_json = r#"{
+            "version": "1.0",
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"[PAD]": 0, "hello": 1},
+                "unk_token": "[PAD]"
+            },
+            "pre_tokenizer": {"type": "Whitespace"}
+        }"#;
+        let mut tokenizer = Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+        configure_tokenizer(&mut tokenizer, 0).unwrap();
+
+        let long_text = "hello ".repeat(3000); // 3000 tokens before truncation
+        let encodings = tokenizer
+            .encode_batch(vec![long_text, "hello".to_string()], true)
+            .unwrap();
+
+        // Long input truncated to MAX_TOKENS; short input padded to batch longest
+        assert_eq!(encodings[0].get_ids().len(), MAX_TOKENS);
+        assert_eq!(encodings[1].get_ids().len(), MAX_TOKENS);
     }
 
     #[test]
