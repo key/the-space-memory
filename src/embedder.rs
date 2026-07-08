@@ -202,6 +202,20 @@ pub fn embed_via_socket_at(socket_path: &Path, texts: &[String]) -> Option<Vec<V
     let response_data = read_message(&mut stream).ok()?;
     let response: serde_json::Value = serde_json::from_slice(&response_data).ok()?;
 
+    parse_embeddings_response(&response)
+}
+
+/// Parse and validate the `{"embeddings": [[f32; N], ...]}` response body.
+/// Split out from [`embed_via_socket_at`] so the parsing/validation logic is
+/// unit-testable without a real socket.
+///
+/// The row-parsing is lossy (`filter_map` drops non-numeric elements), so a
+/// malformed response row would otherwise silently flow through as a short
+/// vector and get persisted. Every row must be exactly `config::EMBEDDING_DIM`
+/// long; any mismatch rejects the whole response (returns `None`) so callers
+/// (which already treat `None` as embedder-failure) defer to the
+/// backfill/skip machinery instead of writing a corrupt vector.
+fn parse_embeddings_response(response: &serde_json::Value) -> Option<Vec<Vec<f32>>> {
     let embeddings = response.get("embeddings")?.as_array()?;
     let result: Vec<Vec<f32>> = embeddings
         .iter()
@@ -213,6 +227,15 @@ pub fn embed_via_socket_at(socket_path: &Path, texts: &[String]) -> Option<Vec<V
             })
         })
         .collect();
+
+    if let Some(bad_row) = result.iter().find(|row| row.len() != config::EMBEDDING_DIM) {
+        log::warn!(
+            "embed_via_socket_at: response row has wrong dimension (expected {}, got {}); rejecting response",
+            config::EMBEDDING_DIM,
+            bad_row.len()
+        );
+        return None;
+    }
 
     Some(result)
 }
@@ -416,6 +439,47 @@ mod tests {
         assert_eq!(counters::embedder_call_count(), 0);
     }
 
+    /// A `config::EMBEDDING_DIM`-sized fake embedding row for socket-response
+    /// fixtures. Must match the real dimension so `embed_via_socket_at`'s
+    /// per-row dimension validation doesn't reject these test responses.
+    fn fake_embedding() -> Vec<f32> {
+        (0..config::EMBEDDING_DIM)
+            .map(|i| i as f32 / 1000.0)
+            .collect()
+    }
+
+    // ─── parse_embeddings_response (socket-free) ────────────────────
+
+    #[test]
+    fn test_parse_embeddings_response_accepts_correct_dimensions() {
+        let response = serde_json::json!({ "embeddings": [fake_embedding(), fake_embedding()] });
+        let result = parse_embeddings_response(&response);
+        assert!(result.is_some());
+        let embeddings = result.unwrap();
+        assert_eq!(embeddings.len(), 2);
+        assert_eq!(embeddings[0].len(), config::EMBEDDING_DIM);
+    }
+
+    #[test]
+    fn test_parse_embeddings_response_rejects_short_row() {
+        // A malformed row shorter than config::EMBEDDING_DIM must reject the
+        // whole response rather than silently flowing through as a short
+        // vector that misaligns downstream chunk_id <-> embedding pairing.
+        let response =
+            serde_json::json!({ "embeddings": [fake_embedding(), vec![0.1_f32, 0.2, 0.3]] });
+        let result = parse_embeddings_response(&response);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_embeddings_response_rejects_long_row() {
+        let mut too_long = fake_embedding();
+        too_long.push(0.5);
+        let response = serde_json::json!({ "embeddings": [too_long] });
+        let result = parse_embeddings_response(&response);
+        assert!(result.is_none());
+    }
+
     #[test]
     #[cfg_attr(feature = "bench-counters", serial_test::serial(embedder_counter))]
     fn test_embed_via_socket_integration() {
@@ -433,8 +497,8 @@ mod tests {
             let req: serde_json::Value = serde_json::from_slice(&req_data).unwrap();
             let n = req["texts"].as_array().unwrap().len();
 
-            // Send back fake embeddings (3-dim for simplicity)
-            let embeddings: Vec<Vec<f32>> = (0..n).map(|_| vec![0.1, 0.2, 0.3]).collect();
+            // Send back fake embeddings, correctly sized (config::EMBEDDING_DIM).
+            let embeddings: Vec<Vec<f32>> = (0..n).map(|_| fake_embedding()).collect();
             let response = serde_json::json!({ "embeddings": embeddings });
             let resp_bytes = serde_json::to_vec(&response).unwrap();
             write_message(&mut stream, &resp_bytes).unwrap();
@@ -453,7 +517,46 @@ mod tests {
         assert!(result.is_some());
         let embeddings = result.unwrap();
         assert_eq!(embeddings.len(), 2);
-        assert_eq!(embeddings[0], vec![0.1, 0.2, 0.3]);
+        assert_eq!(embeddings[0], fake_embedding());
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_embed_via_socket_rejects_wrong_dimension_row() {
+        // A malformed response row (wrong length) must not silently flow
+        // through as a short vector — embed_via_socket_at's lossy
+        // `filter_map` parsing would otherwise drop non-numeric elements and
+        // persist a truncated embedding. Any row whose length doesn't match
+        // config::EMBEDDING_DIM must reject the whole response.
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("test.sock");
+
+        let sock_path_clone = sock_path.clone();
+        let server = std::thread::spawn(move || {
+            let listener = UnixListener::bind(&sock_path_clone).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+
+            let req_data = read_message(&mut stream).unwrap();
+            let _req: serde_json::Value = serde_json::from_slice(&req_data).unwrap();
+
+            // One correctly-sized row, one short row.
+            let embeddings = serde_json::json!([fake_embedding(), vec![0.1_f32, 0.2, 0.3],]);
+            let response = serde_json::json!({ "embeddings": embeddings });
+            let resp_bytes = serde_json::to_vec(&response).unwrap();
+            write_message(&mut stream, &resp_bytes).unwrap();
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let texts = vec!["hello".to_string(), "world".to_string()];
+        let result = embed_via_socket_at(&sock_path, &texts);
+        assert!(result.is_none());
 
         server.join().unwrap();
     }
