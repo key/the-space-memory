@@ -17,7 +17,9 @@ const MODEL_ID: &str = "cl-nagoya/ruri-v3-30m";
 /// Hard cap on tokens per input. candle's ModernBert materializes the full
 /// (batch, heads, seq, seq) attention matrix, so memory grows with seq².
 /// Chunks target ~800 chars (see config::MAX_CHUNK_CHARS); 2048 tokens is
-/// ample headroom while bounding a batch of 8 to ~0.5GB of attention.
+/// ample headroom. The batch dimension is bounded by callers in the indexer
+/// (BACKFILL_BATCH_SIZE = 8), so a full-size request stays around ~0.5GB
+/// of attention memory.
 const MAX_TOKENS: usize = 2048;
 
 /// Apply padding and truncation settings shared by all load paths.

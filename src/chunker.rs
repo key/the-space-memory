@@ -321,5 +321,7 @@ mod tests {
         assert_eq!(hard_split("", 3), Vec::<&str>::new());
         // 3-byte chars, limit 4 → one char per part (cut aligned down to 3)
         assert_eq!(hard_split("ああ", 4), vec!["あ", "あ"]);
+        // max_bytes smaller than one char → remainder emitted as-is (end == 0 branch)
+        assert_eq!(hard_split("あ", 1), vec!["あ"]);
     }
 }

@@ -690,7 +690,7 @@ fn insert_vectors_batched(
             Ok(e) => e,
             Err(e) => {
                 log::warn!(
-                    "insert_vectors: encode failed ({e}); leaving remaining chunks to backfill"
+                    "insert_vectors_batched: encode failed ({e}); leaving remaining chunks to backfill"
                 );
                 return;
             }
@@ -783,6 +783,13 @@ pub fn backfill_next_batch(
     batch_size: usize,
     last_id: i64,
 ) -> anyhow::Result<(BackfillStats, bool)> {
+    // Clamp the caller-supplied batch size: embedder memory is
+    // O(batch × seq²), so a page larger than BACKFILL_BATCH_SIZE sent whole
+    // to `encode_fn` (as this function does) can still exhaust memory even
+    // with the per-input token cap. Treat the caller's value as an upper
+    // hint only.
+    let batch_size = batch_size.clamp(1, BACKFILL_BATCH_SIZE);
+
     if !db::has_vec_table(conn) {
         return Ok((BackfillStats::default(), false));
     }
@@ -881,6 +888,13 @@ pub fn backfill_vectors(
     batch_size: usize,
     progress_cb: Option<&dyn Fn(i64, usize, usize)>,
 ) -> anyhow::Result<BackfillStats> {
+    // Clamp the caller-supplied batch size (e.g. `tsm vector-fill
+    // --batch-size`): embedder memory is O(batch × seq²), and this function
+    // sends each SQL page whole to `encode_fn`, so an unclamped caller value
+    // can still exhaust memory even with the per-input token cap. Treat the
+    // caller's value as an upper hint only.
+    let batch_size = batch_size.clamp(1, BACKFILL_BATCH_SIZE);
+
     if !db::has_vec_table(conn) {
         return Ok(BackfillStats::default());
     }
@@ -1796,6 +1810,39 @@ mod tests {
         let (stats, _) = backfill_next_batch(&conn, &mock_encode_panic, 8, 0).unwrap();
         assert!(stats.panics > 0);
         assert!(stats.errors > 0);
+    }
+
+    #[test]
+    fn test_next_batch_clamps_batch_size_to_backfill_cap() {
+        let (conn, _dir, entries) = arrange_chunks(20);
+        let batch_sizes = std::cell::RefCell::new(Vec::new());
+        let recording_encode = |texts: &[String]| {
+            batch_sizes.borrow_mut().push(texts.len());
+            mock_encode(texts)
+        };
+
+        // Caller passes 64 (e.g. tsm vector-fill --batch-size default) — must
+        // be clamped to BACKFILL_BATCH_SIZE so the SQL page (and thus the
+        // encode_fn call) never exceeds the attention-memory-safe size.
+        let mut last_id = 0i64;
+        loop {
+            let (stats, has_more) =
+                backfill_next_batch(&conn, &recording_encode, 64, last_id).unwrap();
+            if !has_more {
+                break;
+            }
+            last_id = stats.last_id;
+        }
+
+        assert_eq!(entries.len(), 20);
+        assert!(!batch_sizes.borrow().is_empty());
+        for size in batch_sizes.borrow().iter() {
+            assert!(*size <= BACKFILL_BATCH_SIZE);
+        }
+        let vecs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vecs, 20);
     }
 
     // ─── entity integration tests ────────────────────────────
