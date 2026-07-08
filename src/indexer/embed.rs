@@ -72,6 +72,21 @@ fn insert_vectors_batched(
                 return;
             }
         };
+        // Guard against a short result (e.g. embed_via_socket's lossy JSON
+        // parsing silently dropping a malformed row): zip() pairs positionally,
+        // so a shorter `embeddings` would otherwise misalign the tail of this
+        // batch, writing wrong embeddings against wrong chunk_ids. Stop instead
+        // of writing a partially-misaligned batch; the periodic backfill's
+        // `process_batch` has its own per-chunk retry/skip for this batch and
+        // all remaining ones.
+        if embeddings.len() != batch.len() {
+            log::warn!(
+                "insert_vectors_batched: embedding count mismatch (got {}, expected {}); leaving this batch and remaining chunks to backfill",
+                embeddings.len(),
+                batch.len()
+            );
+            return;
+        }
         for ((chunk_id, _), emb) in batch.iter().zip(embeddings.iter()) {
             write_vec_row(conn, *chunk_id, emb);
         }
@@ -479,6 +494,33 @@ mod tests {
             .unwrap();
         assert_eq!(vecs, 8);
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn test_insert_vectors_batched_stops_on_embedding_count_mismatch() {
+        // embed_via_socket's lossy JSON parsing can silently drop a malformed
+        // row, returning fewer embeddings than texts. Without a length guard,
+        // zip() would still pair the short result with the batch's chunk_ids
+        // positionally — writing wrong embeddings to the tail chunk_ids of
+        // this batch. The guard must reject the whole batch and stop, per
+        // insert_vectors_batched's existing "leave the rest to backfill"
+        // contract (mirrors process_batch's mismatch handling).
+        let (conn, _dir, entries) = arrange_chunks(10);
+        let calls = std::cell::Cell::new(0usize);
+        let short_encode = |texts: &[String]| {
+            calls.set(calls.get() + 1);
+            // Always return one fewer embedding than requested.
+            Ok(mock_encode(texts)?.into_iter().skip(1).collect())
+        };
+        insert_vectors_batched(&conn, &entries, &short_encode, 8);
+
+        // No rows written for the short-returning batch, and processing
+        // stopped rather than continuing to the second (2-chunk) batch.
+        let vecs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vecs, 0);
+        assert_eq!(calls.get(), 1);
     }
 
     // ─── backfill_next_batch clamp test ────────────────────────
