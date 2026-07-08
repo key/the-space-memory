@@ -457,6 +457,13 @@ A change is merge-ready when **all** of the following hold:
   path up front and use it for both `set_current_dir` and the assertion (see
   `config::tests::test_load_config_relative_path_resolves_against_cwd`); otherwise
   it fails on macOS only while passing on Linux CI
+- **Embedder memory is O(batch × seq²)** — candle's ModernBert materializes
+  the full attention matrix. All embed requests must stay within
+  `BACKFILL_BATCH_SIZE` texts (indexer sub-batches `insert_vectors`) and the
+  tokenizer truncates at 2048 tokens. Do not send unbounded batches to
+  `embed_via_socket`. The embedder socket server (`embedder_proc::handle_client`)
+  also sub-batches internally at `BACKFILL_BATCH_SIZE` as defense in depth, so a
+  client talking to the socket directly cannot bypass the cap either.
 
 ## Design Decisions (ADR)
 
