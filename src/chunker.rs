@@ -85,7 +85,10 @@ fn chunk_markdown_inner(
             }
 
             // Split by paragraphs and merge small ones
-            let paragraphs = split_paragraphs(h3_text);
+            let paragraphs: Vec<&str> = split_paragraphs(h3_text)
+                .into_iter()
+                .flat_map(|p| hard_split(p, max_chars))
+                .collect();
             let merged = merge_small_chunks(&paragraphs, max_chars);
             for part in merged {
                 let prefix = format!("【{directory}/{filename}】{sub_section_name}\n");
@@ -154,6 +157,30 @@ fn split_paragraphs(text: &str) -> Vec<&str> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Split a text into pieces of at most `max_bytes` bytes, cutting only at
+/// UTF-8 char boundaries. Needed because a single paragraph (e.g. a pasted
+/// log or minified line) can exceed max_chars and would otherwise become
+/// one unbounded chunk.
+fn hard_split(text: &str, max_bytes: usize) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while rest.len() > max_bytes {
+        let mut end = max_bytes;
+        while end > 0 && !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            break; // max_bytes smaller than one char; emit remainder as-is
+        }
+        parts.push(&rest[..end]);
+        rest = &rest[end..];
+    }
+    if !rest.is_empty() {
+        parts.push(rest);
+    }
+    parts
 }
 
 fn merge_small_chunks(paragraphs: &[&str], max_chars: usize) -> Vec<String> {
@@ -250,5 +277,49 @@ mod tests {
         let chunks = chunk_markdown(body, "daily/notes", "myfile", 800);
         assert!(!chunks.is_empty());
         assert!(chunks[0].section_path.contains("myfile"));
+    }
+
+    #[test]
+    fn test_oversized_single_paragraph_is_split() {
+        // One giant paragraph (no blank lines) far above max_chars
+        let big_para = "word ".repeat(1000); // 5000 bytes, single paragraph
+        let body = format!("# Title\n\n## Section\n\n{big_para}\n");
+        let chunks = chunk_markdown(&body, "daily/notes", "test", 800);
+        assert!(
+            chunks.len() >= 5,
+            "expected >=5 chunks, got {}",
+            chunks.len()
+        );
+        for c in &chunks {
+            // prefix is ~40 bytes; body part must be <= 800
+            assert!(
+                c.content.len() <= 900,
+                "chunk too large: {} bytes",
+                c.content.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_oversized_paragraph_split_respects_char_boundary() {
+        // Multibyte text: 3-byte chars; naive byte cut would panic on slice
+        let big_para = "あ".repeat(1000); // 3000 bytes, no whitespace at all
+        let body = format!("# Title\n\n## Section\n\n{big_para}\n");
+        let chunks = chunk_markdown(&body, "daily/notes", "test", 800);
+        assert!(chunks.len() >= 3);
+        let joined: String = chunks
+            .iter()
+            .map(|c| c.content.split_once('\n').unwrap().1)
+            .collect();
+        assert_eq!(joined.chars().filter(|c| *c == 'あ').count(), 1000);
+    }
+
+    #[test]
+    fn test_hard_split_boundaries() {
+        assert_eq!(hard_split("abcdef", 6), vec!["abcdef"]); // exact fit
+        assert_eq!(hard_split("abcdefg", 3), vec!["abc", "def", "g"]);
+        assert_eq!(hard_split("", 3), Vec::<&str>::new());
+        // 3-byte chars, limit 4 → one char per part (cut aligned down to 3)
+        assert_eq!(hard_split("ああ", 4), vec!["あ", "あ"]);
     }
 }
