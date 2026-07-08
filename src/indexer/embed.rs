@@ -131,7 +131,14 @@ fn retry_individually(
         let single = vec![content.clone()];
         let result = catch_unwind(AssertUnwindSafe(|| encode_fn(&single)));
         match result {
-            Ok(Ok(ref embeddings)) if !embeddings.is_empty() => {
+            // Dimension correctness is already guaranteed by
+            // `embed_via_socket_at`'s response validation; here we only need
+            // to guard the *count* — a single-chunk request must get back
+            // exactly one embedding. Accepting any non-empty result would
+            // silently take embeddings[0] even when the encoder returned 2+
+            // rows, pairing this chunk with a vector that isn't necessarily
+            // its own.
+            Ok(Ok(ref embeddings)) if embeddings.len() == 1 => {
                 if write_vec_row(conn, *chunk_id, &embeddings[0]) {
                     stats.filled += 1;
                 } else {
@@ -140,9 +147,12 @@ fn retry_individually(
                     stats.errors += 1;
                 }
             }
-            Ok(Ok(_)) => {
-                log::warn!("chunk {chunk_id} ({file_path}): empty embedding — skipping");
-                mark_chunk_skip(conn, *chunk_id, "empty_embedding");
+            Ok(Ok(ref embeddings)) => {
+                log::warn!(
+                    "chunk {chunk_id} ({file_path}): expected 1 embedding, got {} — skipping",
+                    embeddings.len()
+                );
+                mark_chunk_skip(conn, *chunk_id, "embedding_count_mismatch");
                 stats.errors += 1;
             }
             Ok(Err(e)) => {
@@ -521,6 +531,65 @@ mod tests {
             .unwrap();
         assert_eq!(vecs, 0);
         assert_eq!(calls.get(), 1);
+    }
+
+    // ─── retry_individually embedding-count tests ─────────────────
+
+    #[test]
+    fn test_retry_individually_skips_chunk_with_wrong_embedding_count() {
+        // A single-chunk retry request must get back exactly one embedding.
+        // Accepting any non-empty result (the old `!embeddings.is_empty()`
+        // guard) would take embeddings[0] even when the encoder returned 2+
+        // rows for the 1 text sent, silently pairing the chunk with a vector
+        // that may not even be its own.
+        let (conn, _dir, entries) = arrange_chunks(1);
+        let mut stats = BackfillStats::default();
+        let two_embeddings_encode = |texts: &[String]| {
+            let mut out = mock_encode(texts)?;
+            let dup = out.clone();
+            out.extend(dup);
+            Ok(out)
+        };
+        let batch: Vec<(i64, String, String)> = entries
+            .iter()
+            .map(|(id, content)| (*id, content.clone(), "daily/notes/many.md".to_string()))
+            .collect();
+
+        retry_individually(&batch, &two_embeddings_encode, &conn, &mut stats);
+
+        assert_eq!(stats.filled, 0, "no vector should be written");
+        assert_eq!(stats.errors, 1);
+        let vecs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vecs, 0);
+        let skip_reason: String = conn
+            .query_row(
+                "SELECT reason FROM chunks_vec_skip WHERE chunk_id = ?",
+                rusqlite::params![entries[0].0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(skip_reason, "embedding_count_mismatch");
+    }
+
+    #[test]
+    fn test_retry_individually_writes_single_matching_embedding() {
+        let (conn, _dir, entries) = arrange_chunks(1);
+        let mut stats = BackfillStats::default();
+        let batch: Vec<(i64, String, String)> = entries
+            .iter()
+            .map(|(id, content)| (*id, content.clone(), "daily/notes/many.md".to_string()))
+            .collect();
+
+        retry_individually(&batch, &mock_encode, &conn, &mut stats);
+
+        assert_eq!(stats.filled, 1);
+        assert_eq!(stats.errors, 0);
+        let vecs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vecs, 1);
     }
 
     // ─── backfill_next_batch clamp test ────────────────────────
