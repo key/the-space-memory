@@ -1,3 +1,11 @@
+//! Session JSONL → Markdown source transform (ADR-0016 `source` doctrine).
+//!
+//! This module makes **content** decisions only: which messages are worth
+//! indexing, how they pair into Q&A units, the `Q:` / `A:` labels, and the
+//! per-message length cap. Chunk boundaries, sizes, and indexes are owned
+//! entirely by the markdown chunker downstream — the serialized document is
+//! chunked like any other Markdown source.
+
 use std::io::BufRead;
 use std::path::Path;
 
@@ -5,15 +13,22 @@ use crate::config::MAX_CHUNK_CHARS;
 
 const MIN_MESSAGE_LEN: usize = 10;
 
+/// One conversation unit: a user question with its assistant answer, or an
+/// orphan message (question-only / answer-only).
 #[derive(Debug, Clone, PartialEq)]
-pub struct SessionChunk {
-    pub content: String,
-    pub chunk_index: usize,
+pub struct QaUnit {
+    pub question: Option<String>,
+    pub answer: Option<String>,
+    /// Timestamp of the unit's first message.
     pub timestamp: Option<String>,
 }
 
-/// Parse a Claude session JSONL file into Q&A chunks.
-pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Vec<SessionChunk>> {
+/// Parse a Claude session JSONL file into Q&A units.
+///
+/// Each message is capped at [`MAX_CHUNK_CHARS`] chars — a content decision
+/// ("how much of a pasted log is worth indexing"), not a chunk-size one;
+/// oversized units are split downstream by the markdown chunker.
+pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Vec<QaUnit>> {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
 
@@ -50,84 +65,63 @@ pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Vec<SessionChunk>> {
         messages.push((role, text, timestamp));
     }
 
-    let mut chunks = Vec::new();
+    let mut units = Vec::new();
     let mut i = 0;
 
     while i < messages.len() {
         let (role, text, ts) = &messages[i];
 
         if role == "user" {
-            let q_text = truncate_text(text, MAX_CHUNK_CHARS);
-            let q_ts = ts.clone();
+            let question = Some(truncate_text(text, MAX_CHUNK_CHARS));
             if i + 1 < messages.len() && messages[i + 1].0 == "assistant" {
-                let a_text = truncate_text(&messages[i + 1].1, MAX_CHUNK_CHARS);
-
-                // Blank line between Q and A: they must be separate paragraphs
-                // so the markdown chunker can split an oversized pair at the
-                // Q/A boundary (mirrors the split below).
-                let pair = format!("Q: {q_text}\n\nA: {a_text}");
-                if pair.chars().count() <= MAX_CHUNK_CHARS * 2 {
-                    chunks.push(SessionChunk {
-                        content: pair,
-                        chunk_index: chunks.len(),
-                        timestamp: q_ts,
-                    });
-                } else {
-                    chunks.push(SessionChunk {
-                        content: format!("Q: {q_text}"),
-                        chunk_index: chunks.len(),
-                        timestamp: q_ts,
-                    });
-                    chunks.push(SessionChunk {
-                        content: format!("A: {a_text}"),
-                        chunk_index: chunks.len(),
-                        timestamp: messages[i + 1].2.clone(),
-                    });
-                }
+                units.push(QaUnit {
+                    question,
+                    answer: Some(truncate_text(&messages[i + 1].1, MAX_CHUNK_CHARS)),
+                    timestamp: ts.clone(),
+                });
                 i += 2;
                 continue;
             }
             // Orphan user message
-            chunks.push(SessionChunk {
-                content: format!("Q: {q_text}"),
-                chunk_index: chunks.len(),
-                timestamp: q_ts,
+            units.push(QaUnit {
+                question,
+                answer: None,
+                timestamp: ts.clone(),
             });
         } else {
             // Orphan assistant message
-            let a_text = truncate_text(text, MAX_CHUNK_CHARS);
-            chunks.push(SessionChunk {
-                content: a_text,
-                chunk_index: chunks.len(),
+            units.push(QaUnit {
+                question: None,
+                answer: Some(truncate_text(text, MAX_CHUNK_CHARS)),
                 timestamp: ts.clone(),
             });
         }
         i += 1;
     }
 
-    Ok(chunks)
+    Ok(units)
 }
 
-/// Max chars of a chunk's first line used as its H2 heading text.
+/// Max chars of a unit's first line used as its H2 heading text.
 /// Kept well under the chunker's own 120-byte heading cap.
 const HEADING_SNIPPET_CHARS: usize = 40;
 
-/// Serialize session chunks into Markdown for the Prepare stage (#366).
+/// Serialize Q&A units into Markdown for the Prepare stage (#366).
 ///
-/// One session chunk = one H2 section, so `chunk_markdown_default`
-/// reproduces the Q&A-level chunk boundaries. Document-level created /
-/// updated (first / last conversation timestamp, falling back to
-/// `fallback_ts`) and `status: current` ride in the frontmatter, which
-/// `persist()` writes to the documents row.
-pub fn session_to_markdown(chunks: &[SessionChunk], fallback_ts: &str) -> String {
-    let created = chunks
+/// One unit = one H2 section; Q and A are separate paragraphs, so the
+/// markdown chunker keeps a normal-sized unit as one chunk and splits an
+/// oversized one at the Q/A boundary. Document-level created / updated
+/// (first / last unit timestamp, falling back to `fallback_ts`) and
+/// `status: current` ride in the frontmatter, which `persist()` writes.
+pub fn session_to_markdown(units: &[QaUnit], fallback_ts: &str) -> String {
+    let created = units
         .iter()
-        .filter_map(|c| c.timestamp.as_deref())
+        .filter_map(|u| u.timestamp.as_deref())
         .next()
         .unwrap_or(fallback_ts);
-    let updated = chunks
+    let updated = units
         .iter()
-        .filter_map(|c| c.timestamp.as_deref())
+        .filter_map(|u| u.timestamp.as_deref())
         .next_back()
         .unwrap_or(fallback_ts);
 
@@ -136,14 +130,26 @@ pub fn session_to_markdown(chunks: &[SessionChunk], fallback_ts: &str) -> String
         sanitize_yaml_value(created),
         sanitize_yaml_value(updated),
     );
-    for chunk in chunks {
+    for unit in units {
+        let body = unit_body(unit);
         out.push_str("## ");
-        out.push_str(&heading_snippet(&chunk.content));
+        out.push_str(&heading_snippet(&body));
         out.push_str("\n\n");
-        out.push_str(&escape_heading_lines(&chunk.content));
+        out.push_str(&escape_heading_lines(&body));
         out.push_str("\n\n");
     }
     out
+}
+
+/// Section body text for one unit. Orphan assistant messages stay unlabeled
+/// (they answer nothing in this transcript).
+fn unit_body(unit: &QaUnit) -> String {
+    match (&unit.question, &unit.answer) {
+        (Some(q), Some(a)) => format!("Q: {q}\n\nA: {a}"),
+        (Some(q), None) => format!("Q: {q}"),
+        (None, Some(a)) => a.clone(),
+        (None, None) => String::new(),
+    }
 }
 
 /// Strip characters that would break out of a double-quoted YAML scalar.
@@ -151,9 +157,9 @@ fn sanitize_yaml_value(value: &str) -> String {
     value.replace(['"', '\\', '\n'], "")
 }
 
-/// First line of the chunk content, truncated, as H2 heading text.
-fn heading_snippet(content: &str) -> String {
-    let first_line = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+/// First line of the unit body, truncated, as H2 heading text.
+fn heading_snippet(body: &str) -> String {
+    let first_line = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     truncate_text(first_line.trim(), HEADING_SNIPPET_CHARS)
 }
 
@@ -248,10 +254,10 @@ mod tests {
             r#"{"message":{"role":"user","content":"これはテストの質問です。長いテキスト。"}}"#,
             r#"{"message":{"role":"assistant","content":"これはテストの回答です。長いテキスト。"}}"#,
         ]);
-        let chunks = parse_session_jsonl(f.path()).unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].content.starts_with("Q: "));
-        assert!(chunks[0].content.contains("\nA: "));
+        let units = parse_session_jsonl(f.path()).unwrap();
+        assert_eq!(units.len(), 1);
+        assert!(units[0].question.as_deref().unwrap().contains("質問"));
+        assert!(units[0].answer.as_deref().unwrap().contains("回答"));
     }
 
     #[test]
@@ -260,9 +266,9 @@ mod tests {
             r#"{"message":{"role":"user","content":[{"type":"text","text":"テスト質問のテキストです。"}]}}"#,
             r#"{"message":{"role":"assistant","content":"テスト回答のテキストです。"}}"#,
         ]);
-        let chunks = parse_session_jsonl(f.path()).unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].content.contains("テスト質問"));
+        let units = parse_session_jsonl(f.path()).unwrap();
+        assert_eq!(units.len(), 1);
+        assert!(units[0].question.as_deref().unwrap().contains("テスト質問"));
     }
 
     #[test]
@@ -271,8 +277,8 @@ mod tests {
             r#"{"message":{"role":"user","content":["テスト文字列のリストです。"]}}"#,
             r#"{"message":{"role":"assistant","content":"回答テキストの内容です。"}}"#,
         ]);
-        let chunks = parse_session_jsonl(f.path()).unwrap();
-        assert_eq!(chunks.len(), 1);
+        let units = parse_session_jsonl(f.path()).unwrap();
+        assert_eq!(units.len(), 1);
     }
 
     #[test]
@@ -281,34 +287,25 @@ mod tests {
             r#"{"message":{"role":"user","content":"短い"}}"#,
             r#"{"message":{"role":"assistant","content":"短い回答"}}"#,
         ]);
-        let chunks = parse_session_jsonl(f.path()).unwrap();
-        assert!(chunks.is_empty());
+        let units = parse_session_jsonl(f.path()).unwrap();
+        assert!(units.is_empty());
     }
 
     #[test]
-    fn test_assistant_truncation() {
+    fn test_long_message_capped() {
+        // The per-message cap is a content decision (how much of a pasted
+        // log is worth indexing) — the unit stays whole, just truncated.
         let long_text = "あ".repeat(1000);
         let line = format!(r#"{{"message":{{"role":"assistant","content":"{long_text}"}}}}"#);
         let f = write_jsonl(&[
             r#"{"message":{"role":"user","content":"テスト質問のテキストです。"}}"#,
             &line,
         ]);
-        let chunks = parse_session_jsonl(f.path()).unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].content.contains("..."));
-    }
-
-    #[test]
-    fn test_large_pair_split() {
-        let long_q = "質".repeat(900);
-        let long_a = "答".repeat(900);
-        let q_line = format!(r#"{{"message":{{"role":"user","content":"{long_q}"}}}}"#);
-        let a_line = format!(r#"{{"message":{{"role":"assistant","content":"{long_a}"}}}}"#);
-        let f = write_jsonl(&[&q_line, &a_line]);
-        let chunks = parse_session_jsonl(f.path()).unwrap();
-        assert!(chunks.len() >= 2);
-        assert!(chunks[0].content.starts_with("Q: "));
-        assert!(chunks[1].content.starts_with("A: "));
+        let units = parse_session_jsonl(f.path()).unwrap();
+        assert_eq!(units.len(), 1);
+        let answer = units[0].answer.as_deref().unwrap();
+        assert!(answer.ends_with("..."));
+        assert_eq!(answer.chars().count(), MAX_CHUNK_CHARS + 3);
     }
 
     #[test]
@@ -318,8 +315,8 @@ mod tests {
             r#"{"message":{"role":"user","content":"有効なメッセージテキスト。"}}"#,
             r#"{"message":{"role":"assistant","content":"有効な回答テキストです。"}}"#,
         ]);
-        let chunks = parse_session_jsonl(f.path()).unwrap();
-        assert_eq!(chunks.len(), 1);
+        let units = parse_session_jsonl(f.path()).unwrap();
+        assert_eq!(units.len(), 1);
     }
 
     #[test]
@@ -328,11 +325,11 @@ mod tests {
             r#"{"message":{"role":"user","content":"これはテストの質問です。長いテキスト。"},"timestamp":"2026-03-30T08:00:00.000Z"}"#,
             r#"{"message":{"role":"assistant","content":"これはテストの回答です。長いテキスト。"},"timestamp":"2026-03-30T08:01:00.000Z"}"#,
         ]);
-        let chunks = parse_session_jsonl(f.path()).unwrap();
-        assert_eq!(chunks.len(), 1);
-        // Q&A pair uses Q's timestamp
+        let units = parse_session_jsonl(f.path()).unwrap();
+        assert_eq!(units.len(), 1);
+        // A Q&A unit carries its first message's (the question's) timestamp
         assert_eq!(
-            chunks[0].timestamp.as_deref(),
+            units[0].timestamp.as_deref(),
             Some("2026-03-30T08:00:00.000Z")
         );
     }
@@ -343,27 +340,48 @@ mod tests {
             r#"{"message":{"role":"user","content":"タイムスタンプなしの質問メッセージ。"}}"#,
             r#"{"message":{"role":"assistant","content":"タイムスタンプなしの回答メッセージ。"}}"#,
         ]);
-        let chunks = parse_session_jsonl(f.path()).unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].timestamp.is_none());
+        let units = parse_session_jsonl(f.path()).unwrap();
+        assert_eq!(units.len(), 1);
+        assert!(units[0].timestamp.is_none());
+    }
+
+    #[test]
+    fn test_empty_file() {
+        let f = write_jsonl(&[]);
+        let units = parse_session_jsonl(f.path()).unwrap();
+        assert!(units.is_empty());
+    }
+
+    #[test]
+    fn test_assistant_first() {
+        let f = write_jsonl(&[
+            r#"{"message":{"role":"assistant","content":"先に来たアシスタントのメッセージ。"}}"#,
+            r#"{"message":{"role":"user","content":"後から来たユーザーのメッセージ。"}}"#,
+            r#"{"message":{"role":"assistant","content":"ペアになるアシスタントのメッセージ。"}}"#,
+        ]);
+        let units = parse_session_jsonl(f.path()).unwrap();
+        // First assistant is an orphan unit, then a user+assistant pair
+        assert_eq!(units.len(), 2);
+        assert!(units[0].question.is_none());
+        assert!(units[1].question.is_some() && units[1].answer.is_some());
     }
 
     #[test]
     fn test_session_to_markdown_frontmatter_timestamps() {
-        let chunks = vec![
-            SessionChunk {
-                content: "Q: 最初の質問です。\n\nA: 最初の回答です。".to_string(),
-                chunk_index: 0,
+        let units = vec![
+            QaUnit {
+                question: Some("最初の質問です。".to_string()),
+                answer: Some("最初の回答です。".to_string()),
                 timestamp: Some("2026-01-01T00:00:00Z".to_string()),
             },
-            SessionChunk {
-                content: "Q: 次の質問です。\n\nA: 次の回答です。".to_string(),
-                chunk_index: 1,
+            QaUnit {
+                question: Some("次の質問です。".to_string()),
+                answer: Some("次の回答です。".to_string()),
                 timestamp: Some("2026-02-02T00:00:00Z".to_string()),
             },
         ];
 
-        let md = session_to_markdown(&chunks, "2026-03-03T00:00:00Z");
+        let md = session_to_markdown(&units, "2026-03-03T00:00:00Z");
 
         let (fm, _) = crate::frontmatter::parse(&md);
         assert_eq!(fm.status.as_deref(), Some("current"));
@@ -373,13 +391,13 @@ mod tests {
 
     #[test]
     fn test_session_to_markdown_fallback_timestamp() {
-        let chunks = vec![SessionChunk {
-            content: "Q: タイムスタンプなしの質問。".to_string(),
-            chunk_index: 0,
+        let units = vec![QaUnit {
+            question: Some("タイムスタンプなしの質問。".to_string()),
+            answer: None,
             timestamp: None,
         }];
 
-        let md = session_to_markdown(&chunks, "2026-03-03T00:00:00Z");
+        let md = session_to_markdown(&units, "2026-03-03T00:00:00Z");
 
         let (fm, _) = crate::frontmatter::parse(&md);
         assert_eq!(fm.created.as_deref(), Some("2026-03-03T00:00:00Z"));
@@ -387,24 +405,24 @@ mod tests {
     }
 
     #[test]
-    fn test_session_to_markdown_one_h2_per_chunk() {
-        let chunks = vec![
-            SessionChunk {
-                content: "Q: 一つ目の質問文。\n\nA: 一つ目の回答文。".to_string(),
-                chunk_index: 0,
+    fn test_session_to_markdown_one_h2_per_unit() {
+        let units = vec![
+            QaUnit {
+                question: Some("一つ目の質問文。".to_string()),
+                answer: Some("一つ目の回答文。".to_string()),
                 timestamp: None,
             },
-            SessionChunk {
-                content: "Q: 二つ目の質問文。\n\nA: 二つ目の回答文。".to_string(),
-                chunk_index: 1,
+            QaUnit {
+                question: Some("二つ目の質問文。".to_string()),
+                answer: Some("二つ目の回答文。".to_string()),
                 timestamp: None,
             },
         ];
 
-        let md = session_to_markdown(&chunks, "2026-01-01T00:00:00Z");
+        let md = session_to_markdown(&units, "2026-01-01T00:00:00Z");
 
         let h2_count = md.lines().filter(|l| l.starts_with("## ")).count();
-        assert_eq!(h2_count, 2, "one H2 heading per session chunk");
+        assert_eq!(h2_count, 2, "one H2 heading per Q&A unit");
         assert!(md.contains("## Q: 一つ目の質問文。"));
     }
 
@@ -412,14 +430,16 @@ mod tests {
     fn test_session_to_markdown_escapes_embedded_heading_lines() {
         // Message text containing Markdown headings (assistant answers often
         // do) must not create extra section boundaries in the chunker.
-        let chunks = vec![SessionChunk {
-            content: "Q: 見出しを含む質問です。\n\nA: 回答です。\n\n## 埋め込み見出し\n\n### サブ見出し\n\n#### H4はそのまま\n\n本文です。"
-                .to_string(),
-            chunk_index: 0,
+        let units = vec![QaUnit {
+            question: Some("見出しを含む質問です。".to_string()),
+            answer: Some(
+                "回答です。\n\n## 埋め込み見出し\n\n### サブ見出し\n\n#### H4はそのまま\n\n本文です。"
+                    .to_string(),
+            ),
             timestamp: None,
         }];
 
-        let md = session_to_markdown(&chunks, "2026-01-01T00:00:00Z");
+        let md = session_to_markdown(&units, "2026-01-01T00:00:00Z");
 
         assert!(md.contains("\\## 埋め込み見出し"));
         assert!(md.contains("\\### サブ見出し"));
@@ -430,35 +450,34 @@ mod tests {
     }
 
     /// The core equivalence guarantee (#366): serialized Markdown, run through
-    /// the standard chunker, reproduces the current Q&A chunk granularity —
-    /// one chunk per session chunk, heading-based section_path, even when
-    /// message text contains heading-looking lines.
+    /// the standard chunker, reproduces the Q&A granularity — one chunk per
+    /// unit, heading-based section_path, even when message text contains
+    /// heading-looking lines.
     #[test]
     fn test_markdown_roundtrip_preserves_qa_boundaries() {
-        let chunks = vec![
-            SessionChunk {
-                content: "Q: 最初の質問です。\n\nA: 最初の回答です。".to_string(),
-                chunk_index: 0,
+        let units = vec![
+            QaUnit {
+                question: Some("最初の質問です。".to_string()),
+                answer: Some("最初の回答です。".to_string()),
                 timestamp: Some("2026-01-01T00:00:00Z".to_string()),
             },
-            SessionChunk {
-                content: "Q: 見出し入りの質問。\n\nA: 回答本文。\n\n## 埋め込み見出し\n\n本文が続きます。"
-                    .to_string(),
-                chunk_index: 1,
+            QaUnit {
+                question: Some("見出し入りの質問。".to_string()),
+                answer: Some("回答本文。\n\n## 埋め込み見出し\n\n本文が続きます。".to_string()),
                 timestamp: Some("2026-01-02T00:00:00Z".to_string()),
             },
-            SessionChunk {
-                content: "孤立したアシスタントメッセージです。".to_string(),
-                chunk_index: 2,
+            QaUnit {
+                question: None,
+                answer: Some("孤立したアシスタントメッセージです。".to_string()),
                 timestamp: None,
             },
         ];
 
-        let md = session_to_markdown(&chunks, "2026-01-03T00:00:00Z");
+        let md = session_to_markdown(&units, "2026-01-03T00:00:00Z");
         let (_, body) = crate::frontmatter::parse(&md);
         let out = crate::chunker::chunk_markdown_default(body, "session", "abc123");
 
-        assert_eq!(out.len(), chunks.len(), "one chunk per Q&A unit");
+        assert_eq!(out.len(), units.len(), "one chunk per Q&A unit");
         assert!(out[0].content.contains("最初の質問です。"));
         assert!(out[1].content.contains("埋め込み見出し"));
         assert!(out[2].content.contains("孤立したアシスタント"));
@@ -466,56 +485,26 @@ mod tests {
         assert!(out[1].section_path.contains("見出し入りの質問"));
     }
 
-    /// An oversized pair splits at the Q/A paragraph boundary — the same
-    /// shape as the current session chunker's Q/A split for large pairs.
+    /// Boundary decisions belong to the markdown chunker: an oversized unit
+    /// is ONE H2 section that the chunker splits at the Q/A paragraph
+    /// boundary — the transform itself never pre-splits.
     #[test]
-    fn test_markdown_roundtrip_oversized_pair_splits_at_qa_boundary() {
-        let q = "q".repeat(600);
-        let a = "a".repeat(600);
-        let chunks = vec![SessionChunk {
-            content: format!("Q: {q}\n\nA: {a}"),
-            chunk_index: 0,
+    fn test_markdown_roundtrip_oversized_unit_splits_at_qa_boundary() {
+        let units = vec![QaUnit {
+            question: Some("q".repeat(600)),
+            answer: Some("a".repeat(600)),
             timestamp: None,
         }];
 
-        let md = session_to_markdown(&chunks, "2026-01-01T00:00:00Z");
+        let md = session_to_markdown(&units, "2026-01-01T00:00:00Z");
+        let h2_count = md.lines().filter(|l| l.starts_with("## ")).count();
+        assert_eq!(h2_count, 1, "the transform emits one section per unit");
+
         let (_, body) = crate::frontmatter::parse(&md);
         let out = crate::chunker::chunk_markdown_default(body, "session", "abc123");
 
-        assert_eq!(out.len(), 2, "oversized pair splits into Q and A chunks");
+        assert_eq!(out.len(), 2, "the chunker splits into Q and A chunks");
         assert!(out[0].content.contains("Q: qqq"));
         assert!(out[1].content.contains("A: aaa"));
-    }
-
-    #[test]
-    fn test_qa_pair_joined_with_blank_line() {
-        // Q and A must be separate paragraphs so the markdown chunker can
-        // split oversized pairs at the Q/A boundary.
-        let f = write_jsonl(&[
-            r#"{"message":{"role":"user","content":"これはテストの質問です。長いテキスト。"}}"#,
-            r#"{"message":{"role":"assistant","content":"これはテストの回答です。長いテキスト。"}}"#,
-        ]);
-        let chunks = parse_session_jsonl(f.path()).unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].content.contains("\n\nA: "));
-    }
-
-    #[test]
-    fn test_empty_file() {
-        let f = write_jsonl(&[]);
-        let chunks = parse_session_jsonl(f.path()).unwrap();
-        assert!(chunks.is_empty());
-    }
-
-    #[test]
-    fn test_assistant_first() {
-        let f = write_jsonl(&[
-            r#"{"message":{"role":"assistant","content":"先に来たアシスタントのメッセージ。"}}"#,
-            r#"{"message":{"role":"user","content":"後から来たユーザーのメッセージ。"}}"#,
-            r#"{"message":{"role":"assistant","content":"ペアになるアシスタントのメッセージ。"}}"#,
-        ]);
-        let chunks = parse_session_jsonl(f.path()).unwrap();
-        // First assistant is orphan, then user+assistant pair
-        assert!(chunks.len() >= 2);
     }
 }

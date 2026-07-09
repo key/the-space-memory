@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-use crate::session_chunker::{parse_session_jsonl, session_to_markdown};
+use crate::session_source::{parse_session_jsonl, session_to_markdown};
 use crate::user_dict;
 
 pub mod walker;
@@ -288,13 +288,13 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
         }
     }
 
-    let chunks = parse_session_jsonl(jsonl_path)?;
-    if chunks.is_empty() {
+    let units = parse_session_jsonl(jsonl_path)?;
+    if units.is_empty() {
         return Ok(false);
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    let markdown = session_to_markdown(&chunks, &now);
+    let markdown = session_to_markdown(&units, &now);
     let prepared = prepare::prepare_text(
         &markdown,
         &prepare::PrepareContext {

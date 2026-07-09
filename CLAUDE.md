@@ -90,7 +90,7 @@ src/
 ├── hooks/extract/       — Embedded default extract hook (10-md_frontmatter.lua)
 ├── hooks/score/         — Embedded default score hook (10-default.lua)
 ├── chunker.rs           — Markdown → H2/H3/paragraph chunking
-├── session_chunker.rs   — Claude session JSONL → Q&A chunks → Markdown serialization (source transform)
+├── session_source.rs    — Claude session JSONL → Q&A units → Markdown serialization (source transform)
 ├── frontmatter.rs       — YAML frontmatter parser
 ├── tokenizer.rs         — Morphological analysis via lindera (with user dictionary)
 ├── entity.rs            — Entity graph (link inference)

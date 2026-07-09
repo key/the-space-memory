@@ -104,8 +104,10 @@ in the separate hook API specification.
 
 The `source` row is implemented today by session ingestion:
 `tsm ingest-session` parses Claude session JSONL, serializes it to Markdown
-(`session_chunker::session_to_markdown`), and feeds it into the same Prepare
+(`session_source::session_to_markdown`), and feeds it into the same Prepare
 implementation (`indexer::prepare::prepare_text`) as filesystem documents.
+The transform makes content decisions only; chunk boundaries are owned by
+the markdown chunker like any other source.
 Per-source participation in the side indexes (entity graph, doc links,
 dictionary candidates) is an explicit `SourcePolicy` carried through Prepare
 into Persist.
