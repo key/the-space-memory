@@ -1651,7 +1651,7 @@ fn reindex_fts_after_dict_change() -> anyhow::Result<()> {
 /// (or only `pending` in) the DB into it BEFORE the change, so the subsequent
 /// `user_dict.simpledic` rewrite cannot silently drop them. Any file conflict or
 /// malformed line is detected before the first write, so an abort leaves the DB
-/// completely unchanged (the transaction is never committed).
+/// completely unchanged (the transaction is never committed). `surface` is NFC-normalized (#357).
 fn mutate_verdict(
     conn: &rusqlite::Connection,
     surface: &str,
@@ -1664,7 +1664,7 @@ fn mutate_verdict(
         &config::user_dict_path(),
         &config::reject_words_path(),
     )?;
-    let t = user_dict::set_verdict_in(&tx, surface, to, reading)?;
+    let t = user_dict::set_verdict_in(&tx, &crate::normalize::nfc(surface), to, reading)?;
     tx.commit()?;
     Ok((t, reconciled))
 }
@@ -2564,6 +2564,44 @@ mod tests {
             msg.contains("reindex vectors"),
             "should still point to `reindex vectors`, got: {msg:?}"
         );
+    }
+
+    /// Regression for the 2026-07-06 dict maintenance failure: a
+    /// `reject_words.txt` entry saved in NFD must be recognized by an
+    /// NFC-typed `tsm dict reject` — `mutate_verdict`'s reconcile step loads
+    /// the file (normalizing to NFC) before the verdict change runs, so the
+    /// NFC-typed surface resolves to the same row instead of duplicating it
+    /// (#357). Pre-existing NFD rows written directly into the DB (bypassing
+    /// this normalization) are a separate, out-of-scope migration concern —
+    /// see the PR notes on `rebuild --apply`.
+    #[test]
+    #[serial_test::serial]
+    fn test_cmd_dict_reject_normalizes_nfd_reject_file_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
+        let db_path = config::db_path();
+        db::init_db(&db_path).unwrap();
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        std::fs::write(config::reject_words_path(), format!("{nfd_worker}\n")).unwrap();
+
+        // NFC-typed CLI input must resolve to the file's (now NFC-normalized)
+        // row rather than inserting a byte-mismatched duplicate.
+        cmd_dict_reject("\u{30ef}\u{30fc}\u{30ac}\u{30fc}").unwrap(); // ワーガー precomposed
+
+        let conn = db::get_connection(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dictionary_candidates", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "NFC CLI input must match the NFD file entry, not duplicate it"
+        );
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
     }
 
     #[test]

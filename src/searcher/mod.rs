@@ -165,6 +165,41 @@ mod tests {
         assert_eq!(results[0].source_type, "note");
     }
 
+    /// A document indexed from NFC source (the normal case: `prepare_text`
+    /// normalizes on write) must still be found by an NFD query — `plan()`
+    /// normalizes the query to the same NFC form (#357). Regression for the
+    /// 2026-07-06 NFC/NFD mismatch.
+    #[test]
+    fn test_search_nfd_query_finds_nfc_indexed_doc() {
+        use crate::indexer;
+        use std::io::Write;
+
+        let conn = db::get_memory_connection().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // "モジュール" (NFC) — the source file is typed/stored in ordinary
+        // precomposed form, as `prepare_text` always leaves it.
+        let md = "---\nstatus: current\n---\n\n# LoRaモジュール\n\nLoRaモジュールの開発について説明します。\n";
+        let full = dir.path().join("daily/notes/lora.md");
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&full).unwrap();
+        f.write_all(md.as_bytes()).unwrap();
+
+        indexer::index_file(&conn, &full, dir.path()).unwrap();
+
+        // Decomposed query: ジ (U+30B8) spelled as シ (U+30B7) + combining
+        // dakuten (U+3099), as some IMEs/hand-typed input can produce.
+        let nfd_query = "LoRa\u{30e2}\u{30b7}\u{3099}\u{30e5}\u{30fc}\u{30eb}";
+        assert_ne!(nfd_query, "LoRaモジュール");
+
+        let SearchOutput { results, .. } = search(&conn, nfd_query, 5, None, false, None).unwrap();
+        assert!(
+            !results.is_empty(),
+            "NFD query should find the NFC-indexed document"
+        );
+        assert!(results[0].source_file.contains("lora"));
+    }
+
     #[test]
     fn test_search_empty_query() {
         let conn = db::get_memory_connection().unwrap();

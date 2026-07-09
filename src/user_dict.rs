@@ -174,7 +174,7 @@ pub fn load_existing_surfaces(csv_path: &Path) -> anyhow::Result<HashSet<String>
             continue;
         }
         if let Some(surface) = line.split(',').next() {
-            let surface = surface.trim().to_lowercase();
+            let surface = crate::normalize::nfc(surface.trim()).to_lowercase();
             if !surface.is_empty() {
                 surfaces.insert(surface);
             }
@@ -654,7 +654,7 @@ fn parse_simpledic_line(line: &str) -> anyhow::Result<Option<(String, Option<Str
         return Ok(None);
     }
     let mut cols = trimmed.split(',');
-    let surface = cols.next().map(str::trim).unwrap_or("");
+    let surface = crate::normalize::nfc(cols.next().map(str::trim).unwrap_or("")).into_owned();
     if surface.is_empty() {
         anyhow::bail!("missing surface (first column is empty)");
     }
@@ -662,9 +662,9 @@ fn parse_simpledic_line(line: &str) -> anyhow::Result<Option<(String, Option<Str
         .next() // pos column (ignored)
         .and(cols.next())
         .map(str::trim)
-        .filter(|r| !r.is_empty() && *r != surface)
-        .map(str::to_string);
-    Ok(Some((surface.to_string(), reading)))
+        .map(|r| crate::normalize::nfc(r).into_owned())
+        .filter(|r| !r.is_empty() && *r != surface);
+    Ok(Some((surface, reading)))
 }
 
 /// Read `user_dict.simpledic` into `(surface, reading)` rows, failing closed on
@@ -716,7 +716,7 @@ fn read_reject_surfaces(path: &Path) -> anyhow::Result<Vec<String>> {
         if surface.is_empty() || surface.starts_with('#') {
             continue;
         }
-        out.push(surface.to_string());
+        out.push(crate::normalize::nfc(surface).into_owned());
     }
     Ok(out)
 }
@@ -1665,6 +1665,20 @@ mod tests {
         assert!(surfaces.contains("candle"));
     }
 
+    /// An NFD-encoded surface (decomposed dakuten) in the CSV must be stored
+    /// under its NFC form, so an NFC-typed lookup matches it (#357).
+    #[test]
+    fn test_load_existing_surfaces_normalizes_nfd_to_nfc() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let csv_path = dir.path().join("dict.csv");
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        std::fs::write(&csv_path, format!("{nfd_worker},名詞,{nfd_worker}\n")).unwrap();
+
+        let surfaces = load_existing_surfaces(&csv_path).unwrap();
+
+        assert!(surfaces.contains("\u{30ef}\u{30fc}\u{30ac}\u{30fc}")); // ワーガー precomposed
+    }
+
     // ─── helper function tests ───────────────────────────────
 
     #[test]
@@ -1753,6 +1767,26 @@ mod tests {
         );
         assert_eq!(status_of(&conn, "bad").as_deref(), Some("rejected"));
         assert_eq!(status_of(&conn, "noise").as_deref(), Some("rejected"));
+    }
+
+    /// Regression for the 2026-07-06 dict maintenance failure: a `reject_words.txt`
+    /// entry saved in NFD must be found by an NFC-typed `dict reject` lookup —
+    /// both go through the same `nfc()` normalization now (#357).
+    #[test]
+    fn test_import_reject_words_nfd_matches_nfc_lookup() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reject_words.txt");
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        std::fs::write(&path, format!("{nfd_worker}\n")).unwrap();
+
+        import_reject_words_from_file(&conn, &path).unwrap();
+
+        // The hand-typed NFC form must resolve to the same stored row.
+        assert_eq!(
+            status_of(&conn, "\u{30ef}\u{30fc}\u{30ac}\u{30fc}").as_deref(), // ワーガー precomposed
+            Some("rejected")
+        );
     }
 
     #[test]
@@ -1897,6 +1931,18 @@ mod tests {
             parse_simpledic_line("ハンドロード,名詞,はんどろーど").unwrap(),
             Some(("ハンドロード".to_string(), Some("はんどろーど".to_string())))
         );
+    }
+
+    /// An NFD-encoded surface in `user_dict.simpledic` must parse to its NFC
+    /// form (#357), matching the normalization applied everywhere else.
+    #[test]
+    fn test_parse_simpledic_line_normalizes_nfd_surface() {
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        let nfc_worker = "\u{30ef}\u{30fc}\u{30ac}\u{30fc}"; // ワーガー precomposed
+
+        let parsed = parse_simpledic_line(nfd_worker).unwrap();
+
+        assert_eq!(parsed, Some((nfc_worker.to_string(), None)));
     }
 
     #[test]

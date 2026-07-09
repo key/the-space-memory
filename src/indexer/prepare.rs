@@ -78,7 +78,14 @@ pub(crate) struct PreparedFile {
 /// Prepare stage body: Markdown text -> PreparedFile. Pure (no I/O), so every
 /// source that can serialize itself to Markdown funnels through here — this is
 /// the single Prepare implementation (ADR-0016 `source` transform doctrine).
+///
+/// The first step normalizes the whole input to Unicode NFC (#357), so every
+/// downstream stage — frontmatter parse, chunking, lua extract, content
+/// hashing — sees a single canonical representation regardless of how the
+/// source text was encoded.
 pub(crate) fn prepare_text(text: &str, ctx: &PrepareContext) -> PreparedFile {
+    let text = crate::normalize::nfc(text);
+    let text = text.as_ref();
     let (fm, body) = frontmatter::parse(text);
     let fm_map = frontmatter::parse_map(text);
     let metadata_json =
@@ -91,6 +98,10 @@ pub(crate) fn prepare_text(text: &str, ctx: &PrepareContext) -> PreparedFile {
     let chunk_inputs = chunk_markdown_default(body, ctx.directory, ctx.filename)
         .into_iter()
         .map(|c| {
+            debug_assert!(
+                crate::normalize::is_normalized(&c.content),
+                "chunk content must be NFC-normalized (see src/normalize.rs)"
+            );
             let content_hash = chunk_hash(&c.content);
             ChunkInput {
                 chunk_index: c.chunk_index,
@@ -232,5 +243,36 @@ mod tests {
         assert_eq!(p.chunk_inputs[0].content_hash.len(), 64); // sha-256 hex
         assert!(p.metadata_json.contains("status"));
         assert!(p.text.contains("body text"));
+    }
+
+    /// A Markdown file containing NFD text (decomposed dakuten) must produce
+    /// the same chunk content and content_hash as the equivalent NFC source —
+    /// `prepare_text` normalizes before chunking/hashing (#357).
+    #[test]
+    fn test_prepare_text_normalizes_nfd_to_match_nfc_source() {
+        let nfd_ga = "\u{30ab}\u{3099}"; // ガ (decomposed: カ + combining dakuten)
+        let nfc_ga = "\u{30ac}"; // ガ (precomposed)
+        assert_ne!(nfd_ga, nfc_ga);
+
+        let ctx = PrepareContext {
+            uri: "daily/notes/x.md",
+            directory: "daily/notes",
+            filename: "x",
+            source_type: "note",
+            policy: SourcePolicy::full(),
+        };
+
+        let nfd_text = format!("# H\n\n{nfd_ga}ワーカー\n");
+        let nfc_text = format!("# H\n\n{nfc_ga}ワーカー\n");
+
+        let p_nfd = prepare_text(&nfd_text, &ctx);
+        let p_nfc = prepare_text(&nfc_text, &ctx);
+
+        assert_eq!(p_nfd.chunk_inputs[0].content, p_nfc.chunk_inputs[0].content);
+        assert_eq!(
+            p_nfd.chunk_inputs[0].content_hash,
+            p_nfc.chunk_inputs[0].content_hash
+        );
+        assert!(p_nfd.chunk_inputs[0].content.contains(nfc_ga));
     }
 }

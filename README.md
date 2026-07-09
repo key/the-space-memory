@@ -139,6 +139,14 @@ tsm rebuild --apply   # Delete DB and rebuild
 
 Use `tsm doctor` to check system health and daemon status.
 
+Text is normalized to Unicode NFC (canonical composition) on index and query,
+so visually identical text with different byte encodings (e.g. a precomposed
+vs. decomposed katakana dakuten) always matches. This applies going forward
+only — content indexed before this was added may still hold non-normalized
+text. Run `tsm rebuild --apply` to renormalize existing content, then
+`tsm dict import` to resync dictionary verdicts from `user_dict.simpledic` /
+`reject_words.txt`.
+
 ## Lua Hooks
 
 tsm uses embedded Lua (mlua, lua54) for user-editable metadata extraction and
