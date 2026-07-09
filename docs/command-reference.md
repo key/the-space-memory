@@ -378,8 +378,9 @@ Ingest a Claude Code session JSONL file as searchable knowledge.
 tsm ingest-session <session_file>
 ```
 
-Parses Claude session transcripts (JSONL format) and indexes Q&A pairs as
-chunks. Skips unchanged files based on content hash.
+Parses Claude session transcripts (JSONL format), serializes them to
+Markdown (one Q&A pair per section), and indexes them through the same
+pipeline as Markdown documents. Skips unchanged files based on content hash.
 
 **Arguments:**
 

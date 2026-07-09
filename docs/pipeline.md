@@ -102,6 +102,15 @@ in the separate hook API specification.
 | tokenizer | Prepare + Plan (cross-cutting) |
 | source (external) | outside the pipeline — converted to Markdown, then fed into Prepare |
 
+Session ingestion is the reference implementation of the `source` kind:
+`tsm ingest-session` parses Claude session JSONL, serializes it to Markdown
+(`session_source::session_to_markdown`), and feeds it into the same Prepare
+implementation (`indexer::prepare::prepare_text`) as filesystem documents.
+A `source` transform makes content decisions only; chunk boundaries are
+owned by the markdown chunker. Per-source participation in the side indexes
+(entity graph, doc links, dictionary candidates) is an explicit
+`SourcePolicy` carried through Prepare into Persist.
+
 ## Failure behavior
 
 **Visibility is fail-closed.** A visibility plugin that fails withholds the

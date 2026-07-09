@@ -246,32 +246,40 @@ pub(crate) fn persist(
 
     let diff = diff_chunks(&tx, doc_id, &prepared.chunk_inputs)?;
 
+    // Side indexes are per-source policy (see SourcePolicy): e.g. sessions
+    // are searchable text only and skip all three.
     if diff.had_mutations {
-        // Rebuild entity graph (document-level)
-        tx.execute("DELETE FROM entity_edges WHERE doc_id = ?", [doc_id])
-            .or_else(|e| {
-                if e.to_string().contains("no such table") {
-                    Ok(0)
-                } else {
-                    Err(e)
-                }
-            })?;
-        if let Err(e) = entity::insert_entities(
-            &tx,
-            doc_id,
-            &diff.all_chunk_entries,
-            &prepared.frontmatter.tags,
-        ) {
-            log::warn!("entity extraction warning: {e}");
+        if prepared.policy.entity_graph {
+            // Rebuild entity graph (document-level)
+            tx.execute("DELETE FROM entity_edges WHERE doc_id = ?", [doc_id])
+                .or_else(|e| {
+                    if e.to_string().contains("no such table") {
+                        Ok(0)
+                    } else {
+                        Err(e)
+                    }
+                })?;
+            if let Err(e) = entity::insert_entities(
+                &tx,
+                doc_id,
+                &diff.all_chunk_entries,
+                &prepared.frontmatter.tags,
+            ) {
+                log::warn!("entity extraction warning: {e}");
+            }
         }
 
-        // Rebuild document links
-        doc_links::delete_links(&tx, doc_id);
-        doc_links::build_links(&tx, doc_id, &prepared.text, &prepared.frontmatter.tags);
+        if prepared.policy.doc_links {
+            // Rebuild document links
+            doc_links::delete_links(&tx, doc_id);
+            doc_links::build_links(&tx, doc_id, &prepared.text, &prepared.frontmatter.tags);
+        }
 
-        // Collect dictionary candidates
-        for (_, content) in &diff.all_chunk_entries {
-            user_dict::collect_from_text(&tx, content, "document");
+        if prepared.policy.dict_candidates {
+            // Collect dictionary candidates
+            for (_, content) in &diff.all_chunk_entries {
+                user_dict::collect_from_text(&tx, content, "document");
+            }
         }
     }
 

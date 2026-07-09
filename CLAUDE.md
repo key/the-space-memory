@@ -73,8 +73,8 @@ src/
 ├── config.rs           — Configuration (TSM_* env vars, config file, scoring params)
 ├── db.rs               — SQLite (rusqlite) DB init & connection management
 ├── indexer/             — Index pipeline (Prepare/Persist/Embed stages)
-│   ├── mod.rs           — Orchestration: index_file (prepare→persist→embed), index_all*, index_session
-│   ├── prepare.rs       — Prepare stage: file → PreparedFile (parse/chunk/metadata, no DB)
+│   ├── mod.rs           — Orchestration: index_file / index_session (both: hash check→prepare→persist→embed), index_all*
+│   ├── prepare.rs       — Prepare stage: prepare_text (pure Markdown → PreparedFile) + file-loading wrapper; SourcePolicy
 │   ├── persist.rs       — Persist stage: one transaction (documents/chunks/FTS5/entity/links), diff, rebuild_fts
 │   ├── embed.rs         — Embed stage: async vector inference + writes (backfill)
 │   └── walker.rs        — File discovery + ingest policy
@@ -90,7 +90,7 @@ src/
 ├── hooks/extract/       — Embedded default extract hook (10-md_frontmatter.lua)
 ├── hooks/score/         — Embedded default score hook (10-default.lua)
 ├── chunker.rs           — Markdown → H2/H3/paragraph chunking
-├── session_chunker.rs   — Claude session JSONL → Q&A chunking
+├── session_source.rs    — Claude session JSONL → Q&A units → Markdown serialization (source transform)
 ├── frontmatter.rs       — YAML frontmatter parser
 ├── tokenizer.rs         — Morphological analysis via lindera (with user dictionary)
 ├── entity.rs            — Entity graph (link inference)

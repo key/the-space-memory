@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-use crate::session_chunker::parse_session_jsonl;
+use crate::session_source::{parse_session_jsonl, session_to_markdown};
 use crate::user_dict;
 
 pub mod walker;
@@ -260,11 +260,18 @@ pub fn index_all_with_progress(
 }
 
 /// Index a session JSONL file.
+///
+/// Source transform (ADR-0016 `source` plugin doctrine, #366): the JSONL is
+/// parsed and serialized to Markdown, then flows through the same
+/// hash check → prepare → persist → embed pipeline as filesystem documents.
+/// Only the transform and the synonym learning are session-specific.
 pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<bool> {
-    let file_key = format!(
-        "session:{}",
-        jsonl_path.file_stem().unwrap_or_default().to_string_lossy()
-    );
+    let stem = jsonl_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let file_key = format!("session:{stem}");
     let current_hash = file_hash(jsonl_path)?;
 
     let existing: Option<(i64, String)> = conn
@@ -281,73 +288,31 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
         }
     }
 
-    let chunks = parse_session_jsonl(jsonl_path)?;
-    if chunks.is_empty() {
+    let units = parse_session_jsonl(jsonl_path)?;
+    if units.is_empty() {
         return Ok(false);
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    // Use conversation timestamps from JSONL (first/last chunk) instead of index time
-    let created = chunks
-        .iter()
-        .filter_map(|c| c.timestamp.as_deref())
-        .next()
-        .unwrap_or(&now);
-    let updated = chunks
-        .iter()
-        .filter_map(|c| c.timestamp.as_deref())
-        .next_back()
-        .unwrap_or(&now);
+    let markdown = session_to_markdown(&units, &now);
+    let prepared = prepare::prepare_text(
+        &markdown,
+        &prepare::PrepareContext {
+            uri: &file_key,
+            directory: "session",
+            filename: &stem,
+            source_type: "session",
+            policy: prepare::SourcePolicy::text_only(),
+        },
+    );
 
-    // Build chunk inputs with content hashes
-    let chunk_inputs: Vec<ChunkInput> = chunks
-        .iter()
-        .map(|c| ChunkInput {
-            chunk_index: c.chunk_index,
-            section_path: "session".to_string(),
-            content: c.content.clone(),
-            content_hash: chunk_hash(&c.content),
-        })
-        .collect();
-
-    let title = jsonl_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    let tx = conn.unchecked_transaction()?;
-
-    let doc_id = if let Some((doc_id, _)) = existing {
-        // metadata intentionally omitted: sessions have no frontmatter;
-        // searcher synthesizes scoring from status/updated when metadata is NULL.
-        tx.execute(
-            "UPDATE documents SET source_type=?, title=?, status=?, created=?, updated=?, tags=?, file_hash=?, indexed_at=?
-             WHERE id=?",
-            rusqlite::params![
-                "session", title, "current", created, updated,
-                Option::<String>::None, current_hash, &now, doc_id,
-            ],
-        )?;
-        doc_id
-    } else {
-        tx.execute(
-            "INSERT INTO documents (file_path, source_type, title, status, created, updated, tags, file_hash, indexed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            rusqlite::params![
-                file_key, "session", title, "current", created, updated,
-                Option::<String>::None, current_hash, &now,
-            ],
-        )?;
-        tx.last_insert_rowid()
-    };
-
-    let diff = persist::diff_chunks(&tx, doc_id, &chunk_inputs)?;
-
-    // Note: entity graph and doc_links are not rebuilt for sessions.
-    // Sessions don't participate in entity co-occurrence or link graphs.
-
-    tx.commit()?;
+    let diff = persist::persist(
+        conn,
+        &file_key,
+        &current_hash,
+        existing.map(|(id, _)| id),
+        &prepared,
+    )?;
 
     // Vector embedding outside transaction (socket I/O)
     if !diff.chunks_needing_vectors.is_empty() {
@@ -710,6 +675,141 @@ mod tests {
             .query_row("SELECT source_type FROM documents", [], |r| r.get(0))
             .unwrap();
         assert_eq!(source_type, "session");
+    }
+
+    /// After the source-transform unification (#366), session chunks go through
+    /// the markdown chunker: section_path is heading-based (was the constant
+    /// "session") and content carries the standard chunk prefix.
+    #[test]
+    fn test_session_chunks_are_heading_based() {
+        let (conn, dir) = setup();
+        let jsonl = r#"{"message":{"role":"user","content":"テスト質問のテキストです。"}}
+{"message":{"role":"assistant","content":"テスト回答のテキストです。"}}"#;
+        let path = dir.path().join("mysession.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+
+        assert!(index_session(&conn, &path).unwrap());
+
+        let (section_path, content): (String, String) = conn
+            .query_row("SELECT section_path, content FROM chunks", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_ne!(section_path, "session");
+        assert!(
+            section_path.contains("テスト質問"),
+            "section_path is heading-based: {section_path}"
+        );
+        assert!(
+            content.starts_with("【session/mysession】"),
+            "content carries the standard chunk prefix: {content}"
+        );
+        assert!(content.contains("Q: テスト質問のテキストです。"));
+        assert!(content.contains("A: テスト回答のテキストです。"));
+    }
+
+    /// Sessions do not participate in the entity graph, doc links, or
+    /// per-chunk dictionary candidate collection — that non-participation is
+    /// an explicit per-source policy, not an accident of a separate code path.
+    /// Dictionary learning from *user messages* (source "session") stays.
+    #[test]
+    fn test_session_policy_skips_side_indexes() {
+        let (conn, dir) = setup();
+        let jsonl = r#"{"message":{"role":"user","content":"candle framework is great for lindera tokenization testing."}}
+{"message":{"role":"assistant","content":"tantivy crates provide inverted index functionality for rust applications."}}"#;
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+
+        assert!(index_session(&conn, &path).unwrap());
+
+        let entity_edges: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entity_edges", [], |r| r.get(0))
+            .unwrap_or(0);
+        assert_eq!(entity_edges, 0, "sessions skip the entity graph");
+
+        let doc_links: i64 = conn
+            .query_row("SELECT COUNT(*) FROM document_links", [], |r| r.get(0))
+            .unwrap_or(0);
+        assert_eq!(doc_links, 0, "sessions skip doc links");
+
+        let doc_candidates: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dictionary_candidates WHERE source = 'document'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert_eq!(
+            doc_candidates, 0,
+            "session chunks are not collected as 'document' candidates"
+        );
+
+        let session_candidates: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dictionary_candidates WHERE source = 'session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert!(
+            session_candidates > 0,
+            "user-message dictionary learning is preserved"
+        );
+    }
+
+    /// Metadata semantics (#366): sessions now get a non-NULL metadata JSON
+    /// from the extract hook. It must score identically to the pre-refactor
+    /// NULL-metadata path, where the searcher synthesizes
+    /// `{status, effective_date}` from the documents columns.
+    #[test]
+    fn test_session_metadata_scores_like_null_synthesis() {
+        let (conn, dir) = setup();
+        let jsonl = r#"{"timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"最初の質問のテキスト。"}}
+{"timestamp":"2026-02-02T00:00:00Z","message":{"role":"assistant","content":"最初の回答のテキスト。"}}"#;
+        let path = dir.path().join("meta.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+
+        assert!(index_session(&conn, &path).unwrap());
+
+        let (metadata, status, updated): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT metadata, status, updated FROM documents WHERE file_path = 'session:meta'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+
+        let metadata = metadata.expect("session metadata is now populated by the extract hook");
+
+        // The searcher's NULL-metadata synthesis (rank.rs) builds this JSON;
+        // the extract-hook metadata must produce the same score multiplier.
+        let synthesized = serde_json::json!({
+            "status": status.as_deref(),
+            "effective_date": updated.as_deref(),
+        })
+        .to_string();
+
+        let hooks = crate::lua_hooks::hooks();
+        let from_extract = crate::lua_hooks::run_score(
+            &hooks,
+            Some(&metadata),
+            1.0,
+            "session",
+            "session:meta",
+            30.0,
+        );
+        let from_synthesis = crate::lua_hooks::run_score(
+            &hooks,
+            Some(&synthesized),
+            1.0,
+            "session",
+            "session:meta",
+            30.0,
+        );
+        assert!(
+            (from_extract - from_synthesis).abs() < 1e-12,
+            "extract metadata ({from_extract}) must score like NULL synthesis ({from_synthesis})"
+        );
     }
 
     /// Regression test for the rebuild data-loss bug: session documents are a

@@ -27,7 +27,7 @@ pub mod placement;
 pub mod read_pool;
 pub mod render;
 pub mod searcher;
-pub mod session_chunker;
+pub mod session_source;
 pub mod status;
 pub mod synonyms;
 pub mod temporal;
