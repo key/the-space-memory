@@ -1,4 +1,5 @@
-//! Prepare stage: file -> PreparedFile. Pure (file IO only, no DB).
+//! Prepare stage: Markdown text -> PreparedFile (`prepare_text`, pure) with
+//! a file-loading wrapper (`prepare`). No DB access.
 
 use std::path::Path;
 
@@ -14,10 +15,9 @@ pub(crate) struct ChunkInput {
     pub content_hash: String,
 }
 
-/// Per-source pipeline participation policy. Markdown documents join every
-/// side index; sessions are searchable text only (no entity co-occurrence,
-/// no link graph, no per-chunk dictionary candidate collection — their
-/// dictionary learning happens on user messages via `learn_from_session_jsonl`).
+/// Per-source pipeline participation policy, named by capability — this
+/// generic layer knows nothing about concrete sources. Each source's index
+/// flow picks the policy that matches what its documents should join.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SourcePolicy {
     pub entity_graph: bool,
@@ -26,7 +26,9 @@ pub(crate) struct SourcePolicy {
 }
 
 impl SourcePolicy {
-    pub(crate) fn markdown() -> Self {
+    /// Participate in every side index (entity graph, doc links,
+    /// per-chunk dictionary candidates). Filesystem Markdown uses this.
+    pub(crate) fn full() -> Self {
         Self {
             entity_graph: true,
             doc_links: true,
@@ -34,7 +36,10 @@ impl SourcePolicy {
         }
     }
 
-    pub(crate) fn session() -> Self {
+    /// Searchable text only — no side-index participation. For sources
+    /// whose documents shouldn't shape the entity/link graphs or the
+    /// dictionary (e.g. ingested conversation transcripts).
+    pub(crate) fn text_only() -> Self {
         Self {
             entity_graph: false,
             doc_links: false,
@@ -43,15 +48,19 @@ impl SourcePolicy {
     }
 }
 
-/// Identity and policy for one Prepare invocation. Source transforms
-/// (e.g. session JSONL → Markdown) set `source_type` to override the
-/// directory-derived classification, since their `rel_path` is a synthetic
-/// key (`session:<stem>`) outside the content directories.
+/// Identity and policy for one Prepare invocation. The caller states all of
+/// it explicitly; this layer derives nothing:
+///
+/// - `uri` — document identity: the project-relative path for filesystem
+///   sources, or a `<scheme>:<id>` key for external sources (e.g.
+///   `session:<stem>`). Passed to extract hooks as `ctx.path`.
+/// - `source_type` — classification stored on the documents row. Filesystem
+///   callers derive it from the directory; external sources name their own.
 pub(crate) struct PrepareContext<'a> {
-    pub rel_path: &'a str,
+    pub uri: &'a str,
     pub directory: &'a str,
     pub filename: &'a str,
-    pub source_type: Option<&'a str>,
+    pub source_type: &'a str,
     pub policy: SourcePolicy,
 }
 
@@ -73,11 +82,7 @@ pub(crate) fn prepare_text(text: &str, ctx: &PrepareContext) -> PreparedFile {
     let (fm, body) = frontmatter::parse(text);
     let fm_map = frontmatter::parse_map(text);
     let metadata_json =
-        lua_hooks::run_extract(&lua_hooks::hooks(), ctx.rel_path, body, &fm_map).to_string();
-    let source_type = match ctx.source_type {
-        Some(st) => st.to_string(),
-        None => config::source_type_from_dir(ctx.directory),
-    };
+        lua_hooks::run_extract(&lua_hooks::hooks(), ctx.uri, body, &fm_map).to_string();
     let tags_str = if fm.tags.is_empty() {
         None
     } else {
@@ -96,7 +101,7 @@ pub(crate) fn prepare_text(text: &str, ctx: &PrepareContext) -> PreparedFile {
         })
         .collect();
     PreparedFile {
-        source_type,
+        source_type: ctx.source_type.to_string(),
         title: ctx.filename.to_string(),
         frontmatter: fm,
         tags_str,
@@ -107,8 +112,8 @@ pub(crate) fn prepare_text(text: &str, ctx: &PrepareContext) -> PreparedFile {
     }
 }
 
-/// Load a Markdown file and run [`prepare_text`] with the default
-/// (directory-derived, full-participation) context.
+/// Load a Markdown file and run [`prepare_text`] with the filesystem
+/// context: directory-derived source_type, full side-index participation.
 pub(crate) fn prepare(
     file_path: &Path,
     rel_path: &str,
@@ -119,11 +124,11 @@ pub(crate) fn prepare(
     Ok(prepare_text(
         &text,
         &PrepareContext {
-            rel_path,
+            uri: rel_path,
             directory,
             filename,
-            source_type: None,
-            policy: SourcePolicy::markdown(),
+            source_type: &config::source_type_from_dir(directory),
+            policy: SourcePolicy::full(),
         },
     ))
 }
@@ -136,17 +141,17 @@ mod tests {
     fn test_prepare_text_is_pure_and_mirrors_prepare() {
         let text = "---\nstatus: current\n---\n# H\n\nbody text\n";
         let ctx = PrepareContext {
-            rel_path: "daily/notes/x.md",
+            uri: "daily/notes/x.md",
             directory: "daily/notes",
             filename: "x",
-            source_type: None,
-            policy: SourcePolicy::markdown(),
+            source_type: "note",
+            policy: SourcePolicy::full(),
         };
 
         let p = prepare_text(text, &ctx);
 
         assert_eq!(p.title, "x");
-        assert_eq!(p.source_type, "note"); // derived from directory
+        assert_eq!(p.source_type, "note");
         assert_eq!(p.frontmatter.status.as_deref(), Some("current"));
         assert!(!p.chunk_inputs.is_empty());
         assert_eq!(p.chunk_inputs[0].content_hash.len(), 64);
@@ -154,16 +159,17 @@ mod tests {
         assert!(p.text.contains("body text"));
     }
 
+    /// External sources identify themselves with a `<scheme>:<id>` uri and
+    /// an explicit source_type — this layer stores them verbatim, deriving
+    /// nothing from the content directories.
     #[test]
-    fn test_prepare_text_source_type_override() {
-        // A source transform (e.g. session) must be able to override the
-        // directory-derived source_type.
+    fn test_prepare_text_external_source_identity() {
         let ctx = PrepareContext {
-            rel_path: "session:abc",
+            uri: "session:abc",
             directory: "session",
             filename: "abc",
-            source_type: Some("session"),
-            policy: SourcePolicy::session(),
+            source_type: "session",
+            policy: SourcePolicy::text_only(),
         };
 
         let p = prepare_text("## Q: hello\n\nQ: hello\n\nA: world\n", &ctx);
@@ -173,21 +179,21 @@ mod tests {
 
     #[test]
     fn test_source_policy_constructors() {
-        let md = SourcePolicy::markdown();
-        assert!(md.entity_graph && md.doc_links && md.dict_candidates);
+        let full = SourcePolicy::full();
+        assert!(full.entity_graph && full.doc_links && full.dict_candidates);
 
-        let s = SourcePolicy::session();
-        assert!(!s.entity_graph && !s.doc_links && !s.dict_candidates);
+        let text_only = SourcePolicy::text_only();
+        assert!(!text_only.entity_graph && !text_only.doc_links && !text_only.dict_candidates);
     }
 
     #[test]
     fn test_prepared_file_carries_policy() {
         let ctx = PrepareContext {
-            rel_path: "session:abc",
+            uri: "session:abc",
             directory: "session",
             filename: "abc",
-            source_type: Some("session"),
-            policy: SourcePolicy::session(),
+            source_type: "session",
+            policy: SourcePolicy::text_only(),
         };
 
         let p = prepare_text("## Q: hi\n\nQ: hi there\n", &ctx);
@@ -195,6 +201,20 @@ mod tests {
         assert!(!p.policy.entity_graph);
         assert!(!p.policy.doc_links);
         assert!(!p.policy.dict_candidates);
+    }
+
+    /// The filesystem wrapper derives source_type from the directory.
+    #[test]
+    fn test_prepare_wrapper_derives_source_type_from_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daily/notes/x.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# H\n\nbody\n").unwrap();
+
+        let p = prepare(&path, "daily/notes/x.md", "daily/notes", "x").unwrap();
+
+        assert_eq!(p.source_type, "note");
+        assert!(p.policy.entity_graph && p.policy.doc_links && p.policy.dict_candidates);
     }
 
     #[test]

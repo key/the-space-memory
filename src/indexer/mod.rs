@@ -298,13 +298,11 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
     let prepared = prepare::prepare_text(
         &markdown,
         &prepare::PrepareContext {
-            rel_path: &file_key,
+            uri: &file_key,
             directory: "session",
             filename: &stem,
-            // `session:` keys live outside the content dirs, so the
-            // directory-derived classification is overridden explicitly.
-            source_type: Some("session"),
-            policy: prepare::SourcePolicy::session(),
+            source_type: "session",
+            policy: prepare::SourcePolicy::text_only(),
         },
     );
 
