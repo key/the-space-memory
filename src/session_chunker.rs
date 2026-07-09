@@ -62,7 +62,10 @@ pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Vec<SessionChunk>> {
             if i + 1 < messages.len() && messages[i + 1].0 == "assistant" {
                 let a_text = truncate_text(&messages[i + 1].1, MAX_CHUNK_CHARS);
 
-                let pair = format!("Q: {q_text}\nA: {a_text}");
+                // Blank line between Q and A: they must be separate paragraphs
+                // so the markdown chunker can split an oversized pair at the
+                // Q/A boundary (mirrors the split below).
+                let pair = format!("Q: {q_text}\n\nA: {a_text}");
                 if pair.chars().count() <= MAX_CHUNK_CHARS * 2 {
                     chunks.push(SessionChunk {
                         content: pair,
@@ -103,6 +106,75 @@ pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Vec<SessionChunk>> {
     }
 
     Ok(chunks)
+}
+
+/// Max chars of a chunk's first line used as its H2 heading text.
+/// Kept well under the chunker's own 120-byte heading cap.
+const HEADING_SNIPPET_CHARS: usize = 40;
+
+/// Serialize session chunks into Markdown for the Prepare stage (#366).
+///
+/// One session chunk = one H2 section, so `chunk_markdown_default`
+/// reproduces the Q&A-level chunk boundaries. Document-level created /
+/// updated (first / last conversation timestamp, falling back to
+/// `fallback_ts`) and `status: current` ride in the frontmatter, which
+/// `persist()` writes to the documents row.
+pub fn session_to_markdown(chunks: &[SessionChunk], fallback_ts: &str) -> String {
+    let created = chunks
+        .iter()
+        .filter_map(|c| c.timestamp.as_deref())
+        .next()
+        .unwrap_or(fallback_ts);
+    let updated = chunks
+        .iter()
+        .filter_map(|c| c.timestamp.as_deref())
+        .next_back()
+        .unwrap_or(fallback_ts);
+
+    let mut out = format!(
+        "---\nstatus: current\ncreated: \"{}\"\nupdated: \"{}\"\n---\n\n",
+        sanitize_yaml_value(created),
+        sanitize_yaml_value(updated),
+    );
+    for chunk in chunks {
+        out.push_str("## ");
+        out.push_str(&heading_snippet(&chunk.content));
+        out.push_str("\n\n");
+        out.push_str(&escape_heading_lines(&chunk.content));
+        out.push_str("\n\n");
+    }
+    out
+}
+
+/// Strip characters that would break out of a double-quoted YAML scalar.
+fn sanitize_yaml_value(value: &str) -> String {
+    value.replace(['"', '\\', '\n'], "")
+}
+
+/// First line of the chunk content, truncated, as H2 heading text.
+fn heading_snippet(content: &str) -> String {
+    let first_line = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    truncate_text(first_line.trim(), HEADING_SNIPPET_CHARS)
+}
+
+/// Backslash-escape lines that the markdown chunker would read as H1–H3
+/// headings, so message-internal headings (or `#` comment lines in pasted
+/// code) cannot create extra section boundaries. H4+ is not a boundary.
+fn escape_heading_lines(content: &str) -> String {
+    let escaped: Vec<String> = content
+        .lines()
+        .map(|line| {
+            let hashes = line.bytes().take_while(|b| *b == b'#').count();
+            let is_heading = (1..=3).contains(&hashes)
+                && matches!(line.as_bytes().get(hashes), Some(b' ') | Some(b'\t'));
+            if is_heading {
+                format!("\\{line}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    escaped.join("\n")
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -274,6 +346,158 @@ mod tests {
         let chunks = parse_session_jsonl(f.path()).unwrap();
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].timestamp.is_none());
+    }
+
+    #[test]
+    fn test_session_to_markdown_frontmatter_timestamps() {
+        let chunks = vec![
+            SessionChunk {
+                content: "Q: 最初の質問です。\n\nA: 最初の回答です。".to_string(),
+                chunk_index: 0,
+                timestamp: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+            SessionChunk {
+                content: "Q: 次の質問です。\n\nA: 次の回答です。".to_string(),
+                chunk_index: 1,
+                timestamp: Some("2026-02-02T00:00:00Z".to_string()),
+            },
+        ];
+
+        let md = session_to_markdown(&chunks, "2026-03-03T00:00:00Z");
+
+        let (fm, _) = crate::frontmatter::parse(&md);
+        assert_eq!(fm.status.as_deref(), Some("current"));
+        assert_eq!(fm.created.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(fm.updated.as_deref(), Some("2026-02-02T00:00:00Z"));
+    }
+
+    #[test]
+    fn test_session_to_markdown_fallback_timestamp() {
+        let chunks = vec![SessionChunk {
+            content: "Q: タイムスタンプなしの質問。".to_string(),
+            chunk_index: 0,
+            timestamp: None,
+        }];
+
+        let md = session_to_markdown(&chunks, "2026-03-03T00:00:00Z");
+
+        let (fm, _) = crate::frontmatter::parse(&md);
+        assert_eq!(fm.created.as_deref(), Some("2026-03-03T00:00:00Z"));
+        assert_eq!(fm.updated.as_deref(), Some("2026-03-03T00:00:00Z"));
+    }
+
+    #[test]
+    fn test_session_to_markdown_one_h2_per_chunk() {
+        let chunks = vec![
+            SessionChunk {
+                content: "Q: 一つ目の質問文。\n\nA: 一つ目の回答文。".to_string(),
+                chunk_index: 0,
+                timestamp: None,
+            },
+            SessionChunk {
+                content: "Q: 二つ目の質問文。\n\nA: 二つ目の回答文。".to_string(),
+                chunk_index: 1,
+                timestamp: None,
+            },
+        ];
+
+        let md = session_to_markdown(&chunks, "2026-01-01T00:00:00Z");
+
+        let h2_count = md.lines().filter(|l| l.starts_with("## ")).count();
+        assert_eq!(h2_count, 2, "one H2 heading per session chunk");
+        assert!(md.contains("## Q: 一つ目の質問文。"));
+    }
+
+    #[test]
+    fn test_session_to_markdown_escapes_embedded_heading_lines() {
+        // Message text containing Markdown headings (assistant answers often
+        // do) must not create extra section boundaries in the chunker.
+        let chunks = vec![SessionChunk {
+            content: "Q: 見出しを含む質問です。\n\nA: 回答です。\n\n## 埋め込み見出し\n\n### サブ見出し\n\n#### H4はそのまま\n\n本文です。"
+                .to_string(),
+            chunk_index: 0,
+            timestamp: None,
+        }];
+
+        let md = session_to_markdown(&chunks, "2026-01-01T00:00:00Z");
+
+        assert!(md.contains("\\## 埋め込み見出し"));
+        assert!(md.contains("\\### サブ見出し"));
+        assert!(
+            md.contains("\n#### H4はそのまま"),
+            "H4+ is not a chunk boundary and stays unescaped"
+        );
+    }
+
+    /// The core equivalence guarantee (#366): serialized Markdown, run through
+    /// the standard chunker, reproduces the current Q&A chunk granularity —
+    /// one chunk per session chunk, heading-based section_path, even when
+    /// message text contains heading-looking lines.
+    #[test]
+    fn test_markdown_roundtrip_preserves_qa_boundaries() {
+        let chunks = vec![
+            SessionChunk {
+                content: "Q: 最初の質問です。\n\nA: 最初の回答です。".to_string(),
+                chunk_index: 0,
+                timestamp: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+            SessionChunk {
+                content: "Q: 見出し入りの質問。\n\nA: 回答本文。\n\n## 埋め込み見出し\n\n本文が続きます。"
+                    .to_string(),
+                chunk_index: 1,
+                timestamp: Some("2026-01-02T00:00:00Z".to_string()),
+            },
+            SessionChunk {
+                content: "孤立したアシスタントメッセージです。".to_string(),
+                chunk_index: 2,
+                timestamp: None,
+            },
+        ];
+
+        let md = session_to_markdown(&chunks, "2026-01-03T00:00:00Z");
+        let (_, body) = crate::frontmatter::parse(&md);
+        let out = crate::chunker::chunk_markdown_default(body, "session", "abc123");
+
+        assert_eq!(out.len(), chunks.len(), "one chunk per Q&A unit");
+        assert!(out[0].content.contains("最初の質問です。"));
+        assert!(out[1].content.contains("埋め込み見出し"));
+        assert!(out[2].content.contains("孤立したアシスタント"));
+        // section_path is heading-based (was the constant "session" before)
+        assert!(out[1].section_path.contains("見出し入りの質問"));
+    }
+
+    /// An oversized pair splits at the Q/A paragraph boundary — the same
+    /// shape as the current session chunker's Q/A split for large pairs.
+    #[test]
+    fn test_markdown_roundtrip_oversized_pair_splits_at_qa_boundary() {
+        let q = "q".repeat(600);
+        let a = "a".repeat(600);
+        let chunks = vec![SessionChunk {
+            content: format!("Q: {q}\n\nA: {a}"),
+            chunk_index: 0,
+            timestamp: None,
+        }];
+
+        let md = session_to_markdown(&chunks, "2026-01-01T00:00:00Z");
+        let (_, body) = crate::frontmatter::parse(&md);
+        let out = crate::chunker::chunk_markdown_default(body, "session", "abc123");
+
+        assert_eq!(out.len(), 2, "oversized pair splits into Q and A chunks");
+        assert!(out[0].content.contains("Q: qqq"));
+        assert!(out[1].content.contains("A: aaa"));
+    }
+
+    #[test]
+    fn test_qa_pair_joined_with_blank_line() {
+        // Q and A must be separate paragraphs so the markdown chunker can
+        // split oversized pairs at the Q/A boundary.
+        let f = write_jsonl(&[
+            r#"{"message":{"role":"user","content":"これはテストの質問です。長いテキスト。"}}"#,
+            r#"{"message":{"role":"assistant","content":"これはテストの回答です。長いテキスト。"}}"#,
+        ]);
+        let chunks = parse_session_jsonl(f.path()).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].content.contains("\n\nA: "));
     }
 
     #[test]

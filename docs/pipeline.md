@@ -102,6 +102,14 @@ in the separate hook API specification.
 | tokenizer | Prepare + Plan (cross-cutting) |
 | source (external) | outside the pipeline — converted to Markdown, then fed into Prepare |
 
+The `source` row is implemented today by session ingestion:
+`tsm ingest-session` parses Claude session JSONL, serializes it to Markdown
+(`session_chunker::session_to_markdown`), and feeds it into the same Prepare
+implementation (`indexer::prepare::prepare_text`) as filesystem documents.
+Per-source participation in the side indexes (entity graph, doc links,
+dictionary candidates) is an explicit `SourcePolicy` carried through Prepare
+into Persist.
+
 ## Failure behavior
 
 **Visibility is fail-closed.** A visibility plugin that fails withholds the
