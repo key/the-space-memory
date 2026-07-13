@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use the_space_memory::{config, embedder, indexer, status, tokenizer};
+use the_space_memory::{config, embedder, indexer, status, tokenizer, user_dict};
 
 use crate::backfill_logic::yield_to_pending_writes;
 use crate::SHUTDOWN;
@@ -139,8 +139,9 @@ pub fn run_reindex_fts_pass(
             .unwrap_or(0)
     };
 
-    // Reset segmenter in daemon process so new user dict is picked up
+    // Reset segmenter and existing-surfaces cache so new user dict is picked up
     tokenizer::reset_segmenter();
+    user_dict::reset_existing_surfaces();
 
     let started_at = chrono::Utc::now().to_rfc3339();
     status::update(state_dir, |s| {

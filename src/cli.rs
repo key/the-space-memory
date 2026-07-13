@@ -1645,13 +1645,12 @@ fn reindex_fts_after_dict_change() -> anyhow::Result<()> {
     }
 }
 
-/// Reconcile the on-disk verdict files into the DB and apply the user's verdict
-/// change in ONE transaction. The reconcile pulls
-/// terms present in `user_dict.simpledic` / `reject_words.txt` but absent from
-/// (or only `pending` in) the DB into it BEFORE the change, so the subsequent
-/// `user_dict.simpledic` rewrite cannot silently drop them. Any file conflict or
-/// malformed line is detected before the first write, so an abort leaves the DB
-/// completely unchanged (the transaction is never committed).
+/// Reconcile the on-disk verdict files into the DB and apply the user's verdict change in ONE transaction. The reconcile pulls terms present in
+/// `user_dict.simpledic` / `reject_words.txt` but absent from (or only `pending` in) the DB into it BEFORE the change, so the subsequent
+/// `user_dict.simpledic` rewrite cannot silently drop them. Any file conflict or malformed line is detected before the first write, so an abort
+/// leaves the DB completely unchanged (the transaction is never committed). This function is a deliberate exception to the daemon-as-sole-DB-
+/// owner model: the CLI opens its own connection and writes here directly, so verdicts stay editable while the daemon is stopped. SQLite's WAL
+/// mode + `busy_timeout` arbitrate access; `reindex_fts_after_dict_change` re-syncs a running daemon over IPC afterward.
 fn mutate_verdict(
     conn: &rusqlite::Connection,
     surface: &str,
@@ -1683,8 +1682,7 @@ fn report_reconcile(r: &user_dict::ReconcileOutcome) {
 /// is surfaced (the DB is already committed); the next mutation retries. (A
 /// reindex that fails *after* a successful regenerate is surfaced as an error but
 /// not auto-retried here, since the file then matches the DB.) Takes `conn` by
-/// value so it is dropped before any
-/// local FTS rebuild opens its own writer.
+/// value so it is dropped before any local FTS rebuild opens its own writer.
 fn materialize_dict(conn: rusqlite::Connection) -> anyhow::Result<()> {
     let csv_path = config::user_dict_path();
     let regen = user_dict::regenerate_user_dict(&conn, &csv_path).map_err(|e| {
@@ -1701,6 +1699,7 @@ fn materialize_dict(conn: rusqlite::Connection) -> anyhow::Result<()> {
             regen.written,
             if regen.written == 1 { "" } else { "s" }
         );
+        user_dict::reset_existing_surfaces();
         drop(conn);
         reindex_fts_after_dict_change()?;
     }

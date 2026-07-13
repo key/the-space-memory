@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -146,18 +146,29 @@ pub struct RawCandidate {
 
 // ─── Existing surfaces cache ─────────────────────────────────
 
-/// Cached set of surfaces already in user_dict.simpledic (loaded once per process).
-/// Acceptable because the dict only changes when `tsm dict update` runs (which triggers rebuild).
-static EXISTING_SURFACES: OnceLock<HashSet<String>> = OnceLock::new();
+/// Cached set of surfaces already in user_dict.simpledic. `None` is stale
+/// (never loaded, or invalidated by `reset_existing_surfaces`) and reloads on next access.
+static SURFACES: RwLock<Option<HashSet<String>>> = RwLock::new(None);
 
-fn get_existing_surfaces() -> &'static HashSet<String> {
-    EXISTING_SURFACES.get_or_init(|| match load_existing_surfaces(&config::user_dict_path()) {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("could not read user dict: {e}");
-            HashSet::new()
-        }
-    })
+/// Invalidate the cache so the next lookup reloads `user_dict.simpledic`. The dict changes at
+/// runtime without a daemon restart, so call this wherever the segmenter is also reset — otherwise
+/// a long-lived daemon keeps re-collecting already-accepted words as candidates.
+pub fn reset_existing_surfaces() {
+    *SURFACES.write().expect("existing surfaces lock poisoned") = None;
+}
+
+fn with_existing_surfaces<T>(f: impl FnOnce(&HashSet<String>) -> T) -> T {
+    let guard = SURFACES.read().expect("existing surfaces lock poisoned");
+    if let Some(s) = guard.as_ref() {
+        return f(s);
+    }
+    drop(guard);
+    let loaded = load_existing_surfaces(&config::user_dict_path())
+        .inspect_err(|e| log::warn!("could not read user dict: {e}"))
+        .unwrap_or_default();
+    let result = f(&loaded);
+    *SURFACES.write().expect("existing surfaces lock poisoned") = Some(loaded);
+    result
 }
 
 /// Load existing surface forms from a user dictionary file (IPAdic format).
@@ -282,11 +293,12 @@ pub fn extract_query_candidates(text: &str) -> Vec<RawCandidate> {
     if text.trim().len() < 4 {
         return Vec::new();
     }
-    let existing = get_existing_surfaces();
-    extract_raw_candidates(text)
-        .into_iter()
-        .filter(|c| is_valid_candidate(&c.surface, existing))
-        .collect()
+    with_existing_surfaces(|existing| {
+        extract_raw_candidates(text)
+            .into_iter()
+            .filter(|c| is_valid_candidate(&c.surface, existing))
+            .collect()
+    })
 }
 
 /// Upsert pre-extracted candidates into the DB. Requires a writable connection.
@@ -357,7 +369,7 @@ pub fn get_threshold_candidates(conn: &Connection, threshold: i64) -> Vec<Candid
 
 /// Get summary counts for doctor report.
 pub fn candidate_summary(conn: &Connection) -> CandidateSummary {
-    let dict_word_count = get_existing_surfaces().len() as i64;
+    let dict_word_count = with_existing_surfaces(HashSet::len) as i64;
     if !db::has_candidates_table(conn) {
         return CandidateSummary {
             total_pending: 0,
@@ -401,20 +413,17 @@ pub fn candidate_summary(conn: &Connection) -> CandidateSummary {
 
 // ─── Status updates ──────────────────────────────────────────
 
-/// Transition a single term to `to`, enforcing the accepted XOR rejected XOR
-/// pending invariant via the single `status` column.
+/// Transition a single term to `to`, enforcing the accepted XOR rejected XOR pending invariant via the single `status`
+/// column.
 ///
-/// The term is upserted: a surface with no candidate row is inserted (manual
-/// terms that never surfaced as auto-candidates, e.g. mis-split compounds),
-/// **except** a transition to `Pending` (`dict rm`), which returns
-/// [`SetVerdictError::NotFound`] — `Pending` is the absence of a verdict, so a
-/// nonexistent term has nothing to reset.
+/// The term is upserted: a surface with no candidate row is inserted (manual terms that never surfaced as auto-
+/// candidates, e.g. mis-split compounds), **except** a transition to `Pending` (`dict rm`), which returns
+/// [`SetVerdictError::NotFound`] — `Pending` is the absence of a verdict, so a nonexistent term has nothing to reset.
 ///
-/// `reading` is only meaningful when accepting; it is stored verbatim (the
-/// caller normalizes). A non-NULL `reading` overwrites; `None` preserves any existing reading (`COALESCE`).
+/// `reading` is only meaningful when accepting; it is stored verbatim (the caller normalizes). A non-NULL `reading`
+/// overwrites; `None` preserves any existing reading (`COALESCE`).
 ///
-/// The SELECT and the write run in one transaction so the returned
-/// [`Transition`] always matches the committed DB state.
+/// The SELECT and the write run in one transaction so the returned [`Transition`] always matches the committed DB state.
 pub fn set_verdict(
     conn: &Connection,
     surface: &str,
@@ -542,11 +551,9 @@ pub fn validate_surface(surface: &str) -> anyhow::Result<()> {
 
 /// Regenerate `user_dict.simpledic` from the DB's accepted terms (full rewrite).
 ///
-/// The shared primitive every verdict change relies on: a verdict change
-/// regenerates simpledic and reloads the tokenizer. `export`
-/// reuses it for the simpledic half of its round-trip. Each accepted term becomes
-/// one `surface,POS,reading` row, the reading falling back to the surface when
-/// none is stored (simpledic requires the field). Returns the number of rows
+/// The shared primitive every verdict change relies on: a verdict change regenerates simpledic and reloads the tokenizer.
+/// `export` reuses it for the simpledic half of its round-trip. Each accepted term becomes one `surface,POS,reading` row,
+/// the reading falling back to the surface when none is stored (simpledic requires the field). Returns the number of rows
 /// written; an empty accepted set truncates the file.
 pub fn regenerate_user_dict(conn: &Connection, csv_path: &Path) -> anyhow::Result<RegenOutcome> {
     // Propagate per-row errors rather than silently dropping a term.
@@ -636,12 +643,10 @@ pub fn export_reject_words_to_file(conn: &Connection, path: &Path) -> anyhow::Re
 
 /// Parse one `user_dict.simpledic` line into `(surface, reading)`.
 ///
-/// Blank lines and `#` comments return `Ok(None)` (tolerated). A non-blank,
-/// non-comment line whose first column (the surface) is empty returns `Err`:
-/// silently skipping it would let the next full rewrite delete a real term, so
-/// we **fail closed** instead. `reading == surface` normalizes to `None`
-/// (`regenerate_user_dict` re-emits the surface for a NULL reading, so they
-/// round-trip identically).
+/// Blank lines and `#` comments return `Ok(None)` (tolerated). A non-blank, non-comment line whose first column (the
+/// surface) is empty returns `Err`: silently skipping it would let the next full rewrite delete a real term, so we **fail
+/// closed** instead. `reading == surface` normalizes to `None` (`regenerate_user_dict` re-emits the surface for a NULL
+/// reading, so they round-trip identically).
 fn parse_simpledic_line(line: &str) -> anyhow::Result<Option<(String, Option<String>)>> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -802,22 +807,17 @@ impl ReconcileOutcome {
     }
 }
 
-/// Reconcile the on-disk verdict files INTO the DB before a verdict mutation, so
-/// the subsequent `regenerate_user_dict` rewrite preserves terms present in
-/// `user_dict.simpledic` / `reject_words.txt` but absent from (or only `pending`
-/// in) the DB — the data-loss path of an empty DB after `rebuild`, or a
-/// hand-edited file. The DB becomes a faithful image of disk before any
-/// rewrite, making the DB-as-authority model self-healing.
+/// Reconcile the on-disk verdict files INTO the DB before a verdict mutation, so the subsequent `regenerate_user_dict`
+/// rewrite preserves terms present in `user_dict.simpledic` / `reject_words.txt` but absent from (or only `pending` in)
+/// the DB — the data-loss path of an empty DB after `rebuild`, or a hand-edited file. The DB becomes a faithful image of
+/// disk before any rewrite, making the DB-as-authority model self-healing.
 ///
-/// Insert-or-promote, never override an opposing verdict: an absent or
-/// `pending` surface is inserted/promoted to the file's verdict (`accepted`
-/// for simpledic, `rejected` for reject); an already-matching status is a
-/// no-op. **Fails closed with no writes** on any contradiction — a surface in
-/// both files, or a DB verdict opposing the file's — so an ambiguous state
-/// never silently demotes a term; a malformed simpledic line also fails
-/// closed (see [`read_simpledic_surfaces`]). All parsing + conflict detection
-/// happens before the first write, inside the caller's one transaction, so
-/// an abort leaves the DB completely unchanged.
+/// Insert-or-promote, never override an opposing verdict: an absent or `pending` surface is inserted/promoted to the
+/// file's verdict (`accepted` for simpledic, `rejected` for reject); an already-matching status is a no-op. **Fails
+/// closed with no writes** on any contradiction — a surface in both files, or a DB verdict opposing the file's — so an
+/// ambiguous state never silently demotes a term; a malformed simpledic line also fails closed (see
+/// [`read_simpledic_surfaces`]). All parsing + conflict detection happens before the first write, inside the caller's one
+/// transaction, so an abort leaves the DB completely unchanged.
 pub fn reconcile_files_into_db(
     conn: &Connection,
     simpledic_path: &Path,
@@ -1707,6 +1707,39 @@ mod tests {
         let surfaces = load_existing_surfaces(&csv_path).unwrap();
 
         assert!(surfaces.contains("\u{30ef}\u{30fc}\u{30ac}\u{30fc}")); // ワーガー precomposed
+    }
+
+    /// The dict changes at runtime (`dict add`/`reject`/`rm`) without a daemon
+    /// restart. Before `reset_existing_surfaces`, `with_existing_surfaces` must
+    /// keep returning the stale cached content; after, it must reload and
+    /// reflect the new file.
+    #[test]
+    #[serial_test::serial]
+    fn test_reset_existing_surfaces_reflects_new_content() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
+        reset_existing_surfaces(); // clean slate: another test may have warmed the cache
+
+        std::fs::write(config::user_dict_path(), "candle,名詞,candle\n").unwrap();
+        assert!(with_existing_surfaces(|s| s.contains("candle")));
+
+        std::fs::write(config::user_dict_path(), "lindera,名詞,lindera\n").unwrap();
+        assert!(
+            with_existing_surfaces(|s| s.contains("candle")),
+            "cache must still be stale before reset"
+        );
+
+        reset_existing_surfaces();
+
+        assert!(
+            with_existing_surfaces(|s| s.contains("lindera")),
+            "after reset, the new file content must be reflected"
+        );
+        assert!(!with_existing_surfaces(|s| s.contains("candle")));
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
     }
 
     // ─── helper function tests ───────────────────────────────

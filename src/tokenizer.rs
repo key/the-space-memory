@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use lindera::dictionary::{
@@ -84,15 +85,23 @@ fn load_user_dict(metadata: &lindera::dictionary::Metadata) -> Option<UserDictio
     // (lindera's CSV parser does not support comments)
     let stripped = strip_simpledic_comments(&content)?;
 
-    // Write stripped content to a temp file for lindera
-    let tmp_path = std::env::temp_dir().join("tsm_user_dict.simpledic");
-    if let Err(e) = std::fs::write(&tmp_path, &stripped) {
+    // Write stripped content to a randomly named, 0600, auto-deleted temp file
+    // for lindera — a fixed shared-tmp path is a symlink/TOCTOU surface and
+    // races a concurrent daemon/CLI load of the same file.
+    let mut tmp = match tempfile::NamedTempFile::new() {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("failed to create temp user dictionary: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = tmp.write_all(stripped.as_bytes()) {
         log::warn!("failed to write temp user dictionary: {e}");
         return None;
     }
 
-    let result = load_user_dictionary_from_csv(metadata, &tmp_path);
-    let _ = std::fs::remove_file(&tmp_path);
+    let result = load_user_dictionary_from_csv(metadata, tmp.path());
+    // `tmp` is dropped (and its file removed) once this function returns.
 
     match result {
         Ok(ud) => {
@@ -502,6 +511,69 @@ mod tests {
             std::path::Path::new("/nonexistent/dict.simpledic"),
         );
         assert!(result.is_err());
+    }
+
+    /// `load_user_dict` writes to a `tempfile::NamedTempFile`, not the old
+    /// fixed shared-tmp path — two sequential loads must both succeed (the
+    /// random name means no leftover from load N can collide with load N+1),
+    /// and no `tsm_user_dict.simpledic` artifact must appear in `temp_dir()`.
+    #[test]
+    #[serial_test::serial]
+    fn test_load_user_dict_uses_tempfile_not_fixed_path() {
+        use lindera::dictionary::{load_embedded_dictionary, DictionaryKind};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let dict_path = dir.path().join("test.simpledic");
+        std::fs::write(&dict_path, "ドッグトラッカー,名詞,ドッグトラッカー\n").unwrap();
+        std::env::set_var("TSM_USER_DICT", &dict_path);
+        config::reload();
+
+        let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC).unwrap();
+        for _ in 0..2 {
+            assert!(
+                load_user_dict(&dictionary.metadata).is_some(),
+                "load_user_dict should load the configured dict"
+            );
+        }
+
+        let fixed_path = std::env::temp_dir().join("tsm_user_dict.simpledic");
+        assert!(
+            !fixed_path.exists(),
+            "must not write to the old fixed shared-tmp path"
+        );
+
+        std::env::remove_var("TSM_USER_DICT");
+        config::reload();
+    }
+
+    /// Random temp file names mean concurrent loads (daemon + CLI racing on
+    /// startup) never collide, unlike the old fixed shared-tmp path.
+    #[test]
+    #[serial_test::serial]
+    fn test_load_user_dict_concurrent_loads_do_not_collide() {
+        use lindera::dictionary::{load_embedded_dictionary, DictionaryKind};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let dict_path = dir.path().join("test.simpledic");
+        std::fs::write(&dict_path, "ドッグトラッカー,名詞,ドッグトラッカー\n").unwrap();
+        std::env::set_var("TSM_USER_DICT", &dict_path);
+        config::reload();
+
+        let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC).unwrap();
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| s.spawn(|| load_user_dict(&dictionary.metadata).is_some()))
+                .collect();
+            for h in handles {
+                assert!(
+                    h.join().unwrap(),
+                    "concurrent load_user_dict should succeed"
+                );
+            }
+        });
+
+        std::env::remove_var("TSM_USER_DICT");
+        config::reload();
     }
 
     #[test]
