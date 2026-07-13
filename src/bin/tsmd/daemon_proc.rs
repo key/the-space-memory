@@ -132,10 +132,14 @@ pub fn run(args: Args) -> Result<()> {
             pid,
             socket: socket_str.clone(),
         });
-        // Clear stale reindex status from a previous daemon's interrupted run
-        if s.reindex.is_some() {
+        // Clear stale backfill/reindex progress left by a previous daemon's
+        // interrupted run — a fresh process means neither pass is still live.
+        let cleared = daemon_logic::clear_stale_progress(s);
+        if cleared.backfill {
+            log::info!("clearing stale backfill status from previous run");
+        }
+        if cleared.reindex {
             log::info!("clearing stale reindex status from previous run");
-            s.reindex = None;
         }
     });
 
@@ -251,6 +255,7 @@ pub fn run(args: Args) -> Result<()> {
     if !args.no_embedder {
         let conn = Arc::clone(&conn);
         let writes_pending = Arc::clone(&writes_pending);
+        let state_dir = state_dir.clone();
         std::thread::spawn(move || {
             let sock = config::embedder_socket_path();
             for _ in 0..120 {
@@ -264,7 +269,7 @@ pub fn run(args: Args) -> Result<()> {
                 return;
             }
             log::info!("starting startup backfill...");
-            backfill_proc::run_backfill_pass(&conn, &writes_pending);
+            backfill_proc::run_backfill_pass(&conn, &writes_pending, Some(&state_dir));
             log::info!("startup backfill complete");
         });
     }
@@ -274,8 +279,14 @@ pub fn run(args: Args) -> Result<()> {
     if backfill_interval_secs > 0 && !args.no_embedder {
         let conn = Arc::clone(&conn);
         let writes_pending = Arc::clone(&writes_pending);
+        let state_dir = state_dir.clone();
         std::thread::spawn(move || {
-            backfill_proc::periodic_backfill(&conn, &writes_pending, backfill_interval_secs);
+            backfill_proc::periodic_backfill(
+                &conn,
+                &writes_pending,
+                backfill_interval_secs,
+                &state_dir,
+            );
         });
     }
 

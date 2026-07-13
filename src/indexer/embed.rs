@@ -315,7 +315,7 @@ pub fn backfill_next_batch(
 /// reported total matches what the fetch query will actually attempt; otherwise
 /// skipped chunks show up as permanent phantom "missing" work in doctor/status
 /// (matches the daemon's periodic-backfill count).
-fn count_missing(conn: &Connection) -> i64 {
+pub fn count_missing(conn: &Connection) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM chunks c
          LEFT JOIN chunks_vec v ON c.id = v.rowid

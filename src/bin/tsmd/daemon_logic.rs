@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use the_space_memory::daemon_protocol::{DaemonResponse, ReindexKind};
+use the_space_memory::status::StatusFile;
 
 /// Build the argv for spawning the embedder child.
 ///
@@ -22,6 +23,27 @@ pub fn embedder_child_args(model_dir: Option<&Path>) -> Vec<String> {
         args.push(format!("--model={}", dir.display()));
     }
     args
+}
+
+/// Which stale progress entries a startup clear removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StaleProgressCleared {
+    pub backfill: bool,
+    pub reindex: bool,
+}
+
+/// Clear `backfill`/`reindex` progress left over from a previous daemon's
+/// interrupted run. A fresh daemon start means no such pass can still be
+/// executing, so a populated entry is always a leftover, never live progress —
+/// left alone, it renders in `tsm status`/`tsm doctor` as an indefinitely
+/// "running" operation with an ever-worsening ETA. Other status fields
+/// (`daemon`, `embedder`, `watcher`) are untouched; the caller sets those
+/// separately for the current process.
+pub fn clear_stale_progress(sf: &mut StatusFile) -> StaleProgressCleared {
+    StaleProgressCleared {
+        backfill: sf.backfill.take().is_some(),
+        reindex: sf.reindex.take().is_some(),
+    }
 }
 
 /// One step in a reindex sequence.
@@ -145,6 +167,91 @@ mod tests {
                 "--model=/cache/ruri-v3-30m"
             ]
         );
+    }
+
+    #[test]
+    fn test_clear_stale_progress_clears_both_when_both_present() {
+        let mut sf = StatusFile {
+            backfill: Some(the_space_memory::status::BackfillStatus {
+                total: 100,
+                filled: 10,
+                errors: 0,
+                started_at: "2026-06-26T06:52:01Z".to_string(),
+            }),
+            reindex: Some(the_space_memory::status::ReindexStatus {
+                kind: ReindexKind::Fts,
+                total: 50,
+                processed: 5,
+                errors: 0,
+                started_at: "2026-06-26T06:52:01Z".to_string(),
+            }),
+            ..Default::default()
+        };
+        let cleared = clear_stale_progress(&mut sf);
+        assert_eq!(
+            cleared,
+            StaleProgressCleared {
+                backfill: true,
+                reindex: true
+            }
+        );
+        assert!(sf.backfill.is_none());
+        assert!(sf.reindex.is_none());
+    }
+
+    #[test]
+    fn test_clear_stale_progress_reports_false_when_absent() {
+        let mut sf = StatusFile::default();
+        let cleared = clear_stale_progress(&mut sf);
+        assert_eq!(cleared, StaleProgressCleared::default());
+    }
+
+    #[test]
+    fn test_clear_stale_progress_only_backfill_present() {
+        let mut sf = StatusFile {
+            backfill: Some(the_space_memory::status::BackfillStatus {
+                total: 1,
+                filled: 0,
+                errors: 0,
+                started_at: "t0".to_string(),
+            }),
+            ..Default::default()
+        };
+        let cleared = clear_stale_progress(&mut sf);
+        assert!(cleared.backfill);
+        assert!(!cleared.reindex);
+        assert!(sf.backfill.is_none());
+    }
+
+    #[test]
+    fn test_clear_stale_progress_leaves_other_fields_untouched() {
+        let mut sf = StatusFile {
+            daemon: Some(the_space_memory::status::DaemonStatus {
+                started_at: "t0".to_string(),
+                pid: 1,
+                socket: "/tmp/d.sock".to_string(),
+            }),
+            embedder: Some(the_space_memory::status::EmbedderStatus {
+                started_at: "t0".to_string(),
+                pid: 2,
+            }),
+            watcher: Some(the_space_memory::status::WatcherStatus {
+                started_at: "t0".to_string(),
+                pid: 3,
+            }),
+            reindex: Some(the_space_memory::status::ReindexStatus {
+                kind: ReindexKind::Vectors,
+                total: 1,
+                processed: 0,
+                errors: 0,
+                started_at: "t0".to_string(),
+            }),
+            ..Default::default()
+        };
+        clear_stale_progress(&mut sf);
+        assert!(sf.daemon.is_some());
+        assert!(sf.embedder.is_some());
+        assert!(sf.watcher.is_some());
     }
 
     #[test]
