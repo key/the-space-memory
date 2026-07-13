@@ -354,9 +354,14 @@ pub fn run_reindex_vectors_pass(
     // above; writing `s.backfill` too would double-count the same work.
     let outcome = run_backfill_pass(conn, writes_pending, None);
 
-    if outcome.errors > 0 {
+    // `run_backfill_pass` only reports its final tally here, not live
+    // per-batch progress (unlike `run_reindex_fts_pass`'s `processed` ticks) —
+    // but writing it now still matters: an aborted pass otherwise leaves
+    // `s.reindex` claiming `processed: 0` despite having filled many vectors.
+    if outcome.filled > 0 || outcome.errors > 0 {
         status::update(state_dir, |s| {
             if let Some(ref mut r) = s.reindex {
+                r.processed = outcome.filled as i64;
                 r.errors = outcome.errors as i64;
             }
         });

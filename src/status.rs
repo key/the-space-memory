@@ -1,10 +1,24 @@
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 use crate::daemon_protocol::ReindexKind;
 
 const STATUS_FILENAME: &str = "tsm-status.json";
+
+// Serializes `update`'s read-modify-write across the daemon's own threads
+// (accept-loop child reaping, startup/periodic backfill, FTS/vector reindex —
+// all call `update` concurrently on independent background threads). Without
+// this, two interleaved read-modify-writes can lose an update: e.g. a reap
+// clears `embedder` while a backfill progress tick (read before the reap's
+// write) writes its own snapshot afterward, silently resurrecting the
+// already-dead embedder entry — the same "status lies about what's actually
+// running" failure this module exists to prevent, just via a race instead of
+// a missing clear. One daemon process owns a given `state_dir` at a time
+// (enforced by `daemon_lock`), so a single process-wide lock — rather than a
+// per-`state_dir` one — is sufficient and simpler.
+static UPDATE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct StatusFile {
@@ -85,7 +99,14 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// Update the status file by applying a mutation function.
 /// Reads current state, applies the mutation, writes back atomically.
+///
+/// Holds [`UPDATE_LOCK`] for the whole read-modify-write so concurrent
+/// callers (multiple daemon threads) serialize instead of racing each
+/// other's writes.
 pub fn update(state_dir: &Path, f: impl FnOnce(&mut StatusFile)) {
+    let _guard = UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = status_path(state_dir);
     let mut status = read(state_dir);
     f(&mut status);
@@ -173,6 +194,42 @@ mod tests {
         assert_eq!(sf.watcher.unwrap().pid, 8);
         // The atomic-write temp file is renamed away, not left behind.
         assert!(!status_path(dir.path()).with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn test_update_serializes_concurrent_writers_no_lost_updates() {
+        // Without `UPDATE_LOCK`, N threads racing `update`'s read-modify-write
+        // can lose increments (thread A's write overwrites thread B's, since
+        // both read the pre-increment value). With the lock, every increment
+        // is observed regardless of interleaving — the daemon's real callers
+        // (child reaping, backfill/reindex progress) are exactly this shape:
+        // independent threads mutating disjoint-looking fields of one file.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        const THREADS: usize = 32;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    update(&path, |s| {
+                        let filled = s.backfill.as_ref().map(|b| b.filled).unwrap_or(0);
+                        s.backfill = Some(BackfillStatus {
+                            total: THREADS as i64,
+                            filled: filled + 1,
+                            errors: 0,
+                            started_at: "t0".to_string(),
+                        });
+                    });
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let sf = read(&path);
+        assert_eq!(sf.backfill.unwrap().filled, THREADS);
     }
 
     #[test]
