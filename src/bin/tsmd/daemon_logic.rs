@@ -107,6 +107,17 @@ impl Drop for ReindexGuard {
     }
 }
 
+/// Whether `tsmd-stderr.log` has grown past its configured cap and should be
+/// truncated.
+///
+/// A pure size comparison so the decision is unit-tested without a real fd;
+/// the truncation itself — an `lseek` + `ftruncate` pair applied directly to
+/// the daemon's own stderr descriptor, which `embedder`/`watcher` share via
+/// inherited-fd semantics — is `daemon_proc.rs`'s job.
+pub fn stderr_log_over_cap(current_size: u64, cap_bytes: u64) -> bool {
+    current_size >= cap_bytes
+}
+
 /// Read a PID from a PID file. Returns `None` if the file is missing or unreadable.
 pub fn read_pid_from_file(pid_path: &Path) -> Option<u32> {
     let content = std::fs::read_to_string(pid_path).ok()?;
@@ -278,6 +289,25 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let guard = ReindexGuard::try_acquire(&flag).expect("clear flag claims");
         assert!(format!("{guard:?}").contains("ReindexGuard"));
+    }
+
+    #[test]
+    fn test_stderr_log_over_cap_below_cap_is_false() {
+        assert!(!stderr_log_over_cap(999, 1000));
+    }
+
+    #[test]
+    fn test_stderr_log_over_cap_at_cap_is_true() {
+        // At-cap truncates too, rather than waiting for the next check to
+        // find it one byte over: a check that only fires strictly-above
+        // could let the file sit exactly at the cap indefinitely on a daemon
+        // that stops growing right at the boundary.
+        assert!(stderr_log_over_cap(1000, 1000));
+    }
+
+    #[test]
+    fn test_stderr_log_over_cap_above_cap_is_true() {
+        assert!(stderr_log_over_cap(5_000_000, 1000));
     }
 
     #[test]

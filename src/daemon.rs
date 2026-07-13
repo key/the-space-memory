@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 
@@ -7,6 +9,32 @@ use crate::cli;
 use crate::config;
 use crate::daemon_protocol::{DaemonRequest, DaemonResponse};
 use crate::indexer::IngestPolicy;
+use crate::log_dedup::LogDedup;
+
+/// Cooldown for the "excluded by policy" warning below: a directory that
+/// keeps producing rejected paths (a churning build-artifact tree forwarded
+/// by the fs-watcher, or a bulk misconfigured stdin batch) collapses into one
+/// line per window instead of one per file. Keyed by the rejected path's
+/// parent directory (`policy_reject_dedup_key`) — coarse enough that a single
+/// noisy tree stays one line, fine enough that unrelated directories still
+/// report independently. A process-wide static (rather than threading a
+/// dedup instance through `handle_client`/`handle_request`) matches this
+/// codebase's existing pattern for daemon-wide shared state (see `config`'s
+/// `RESOLVED` singleton); it also keeps every existing `handle_request` call
+/// site and test signature unchanged.
+static POLICY_REJECT_DEDUP: OnceLock<Mutex<LogDedup>> = OnceLock::new();
+
+fn policy_reject_dedup() -> &'static Mutex<LogDedup> {
+    POLICY_REJECT_DEDUP.get_or_init(|| Mutex::new(LogDedup::new(Duration::from_secs(60))))
+}
+
+/// Directory-prefix dedup key for a policy-rejected path: its parent
+/// directory, or the path itself if it has none (e.g. a bare root).
+fn policy_reject_dedup_key(p: &Path) -> String {
+    p.parent()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.to_string_lossy().into_owned())
+}
 
 /// Handle a single daemon request and return a response.
 ///
@@ -92,10 +120,27 @@ pub fn handle_request(
                 let joined: Vec<PathBuf> = files.iter().map(|f| project_root.join(f)).collect();
                 for p in &joined {
                     if !walker.accepts(p) {
-                        log::warn!(
-                            "skipping {} (excluded by policy — ignore rules or extension mismatch)",
-                            p.display()
-                        );
+                        let key = policy_reject_dedup_key(p);
+                        // A poisoned lock (only possible if a prior holder
+                        // panicked mid-gate) falls back to the recovered
+                        // guard rather than dropping the warning: staying
+                        // loud is the safe failure mode here.
+                        let mut dedup = policy_reject_dedup()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if let Some(suppressed) = dedup.gate(&key, Instant::now()) {
+                            if suppressed > 0 {
+                                log::warn!(
+                                    "skipping {} (excluded by policy — ignore rules or extension mismatch) [{suppressed} more under {key} suppressed in the last 60s]",
+                                    p.display()
+                                );
+                            } else {
+                                log::warn!(
+                                    "skipping {} (excluded by policy — ignore rules or extension mismatch)",
+                                    p.display()
+                                );
+                            }
+                        }
                     }
                 }
                 joined
@@ -189,6 +234,21 @@ mod tests {
     use crate::db;
     use crate::test_utils::setup_db_with_dir as setup;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn test_policy_reject_dedup_key_uses_parent_directory() {
+        assert_eq!(
+            policy_reject_dedup_key(Path::new("/a/b/target/debug/deps/foo.rcgu.o")),
+            "/a/b/target/debug/deps"
+        );
+    }
+
+    #[test]
+    fn test_policy_reject_dedup_key_falls_back_to_path_when_no_parent() {
+        // The root has no parent; the key degrades to the path itself rather
+        // than panicking or producing an empty string.
+        assert_eq!(policy_reject_dedup_key(Path::new("/")), "/");
+    }
 
     #[test]
     fn test_ping() {

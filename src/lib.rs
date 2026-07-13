@@ -18,6 +18,7 @@ pub mod entity;
 pub mod frontmatter;
 pub mod indexer;
 pub mod ipc;
+pub mod log_dedup;
 pub mod logging;
 pub mod lua_hooks;
 pub mod manifest;

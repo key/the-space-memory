@@ -279,6 +279,14 @@ pub fn run(args: Args) -> Result<()> {
         });
     }
 
+    // Periodic tsmd-stderr.log size-cap thread. Runs unconditionally (unlike
+    // the backfill/embedder threads above) since it caps a file every daemon
+    // instance writes to, regardless of --no-embedder/--no-watcher.
+    let stderr_cap_bytes = config::stderr_cap_bytes();
+    std::thread::spawn(move || {
+        cap_stderr_log(STDERR_CAP_CHECK_INTERVAL_SECS, stderr_cap_bytes);
+    });
+
     // ─── Accept loop — children are NOT restarted on crash ───────────
     while !SHUTDOWN.load(Ordering::SeqCst) {
         match accept_blocking(&listener) {
@@ -337,6 +345,75 @@ pub fn run(args: Args) -> Result<()> {
     });
 
     Ok(())
+}
+
+// ─── stderr log cap ─────────────────────────────────────────────────
+
+/// How often the size-cap check runs. `tsmd-stderr.log` is also truncated at
+/// every `tsm start`, so this only bounds growth within a single long-lived
+/// session; a check every 30s keeps the worst-case overshoot past the cap
+/// small without adding meaningful daemon overhead.
+const STDERR_CAP_CHECK_INTERVAL_SECS: u64 = 30;
+
+/// Periodically caps `tsmd-stderr.log`'s size by truncating the daemon's own
+/// fd 2 in place.
+///
+/// `embedder`/`watcher` are spawned with `Stdio::inherit()` for stderr
+/// (`child_proc.rs`), so all three processes share one open-file-description
+/// with `tsmd`'s own fd 2 for `tsmd-stderr.log` — not just the same path.
+/// Acting on fd 2 directly (rather than reopening the path, which would
+/// create a *different* open-file-description with its own offset) resets
+/// that shared offset for every writer at once: their next `write()` lands
+/// at the fresh offset instead of re-extending the file with a zero-filled
+/// hole up to their old, now-invalid position.
+fn cap_stderr_log(check_interval_secs: u64, cap_bytes: u64) {
+    let interval = std::time::Duration::from_secs(check_interval_secs);
+    loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            return;
+        }
+        let path = config::tsmd_stderr_log_path();
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if daemon_logic::stderr_log_over_cap(meta.len(), cap_bytes) {
+                truncate_own_stderr_fd();
+                log::info!(
+                    "truncated tsmd-stderr.log ({} bytes exceeded the {cap_bytes}-byte cap)",
+                    meta.len()
+                );
+            }
+        }
+        backfill_proc::sleep_interruptible(interval);
+    }
+}
+
+/// Reset fd 2 (this process's stderr) to empty, in place.
+///
+/// Order matters: `lseek` to 0 FIRST, then `ftruncate`. Doing it in the
+/// other order leaves a window where a concurrent writer (embedder/watcher,
+/// sharing this open-file-description) can write at the still-large
+/// pre-truncate offset between the two calls — the kernel then extends the
+/// file back up to that offset with a zero-filled hole before appending,
+/// undoing the cap. Seeking first bounds that race to, at worst, losing one
+/// interleaved log line, never re-inflating the file.
+fn truncate_own_stderr_fd() {
+    // SAFETY: STDERR_FILENO is a valid, open fd for the lifetime of this
+    // process (it is the process's own stderr); both calls only affect that
+    // one fd's offset/length and cannot invalidate any Rust reference.
+    let seek = unsafe { libc::lseek(libc::STDERR_FILENO, 0, libc::SEEK_SET) };
+    if seek < 0 {
+        log::warn!(
+            "stderr cap: lseek failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let truncated = unsafe { libc::ftruncate(libc::STDERR_FILENO, 0) };
+    if truncated < 0 {
+        log::warn!(
+            "stderr cap: ftruncate failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 // ─── Client handling ──────────────────────────────────────────────
