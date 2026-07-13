@@ -86,7 +86,7 @@ regression it prevents.
 6. **Normalization consistency** — Prepare and Plan apply the same canonical
    normalization (NFC); changing it requires a re-index. *(Breaking it makes
    NFC/NFD variants of the same text diverge between index and query,
-   silently losing recall — the #357 failure mode.)*
+   silently losing recall.)*
 
 ## Hook insertion points
 

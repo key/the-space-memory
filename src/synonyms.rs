@@ -120,10 +120,10 @@ pub fn expand_query_synonyms(
 /// result is `(lo, hi)` with `lo <= hi`. Shared by every site that stores or
 /// looks up a pair so the normalization rule lives in one place — including
 /// `add_user_synonym`'s CLI input, so a hand-typed word matches a
-/// CSV-imported one regardless of source encoding (#357).
+/// CSV-imported one regardless of source encoding.
 fn normalize_pair(a: &str, b: &str) -> (String, String) {
-    let a = crate::normalize::nfc(a.trim()).to_lowercase();
-    let b = crate::normalize::nfc(b.trim()).to_lowercase();
+    let a = crate::normalize::nfc_lower(a);
+    let b = crate::normalize::nfc_lower(b);
     if a < b {
         (a, b)
     } else {
@@ -980,7 +980,7 @@ mod tests {
 
     /// An NFD-encoded CSV pair must import under its NFC form, so a later
     /// CLI `synonym add` with NFC input upserts into the same row instead of
-    /// creating a byte-mismatched duplicate (#357).
+    /// creating a byte-mismatched duplicate.
     #[test]
     fn test_import_user_synonyms_normalizes_nfd_to_nfc() {
         let conn = setup();
@@ -1189,7 +1189,7 @@ mod tests {
     }
 
     /// A CLI `synonym add` with NFD input must resolve to the same pair as
-    /// its NFC-imported counterpart, upserting rather than duplicating (#357).
+    /// its NFC-imported counterpart, upserting rather than duplicating.
     #[test]
     fn test_add_user_synonym_normalizes_nfd_to_nfc() {
         let conn = setup();

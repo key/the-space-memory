@@ -28,7 +28,7 @@ pub(crate) struct QueryPlan {
 /// search (the caller should return an empty result set). Returns
 /// `Ok(Some(QueryPlan))` otherwise.
 ///
-/// The query is normalized to NFC first (#357), matching the normalization
+/// The query is normalized to NFC first, matching the normalization
 /// `prepare_text` applies on the index side — the same query keywords,
 /// classification, expansion, and embedding regardless of the query's source
 /// encoding.
@@ -143,7 +143,7 @@ mod tests {
 
     /// An NFD query (decomposed dakuten on ジ) must yield the same keywords
     /// as its NFC equivalent — `plan()` normalizes before keyword extraction
-    /// so the query's source encoding cannot change the result (#357).
+    /// so the query's source encoding cannot change the result.
     #[test]
     fn test_plan_normalizes_nfd_query_to_match_nfc() {
         let conn = db::get_memory_connection().unwrap();

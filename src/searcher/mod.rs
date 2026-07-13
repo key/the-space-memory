@@ -167,7 +167,7 @@ mod tests {
 
     /// A document indexed from NFC source (the normal case: `prepare_text`
     /// normalizes on write) must still be found by an NFD query — `plan()`
-    /// normalizes the query to the same NFC form (#357). Regression for the
+    /// normalizes the query to the same NFC form. Regression for the
     /// 2026-07-06 NFC/NFD mismatch.
     #[test]
     fn test_search_nfd_query_finds_nfc_indexed_doc() {

@@ -79,13 +79,19 @@ pub(crate) struct PreparedFile {
 /// source that can serialize itself to Markdown funnels through here — this is
 /// the single Prepare implementation (ADR-0016 `source` transform doctrine).
 ///
-/// The first step normalizes the whole input to Unicode NFC (#357), so every
-/// downstream stage — frontmatter parse, chunking, lua extract, content
-/// hashing — sees a single canonical representation regardless of how the
-/// source text was encoded.
+/// The first step normalizes the whole input, plus `ctx.directory` and
+/// `ctx.filename`, to Unicode NFC — the latter two come straight from the
+/// filesystem walker (which does not itself normalize) and are embedded
+/// verbatim into every chunk's section-path prefix and the document title, so
+/// leaving them raw would let a non-NFC path silently reintroduce the mismatch
+/// this module exists to close. Once normalized, every downstream stage —
+/// frontmatter parse, chunking, lua extract, content hashing — sees a single
+/// canonical representation regardless of how the source was encoded.
 pub(crate) fn prepare_text(text: &str, ctx: &PrepareContext) -> PreparedFile {
     let text = crate::normalize::nfc(text);
     let text = text.as_ref();
+    let directory = crate::normalize::nfc(ctx.directory);
+    let filename = crate::normalize::nfc(ctx.filename);
     let (fm, body) = frontmatter::parse(text);
     let fm_map = frontmatter::parse_map(text);
     let metadata_json =
@@ -95,7 +101,7 @@ pub(crate) fn prepare_text(text: &str, ctx: &PrepareContext) -> PreparedFile {
     } else {
         Some(format!("{:?}", fm.tags))
     };
-    let chunk_inputs = chunk_markdown_default(body, ctx.directory, ctx.filename)
+    let chunk_inputs = chunk_markdown_default(body, &directory, &filename)
         .into_iter()
         .map(|c| {
             debug_assert!(
@@ -113,7 +119,7 @@ pub(crate) fn prepare_text(text: &str, ctx: &PrepareContext) -> PreparedFile {
         .collect();
     PreparedFile {
         source_type: ctx.source_type.to_string(),
-        title: ctx.filename.to_string(),
+        title: filename.to_string(),
         frontmatter: fm,
         tags_str,
         metadata_json,
@@ -247,7 +253,7 @@ mod tests {
 
     /// A Markdown file containing NFD text (decomposed dakuten) must produce
     /// the same chunk content and content_hash as the equivalent NFC source —
-    /// `prepare_text` normalizes before chunking/hashing (#357).
+    /// `prepare_text` normalizes before chunking/hashing.
     #[test]
     fn test_prepare_text_normalizes_nfd_to_match_nfc_source() {
         let nfd_ga = "\u{30ab}\u{3099}"; // ガ (decomposed: カ + combining dakuten)
@@ -274,5 +280,38 @@ mod tests {
             p_nfc.chunk_inputs[0].content_hash
         );
         assert!(p_nfd.chunk_inputs[0].content.contains(nfc_ga));
+    }
+
+    /// `ctx.directory` and `ctx.filename` come straight from the filesystem
+    /// walker, which does not itself normalize — an NFD path (as returned by
+    /// some filesystems for decomposed Japanese names) must still converge to
+    /// NFC, since both are embedded verbatim into every chunk's
+    /// `【directory/filename】` prefix and used as the H1-fallback title.
+    #[test]
+    fn test_prepare_text_normalizes_nfd_directory_and_filename() {
+        let nfd_ga = "\u{30ab}\u{3099}"; // ガ (decomposed: カ + combining dakuten)
+        let nfc_ga = "\u{30ac}"; // ガ (precomposed)
+        let nfd_directory = format!("daily/{nfd_ga}note");
+        let nfd_filename = format!("{nfd_ga}memo");
+        let ctx = PrepareContext {
+            uri: "daily/x/x.md",
+            directory: &nfd_directory,
+            filename: &nfd_filename,
+            source_type: "note",
+            policy: SourcePolicy::full(),
+        };
+
+        let p = prepare_text("body text with no heading\n", &ctx);
+
+        assert!(!p.chunk_inputs.is_empty());
+        for chunk in &p.chunk_inputs {
+            assert!(
+                crate::normalize::is_normalized(&chunk.content),
+                "chunk content (including the 【dir/file】 prefix) must be NFC: {:?}",
+                chunk.content
+            );
+        }
+        assert!(crate::normalize::is_normalized(&p.title));
+        assert_eq!(p.title, format!("{nfc_ga}memo"));
     }
 }

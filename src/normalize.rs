@@ -1,7 +1,9 @@
 //! Unicode canonical normalization (NFC), applied at the pipeline's two entry
 //! points — Index/Prepare and Search/Plan — plus load-time auxiliary points
-//! for user-edited files (see #357). Compatibility folding (NFKC: half/full
-//! width, dash variants) is explicitly out of scope; see the issue for why.
+//! for user-edited files, so visually identical text with different byte
+//! encodings always converges to one representation. Compatibility folding
+//! (NFKC: half/full width, dash variants) is lossy and out of scope here —
+//! it would make the indexed/displayed text diverge from the source file.
 
 use std::borrow::Cow;
 
@@ -27,15 +29,25 @@ pub fn is_normalized(text: &str) -> bool {
     is_nfc(text)
 }
 
+/// Trim, lowercase, then re-apply NFC — the shared order for every
+/// case-insensitive comparison key (dictionary surfaces, synonym pairs,
+/// entity names). `to_lowercase()` runs *before* the final `nfc()` because
+/// case folding can itself decompose a codepoint (e.g. U+0130 İ lowercases
+/// to `i` + a combining dot above); normalizing only up front and trusting
+/// the lowercase step not to disturb it would let that decomposition slip
+/// into the output.
+pub fn nfc_lower(s: &str) -> String {
+    nfc(&s.trim().to_lowercase()).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_nfd_composes_to_nfc() {
-        // "ワーカー" with the dakuten on カ held as a combining character
-        // (U+30AB U+3099) rather than the precomposed ガ... here specifically
-        // the long vowel mark katakana with a decomposed voiced sound mark.
+        // "ワーガー" with the dakuten on カ held as a combining character
+        // (U+30AB U+3099) rather than the precomposed ガ.
         let nfd = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガ(decomposed)ー
         let nfc_form = "\u{30ef}\u{30fc}\u{30ac}\u{30fc}"; // ワーガー (precomposed)
 
@@ -78,9 +90,9 @@ mod tests {
 
     #[test]
     fn test_mixed_content() {
-        // ASCII + already-NFC Japanese + a decomposed sequence, all in one
-        // string — the slow path must still normalize only what's needed
-        // while preserving the rest verbatim.
+        // ASCII text surrounding a decomposed sequence, all in one string —
+        // the slow path must recompose the affected span while leaving the
+        // surrounding ASCII untouched.
         let nfd_ga = "\u{30ab}\u{3099}"; // ガ decomposed
         let text = format!("note: {nfd_ga} worker thread");
         let expected = "note: \u{30ac} worker thread"; // ガ precomposed
@@ -97,5 +109,21 @@ mod tests {
 
         assert!(!is_normalized(nfd));
         assert!(is_normalized(nfc_form));
+    }
+
+    #[test]
+    fn test_nfc_lower_basic() {
+        assert_eq!(nfc_lower("  LoRa "), "lora");
+    }
+
+    /// U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE) lowercases to `i` plus
+    /// a combining dot above (U+0307) — a decomposed sequence introduced by
+    /// `to_lowercase()` itself, not present in the input. `nfc_lower` must
+    /// still return NFC-normalized output.
+    #[test]
+    fn test_nfc_lower_normalizes_decomposition_introduced_by_lowering() {
+        let result = nfc_lower("\u{0130}");
+
+        assert!(is_normalized(&result));
     }
 }

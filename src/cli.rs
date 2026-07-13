@@ -1651,7 +1651,7 @@ fn reindex_fts_after_dict_change() -> anyhow::Result<()> {
 /// (or only `pending` in) the DB into it BEFORE the change, so the subsequent
 /// `user_dict.simpledic` rewrite cannot silently drop them. Any file conflict or
 /// malformed line is detected before the first write, so an abort leaves the DB
-/// completely unchanged (the transaction is never committed). `surface` is NFC-normalized (#357).
+/// completely unchanged (the transaction is never committed).
 fn mutate_verdict(
     conn: &rusqlite::Connection,
     surface: &str,
@@ -2570,10 +2570,7 @@ mod tests {
     /// `reject_words.txt` entry saved in NFD must be recognized by an
     /// NFC-typed `tsm dict reject` — `mutate_verdict`'s reconcile step loads
     /// the file (normalizing to NFC) before the verdict change runs, so the
-    /// NFC-typed surface resolves to the same row instead of duplicating it
-    /// (#357). Pre-existing NFD rows written directly into the DB (bypassing
-    /// this normalization) are a separate, out-of-scope migration concern —
-    /// see the PR notes on `rebuild --apply`.
+    /// NFC-typed surface resolves to the same row instead of duplicating it.
     #[test]
     #[serial_test::serial]
     fn test_cmd_dict_reject_normalizes_nfd_reject_file_entry() {
@@ -2599,6 +2596,66 @@ mod tests {
             count, 1,
             "NFC CLI input must match the NFD file entry, not duplicate it"
         );
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    /// An explicit NFD yomi passed to `tsm dict add` must be stored as NFC —
+    /// `cmd_dict_add` normalizes both inputs before `resolve_reading` runs.
+    #[test]
+    #[serial_test::serial]
+    fn test_cmd_dict_add_normalizes_nfd_yomi() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
+        let db_path = config::db_path();
+        db::init_db(&db_path).unwrap();
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        let nfc_worker = "\u{30ef}\u{30fc}\u{30ac}\u{30fc}"; // ワーガー precomposed
+
+        cmd_dict_add("candle", Some(nfd_worker)).unwrap();
+
+        let conn = db::get_connection(&db_path).unwrap();
+        let reading: Option<String> = conn
+            .query_row(
+                "SELECT reading FROM dictionary_candidates WHERE surface = 'candle'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reading.as_deref(), Some(nfc_worker));
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    /// An NFD surface with no explicit yomi falls back to the surface as its
+    /// own reading — that fallback must use the *normalized* surface, not
+    /// the raw NFD input, so both columns end up NFC.
+    #[test]
+    #[serial_test::serial]
+    fn test_cmd_dict_add_no_yomi_falls_back_to_normalized_surface() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
+        let db_path = config::db_path();
+        db::init_db(&db_path).unwrap();
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        let nfc_worker = "\u{30ef}\u{30fc}\u{30ac}\u{30fc}"; // ワーガー precomposed
+
+        cmd_dict_add(nfd_worker, None).unwrap();
+
+        let conn = db::get_connection(&db_path).unwrap();
+        let (surface, reading): (String, Option<String>) = conn
+            .query_row(
+                "SELECT surface, reading FROM dictionary_candidates",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(surface, nfc_worker);
+        assert_eq!(reading.as_deref(), Some(nfc_worker));
 
         std::env::remove_var("TSM_STATE_DIR");
         config::reload();

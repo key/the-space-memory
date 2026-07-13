@@ -72,7 +72,7 @@ src/
 ├── render.rs           — Daemon-response → terminal rendering (writer-based); gate-covered
 ├── config.rs           — Configuration (TSM_* env vars, config file, scoring params)
 ├── db.rs               — SQLite (rusqlite) DB init & connection management
-├── normalize.rs         — Unicode NFC canonical normalization (SSoT); applied by Prepare and Plan
+├── normalize.rs         — Unicode NFC canonical normalization (SSoT); Prepare, Plan, dict/synonym/entity load
 ├── indexer/             — Index pipeline (Prepare/Persist/Embed stages)
 │   ├── mod.rs           — Orchestration: index_file / index_session (both: hash check→prepare→persist→embed), index_all*
 │   ├── prepare.rs       — Prepare stage: prepare_text (pure Markdown → PreparedFile) + file-loading wrapper; SourcePolicy
@@ -404,7 +404,7 @@ A change is merge-ready when **all** of the following hold:
   so the `dictionary_candidates` table (accepted + rejected verdicts) is lost.
   Run `tsm dict import` after rebuild to restore from `user_dict.simpledic` /
   `reject_words.txt` (DB is the authority, files are the portable record)
-- **NFC normalization (#357) only applies going forward** — `prepare_text` /
+- **NFC normalization only applies going forward** — `prepare_text` /
   `plan` normalize new writes and queries, and the dictionary/synonym/entity
   load paths normalize on read, but rows already in the DB from before this
   change may still hold NFD text. Run `tsm rebuild --apply` to renormalize
