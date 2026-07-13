@@ -11,7 +11,7 @@ pub mod walker;
 pub use walker::ContentWalker;
 
 mod embed;
-pub use embed::{backfill_next_batch, backfill_vectors, BackfillStats, EncodeFn};
+pub use embed::{backfill_next_batch, backfill_vectors, count_missing, BackfillStats, EncodeFn};
 
 mod prepare;
 

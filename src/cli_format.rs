@@ -132,9 +132,9 @@ pub fn render_doctor_report(use_color: bool, report: &DoctorReport) -> String {
 /// Render the embedder/watcher "running since" line body, or a bare "running"
 /// when no timestamp is known. Factored out so `render_status` stays focused on
 /// the section layout rather than the per-section running/stopped branching.
-fn running_since_suffix(since: Option<&String>) -> String {
+fn running_since_suffix(since: Option<&String>, now: DateTime<Utc>) -> String {
     match since {
-        Some(s) => format!(" (since {})", format_since(s)),
+        Some(s) => format!(" (since {})", format_since(s, now)),
         None => String::new(),
     }
 }
@@ -150,7 +150,7 @@ fn render_backfill(out: &mut String, info: &StatusInfo, now: DateTime<Utc>) {
     } else {
         0
     };
-    let since = format_since(&bf.since);
+    let since = format_since(&bf.since, now);
     let processed = bf.filled + bf.errors;
     let eta = if processed > 0 && bf.total > 0 {
         estimate_eta(&bf.since, processed, bf.total as usize, now)
@@ -213,7 +213,9 @@ pub fn render_status(info: &StatusInfo, now: DateTime<Utc>) -> String {
     // Embedder
     if info.embedder_running {
         let suffix = match (info.embedder_pid, info.embedder_since.as_ref()) {
-            (Some(pid), Some(since)) => format!(" (since {}, PID {pid})", format_since(since)),
+            (Some(pid), Some(since)) => {
+                format!(" (since {}, PID {pid})", format_since(since, now))
+            }
             _ => String::new(),
         };
         let _ = writeln!(out, "  Embedder:  running{suffix}");
@@ -223,7 +225,7 @@ pub fn render_status(info: &StatusInfo, now: DateTime<Utc>) -> String {
 
     // Watcher
     if info.watcher_running {
-        let suffix = running_since_suffix(info.watcher_since.as_ref());
+        let suffix = running_since_suffix(info.watcher_since.as_ref(), now);
         let _ = writeln!(out, "  Watcher:   running{suffix}");
     } else {
         let _ = writeln!(out, "  Watcher:   stopped");
@@ -234,12 +236,21 @@ pub fn render_status(info: &StatusInfo, now: DateTime<Utc>) -> String {
     out
 }
 
-/// Format an RFC3339 instant as `HH:MM:SS`, falling back to the raw string when
-/// it cannot be parsed.
-fn format_since(rfc3339: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(rfc3339)
-        .map(|dt| dt.format("%H:%M:%S").to_string())
-        .unwrap_or_else(|_| rfc3339.to_string())
+/// Format an RFC3339 instant relative to `now`: within a rolling 24h window
+/// of `now` (in either direction) it renders as `HH:MM:SS`; past that window
+/// (or, under clock skew, further in the future) it includes the date so a
+/// stale entry from days ago cannot be mistaken for one that started this
+/// morning. Falls back to the raw string when it cannot be parsed.
+fn format_since(rfc3339: &str, now: DateTime<Utc>) -> String {
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return rfc3339.to_string();
+    };
+    let dt = dt.with_timezone(&Utc);
+    if (now - dt).num_hours().abs() >= 24 {
+        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        dt.format("%H:%M:%S").to_string()
+    }
 }
 
 /// Estimate remaining backfill time from the elapsed `now - started_at` and the
@@ -411,6 +422,8 @@ mod tests {
 
     #[test]
     fn status_running_with_pids_and_since() {
+        // `now` is a few hours after `since` (same day) so both render bare
+        // `HH:MM:SS`, not the >=24h date-fallback form.
         let mut info = base_status();
         info.daemon_running = true;
         info.daemon_pid = Some(42);
@@ -419,10 +432,29 @@ mod tests {
         info.embedder_since = Some("2026-06-30T08:00:00Z".to_string());
         info.watcher_running = true;
         info.watcher_since = Some("2026-06-30T08:00:00Z".to_string());
-        let got = render_status(&info, Utc::now());
+        let now = DateTime::parse_from_rfc3339("2026-06-30T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let got = render_status(&info, now);
         assert!(got.contains("Daemon:    running (PID 42)"));
         assert!(got.contains("Embedder:  running (since 08:00:00, PID 7)"));
         assert!(got.contains("Watcher:   running (since 08:00:00)"));
+    }
+
+    #[test]
+    fn status_running_since_over_24h_ago_falls_back_to_date() {
+        // A stale entry (e.g. a leftover from a previous process) must not be
+        // mistaken for one that started "this morning" — the display switches
+        // to a date-qualified form once it crosses the 24h boundary.
+        let mut info = base_status();
+        info.embedder_running = true;
+        info.embedder_pid = Some(7);
+        info.embedder_since = Some("2026-06-26T06:52:01Z".to_string());
+        let now = DateTime::parse_from_rfc3339("2026-07-06T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let got = render_status(&info, now);
+        assert!(got.contains("Embedder:  running (since 2026-06-26 06:52:01, PID 7)"));
     }
 
     #[test]
@@ -542,8 +574,57 @@ mod tests {
 
     #[test]
     fn format_since_parses_and_falls_back() {
-        assert_eq!(format_since("2026-06-30T08:09:10Z"), "08:09:10");
-        assert_eq!(format_since("not-a-date"), "not-a-date");
+        let now = DateTime::parse_from_rfc3339("2026-06-30T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(format_since("2026-06-30T08:09:10Z", now), "08:09:10");
+        assert_eq!(format_since("not-a-date", now), "not-a-date");
+    }
+
+    #[test]
+    fn format_since_falls_back_to_date_past_24h() {
+        let now = DateTime::parse_from_rfc3339("2026-07-06T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            format_since("2026-06-26T06:52:01Z", now),
+            "2026-06-26 06:52:01"
+        );
+    }
+
+    #[test]
+    fn format_since_handles_future_timestamp_clock_skew() {
+        // A `since` in the future (clock skew) also crosses the 24h check via
+        // `.abs()`; it must not panic and must switch to the date form too.
+        let now = DateTime::parse_from_rfc3339("2026-06-26T06:52:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            format_since("2026-07-06T09:00:00Z", now),
+            "2026-07-06 09:00:00"
+        );
+    }
+
+    #[test]
+    fn format_since_just_under_24h_stays_time_only() {
+        let now = DateTime::parse_from_rfc3339("2026-06-27T06:52:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(format_since("2026-06-26T06:52:01Z", now), "06:52:01");
+    }
+
+    #[test]
+    fn format_since_exactly_24h_falls_back_to_date() {
+        // The boundary itself: `>= 24` is what triggers the date fallback, so
+        // this guards against an off-by-one (e.g. a `> 24` regression) on the
+        // one comparison the whole #355 fix hinges on.
+        let now = DateTime::parse_from_rfc3339("2026-06-27T06:52:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            format_since("2026-06-26T06:52:01Z", now),
+            "2026-06-26 06:52:01"
+        );
     }
 
     #[test]
