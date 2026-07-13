@@ -78,6 +78,34 @@ pub fn reconcile_message(r: &ReconcileOutcome) -> Option<String> {
     ))
 }
 
+/// Error message when `regenerate_user_dict` fails after the DB was already
+/// committed: the DB is correct, but the on-disk file may now be stale.
+pub fn regen_failed_message(csv_path: &std::path::Path, e: &anyhow::Error) -> String {
+    format!(
+        "the database was updated, but regenerating {} failed: {e}. \
+         Re-run the command (or `tsm dict export`) to retry.",
+        csv_path.display()
+    )
+}
+
+/// Status line for a successful `regenerate_user_dict` that changed the file.
+pub fn regenerated_message(csv_path: &std::path::Path, written: usize) -> String {
+    format!(
+        "Regenerated {} ({written} accepted term{}).",
+        csv_path.display(),
+        if written == 1 { "" } else { "s" }
+    )
+}
+
+/// Warning for `tsm dict add` when no reading was given for a kanji surface —
+/// the surface itself becomes a substitute reading.
+pub fn no_reading_warning(surface: &str) -> String {
+    format!(
+        "warning: no reading for '{surface}'; storing the surface as a substitute. \
+         Provide one with `tsm dict add {surface} <yomi>`."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +210,39 @@ mod tests {
             reconcile_message(&outcome).as_deref(),
             Some("Recovered 2 accepted and 1 rejected term(s) from the on-disk files into the database.")
         );
+    }
+
+    #[test]
+    fn regen_failed_message_names_path_and_retry_hint() {
+        let path = std::path::Path::new("/tmp/user_dict.simpledic");
+        let err = anyhow::anyhow!("disk full");
+        let msg = regen_failed_message(path, &err);
+        assert!(msg.contains("/tmp/user_dict.simpledic"));
+        assert!(msg.contains("disk full"));
+        assert!(msg.contains("tsm dict export"));
+    }
+
+    #[test]
+    fn regenerated_message_pluralizes_by_count() {
+        let path = std::path::Path::new("/tmp/user_dict.simpledic");
+        assert_eq!(
+            regenerated_message(path, 1),
+            "Regenerated /tmp/user_dict.simpledic (1 accepted term)."
+        );
+        assert_eq!(
+            regenerated_message(path, 2),
+            "Regenerated /tmp/user_dict.simpledic (2 accepted terms)."
+        );
+        assert_eq!(
+            regenerated_message(path, 0),
+            "Regenerated /tmp/user_dict.simpledic (0 accepted terms)."
+        );
+    }
+
+    #[test]
+    fn no_reading_warning_names_surface_and_the_retry_command() {
+        let msg = no_reading_warning("漢字");
+        assert!(msg.contains("漢字"));
+        assert!(msg.contains("tsm dict add 漢字 <yomi>"));
     }
 }

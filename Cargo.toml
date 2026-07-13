@@ -48,9 +48,9 @@ notify = "8"
 ignore = "0.4"
 ureq = "3"
 flate2 = "1"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 serial_test = "3"
 criterion = { version = "0.8", default-features = false }
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }

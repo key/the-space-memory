@@ -1652,6 +1652,11 @@ fn reindex_fts_after_dict_change() -> anyhow::Result<()> {
 /// `user_dict.simpledic` rewrite cannot silently drop them. Any file conflict or
 /// malformed line is detected before the first write, so an abort leaves the DB
 /// completely unchanged (the transaction is never committed).
+///
+/// This is a deliberate exception to the daemon-as-sole-DB-owner model: the CLI
+/// writes here directly so verdicts stay editable while the daemon is stopped.
+/// WAL mode + `busy_timeout` arbitrate the resulting concurrent access;
+/// `reindex_fts_after_dict_change` re-syncs a running daemon afterward.
 fn mutate_verdict(
     conn: &rusqlite::Connection,
     surface: &str,
@@ -1687,20 +1692,14 @@ fn report_reconcile(r: &user_dict::ReconcileOutcome) {
 /// local FTS rebuild opens its own writer.
 fn materialize_dict(conn: rusqlite::Connection) -> anyhow::Result<()> {
     let csv_path = config::user_dict_path();
-    let regen = user_dict::regenerate_user_dict(&conn, &csv_path).map_err(|e| {
-        anyhow::anyhow!(
-            "the database was updated, but regenerating {} failed: {e}. \
-             Re-run the command (or `tsm dict export`) to retry.",
-            csv_path.display()
-        )
-    })?;
+    let regen = user_dict::regenerate_user_dict(&conn, &csv_path)
+        .map_err(|e| anyhow::anyhow!(crate::cli_dict_logic::regen_failed_message(&csv_path, &e)))?;
     if regen.changed {
         println!(
-            "Regenerated {} ({} accepted term{}).",
-            csv_path.display(),
-            regen.written,
-            if regen.written == 1 { "" } else { "s" }
+            "{}",
+            crate::cli_dict_logic::regenerated_message(&csv_path, regen.written)
         );
+        user_dict::reset_existing_surfaces();
         drop(conn);
         reindex_fts_after_dict_change()?;
     }
@@ -1713,10 +1712,7 @@ pub fn cmd_dict_add(surface: &str, yomi: Option<&str>) -> anyhow::Result<()> {
     let conn = db::get_connection(&config::db_path())?;
     let (reading, warned) = user_dict::resolve_reading(surface, yomi);
     if warned {
-        eprintln!(
-            "warning: no reading for '{surface}'; storing the surface as a substitute. \
-             Provide one with `tsm dict add {surface} <yomi>`."
-        );
+        eprintln!("{}", crate::cli_dict_logic::no_reading_warning(surface));
     }
     let (t, reconciled) =
         mutate_verdict(&conn, surface, user_dict::Verdict::Accepted, Some(&reading))?;
@@ -1758,6 +1754,7 @@ pub fn cmd_dict_export() -> anyhow::Result<()> {
 
     let dict_path = config::user_dict_path();
     let accepted = user_dict::regenerate_user_dict(&conn, &dict_path)?.written;
+    user_dict::reset_existing_surfaces();
     eprintln!(
         "Wrote {accepted} accepted word(s) to {}",
         dict_path.display()
