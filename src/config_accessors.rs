@@ -45,6 +45,28 @@ pub fn reindex_fts_batch_size() -> usize {
     resolved().reindex_fts_batch_size
 }
 
+/// Size cap in bytes for `tsmd-stderr.log`, truncated once exceeded (also
+/// truncated at every `tsm start`). Default 20 MB: comfortably holds many
+/// days of ordinary `info`-level daemon-tree stderr while bounding a runaway
+/// warning loop to a small, fixed footprint.
+///
+/// Resolved directly from `TSM_STDERR_CAP_BYTES` rather than through the
+/// `ResolvedConfig`/tsm.toml pipeline the other accessors in this file use:
+/// `config.rs` is already well past its per-file line-count gate baseline,
+/// and this one knob does not carry its weight there. If a
+/// tsm.toml key is wanted later, resolving it costs the same
+/// `env > file > default` precedence as every other setting — moving it into
+/// `ResolvedConfig` then is a config.rs line-budget problem to solve on its
+/// own, not a reason to hold this fix back.
+pub fn stderr_cap_bytes() -> u64 {
+    const DEFAULT_STDERR_CAP_BYTES: u64 = 20_000_000;
+    std::env::var("TSM_STDERR_CAP_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_STDERR_CAP_BYTES)
+}
+
 /// Per-document chunk cap for the search result window (#299); `0` disables it.
 pub fn max_chunks_per_document() -> usize {
     resolved().max_chunks_per_document
@@ -99,6 +121,14 @@ pub fn db_path() -> PathBuf {
     state_dir().join("tsm.db")
 }
 
+/// Path to the daemon tree's captured raw stderr. Shared by `cmd_start`
+/// (which creates/truncates it and reads it back for startup-failure
+/// surfacing) and the daemon's own periodic size-cap check, so both sides
+/// agree on the same file without duplicating the join.
+pub fn tsmd_stderr_log_path() -> PathBuf {
+    log_dir().join("tsmd-stderr.log")
+}
+
 pub fn user_dict_path() -> PathBuf {
     resolved().user_dict_path.clone()
 }
@@ -138,6 +168,40 @@ pub fn daemon_pid_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn test_stderr_cap_bytes_default_when_unset() {
+        std::env::remove_var("TSM_STDERR_CAP_BYTES");
+        assert_eq!(stderr_cap_bytes(), 20_000_000);
+    }
+
+    #[test]
+    #[serial]
+    fn test_stderr_cap_bytes_env_override() {
+        std::env::set_var("TSM_STDERR_CAP_BYTES", "5000000");
+        assert_eq!(stderr_cap_bytes(), 5_000_000);
+        std::env::remove_var("TSM_STDERR_CAP_BYTES");
+    }
+
+    #[test]
+    #[serial]
+    fn test_stderr_cap_bytes_zero_falls_back_to_default() {
+        // 0 is not a meaningful cap (an always-truncating daemon would lose
+        // every log line); treat it as unset rather than "cap at nothing".
+        std::env::set_var("TSM_STDERR_CAP_BYTES", "0");
+        assert_eq!(stderr_cap_bytes(), 20_000_000);
+        std::env::remove_var("TSM_STDERR_CAP_BYTES");
+    }
+
+    #[test]
+    #[serial]
+    fn test_stderr_cap_bytes_invalid_falls_back_to_default() {
+        std::env::set_var("TSM_STDERR_CAP_BYTES", "not-a-number");
+        assert_eq!(stderr_cap_bytes(), 20_000_000);
+        std::env::remove_var("TSM_STDERR_CAP_BYTES");
+    }
 
     #[test]
     fn state_dir_derived_paths_have_stable_filenames() {
@@ -176,6 +240,7 @@ mod tests {
         let _ = embedder_backfill_interval_secs();
         let _ = reader_pool_size();
         let _ = reindex_fts_batch_size();
+        let _ = tsmd_stderr_log_path();
         let _ = max_chunks_per_document();
         let _ = search_fallback();
         let _ = session_weight();

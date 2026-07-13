@@ -40,6 +40,27 @@ pub(crate) fn is_index_relevant(kind: &EventKind) -> bool {
     }
 }
 
+/// Whether `path`'s extension is in the watcher's index-extension allowlist.
+///
+/// Mirrors `ContentWalker::extension_allowed`'s allowlist semantics (also
+/// rejecting extension-less paths) without depending on the indexer's
+/// `pub(crate)` internals, which are not visible across the binary/library
+/// crate boundary. Duplicating this one predicate is preferred over widening
+/// `ContentWalker`'s visibility or running the indexer's full ignore-rule
+/// matching here: the watcher intentionally stays oblivious to `.tsmignore`
+/// (so ignore-rule edits take effect without a watcher reload), and this
+/// filter exists purely to drop obviously-irrelevant events — build
+/// artifacts, object files, anything outside the index extension allowlist —
+/// before they enter the debounce map and cross the IPC boundary. The
+/// indexer's `IngestPolicy::accepts` remains the sole correctness authority
+/// for what actually gets indexed; this is a caller-side optimization only.
+pub(crate) fn extension_allowed(extensions: &[String], path: &Path) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => extensions.iter().any(|e| e == ext),
+        None => false,
+    }
+}
+
 /// Coalesces file-change events by relative path: a path is emitted once it has
 /// stayed quiet for its timeout. Replaces notify-debouncer-mini, whose
 /// `DebouncedEvent` collapsed every notify event kind into an opaque "changed"
@@ -210,6 +231,43 @@ mod tests {
         ] {
             assert!(is_index_relevant(&kind), "{kind:?} must be forwarded");
         }
+    }
+
+    // ── Extension pre-filter ──────────────────────────────────────────
+
+    #[test]
+    fn test_extension_allowed_matches_allowlist() {
+        let exts = vec!["md".to_string()];
+        assert!(extension_allowed(&exts, Path::new("notes/a.md")));
+    }
+
+    #[test]
+    fn test_extension_allowed_rejects_unlisted_extension() {
+        // The exact shape of the incident noise: cargo build artifacts under
+        // a watched external content_dir.
+        let exts = vec!["md".to_string()];
+        assert!(!extension_allowed(
+            &exts,
+            Path::new("the-space-memory/target/debug/build-script-build")
+        ));
+        assert!(!extension_allowed(
+            &exts,
+            Path::new("the-space-memory/target/debug/deps/foo.rcgu.o")
+        ));
+    }
+
+    #[test]
+    fn test_extension_allowed_rejects_no_extension() {
+        let exts = vec!["md".to_string()];
+        assert!(!extension_allowed(&exts, Path::new("notes/README")));
+    }
+
+    #[test]
+    fn test_extension_allowed_honors_multiple_configured_extensions() {
+        let exts = vec!["md".to_string(), "txt".to_string()];
+        assert!(extension_allowed(&exts, Path::new("a.txt")));
+        assert!(extension_allowed(&exts, Path::new("a.md")));
+        assert!(!extension_allowed(&exts, Path::new("a.rs")));
     }
 
     // ── Debounce coalescing ───────────────────────────────────────────

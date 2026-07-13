@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 
@@ -7,6 +9,56 @@ use crate::cli;
 use crate::config;
 use crate::daemon_protocol::{DaemonRequest, DaemonResponse};
 use crate::indexer::IngestPolicy;
+use crate::log_dedup::LogDedup;
+
+/// Cooldown for the "excluded by policy" warning below: a directory that
+/// keeps producing rejected paths (a churning build-artifact tree forwarded
+/// by the fs-watcher, or a bulk misconfigured stdin batch) collapses into one
+/// line per window instead of one per file. Keyed by the rejected path's
+/// parent directory (`policy_reject_dedup_key`) — coarse enough that a single
+/// noisy tree stays one line, fine enough that unrelated directories still
+/// report independently. A process-wide static (rather than threading a
+/// dedup instance through `handle_client`/`handle_request`) matches this
+/// codebase's existing pattern for daemon-wide shared state (see `config`'s
+/// `RESOLVED` singleton); it also keeps every existing `handle_request` call
+/// site and test signature unchanged.
+static POLICY_REJECT_DEDUP: OnceLock<Mutex<LogDedup>> = OnceLock::new();
+
+fn policy_reject_dedup() -> &'static Mutex<LogDedup> {
+    POLICY_REJECT_DEDUP.get_or_init(|| Mutex::new(LogDedup::new(Duration::from_secs(60))))
+}
+
+/// Directory-prefix dedup key for a policy-rejected path: its parent
+/// directory, or the path itself if it has none (e.g. a bare root).
+fn policy_reject_dedup_key(p: &Path) -> String {
+    p.parent()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.to_string_lossy().into_owned())
+}
+
+/// Decide whether — and with what text — to warn about a policy-rejected
+/// path, given the dedup gate.
+///
+/// Pure aside from mutating `dedup`: no locking or logging here, so all
+/// three outcomes (first occurrence, an occurrence carrying a suppressed
+/// count after the cooldown, and silent suppression within the cooldown)
+/// are directly unit-testable with injected `Instant`s. The call site stays
+/// a one-line `if let Some(msg) = ... { log::warn!("{msg}") }`.
+fn policy_reject_warning(dedup: &mut LogDedup, path: &Path, now: Instant) -> Option<String> {
+    let key = policy_reject_dedup_key(path);
+    let suppressed = dedup.gate(&key, now)?;
+    Some(if suppressed > 0 {
+        format!(
+            "skipping {} (excluded by policy — ignore rules or extension mismatch) [{suppressed} more under {key} suppressed in the last 60s]",
+            path.display()
+        )
+    } else {
+        format!(
+            "skipping {} (excluded by policy — ignore rules or extension mismatch)",
+            path.display()
+        )
+    })
+}
 
 /// Handle a single daemon request and return a response.
 ///
@@ -92,10 +144,16 @@ pub fn handle_request(
                 let joined: Vec<PathBuf> = files.iter().map(|f| project_root.join(f)).collect();
                 for p in &joined {
                     if !walker.accepts(p) {
-                        log::warn!(
-                            "skipping {} (excluded by policy — ignore rules or extension mismatch)",
-                            p.display()
-                        );
+                        // A poisoned lock (only possible if a prior holder
+                        // panicked mid-gate) falls back to the recovered
+                        // guard rather than dropping the warning: staying
+                        // loud is the safe failure mode here.
+                        let mut dedup = policy_reject_dedup()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if let Some(msg) = policy_reject_warning(&mut dedup, p, Instant::now()) {
+                            log::warn!("{msg}");
+                        }
                     }
                 }
                 joined
@@ -189,6 +247,82 @@ mod tests {
     use crate::db;
     use crate::test_utils::setup_db_with_dir as setup;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn test_policy_reject_dedup_key_uses_parent_directory() {
+        assert_eq!(
+            policy_reject_dedup_key(Path::new("/a/b/target/debug/deps/foo.rcgu.o")),
+            "/a/b/target/debug/deps"
+        );
+    }
+
+    #[test]
+    fn test_policy_reject_dedup_key_falls_back_to_path_when_no_parent() {
+        // The root has no parent; the key degrades to the path itself rather
+        // than panicking or producing an empty string.
+        assert_eq!(policy_reject_dedup_key(Path::new("/")), "/");
+    }
+
+    // ── policy_reject_warning: all three dedup-gate outcomes ──────────
+
+    #[test]
+    fn test_policy_reject_warning_first_occurrence_has_no_suppressed_count() {
+        let mut dedup = LogDedup::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let msg = policy_reject_warning(&mut dedup, Path::new("/a/target/foo.o"), t0)
+            .expect("first occurrence must log");
+        assert!(msg.contains("/a/target/foo.o"));
+        assert!(
+            !msg.contains("suppressed"),
+            "first occurrence must not claim a suppressed count: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_policy_reject_warning_within_cooldown_is_silently_suppressed() {
+        let mut dedup = LogDedup::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        policy_reject_warning(&mut dedup, Path::new("/a/target/foo.o"), t0);
+        // A second rejection under the same directory, seconds later, is
+        // within the cooldown: nothing to log.
+        let second = policy_reject_warning(
+            &mut dedup,
+            Path::new("/a/target/bar.o"),
+            t0 + Duration::from_secs(5),
+        );
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn test_policy_reject_warning_after_cooldown_carries_suppressed_count() {
+        let mut dedup = LogDedup::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        policy_reject_warning(&mut dedup, Path::new("/a/target/foo.o"), t0);
+        // Two more under the same directory, still within the cooldown —
+        // both silently counted.
+        policy_reject_warning(
+            &mut dedup,
+            Path::new("/a/target/bar.o"),
+            t0 + Duration::from_secs(10),
+        );
+        policy_reject_warning(
+            &mut dedup,
+            Path::new("/a/target/baz.o"),
+            t0 + Duration::from_secs(20),
+        );
+        // Past the cooldown: logs again, reporting the two swallowed above.
+        let msg = policy_reject_warning(
+            &mut dedup,
+            Path::new("/a/target/qux.o"),
+            t0 + Duration::from_secs(61),
+        )
+        .expect("occurrence past the cooldown must log");
+        assert!(msg.contains("/a/target/qux.o"));
+        assert!(
+            msg.contains("2 more under /a/target suppressed"),
+            "must carry the suppressed count: {msg}"
+        );
+    }
 
     #[test]
     fn test_ping() {

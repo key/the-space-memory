@@ -10,7 +10,9 @@ use notify::{recommended_watcher, Event, RecommendedWatcher, RecursiveMode, Watc
 use the_space_memory::config;
 use the_space_memory::daemon_protocol::{self, DaemonRequest};
 
-use crate::watch_logic::{diff_watch_set, is_index_relevant, watch_targets, Debounce};
+use crate::watch_logic::{
+    diff_watch_set, extension_allowed, is_index_relevant, watch_targets, Debounce,
+};
 use crate::SHUTDOWN;
 
 /// Flag set by SIGHUP to trigger watch target reload.
@@ -65,12 +67,18 @@ pub fn run() -> Result<()> {
     )
     .context("Failed to create file watcher")?;
 
-    // The watcher's scope comes purely from `project_root` + `content_dirs`
-    // — it does NOT consult `.tsmignore`, `extensions`, or `respect_gitignore`.
-    // Those are policy concerns owned by the daemon's indexer via
-    // `IngestPolicy`. Keeping the watcher oblivious means the event stream
-    // is independent of user policy edits (no SIGHUP needed to pick up
-    // `.tsmignore` changes — the indexer's next gate call does that).
+    // The watcher's *registration* scope comes purely from `project_root` +
+    // `content_dirs` — it does NOT consult `.tsmignore` or
+    // `respect_gitignore`. Those are policy concerns owned by the daemon's
+    // indexer via `IngestPolicy`. Keeping registration oblivious to ignore
+    // rules means the watched directory set is independent of user policy
+    // edits (no SIGHUP needed to pick up `.tsmignore` changes — the
+    // indexer's next gate call does that).
+    //
+    // The event *forwarding* loop below does apply the index-extension
+    // allowlist (but still not `.tsmignore`) as a caller-side pre-filter —
+    // see `extension_allowed`'s doc comment for why that one check is safe
+    // to duplicate here without reintroducing a reload dependency.
     let mut watched = setup_watches(&mut watcher, &project_root);
 
     if watched.is_empty() {
@@ -88,6 +96,7 @@ pub fn run() -> Result<()> {
 
     let daemon_socket = config::daemon_socket_path();
     let mut debounce = Debounce::new(DEBOUNCE);
+    let mut extensions = config::index_extensions();
 
     while !SHUTDOWN.load(Ordering::SeqCst) {
         // Handle reload requests (SIGHUP from tsmd)
@@ -96,7 +105,9 @@ pub fn run() -> Result<()> {
             config::reload();
             // Only `content_dirs` can change the watch scope; a new
             // `.tsmignore` would not affect registration (the watcher
-            // doesn't know about it by design).
+            // doesn't know about it by design). `extensions` is refreshed
+            // here too, since the forwarding pre-filter reads it.
+            extensions = config::index_extensions();
             update_watches(&mut watcher, &mut watched, &project_root);
             if watched.is_empty() {
                 // Config edit left us with nothing to watch (e.g. every
@@ -126,12 +137,20 @@ pub fn run() -> Result<()> {
             Ok(Ok(event)) => {
                 let now = Instant::now();
                 for path in &event.paths {
-                    match path.strip_prefix(&project_root) {
-                        Ok(rel) => debounce.record_at(rel.to_string_lossy().into_owned(), now),
-                        Err(_) => {
-                            log::warn!("path {} outside project root, skipping", path.display());
-                        }
+                    // Debounce keys and forwarded paths are absolute
+                    // (lexically folded, symlinks not resolved), matching
+                    // `tsm index --files-from-stdin`'s wire convention: the
+                    // daemon's `project_root.join` passes an absolute path
+                    // through unchanged, so no project_root-relative framing
+                    // is needed. This also covers `content_dirs` registered
+                    // above project_root via `..` — those events are just as
+                    // real as project_root-local ones and must not be
+                    // dropped.
+                    let abs = the_space_memory::paths::absolutize(path, &project_root);
+                    if !extension_allowed(&extensions, &abs) {
+                        continue;
                     }
+                    debounce.record_at(abs.to_string_lossy().into_owned(), now);
                 }
             }
             Ok(Err(e)) => {

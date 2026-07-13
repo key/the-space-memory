@@ -583,7 +583,7 @@ fn cmd_start(no_watcher: bool, verbose: bool) -> anyhow::Result<()> {
     // fd and log to it too (they keep no separate files), so this is the daemon
     // tree's combined stderr. It is also read back below to surface startup
     // failures. Truncated each start, so it does not accumulate across runs.
-    let stderr_path = config::log_dir().join("tsmd-stderr.log");
+    let stderr_path = config::tsmd_stderr_log_path();
     if let Some(parent) = stderr_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

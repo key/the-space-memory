@@ -244,6 +244,7 @@ the environment variable takes precedence. See
 | `TSM_INIT_LINK_MODE` | `symlink` | `[init].link_mode` | How `tsm init` links workspace resources to the cache: `symlink` or `copy` |
 | `TSM_READER_POOL_SIZE` | CPU cores | `reader_pool_size` | Number of `query_only` reader connections in the daemon's reader pool; caps concurrent reads |
 | `TSM_REINDEX_FTS_BATCH_SIZE` | `200` | `reindex_fts_batch_size` | Documents per FTS reindex batch; smaller = finer preemption granularity and more fsync, larger = better reindex throughput |
+| `TSM_STDERR_CAP_BYTES` | `20000000` | *(n/a)* | Size cap in bytes for `tsmd-stderr.log`; the daemon truncates the file once it grows past this during a single long-lived session (it is also truncated at every `tsm start`). `0` or an unparseable value falls back to the default |
 
 tsm also honors `RUST_LOG` (log level, default `info`) and `NO_COLOR`
 (disable colored output).
