@@ -1,6 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::RwLock;
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -144,55 +143,16 @@ pub struct RawCandidate {
     pos: CandidatePos,
 }
 
-// ─── Existing surfaces cache ─────────────────────────────────
+mod simpledic_format;
+mod surfaces_cache;
 
-/// Cached set of surfaces already in user_dict.simpledic. `None` is stale
-/// (never loaded, or invalidated by `reset_existing_surfaces`) and reloads on next access.
-static SURFACES: RwLock<Option<HashSet<String>>> = RwLock::new(None);
-
-/// Invalidate the cache so the next lookup reloads `user_dict.simpledic`. The dict changes at
-/// runtime without a daemon restart, so call this wherever the segmenter is also reset — otherwise
-/// a long-lived daemon keeps re-collecting already-accepted words as candidates.
-pub fn reset_existing_surfaces() {
-    *SURFACES.write().expect("existing surfaces lock poisoned") = None;
-}
-
-fn with_existing_surfaces<T>(f: impl FnOnce(&HashSet<String>) -> T) -> T {
-    let guard = SURFACES.read().expect("existing surfaces lock poisoned");
-    if let Some(s) = guard.as_ref() {
-        return f(s);
-    }
-    drop(guard);
-    let loaded = load_existing_surfaces(&config::user_dict_path())
-        .inspect_err(|e| log::warn!("could not read user dict: {e}"))
-        .unwrap_or_default();
-    let result = f(&loaded);
-    *SURFACES.write().expect("existing surfaces lock poisoned") = Some(loaded);
-    result
-}
-
-/// Load existing surface forms from a user dictionary file (IPAdic format).
-/// The first column (comma-separated) is the surface form.
-pub fn load_existing_surfaces(csv_path: &Path) -> anyhow::Result<HashSet<String>> {
-    let mut surfaces = HashSet::new();
-    if !csv_path.exists() {
-        return Ok(surfaces);
-    }
-    let content = std::fs::read_to_string(csv_path)?;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(surface) = line.split(',').next() {
-            let surface = crate::normalize::nfc_lower(surface);
-            if !surface.is_empty() {
-                surfaces.insert(surface);
-            }
-        }
-    }
-    Ok(surfaces)
-}
+pub use simpledic_format::{
+    export_reject_words_to_file, format_simpledic_row_with_reading, import_reject_words_from_file,
+    import_user_dict_from_file, regenerate_user_dict, ImportOutcome, RegenOutcome,
+};
+use simpledic_format::{read_reject_surfaces, read_simpledic_surfaces};
+use surfaces_cache::with_existing_surfaces;
+pub use surfaces_cache::{load_existing_surfaces, reset_existing_surfaces};
 
 // ─── Extraction helpers ──────────────────────────────────────
 
@@ -413,17 +373,20 @@ pub fn candidate_summary(conn: &Connection) -> CandidateSummary {
 
 // ─── Status updates ──────────────────────────────────────────
 
-/// Transition a single term to `to`, enforcing the accepted XOR rejected XOR pending invariant via the single `status`
-/// column.
+/// Transition a single term to `to`, enforcing the accepted XOR rejected XOR
+/// pending invariant via the single `status` column.
 ///
-/// The term is upserted: a surface with no candidate row is inserted (manual terms that never surfaced as auto-
-/// candidates, e.g. mis-split compounds), **except** a transition to `Pending` (`dict rm`), which returns
-/// [`SetVerdictError::NotFound`] — `Pending` is the absence of a verdict, so a nonexistent term has nothing to reset.
+/// The term is upserted: a surface with no candidate row is inserted (manual
+/// terms that never surfaced as auto-candidates, e.g. mis-split compounds),
+/// **except** a transition to `Pending` (`dict rm`), which returns
+/// [`SetVerdictError::NotFound`] — `Pending` is the absence of a verdict, so a
+/// nonexistent term has nothing to reset.
 ///
-/// `reading` is only meaningful when accepting; it is stored verbatim (the caller normalizes). A non-NULL `reading`
-/// overwrites; `None` preserves any existing reading (`COALESCE`).
+/// `reading` is only meaningful when accepting; it is stored verbatim (the
+/// caller normalizes). A non-NULL `reading` overwrites; `None` preserves any existing reading (`COALESCE`).
 ///
-/// The SELECT and the write run in one transaction so the returned [`Transition`] always matches the committed DB state.
+/// The SELECT and the write run in one transaction so the returned
+/// [`Transition`] always matches the committed DB state.
 pub fn set_verdict(
     conn: &Connection,
     surface: &str,
@@ -499,11 +462,6 @@ pub(crate) fn set_verdict_in(
 
 // ─── CSV formatting ──────────────────────────────────────────
 
-/// Format a simpledic row with an explicit reading: surface,{USER_DICT_POS},reading
-pub fn format_simpledic_row_with_reading(surface: &str, reading: &str) -> String {
-    format!("{surface},{},{reading}", USER_DICT_POS)
-}
-
 /// Whether `s` contains a CJK ideograph (kanji), whose reading cannot be
 /// inferred from the surface alone.
 fn surface_has_kanji(s: &str) -> bool {
@@ -549,224 +507,6 @@ pub fn validate_surface(surface: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Regenerate `user_dict.simpledic` from the DB's accepted terms (full rewrite).
-///
-/// The shared primitive every verdict change relies on: a verdict change regenerates simpledic and reloads the tokenizer.
-/// `export` reuses it for the simpledic half of its round-trip. Each accepted term becomes one `surface,POS,reading` row,
-/// the reading falling back to the surface when none is stored (simpledic requires the field). Returns the number of rows
-/// written; an empty accepted set truncates the file.
-pub fn regenerate_user_dict(conn: &Connection, csv_path: &Path) -> anyhow::Result<RegenOutcome> {
-    // Propagate per-row errors rather than silently dropping a term.
-    let rows: Vec<(String, Option<String>)> = conn
-        .prepare(
-            "SELECT surface, reading FROM dictionary_candidates
-             WHERE status = 'accepted' ORDER BY surface ASC",
-        )?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let mut content = String::new();
-    for (surface, reading) in &rows {
-        let reading = reading.as_deref().unwrap_or(surface);
-        content.push_str(&format_simpledic_row_with_reading(surface, reading));
-        content.push('\n');
-    }
-
-    // Compare against the current file so callers can skip an FTS reindex when
-    // nothing changed — and so a retry after a failed reindex still detects the
-    // on-disk/DB divergence and re-materializes (no dirty-marker needed).
-    let changed = match std::fs::read_to_string(csv_path) {
-        Ok(existing) => existing != content,
-        // Any read error (missing file, permissions, non-UTF-8) → treat as
-        // changed and rewrite; at worst this is one redundant reindex, never loss.
-        Err(_) => true,
-    };
-
-    if let Some(parent) = csv_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Write to a sibling temp file then atomically rename, so a crash or write
-    // failure mid-rewrite never leaves lindera reading a truncated/partial dict.
-    let tmp_path = csv_path.with_extension("simpledic.tmp");
-    {
-        use std::io::Write;
-        let mut tmp = std::fs::File::create(&tmp_path)?;
-        tmp.write_all(content.as_bytes())?;
-        tmp.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, csv_path)?;
-    Ok(RegenOutcome {
-        written: rows.len(),
-        changed,
-    })
-}
-
-/// Result of [`regenerate_user_dict`]: how many accepted terms were written, and
-/// whether the file content actually changed (so the caller reindexes FTS only
-/// when needed, and a post-failure retry still re-materializes on divergence).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct RegenOutcome {
-    pub written: usize,
-    pub changed: bool,
-}
-
-/// Export the DB's rejected set to `reject_words.txt`, overwriting the file.
-/// One surface per line, sorted. Returns the number of words written. An empty
-/// rejected set truncates the file. Round-trips with
-/// [`import_reject_words_from_file`]. Mirrors [`regenerate_user_dict`]'s
-/// durability: per-row DB errors propagate and the write goes through a sibling
-/// temp file + atomic rename.
-pub fn export_reject_words_to_file(conn: &Connection, path: &Path) -> anyhow::Result<usize> {
-    let surfaces: Vec<String> = conn
-        .prepare(
-            "SELECT surface FROM dictionary_candidates
-             WHERE status = 'rejected' ORDER BY surface ASC",
-        )?
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp_path = path.with_extension("txt.tmp");
-    {
-        use std::io::Write;
-        let mut tmp = std::fs::File::create(&tmp_path)?;
-        for surface in &surfaces {
-            writeln!(tmp, "{surface}")?;
-        }
-        tmp.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, path)?;
-    Ok(surfaces.len())
-}
-
-/// Parse one `user_dict.simpledic` line into `(surface, reading)`.
-///
-/// Blank lines and `#` comments return `Ok(None)` (tolerated). A non-blank, non-comment line whose first column (the
-/// surface) is empty returns `Err`: silently skipping it would let the next full rewrite delete a real term, so we **fail
-/// closed** instead. `reading == surface` normalizes to `None` (`regenerate_user_dict` re-emits the surface for a NULL
-/// reading, so they round-trip identically).
-fn parse_simpledic_line(line: &str) -> anyhow::Result<Option<(String, Option<String>)>> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.starts_with('#') {
-        return Ok(None);
-    }
-    let mut cols = trimmed.split(',');
-    let surface = crate::normalize::nfc(cols.next().map(str::trim).unwrap_or("")).into_owned();
-    if surface.is_empty() {
-        anyhow::bail!("missing surface (first column is empty)");
-    }
-    let reading = cols
-        .next() // pos column (ignored)
-        .and(cols.next())
-        .map(str::trim)
-        .map(|r| crate::normalize::nfc(r).into_owned())
-        .filter(|r| !r.is_empty() && *r != surface);
-    Ok(Some((surface, reading)))
-}
-
-/// Read `user_dict.simpledic` into `(surface, reading)` rows, failing closed on
-/// any malformed line (reported with its 1-based line number and path) so a
-/// hand-edit typo never gets silently dropped by a later rewrite. A surface that
-/// repeats with a *different* reading also fails closed (collapsing it would
-/// silently drop one reading); an exact duplicate is harmless and deduped.
-/// Missing file → empty vec.
-fn read_simpledic_surfaces(path: &Path) -> anyhow::Result<Vec<(String, Option<String>)>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = std::fs::read_to_string(path)?;
-    let mut out: Vec<(String, Option<String>)> = Vec::new();
-    let mut seen: HashMap<String, Option<String>> = HashMap::new();
-    for (i, line) in content.lines().enumerate() {
-        let row = match parse_simpledic_line(line) {
-            Ok(Some(row)) => row,
-            Ok(None) => continue,
-            Err(e) => anyhow::bail!("{}:{}: {e}", path.display(), i + 1),
-        };
-        match seen.get(&row.0) {
-            Some(prev) if *prev == row.1 => continue, // exact duplicate: dedupe
-            Some(_) => anyhow::bail!(
-                "{}:{}: surface '{}' appears more than once with different readings",
-                path.display(),
-                i + 1,
-                row.0
-            ),
-            None => {}
-        }
-        seen.insert(row.0.clone(), row.1.clone());
-        out.push(row);
-    }
-    Ok(out)
-}
-
-/// Read `reject_words.txt` surfaces (one per line; `#` comments and blanks
-/// tolerated), case preserved. A non-blank, non-comment line is taken verbatim
-/// as a surface. Missing file → empty vec.
-fn read_reject_surfaces(path: &Path) -> anyhow::Result<Vec<String>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = std::fs::read_to_string(path)?;
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let surface = line.trim();
-        if surface.is_empty() || surface.starts_with('#') {
-            continue;
-        }
-        out.push(crate::normalize::nfc(surface).into_owned());
-    }
-    Ok(out)
-}
-
-/// Outcome of importing one verdict file: how many rows were applied, and how
-/// many of those changed the accepted set. The caller regenerates the dictionary
-/// and reindexes once when `dict_affected > 0` (a rejected import can demote a
-/// previously-accepted word, so a non-zero `dict_affected` is possible even for
-/// the reject file).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ImportOutcome {
-    pub imported: usize,
-    pub dict_affected: usize,
-}
-
-/// Import `reject_words.txt` into the DB, marking each listed word `rejected`
-/// via [`set_verdict`]. Insert-only: words absent from the file keep their
-/// verdict (use `dict rm`/`reject` to remove). Lines starting with `#` and blank
-/// lines are skipped; case is preserved verbatim. A missing file is a no-op.
-pub fn import_reject_words_from_file(
-    conn: &Connection,
-    path: &Path,
-) -> anyhow::Result<ImportOutcome> {
-    let mut outcome = ImportOutcome::default();
-    for surface in read_reject_surfaces(path)? {
-        let t = set_verdict_in(conn, &surface, Verdict::Rejected, None)?;
-        outcome.imported += 1;
-        if t.affected_dict {
-            outcome.dict_affected += 1;
-        }
-    }
-    Ok(outcome)
-}
-
-/// Import `user_dict.simpledic` into the DB, marking each surface `accepted`
-/// with its reading via [`set_verdict`]. Insert-only (see
-/// [`import_reject_words_from_file`]). Row format is `surface[,pos,reading]`; the
-/// reading column is stored when present and non-empty. Lines starting with `#`
-/// and blank lines are skipped. A missing file is a no-op.
-pub fn import_user_dict_from_file(conn: &Connection, path: &Path) -> anyhow::Result<ImportOutcome> {
-    let mut outcome = ImportOutcome::default();
-    for (surface, reading) in read_simpledic_surfaces(path)? {
-        let t = set_verdict_in(conn, &surface, Verdict::Accepted, reading.as_deref())?;
-        outcome.imported += 1;
-        if t.affected_dict {
-            outcome.dict_affected += 1;
-        }
-    }
-    Ok(outcome)
-}
-
 /// Resolve `surface`'s status by exact match, migrating in place a legacy
 /// row whose surface normalizes to the same NFC form on a miss (small table).
 fn find_status(conn: &Connection, surface: &str) -> Result<Option<String>, rusqlite::Error> {
@@ -807,17 +547,22 @@ impl ReconcileOutcome {
     }
 }
 
-/// Reconcile the on-disk verdict files INTO the DB before a verdict mutation, so the subsequent `regenerate_user_dict`
-/// rewrite preserves terms present in `user_dict.simpledic` / `reject_words.txt` but absent from (or only `pending` in)
-/// the DB — the data-loss path of an empty DB after `rebuild`, or a hand-edited file. The DB becomes a faithful image of
-/// disk before any rewrite, making the DB-as-authority model self-healing.
+/// Reconcile the on-disk verdict files INTO the DB before a verdict mutation, so
+/// the subsequent `regenerate_user_dict` rewrite preserves terms present in
+/// `user_dict.simpledic` / `reject_words.txt` but absent from (or only `pending`
+/// in) the DB — the data-loss path of an empty DB after `rebuild`, or a
+/// hand-edited file. The DB becomes a faithful image of disk before any
+/// rewrite, making the DB-as-authority model self-healing.
 ///
-/// Insert-or-promote, never override an opposing verdict: an absent or `pending` surface is inserted/promoted to the
-/// file's verdict (`accepted` for simpledic, `rejected` for reject); an already-matching status is a no-op. **Fails
-/// closed with no writes** on any contradiction — a surface in both files, or a DB verdict opposing the file's — so an
-/// ambiguous state never silently demotes a term; a malformed simpledic line also fails closed (see
-/// [`read_simpledic_surfaces`]). All parsing + conflict detection happens before the first write, inside the caller's one
-/// transaction, so an abort leaves the DB completely unchanged.
+/// Insert-or-promote, never override an opposing verdict: an absent or
+/// `pending` surface is inserted/promoted to the file's verdict (`accepted`
+/// for simpledic, `rejected` for reject); an already-matching status is a
+/// no-op. **Fails closed with no writes** on any contradiction — a surface in
+/// both files, or a DB verdict opposing the file's — so an ambiguous state
+/// never silently demotes a term; a malformed simpledic line also fails
+/// closed (see [`read_simpledic_surfaces`]). All parsing + conflict detection
+/// happens before the first write, inside the caller's one transaction, so
+/// an abort leaves the DB completely unchanged.
 pub fn reconcile_files_into_db(
     conn: &Connection,
     simpledic_path: &Path,
@@ -1231,108 +976,6 @@ mod tests {
         assert!(validate_surface("foo\rbar").is_err());
     }
 
-    // ─── regenerate_user_dict tests ──────────────────────────
-
-    #[test]
-    fn test_regenerate_user_dict_writes_accepted_only() {
-        let conn = setup();
-        seed(&conn, "accepted_a", "accepted");
-        seed(&conn, "accepted_b", "accepted");
-        seed(&conn, "pending_x", "pending");
-        seed(&conn, "rejected_y", "rejected");
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("user_dict.simpledic");
-
-        let count = regenerate_user_dict(&conn, &path).unwrap();
-
-        assert_eq!(count.written, 2);
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("accepted_a,"));
-        assert!(body.contains("accepted_b,"));
-        assert!(!body.contains("pending_x"));
-        assert!(!body.contains("rejected_y"));
-    }
-
-    #[test]
-    fn test_regenerate_user_dict_is_full_rewrite() {
-        let conn = setup();
-        seed(&conn, "keep", "accepted");
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("user_dict.simpledic");
-        std::fs::write(&path, "stale_word,名詞,stale_word\n").unwrap();
-
-        regenerate_user_dict(&conn, &path).unwrap();
-
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("keep,"));
-        assert!(!body.contains("stale_word"), "regen truncates, not appends");
-    }
-
-    #[test]
-    fn test_regenerate_user_dict_empty_accepted_set() {
-        let conn = setup();
-        seed(&conn, "pending_only", "pending");
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("user_dict.simpledic");
-        std::fs::write(&path, "stale,名詞,stale\n").unwrap();
-
-        let count = regenerate_user_dict(&conn, &path).unwrap();
-
-        assert_eq!(count.written, 0);
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.is_empty(), "no accepted terms => empty dict file");
-    }
-
-    #[test]
-    fn test_regenerate_user_dict_output_is_sorted() {
-        let conn = setup();
-        seed(&conn, "zebra", "accepted");
-        seed(&conn, "apple", "accepted");
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("user_dict.simpledic");
-
-        regenerate_user_dict(&conn, &path).unwrap();
-
-        let body = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = body.lines().collect();
-        assert!(lines[0].starts_with("apple,"), "rows sorted by surface ASC");
-        assert!(lines[1].starts_with("zebra,"));
-    }
-
-    #[test]
-    fn test_regenerate_user_dict_emits_stored_readings() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("user_dict.simpledic");
-        // accepted with a distinct reading, accepted without (NULL reading),
-        // plus rejected/pending noise that must not be written.
-        set_verdict(
-            &conn,
-            "ハンドロード",
-            Verdict::Accepted,
-            Some("はんどろーど"),
-        )
-        .unwrap();
-        set_verdict(&conn, "クラウド", Verdict::Accepted, None).unwrap();
-        set_verdict(&conn, "noise", Verdict::Rejected, None).unwrap();
-        seed(&conn, "foo", "pending");
-
-        let written = regenerate_user_dict(&conn, &path).unwrap();
-
-        assert_eq!(written.written, 2, "only accepted surfaces are written");
-        let body = std::fs::read_to_string(&path).unwrap();
-        let rows: Vec<&str> = body.lines().collect();
-        // Sorted by surface; the stored reading is emitted, falling back to the
-        // surface when NULL.
-        assert_eq!(
-            rows,
-            vec![
-                format!("クラウド,{},クラウド", USER_DICT_POS),
-                format!("ハンドロード,{},はんどろーど", USER_DICT_POS),
-            ]
-        );
-    }
-
     // ─── is_valid_candidate tests ────────────────────────────
 
     #[test]
@@ -1664,84 +1307,6 @@ mod tests {
         assert_eq!(summary.rejected_count, 1);
     }
 
-    // ─── load_existing_surfaces tests ────────────────────────
-
-    #[test]
-    fn test_load_existing_surfaces_missing_file() {
-        let result = load_existing_surfaces(Path::new("/nonexistent/dict.csv")).unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_load_existing_surfaces_reads_csv() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let csv_path = dir.path().join("dict.csv");
-        std::fs::write(&csv_path, "candle,名詞,candle\nlindera,名詞,lindera\n").unwrap();
-
-        let surfaces = load_existing_surfaces(&csv_path).unwrap();
-        assert!(surfaces.contains("candle"));
-        assert!(surfaces.contains("lindera"));
-        assert_eq!(surfaces.len(), 2);
-    }
-
-    #[test]
-    fn test_load_existing_surfaces_skips_comments_and_empty() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let csv_path = dir.path().join("dict.csv");
-        std::fs::write(&csv_path, "# comment\n\ncandle,名詞,candle\n").unwrap();
-
-        let surfaces = load_existing_surfaces(&csv_path).unwrap();
-        assert_eq!(surfaces.len(), 1);
-        assert!(surfaces.contains("candle"));
-    }
-
-    /// An NFD-encoded surface (decomposed dakuten) in the CSV must be stored
-    /// under its NFC form, so an NFC-typed lookup matches it.
-    #[test]
-    fn test_load_existing_surfaces_normalizes_nfd_to_nfc() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let csv_path = dir.path().join("dict.csv");
-        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
-        std::fs::write(&csv_path, format!("{nfd_worker},名詞,{nfd_worker}\n")).unwrap();
-
-        let surfaces = load_existing_surfaces(&csv_path).unwrap();
-
-        assert!(surfaces.contains("\u{30ef}\u{30fc}\u{30ac}\u{30fc}")); // ワーガー precomposed
-    }
-
-    /// The dict changes at runtime (`dict add`/`reject`/`rm`) without a daemon
-    /// restart. Before `reset_existing_surfaces`, `with_existing_surfaces` must
-    /// keep returning the stale cached content; after, it must reload and
-    /// reflect the new file.
-    #[test]
-    #[serial_test::serial]
-    fn test_reset_existing_surfaces_reflects_new_content() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::env::set_var("TSM_STATE_DIR", dir.path());
-        config::reload();
-        reset_existing_surfaces(); // clean slate: another test may have warmed the cache
-
-        std::fs::write(config::user_dict_path(), "candle,名詞,candle\n").unwrap();
-        assert!(with_existing_surfaces(|s| s.contains("candle")));
-
-        std::fs::write(config::user_dict_path(), "lindera,名詞,lindera\n").unwrap();
-        assert!(
-            with_existing_surfaces(|s| s.contains("candle")),
-            "cache must still be stale before reset"
-        );
-
-        reset_existing_surfaces();
-
-        assert!(
-            with_existing_surfaces(|s| s.contains("lindera")),
-            "after reset, the new file content must be reflected"
-        );
-        assert!(!with_existing_surfaces(|s| s.contains("candle")));
-
-        std::env::remove_var("TSM_STATE_DIR");
-        config::reload();
-    }
-
     // ─── helper function tests ───────────────────────────────
 
     #[test]
@@ -1761,275 +1326,6 @@ mod tests {
         assert!(!is_ascii_term("123"));
         assert!(!is_ascii_term(""));
         assert!(!is_ascii_term("日本語"));
-    }
-
-    // ─── export_reject_words_to_file tests ───────────────────────
-
-    #[test]
-    fn test_export_reject_words_writes_only_rejected_sorted() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reject_words.txt");
-        set_verdict(&conn, "noise", Verdict::Rejected, None).unwrap();
-        set_verdict(&conn, "bad", Verdict::Rejected, None).unwrap();
-        set_verdict(&conn, "good", Verdict::Accepted, None).unwrap();
-        seed(&conn, "foo", "pending");
-
-        let written = export_reject_words_to_file(&conn, &path).unwrap();
-
-        assert_eq!(written, 2, "only rejected surfaces are written");
-        let body = std::fs::read_to_string(&path).unwrap();
-        let rows: Vec<&str> = body.lines().collect();
-        assert_eq!(rows, vec!["bad", "noise"], "sorted, rejected only");
-    }
-
-    #[test]
-    fn test_export_reject_words_overwrites_stale_content() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reject_words.txt");
-        std::fs::write(&path, "outdated\n").unwrap();
-        set_verdict(&conn, "fresh", Verdict::Rejected, None).unwrap();
-
-        export_reject_words_to_file(&conn, &path).unwrap();
-
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(!body.contains("outdated"), "stale lines are gone");
-        assert!(body.contains("fresh"), "rejected surface is present");
-    }
-
-    #[test]
-    fn test_export_reject_words_empty_truncates() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reject_words.txt");
-        std::fs::write(&path, "outdated\n").unwrap();
-
-        let written = export_reject_words_to_file(&conn, &path).unwrap();
-
-        assert_eq!(written, 0);
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.is_empty(), "no rejected rows truncates the file");
-    }
-
-    // ─── import_reject_words_from_file tests ─────────────────────
-
-    #[test]
-    fn test_import_reject_words_inserts_rejected_skips_comments() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reject_words.txt");
-        std::fs::write(&path, "bad\n# a comment\n\n  noise  \n").unwrap();
-
-        let outcome = import_reject_words_from_file(&conn, &path).unwrap();
-
-        assert_eq!(outcome.imported, 2, "comments and blank lines are skipped");
-        assert_eq!(
-            outcome.dict_affected, 0,
-            "rejecting never-accepted words does not touch the dict"
-        );
-        assert_eq!(status_of(&conn, "bad").as_deref(), Some("rejected"));
-        assert_eq!(status_of(&conn, "noise").as_deref(), Some("rejected"));
-    }
-
-    /// Regression for the 2026-07-06 dict maintenance failure: a `reject_words.txt`
-    /// entry saved in NFD must be found by an NFC-typed `dict reject` lookup —
-    /// both go through the same `nfc()` normalization now.
-    #[test]
-    fn test_import_reject_words_nfd_matches_nfc_lookup() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reject_words.txt");
-        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
-        std::fs::write(&path, format!("{nfd_worker}\n")).unwrap();
-
-        import_reject_words_from_file(&conn, &path).unwrap();
-
-        // The hand-typed NFC form must resolve to the same stored row.
-        assert_eq!(
-            status_of(&conn, "\u{30ef}\u{30fc}\u{30ac}\u{30fc}").as_deref(), // ワーガー precomposed
-            Some("rejected")
-        );
-    }
-
-    #[test]
-    fn test_import_reject_words_demoting_accepted_marks_dict_affected() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reject_words.txt");
-        // `prev` was accepted; rejecting it shrinks the accepted set.
-        set_verdict(&conn, "prev", Verdict::Accepted, None).unwrap();
-        std::fs::write(&path, "prev\n").unwrap();
-
-        let outcome = import_reject_words_from_file(&conn, &path).unwrap();
-
-        assert_eq!(outcome.imported, 1);
-        assert_eq!(
-            outcome.dict_affected, 1,
-            "demoting an accepted word changes the accepted set"
-        );
-    }
-
-    #[test]
-    fn test_import_reject_words_preserves_case() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reject_words.txt");
-        std::fs::write(&path, "FooBar\n").unwrap();
-
-        import_reject_words_from_file(&conn, &path).unwrap();
-
-        // Case is preserved verbatim (the surface is stored as written).
-        assert_eq!(status_of(&conn, "FooBar").as_deref(), Some("rejected"));
-        assert_eq!(status_of(&conn, "foobar"), None);
-    }
-
-    #[test]
-    fn test_import_reject_words_missing_file_is_zero() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("absent.txt");
-
-        let outcome = import_reject_words_from_file(&conn, &path).unwrap();
-
-        assert_eq!(outcome.imported, 0);
-    }
-
-    // ─── import_user_dict_from_file tests ────────────────────────
-
-    #[test]
-    fn test_import_user_dict_inserts_accepted_with_reading() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("user_dict.simpledic");
-        std::fs::write(
-            &path,
-            "ハンドロード,名詞,はんどろーど\n# comment\n\nクラウド,名詞,クラウド\n",
-        )
-        .unwrap();
-
-        let outcome = import_user_dict_from_file(&conn, &path).unwrap();
-
-        assert_eq!(outcome.imported, 2);
-        assert_eq!(
-            status_of(&conn, "ハンドロード").as_deref(),
-            Some("accepted")
-        );
-        assert_eq!(
-            reading_of(&conn, "ハンドロード").as_deref(),
-            Some("はんどろーど")
-        );
-        assert_eq!(status_of(&conn, "クラウド").as_deref(), Some("accepted"));
-        // reading == surface → no distinct reading stored.
-        assert_eq!(reading_of(&conn, "クラウド"), None);
-    }
-
-    #[test]
-    fn test_import_user_dict_empty_reading_is_none() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("user_dict.simpledic");
-        // surface only / surface with empty reading column → no reading stored.
-        std::fs::write(&path, "alpha\nbeta,名詞,\n").unwrap();
-
-        let outcome = import_user_dict_from_file(&conn, &path).unwrap();
-
-        assert_eq!(outcome.imported, 2);
-        assert_eq!(status_of(&conn, "alpha").as_deref(), Some("accepted"));
-        assert_eq!(reading_of(&conn, "alpha"), None);
-        assert_eq!(reading_of(&conn, "beta"), None);
-    }
-
-    #[test]
-    fn test_import_user_dict_missing_file_is_zero() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("absent.simpledic");
-
-        let outcome = import_user_dict_from_file(&conn, &path).unwrap();
-
-        assert_eq!(outcome.imported, 0);
-    }
-
-    #[test]
-    fn test_import_user_dict_round_trips_with_export() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("user_dict.simpledic");
-        set_verdict(&conn, "甲", Verdict::Accepted, Some("こう")).unwrap();
-        set_verdict(&conn, "乙", Verdict::Accepted, None).unwrap();
-        regenerate_user_dict(&conn, &path).unwrap();
-
-        // Fresh DB, import the exported file: same accepted set + readings.
-        let conn2 = setup();
-        let outcome = import_user_dict_from_file(&conn2, &path).unwrap();
-
-        assert_eq!(outcome.imported, 2);
-        assert_eq!(status_of(&conn2, "甲").as_deref(), Some("accepted"));
-        assert_eq!(reading_of(&conn2, "甲").as_deref(), Some("こう"));
-        assert_eq!(status_of(&conn2, "乙").as_deref(), Some("accepted"));
-        assert_eq!(reading_of(&conn2, "乙"), None);
-    }
-
-    // ─── parse_simpledic_line tests ──────────────────────────────
-
-    #[test]
-    fn test_parse_simpledic_line_blank_and_comment() {
-        assert_eq!(parse_simpledic_line("").unwrap(), None);
-        assert_eq!(parse_simpledic_line("   ").unwrap(), None);
-        assert_eq!(parse_simpledic_line("# a comment").unwrap(), None);
-    }
-
-    #[test]
-    fn test_parse_simpledic_line_surface_only() {
-        assert_eq!(
-            parse_simpledic_line("クラウド").unwrap(),
-            Some(("クラウド".to_string(), None))
-        );
-    }
-
-    #[test]
-    fn test_parse_simpledic_line_with_distinct_reading() {
-        assert_eq!(
-            parse_simpledic_line("ハンドロード,名詞,はんどろーど").unwrap(),
-            Some(("ハンドロード".to_string(), Some("はんどろーど".to_string())))
-        );
-    }
-
-    /// An NFD-encoded surface in `user_dict.simpledic` must parse to its NFC
-    /// form, matching the normalization applied everywhere else.
-    #[test]
-    fn test_parse_simpledic_line_normalizes_nfd_surface() {
-        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
-        let nfc_worker = "\u{30ef}\u{30fc}\u{30ac}\u{30fc}"; // ワーガー precomposed
-
-        let parsed = parse_simpledic_line(nfd_worker).unwrap();
-
-        assert_eq!(parsed, Some((nfc_worker.to_string(), None)));
-    }
-
-    #[test]
-    fn test_parse_simpledic_line_reading_equal_surface_is_none() {
-        assert_eq!(
-            parse_simpledic_line("クラウド,名詞,クラウド").unwrap(),
-            Some(("クラウド".to_string(), None))
-        );
-    }
-
-    #[test]
-    fn test_parse_simpledic_line_empty_surface_fails_closed() {
-        // A non-comment line with no surface must error, not silently skip:
-        // skipping it would let the next full rewrite delete a real term.
-        assert!(parse_simpledic_line(",名詞,reading").is_err());
-    }
-
-    #[test]
-    fn test_read_simpledic_surfaces_reports_line_number() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("user_dict.simpledic");
-        std::fs::write(&path, "good\n# c\n,bad\n").unwrap();
-        let err = read_simpledic_surfaces(&path).unwrap_err().to_string();
-        assert!(err.contains(":3:"), "error names the offending line: {err}");
     }
 
     // ─── reconcile_files_into_db tests ───────────────────────────
@@ -2238,42 +1534,7 @@ mod tests {
         assert!(body.contains("新語,名詞,シンゴ"), "new term added: {body}");
     }
 
-    // ─── regenerate_user_dict change detection ───────────────────
-
-    #[test]
-    fn test_regenerate_reports_changed_then_unchanged() {
-        let conn = setup();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("user_dict.simpledic");
-        seed(&conn, "alpha", "accepted");
-
-        let first = regenerate_user_dict(&conn, &path).unwrap();
-        assert!(first.changed, "writing a fresh file counts as changed");
-
-        let second = regenerate_user_dict(&conn, &path).unwrap();
-        assert!(!second.changed, "re-running with no DB change is unchanged");
-    }
-
     // ─── review follow-ups: dup lines, reading sync, import overlap ───
-
-    #[test]
-    fn test_read_simpledic_dedupes_identical_but_errors_on_conflicting_dup() {
-        let dir = tempfile::tempdir().unwrap();
-        let ident = dir.path().join("a.simpledic");
-        std::fs::write(&ident, "x,名詞,x\nx,名詞,x\n").unwrap();
-        assert_eq!(
-            read_simpledic_surfaces(&ident).unwrap().len(),
-            1,
-            "identical dup deduped"
-        );
-
-        let conflicting = dir.path().join("b.simpledic");
-        std::fs::write(&conflicting, "x,名詞,r1\nx,名詞,r2\n").unwrap();
-        let err = read_simpledic_surfaces(&conflicting)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("different readings"), "{err}");
-    }
 
     #[test]
     fn test_reconcile_syncs_hand_edited_reading_on_accepted() {
