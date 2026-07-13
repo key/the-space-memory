@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use the_space_memory::{config, embedder, indexer, status, tokenizer, user_dict};
@@ -8,6 +8,23 @@ use crate::backfill_logic::yield_to_pending_writes;
 use crate::SHUTDOWN;
 
 // ─── Backfill ───────────────────────────────────────────────────────
+
+/// Outcome of a [`run_backfill_pass`] call.
+///
+/// `run_reindex_vectors_pass` calls `run_backfill_pass` for its embedding
+/// phase (with `state_dir: None`, since it tracks `s.reindex` itself instead
+/// of `s.backfill`) and needs to know whether that nested pass actually
+/// finished — folding `completed`/`errors` into its own completion decision
+/// keeps `s.reindex` from being cleared as "complete" when the backfill
+/// underneath it aborted (a poisoned lock or batch error), which would be
+/// the same status-lies-about-progress failure mode this module now guards
+/// `s.backfill` against, one level up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BackfillPassOutcome {
+    pub completed: bool,
+    pub filled: usize,
+    pub errors: usize,
+}
 
 /// Run one full backfill pass, releasing the DB lock between batches
 /// so pending write requests can proceed.
@@ -21,14 +38,17 @@ pub fn run_backfill_pass(
     conn: &Arc<Mutex<rusqlite::Connection>>,
     writes_pending: &Arc<AtomicUsize>,
     state_dir: Option<&Path>,
-) {
+) -> BackfillPassOutcome {
     let encode_fn = |texts: &[String]| {
         embedder::embed_via_socket(texts).ok_or_else(|| anyhow::anyhow!("embedder not available"))
     };
 
     if let Some(dir) = state_dir {
         let total = {
-            let Ok(conn) = conn.lock() else { return };
+            let Ok(conn) = conn.lock() else {
+                log::error!("backfill: DB mutex poisoned; aborting before start");
+                return BackfillPassOutcome::default();
+            };
             indexer::count_missing(&conn)
         };
         status::update(dir, |s| {
@@ -44,6 +64,11 @@ pub fn run_backfill_pass(
     let mut last_id: i64 = 0;
     let mut total_filled: usize = 0;
     let mut total_errors: usize = 0;
+    // Only a clean `!has_more` exit is true completion; a poisoned lock, a
+    // shutdown, or a batch error all leave `s.backfill` populated (mirroring
+    // `run_reindex_fts_pass`) so `doctor`/`status` can surface the abnormal
+    // stop instead of reporting a finished pass that didn't actually finish.
+    let mut completed = false;
 
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -55,7 +80,10 @@ pub fn run_backfill_pass(
         }
 
         // Lock DB only for this one batch
-        let Ok(conn) = conn.lock() else { break };
+        let Ok(conn) = conn.lock() else {
+            log::error!("backfill: DB mutex poisoned mid-batch (last_id={last_id})");
+            break;
+        };
         let result =
             indexer::backfill_next_batch(&conn, &encode_fn, config::BACKFILL_BATCH_SIZE, last_id);
         drop(conn); // release lock immediately after batch
@@ -74,11 +102,12 @@ pub fn run_backfill_pass(
                     });
                 }
                 if !has_more {
+                    completed = true;
                     break;
                 }
             }
             Err(e) => {
-                log::warn!("backfill batch error: {e}");
+                log::error!("backfill batch error (last_id={last_id}): {e}");
                 break;
             }
         }
@@ -89,22 +118,42 @@ pub fn run_backfill_pass(
     }
 
     if let Some(dir) = state_dir {
-        if SHUTDOWN.load(Ordering::SeqCst) {
-            log::warn!("backfill interrupted by shutdown; status left populated");
+        if completed {
+            status::update(dir, |s| s.backfill = None);
+        } else {
+            log::warn!("backfill did not complete; status left populated");
             // Leave s.backfill populated so doctor/status can report the
             // incomplete state; the next daemon startup clears it.
-        } else {
-            status::update(dir, |s| s.backfill = None);
         }
+    }
+
+    BackfillPassOutcome {
+        completed,
+        filled: total_filled,
+        errors: total_errors,
     }
 }
 
 /// Run periodic backfill in tsmd, yielding to pending write requests.
+///
+/// `reindex_active` is the same flag `handle_client`'s `Reindex` branch
+/// claims via `ReindexGuard` for any [`ReindexKind`](the_space_memory::daemon_protocol::ReindexKind)
+/// (Fts, Vectors, or All): a `Vectors`/`All` reindex's embedding phase already
+/// tracks progress under `s.reindex` (via its own, guard-internal call to
+/// `run_backfill_pass` with `state_dir: None`), so a periodic tick landing
+/// mid-reindex would race it — both threads writing `s.backfill`/`s.reindex`
+/// for the same rows — and reintroduce the misleading-progress problem this
+/// module now guards against. The flag is checked unconditionally rather
+/// than only for `Vectors`/`All`, since a bare `Fts` reindex holds it too and
+/// special-casing which kinds actually touch `s.backfill` isn't worth the
+/// extra branching for one skipped tick. The skipped work is simply picked
+/// up on the next tick once the reindex (and its own backfill) has finished.
 pub fn periodic_backfill(
     conn: &Arc<Mutex<rusqlite::Connection>>,
     writes_pending: &Arc<AtomicUsize>,
     interval_secs: u64,
     state_dir: &Path,
+    reindex_active: &Arc<AtomicBool>,
 ) {
     let interval = std::time::Duration::from_secs(interval_secs);
 
@@ -114,6 +163,12 @@ pub fn periodic_backfill(
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             break;
+        }
+
+        if reindex_active.load(Ordering::Acquire) {
+            log::debug!("periodic backfill: reindex in progress, skipping this tick");
+            sleep_interruptible(interval);
+            continue;
         }
 
         let sock = config::embedder_socket_path();
@@ -297,13 +352,33 @@ pub fn run_reindex_vectors_pass(
     log::info!("reindex vectors: cleared, starting backfill...");
     // `None`: this pass's progress is already tracked under `s.reindex`
     // above; writing `s.backfill` too would double-count the same work.
-    run_backfill_pass(conn, writes_pending, None);
+    let outcome = run_backfill_pass(conn, writes_pending, None);
 
-    if SHUTDOWN.load(Ordering::SeqCst) {
-        log::warn!("reindex vectors interrupted by shutdown");
+    if outcome.errors > 0 {
+        status::update(state_dir, |s| {
+            if let Some(ref mut r) = s.reindex {
+                r.errors = outcome.errors as i64;
+            }
+        });
+    }
+
+    // `outcome.completed` folds in the nested backfill's own poisoned-lock
+    // and batch-error exits, not just `SHUTDOWN` — otherwise a backfill that
+    // aborted abnormally (vectors just cleared, never fully repopulated)
+    // would still be reported as a clean "complete" here.
+    if SHUTDOWN.load(Ordering::SeqCst) || !outcome.completed {
+        log::warn!(
+            "reindex vectors did not complete ({} filled, {} errors); status left populated",
+            outcome.filled,
+            outcome.errors
+        );
         // Leave s.reindex populated so doctor can report the incomplete state
     } else {
-        log::info!("reindex vectors: complete");
+        log::info!(
+            "reindex vectors: complete ({} filled, {} errors)",
+            outcome.filled,
+            outcome.errors
+        );
         status::update(state_dir, |s| s.reindex = None);
     }
 }

@@ -35,10 +35,10 @@ pub struct StaleProgressCleared {
 /// Clear `backfill`/`reindex` progress left over from a previous daemon's
 /// interrupted run. A fresh daemon start means no such pass can still be
 /// executing, so a populated entry is always a leftover, never live progress —
-/// left alone, it renders in `tsm status`/`tsm doctor` as an indefinitely
-/// "running" operation with an ever-worsening ETA. Other status fields
-/// (`daemon`, `embedder`, `watcher`) are untouched; the caller sets those
-/// separately for the current process.
+/// left alone, `backfill` renders in `tsm status` (and both render in `tsm
+/// doctor`) as an indefinitely "running" operation with an ever-worsening
+/// ETA. Other status fields (`daemon`, `embedder`, `watcher`) are untouched;
+/// the caller sets those separately for the current process.
 pub fn clear_stale_progress(sf: &mut StatusFile) -> StaleProgressCleared {
     StaleProgressCleared {
         backfill: sf.backfill.take().is_some(),
@@ -221,6 +221,24 @@ mod tests {
         assert!(cleared.backfill);
         assert!(!cleared.reindex);
         assert!(sf.backfill.is_none());
+    }
+
+    #[test]
+    fn test_clear_stale_progress_only_reindex_present() {
+        let mut sf = StatusFile {
+            reindex: Some(the_space_memory::status::ReindexStatus {
+                kind: ReindexKind::Vectors,
+                total: 1,
+                processed: 0,
+                errors: 0,
+                started_at: "t0".to_string(),
+            }),
+            ..Default::default()
+        };
+        let cleared = clear_stale_progress(&mut sf);
+        assert!(!cleared.backfill);
+        assert!(cleared.reindex);
+        assert!(sf.reindex.is_none());
     }
 
     #[test]

@@ -236,9 +236,9 @@ pub fn render_status(info: &StatusInfo, now: DateTime<Utc>) -> String {
     out
 }
 
-/// Format an RFC3339 instant relative to `now`: a same-day timestamp
-/// (< 24h away, in either direction) renders as `HH:MM:SS`; anything older
-/// (or, under clock skew, further in the future) includes the date so a
+/// Format an RFC3339 instant relative to `now`: within a rolling 24h window
+/// of `now` (in either direction) it renders as `HH:MM:SS`; past that window
+/// (or, under clock skew, further in the future) it includes the date so a
 /// stale entry from days ago cannot be mistaken for one that started this
 /// morning. Falls back to the raw string when it cannot be parsed.
 fn format_since(rfc3339: &str, now: DateTime<Utc>) -> String {
@@ -611,6 +611,20 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(format_since("2026-06-26T06:52:01Z", now), "06:52:01");
+    }
+
+    #[test]
+    fn format_since_exactly_24h_falls_back_to_date() {
+        // The boundary itself: `>= 24` is what triggers the date fallback, so
+        // this guards against an off-by-one (e.g. a `> 24` regression) on the
+        // one comparison the whole #355 fix hinges on.
+        let now = DateTime::parse_from_rfc3339("2026-06-27T06:52:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            format_since("2026-06-26T06:52:01Z", now),
+            "2026-06-26 06:52:01"
+        );
     }
 
     #[test]

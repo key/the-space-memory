@@ -256,6 +256,7 @@ pub fn run(args: Args) -> Result<()> {
         let conn = Arc::clone(&conn);
         let writes_pending = Arc::clone(&writes_pending);
         let state_dir = state_dir.clone();
+        let reindex_active = Arc::clone(&reindex_active);
         std::thread::spawn(move || {
             let sock = config::embedder_socket_path();
             for _ in 0..120 {
@@ -268,9 +269,34 @@ pub fn run(args: Args) -> Result<()> {
                 log::warn!("embedder socket not ready; skipping startup backfill");
                 return;
             }
+            // A client could already have started `tsm reindex` (any kind) in
+            // the window between the accept loop opening and this wait
+            // finishing (up to ~60s while polling for the embedder socket); a
+            // `Vectors`/`All` reindex tracks its own backfill phase under
+            // `s.reindex`, so skip here rather than race it — checking the
+            // flag for every kind (not just Vectors) is simpler than special-
+            // casing which kinds actually touch `s.backfill`, and the
+            // periodic backfill thread picks up any remaining work afterward.
+            if reindex_active.load(Ordering::Acquire) {
+                log::info!("reindex in progress; skipping startup backfill");
+                return;
+            }
             log::info!("starting startup backfill...");
-            backfill_proc::run_backfill_pass(&conn, &writes_pending, Some(&state_dir));
-            log::info!("startup backfill complete");
+            let outcome =
+                backfill_proc::run_backfill_pass(&conn, &writes_pending, Some(&state_dir));
+            if outcome.completed {
+                log::info!(
+                    "startup backfill complete ({} filled, {} errors)",
+                    outcome.filled,
+                    outcome.errors
+                );
+            } else {
+                log::warn!(
+                    "startup backfill did not complete cleanly ({} filled, {} errors)",
+                    outcome.filled,
+                    outcome.errors
+                );
+            }
         });
     }
 
@@ -280,12 +306,14 @@ pub fn run(args: Args) -> Result<()> {
         let conn = Arc::clone(&conn);
         let writes_pending = Arc::clone(&writes_pending);
         let state_dir = state_dir.clone();
+        let reindex_active = Arc::clone(&reindex_active);
         std::thread::spawn(move || {
             backfill_proc::periodic_backfill(
                 &conn,
                 &writes_pending,
                 backfill_interval_secs,
                 &state_dir,
+                &reindex_active,
             );
         });
     }
