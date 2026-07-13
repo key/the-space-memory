@@ -52,8 +52,8 @@ pub fn reindex_fts_batch_size() -> usize {
 ///
 /// Resolved directly from `TSM_STDERR_CAP_BYTES` rather than through the
 /// `ResolvedConfig`/tsm.toml pipeline the other accessors in this file use:
-/// `config.rs` is already well past its ADR-0018 per-file line-count gate
-/// baseline, and this one knob does not carry its weight there. If a
+/// `config.rs` is already well past its per-file line-count gate baseline,
+/// and this one knob does not carry its weight there. If a
 /// tsm.toml key is wanted later, resolving it costs the same
 /// `env > file > default` precedence as every other setting — moving it into
 /// `ResolvedConfig` then is a config.rs line-budget problem to solve on its

@@ -47,6 +47,7 @@ which additionally consults the user config directory:
 | `TSM_USER_DICT` | path | `{state_dir}/user_dict.simpledic` | `user_dict_path` | Path to the lindera user dictionary |
 | `TSM_SETUP_LINK_MODE` | enum | `symlink` | `[setup].link_mode` | How `tsm setup` materializes cached resources: `symlink` or `copy` |
 | `TSM_INIT_LINK_MODE` | enum | `symlink` | `[init].link_mode` | How `tsm init` links workspace resources to the cache: `symlink` or `copy` |
+| `TSM_STDERR_CAP_BYTES` | u64 (bytes) | `20000000` | _(no toml equiv)_ | Size cap for `tsmd-stderr.log`; the daemon truncates the file once it grows past this during a single long-lived session (also truncated at every `tsm start`). `0` or an unparseable value falls back to the default |
 
 ## Standard and External Variables
 

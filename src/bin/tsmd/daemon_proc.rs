@@ -367,6 +367,18 @@ const STDERR_CAP_CHECK_INTERVAL_SECS: u64 = 30;
 /// at the fresh offset instead of re-extending the file with a zero-filled
 /// hole up to their old, now-invalid position.
 fn cap_stderr_log(check_interval_secs: u64, cap_bytes: u64) {
+    // A foreground `tsmd` inherits a tty (or is piped) on fd 2, not the
+    // captured `tsmd-stderr.log` file `cmd_start` sets up for a detached
+    // run. `lseek`/`ftruncate` are meaningless there (`lseek` on a tty fails
+    // with ESPIPE), and a *stale*, over-cap log file left over from a
+    // previous detached run would otherwise make every check interval log a
+    // "lseek failed" warning for the lifetime of the foreground session.
+    // Checked once at thread start, not per-iteration, since fd 2's identity
+    // cannot change during the daemon's lifetime.
+    if !stderr_is_regular_file() {
+        log::debug!("stderr cap: fd 2 is not a regular file (foreground run?); skipping");
+        return;
+    }
     let interval = std::time::Duration::from_secs(check_interval_secs);
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -384,6 +396,19 @@ fn cap_stderr_log(check_interval_secs: u64, cap_bytes: u64) {
         }
         backfill_proc::sleep_interruptible(interval);
     }
+}
+
+/// True when fd 2 (this process's stderr) is a regular file, i.e. `cmd_start`
+/// redirected it to `tsmd-stderr.log` (the detached-daemon case). False for a
+/// tty or pipe (a foreground `tsmd`), where the cap has nothing meaningful to
+/// act on.
+fn stderr_is_regular_file() -> bool {
+    // SAFETY: `stat` is a plain-old-data out-parameter; `fstat` only writes
+    // to it and reads STDERR_FILENO's metadata, neither of which can
+    // invalidate any Rust reference.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(libc::STDERR_FILENO, &mut stat) };
+    rc == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
 }
 
 /// Reset fd 2 (this process's stderr) to empty, in place.
