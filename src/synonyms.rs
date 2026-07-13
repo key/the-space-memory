@@ -116,12 +116,14 @@ pub fn expand_query_synonyms(
     expansions
 }
 
-/// Normalize and order a word pair: trim, lowercase, then sort so the result is
-/// `(lo, hi)` with `lo <= hi`. Shared by every site that stores or looks up a
-/// pair so the normalization rule lives in one place.
+/// Normalize and order a word pair: NFC, trim, lowercase, then sort so the
+/// result is `(lo, hi)` with `lo <= hi`. Shared by every site that stores or
+/// looks up a pair so the normalization rule lives in one place — including
+/// `add_user_synonym`'s CLI input, so a hand-typed word matches a
+/// CSV-imported one regardless of source encoding.
 fn normalize_pair(a: &str, b: &str) -> (String, String) {
-    let a = a.trim().to_lowercase();
-    let b = b.trim().to_lowercase();
+    let a = crate::normalize::nfc_lower(a);
+    let b = crate::normalize::nfc_lower(b);
     if a < b {
         (a, b)
     } else {
@@ -255,8 +257,8 @@ fn parse_synonym_csv(content: &str) -> (HashSet<(String, String)>, usize) {
             skipped += 1;
             continue;
         }
-        let a = parts[0].trim().to_lowercase();
-        let b = parts[1].trim().to_lowercase();
+        let a = crate::normalize::nfc(parts[0].trim()).to_lowercase();
+        let b = crate::normalize::nfc(parts[1].trim()).to_lowercase();
         if a.is_empty() || b.is_empty() || a == b {
             log::warn!(
                 "synonyms.csv line {}: skipping invalid pair: {:?}",
@@ -976,6 +978,28 @@ mod tests {
         assert_eq!(user_count(&conn), 2);
     }
 
+    /// An NFD-encoded CSV pair must import under its NFC form, so a later
+    /// CLI `synonym add` with NFC input upserts into the same row instead of
+    /// creating a byte-mismatched duplicate.
+    #[test]
+    fn test_import_user_synonyms_normalizes_nfd_to_nfc() {
+        let conn = setup();
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        let nfc_worker = "\u{30ef}\u{30fc}\u{30ac}\u{30fc}"; // ワーガー precomposed
+
+        import_user_synonyms(&conn, &format!("{nfd_worker},作業員\n"), true).unwrap();
+
+        let (a, b): (String, String) = conn
+            .query_row("SELECT word_a, word_b FROM synonyms", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert!(
+            a == nfc_worker || b == nfc_worker,
+            "expected NFC form '{nfc_worker}' in stored pair ({a}, {b})"
+        );
+    }
+
     #[test]
     fn test_import_user_synonyms_idempotent() {
         let conn = setup();
@@ -1162,6 +1186,25 @@ mod tests {
             .unwrap();
         assert_eq!(a, "lora");
         assert_eq!(b, "lpwan");
+    }
+
+    /// A CLI `synonym add` with NFD input must resolve to the same pair as
+    /// its NFC-imported counterpart, upserting rather than duplicating.
+    #[test]
+    fn test_add_user_synonym_normalizes_nfd_to_nfc() {
+        let conn = setup();
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        let nfc_worker = "\u{30ef}\u{30fc}\u{30ac}\u{30fc}"; // ワーガー precomposed
+        import_user_synonyms(&conn, &format!("{nfc_worker},作業員\n"), true).unwrap();
+        assert_eq!(user_count(&conn), 1);
+
+        add_user_synonym(&conn, nfd_worker, "作業員").unwrap();
+
+        assert_eq!(
+            user_count(&conn),
+            1,
+            "NFD CLI input must upsert into the existing NFC-stored pair, not duplicate it"
+        );
     }
 
     #[test]

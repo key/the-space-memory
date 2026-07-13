@@ -27,7 +27,14 @@ pub(crate) struct QueryPlan {
 /// Returns `Ok(None)` if the query contains too few meaningful keywords to
 /// search (the caller should return an empty result set). Returns
 /// `Ok(Some(QueryPlan))` otherwise.
+///
+/// The query is normalized to NFC first, matching the normalization
+/// `prepare_text` applies on the index side — the same query keywords,
+/// classification, expansion, and embedding regardless of the query's source
+/// encoding.
 pub(crate) fn plan(conn: &Connection, query: &str) -> anyhow::Result<Option<QueryPlan>> {
+    let query = crate::normalize::nfc(query);
+    let query = query.as_ref();
     let keywords = extract_search_keywords(query);
     if keywords.len() < config::MIN_QUERY_KEYWORDS {
         return Ok(None);
@@ -132,5 +139,21 @@ mod tests {
             result.is_none(),
             "Interjection query should return None from plan()"
         );
+    }
+
+    /// An NFD query (decomposed dakuten on ジ) must yield the same keywords
+    /// as its NFC equivalent — `plan()` normalizes before keyword extraction
+    /// so the query's source encoding cannot change the result.
+    #[test]
+    fn test_plan_normalizes_nfd_query_to_match_nfc() {
+        let conn = db::get_memory_connection().unwrap();
+        let nfc_query = "LoRaモジュール 開発";
+        let nfd_query = "LoRa\u{30e2}\u{30b7}\u{3099}\u{30e5}\u{30fc}\u{30eb} \u{958b}\u{767a}";
+        assert_ne!(nfc_query, nfd_query);
+
+        let from_nfc = plan(&conn, nfc_query).unwrap().expect("meaningful query");
+        let from_nfd = plan(&conn, nfd_query).unwrap().expect("meaningful query");
+
+        assert_eq!(from_nfc.keywords_query, from_nfd.keywords_query);
     }
 }

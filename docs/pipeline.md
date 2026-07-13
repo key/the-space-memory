@@ -83,6 +83,10 @@ regression it prevents.
    post-commit plus backfill). *(Breaking it couples indexing throughput and
    availability to the embedder: a slow or stopped embedder would stall or
    fail indexing instead of degrading to FTS-only.)*
+6. **Normalization consistency** — Prepare and Plan apply the same canonical
+   normalization (NFC); changing it requires a re-index. *(Breaking it makes
+   NFC/NFD variants of the same text diverge between index and query,
+   silently losing recall.)*
 
 ## Hook insertion points
 

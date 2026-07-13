@@ -174,7 +174,7 @@ pub fn load_existing_surfaces(csv_path: &Path) -> anyhow::Result<HashSet<String>
             continue;
         }
         if let Some(surface) = line.split(',').next() {
-            let surface = surface.trim().to_lowercase();
+            let surface = crate::normalize::nfc_lower(surface);
             if !surface.is_empty() {
                 surfaces.insert(surface);
             }
@@ -411,8 +411,7 @@ pub fn candidate_summary(conn: &Connection) -> CandidateSummary {
 /// nonexistent term has nothing to reset.
 ///
 /// `reading` is only meaningful when accepting; it is stored verbatim (the
-/// caller normalizes). A non-NULL `reading` overwrites; `None`
-/// preserves any existing reading (`COALESCE`).
+/// caller normalizes). A non-NULL `reading` overwrites; `None` preserves any existing reading (`COALESCE`).
 ///
 /// The SELECT and the write run in one transaction so the returned
 /// [`Transition`] always matches the committed DB state.
@@ -440,13 +439,7 @@ pub(crate) fn set_verdict_in(
     to: Verdict,
     reading: Option<&str>,
 ) -> Result<Transition, SetVerdictError> {
-    let current: Option<String> = conn
-        .query_row(
-            "SELECT status FROM dictionary_candidates WHERE surface = ?1",
-            [surface],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let current = find_status(conn, surface)?;
 
     let from = match current.as_deref() {
         None => None,
@@ -518,16 +511,17 @@ fn surface_has_kanji(s: &str) -> bool {
 }
 
 /// Resolve the reading stored by `dict add`.
-///
-/// An explicit `yomi` is used verbatim. When omitted, the surface stands in as
-/// its own reading; the returned bool is `true` when the surface contains kanji,
-/// so the caller can warn and surface the data debt (automatic readings are
-/// never inferred — added terms are exactly the words lindera does not know).
-/// Readings are stored only; search is surface-based today.
+/// An explicit `yomi` is normalized to NFC and used as-is. When omitted, the
+/// normalized surface stands in as its own reading; the returned bool is
+/// `true` when the surface contains kanji, so the caller can warn and surface
+/// the data debt (automatic readings are never inferred — added terms are
+/// exactly the words lindera does not know). Readings are stored only; search
+/// is surface-based today.
 pub fn resolve_reading(surface: &str, yomi: Option<&str>) -> (String, bool) {
+    let normalized_surface = crate::normalize::nfc(surface);
     match yomi {
-        Some(y) => (y.to_string(), false),
-        None => (surface.to_string(), surface_has_kanji(surface)),
+        Some(y) => (crate::normalize::nfc(y).into_owned(), false),
+        None => (normalized_surface.into_owned(), surface_has_kanji(surface)),
     }
 }
 
@@ -654,7 +648,7 @@ fn parse_simpledic_line(line: &str) -> anyhow::Result<Option<(String, Option<Str
         return Ok(None);
     }
     let mut cols = trimmed.split(',');
-    let surface = cols.next().map(str::trim).unwrap_or("");
+    let surface = crate::normalize::nfc(cols.next().map(str::trim).unwrap_or("")).into_owned();
     if surface.is_empty() {
         anyhow::bail!("missing surface (first column is empty)");
     }
@@ -662,9 +656,9 @@ fn parse_simpledic_line(line: &str) -> anyhow::Result<Option<(String, Option<Str
         .next() // pos column (ignored)
         .and(cols.next())
         .map(str::trim)
-        .filter(|r| !r.is_empty() && *r != surface)
-        .map(str::to_string);
-    Ok(Some((surface.to_string(), reading)))
+        .map(|r| crate::normalize::nfc(r).into_owned())
+        .filter(|r| !r.is_empty() && *r != surface);
+    Ok(Some((surface, reading)))
 }
 
 /// Read `user_dict.simpledic` into `(surface, reading)` rows, failing closed on
@@ -716,7 +710,7 @@ fn read_reject_surfaces(path: &Path) -> anyhow::Result<Vec<String>> {
         if surface.is_empty() || surface.starts_with('#') {
             continue;
         }
-        out.push(surface.to_string());
+        out.push(crate::normalize::nfc(surface).into_owned());
     }
     Ok(out)
 }
@@ -768,16 +762,26 @@ pub fn import_user_dict_from_file(conn: &Connection, path: &Path) -> anyhow::Res
     Ok(outcome)
 }
 
+/// Resolve `surface`'s status by exact match, migrating in place a legacy
+/// row whose surface normalizes to the same NFC form on a miss (small table).
+fn find_status(conn: &Connection, surface: &str) -> Result<Option<String>, rusqlite::Error> {
+    let sql = "SELECT status FROM dictionary_candidates WHERE surface = ?1";
+    let exact: Option<String> = conn.query_row(sql, [surface], |r| r.get(0)).optional()?;
+    let None = exact else { return Ok(exact) };
+    let hit = conn
+        .prepare("SELECT surface, status FROM dictionary_candidates")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .flatten()
+        .find(|(s, _)| crate::normalize::nfc(s).as_ref() == surface);
+    let Some(hit) = hit else { return Ok(None) };
+    let update = "UPDATE dictionary_candidates SET surface = ?1 WHERE surface = ?2";
+    conn.execute(update, rusqlite::params![surface, hit.0])?;
+    Ok(Some(hit.1))
+}
+
 /// Current DB verdict for `surface`, or `None` if it has no candidate row.
 fn db_status(conn: &Connection, surface: &str) -> anyhow::Result<Option<Verdict>> {
-    let raw: Option<String> = conn
-        .query_row(
-            "SELECT status FROM dictionary_candidates WHERE surface = ?1",
-            [surface],
-            |r| r.get(0),
-        )
-        .optional()?;
-    match raw {
+    match find_status(conn, surface)? {
         None => Ok(None),
         Some(s) => Verdict::from_status(&s)
             .map(Some)
@@ -805,19 +809,15 @@ impl ReconcileOutcome {
 /// hand-edited file. The DB becomes a faithful image of disk before any
 /// rewrite, making the DB-as-authority model self-healing.
 ///
-/// Insert-or-promote, never override an opposing verdict:
-/// - simpledic surface: absent → insert `accepted`; `pending` → promote to
-///   `accepted` (presence in the dict file is an accept); `accepted` → no-op.
-/// - reject surface: absent → insert `rejected`; `pending` → promote to
-///   `rejected`; `rejected` → no-op.
-///
-/// **Fails closed with no writes** on any contradiction — a surface in both
-/// files, a simpledic surface already `rejected` in the DB, or a reject surface
-/// already `accepted` in the DB — so an ambiguous state never silently demotes a
-/// term. All parsing + conflict detection happens before the first write, and
-/// the caller drives this inside one transaction, so an abort leaves the DB
-/// completely unchanged. A malformed simpledic line also fails closed (see
-/// [`read_simpledic_surfaces`]).
+/// Insert-or-promote, never override an opposing verdict: an absent or
+/// `pending` surface is inserted/promoted to the file's verdict (`accepted`
+/// for simpledic, `rejected` for reject); an already-matching status is a
+/// no-op. **Fails closed with no writes** on any contradiction — a surface in
+/// both files, or a DB verdict opposing the file's — so an ambiguous state
+/// never silently demotes a term; a malformed simpledic line also fails
+/// closed (see [`read_simpledic_surfaces`]). All parsing + conflict detection
+/// happens before the first write, inside the caller's one transaction, so
+/// an abort leaves the DB completely unchanged.
 pub fn reconcile_files_into_db(
     conn: &Connection,
     simpledic_path: &Path,
@@ -1016,6 +1016,36 @@ mod tests {
         assert_eq!(t.to, Verdict::Accepted);
         assert!(t.affected_dict, "entering accepted touches the dict");
         assert_eq!(status_of(&conn, "candle").as_deref(), Some("accepted"));
+    }
+
+    /// A legacy row written before this crate normalized surfaces (an NFD
+    /// surface inserted directly, bypassing every normalized load/CLI path)
+    /// must be found — not duplicated — when a caller supplies its NFC form.
+    /// `find_status` migrates the row's key in place on the first
+    /// touch, so a verdict change against it converges without a rebuild.
+    #[test]
+    fn test_set_verdict_migrates_legacy_nfd_surface_key() {
+        let conn = setup();
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        let nfc_worker = "\u{30ef}\u{30fc}\u{30ac}\u{30fc}"; // ワーガー precomposed
+        seed(&conn, nfd_worker, "accepted");
+
+        let t = set_verdict(&conn, nfc_worker, Verdict::Rejected, None).unwrap();
+
+        assert_eq!(t.from, Some(Verdict::Accepted));
+        assert_eq!(t.to, Verdict::Rejected);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dictionary_candidates", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "must migrate the legacy row, not duplicate it");
+        assert_eq!(status_of(&conn, nfc_worker).as_deref(), Some("rejected"));
+        assert_eq!(
+            status_of(&conn, nfd_worker),
+            None,
+            "old NFD key must no longer exist"
+        );
     }
 
     #[test]
@@ -1665,6 +1695,20 @@ mod tests {
         assert!(surfaces.contains("candle"));
     }
 
+    /// An NFD-encoded surface (decomposed dakuten) in the CSV must be stored
+    /// under its NFC form, so an NFC-typed lookup matches it.
+    #[test]
+    fn test_load_existing_surfaces_normalizes_nfd_to_nfc() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let csv_path = dir.path().join("dict.csv");
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        std::fs::write(&csv_path, format!("{nfd_worker},名詞,{nfd_worker}\n")).unwrap();
+
+        let surfaces = load_existing_surfaces(&csv_path).unwrap();
+
+        assert!(surfaces.contains("\u{30ef}\u{30fc}\u{30ac}\u{30fc}")); // ワーガー precomposed
+    }
+
     // ─── helper function tests ───────────────────────────────
 
     #[test]
@@ -1753,6 +1797,26 @@ mod tests {
         );
         assert_eq!(status_of(&conn, "bad").as_deref(), Some("rejected"));
         assert_eq!(status_of(&conn, "noise").as_deref(), Some("rejected"));
+    }
+
+    /// Regression for the 2026-07-06 dict maintenance failure: a `reject_words.txt`
+    /// entry saved in NFD must be found by an NFC-typed `dict reject` lookup —
+    /// both go through the same `nfc()` normalization now.
+    #[test]
+    fn test_import_reject_words_nfd_matches_nfc_lookup() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reject_words.txt");
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        std::fs::write(&path, format!("{nfd_worker}\n")).unwrap();
+
+        import_reject_words_from_file(&conn, &path).unwrap();
+
+        // The hand-typed NFC form must resolve to the same stored row.
+        assert_eq!(
+            status_of(&conn, "\u{30ef}\u{30fc}\u{30ac}\u{30fc}").as_deref(), // ワーガー precomposed
+            Some("rejected")
+        );
     }
 
     #[test]
@@ -1899,6 +1963,18 @@ mod tests {
         );
     }
 
+    /// An NFD-encoded surface in `user_dict.simpledic` must parse to its NFC
+    /// form, matching the normalization applied everywhere else.
+    #[test]
+    fn test_parse_simpledic_line_normalizes_nfd_surface() {
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        let nfc_worker = "\u{30ef}\u{30fc}\u{30ac}\u{30fc}"; // ワーガー precomposed
+
+        let parsed = parse_simpledic_line(nfd_worker).unwrap();
+
+        assert_eq!(parsed, Some((nfc_worker.to_string(), None)));
+    }
+
     #[test]
     fn test_parse_simpledic_line_reading_equal_surface_is_none() {
         assert_eq!(
@@ -1976,6 +2052,33 @@ mod tests {
         let out = reconcile_files_into_db(&conn, &sp, &rp).unwrap();
 
         assert_eq!(out.accepted_healed, 0, "already accepted needs no heal");
+    }
+
+    /// The reconcile path shares `db_status`'s legacy-key migration: a row
+    /// seeded before this crate normalized surfaces (an NFD surface) must be
+    /// recognized as already accepted when `user_dict.simpledic` names its
+    /// NFC form, instead of reconcile treating it as a new term to heal.
+    #[test]
+    fn test_reconcile_migrates_legacy_nfd_surface_key() {
+        let conn = setup();
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        let nfc_worker = "\u{30ef}\u{30fc}\u{30ac}\u{30fc}"; // ワーガー precomposed
+        seed(&conn, nfd_worker, "accepted");
+        let dir = tempfile::tempdir().unwrap();
+        let (sp, rp) = write_files(dir.path(), &format!("{nfc_worker}\n"), "");
+
+        let out = reconcile_files_into_db(&conn, &sp, &rp).unwrap();
+
+        assert_eq!(
+            out.accepted_healed, 0,
+            "already accepted (legacy NFD row) needs no heal"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dictionary_candidates", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "must migrate the legacy row, not duplicate it");
     }
 
     #[test]

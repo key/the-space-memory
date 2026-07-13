@@ -128,8 +128,12 @@ fn compile_custom_terms(entities: &[Entity]) -> Vec<CompiledTerm> {
         .collect()
 }
 
+/// NFC-normalize, trim, and lowercase. Shared by every entity-name site —
+/// custom_terms.toml load, proper-noun extraction, and tag entities — so a
+/// `custom_terms.toml` entry matches an equivalent name extracted from
+/// (already-NFC) chunk text regardless of the source file's encoding.
 fn normalize(s: &str) -> String {
-    s.trim().to_lowercase()
+    crate::normalize::nfc_lower(s)
 }
 
 /// Extract proper noun entities from chunk text via lindera POS analysis.
@@ -939,6 +943,20 @@ type = "tech"
         assert_eq!(terms.len(), 2); // "x" filtered (< 2 chars)
         assert!(terms.iter().any(|t| t.name == "candle"));
         assert!(terms.iter().any(|t| t.name == "lindera"));
+    }
+
+    /// An NFD-encoded term name in `custom_terms.toml` must normalize to its
+    /// NFC form, so it matches proper nouns extracted from (already-NFC)
+    /// chunk text regardless of how the TOML file was hand-typed.
+    #[test]
+    fn test_parse_custom_terms_normalizes_nfd_to_nfc() {
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        let nfc_worker = "\u{30ef}\u{30fc}\u{30ac}\u{30fc}"; // ワーガー precomposed
+        let toml = format!("[[terms]]\nname = \"{nfd_worker}\"\ntype = \"tech\"\n");
+
+        let terms = parse_custom_terms(&toml);
+
+        assert_eq!(terms[0].name, nfc_worker);
     }
 
     #[test]

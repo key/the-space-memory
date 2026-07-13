@@ -1664,7 +1664,7 @@ fn mutate_verdict(
         &config::user_dict_path(),
         &config::reject_words_path(),
     )?;
-    let t = user_dict::set_verdict_in(&tx, surface, to, reading)?;
+    let t = user_dict::set_verdict_in(&tx, &crate::normalize::nfc(surface), to, reading)?;
     tx.commit()?;
     Ok((t, reconciled))
 }
@@ -2564,6 +2564,101 @@ mod tests {
             msg.contains("reindex vectors"),
             "should still point to `reindex vectors`, got: {msg:?}"
         );
+    }
+
+    /// Regression for the 2026-07-06 dict maintenance failure: a
+    /// `reject_words.txt` entry saved in NFD must be recognized by an
+    /// NFC-typed `tsm dict reject` — `mutate_verdict`'s reconcile step loads
+    /// the file (normalizing to NFC) before the verdict change runs, so the
+    /// NFC-typed surface resolves to the same row instead of duplicating it.
+    #[test]
+    #[serial_test::serial]
+    fn test_cmd_dict_reject_normalizes_nfd_reject_file_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
+        let db_path = config::db_path();
+        db::init_db(&db_path).unwrap();
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        std::fs::write(config::reject_words_path(), format!("{nfd_worker}\n")).unwrap();
+
+        // NFC-typed CLI input must resolve to the file's (now NFC-normalized)
+        // row rather than inserting a byte-mismatched duplicate.
+        cmd_dict_reject("\u{30ef}\u{30fc}\u{30ac}\u{30fc}").unwrap(); // ワーガー precomposed
+
+        let conn = db::get_connection(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dictionary_candidates", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "NFC CLI input must match the NFD file entry, not duplicate it"
+        );
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    /// An explicit NFD yomi passed to `tsm dict add` must be stored as NFC —
+    /// `cmd_dict_add` normalizes both inputs before `resolve_reading` runs.
+    #[test]
+    #[serial_test::serial]
+    fn test_cmd_dict_add_normalizes_nfd_yomi() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
+        let db_path = config::db_path();
+        db::init_db(&db_path).unwrap();
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        let nfc_worker = "\u{30ef}\u{30fc}\u{30ac}\u{30fc}"; // ワーガー precomposed
+
+        cmd_dict_add("candle", Some(nfd_worker)).unwrap();
+
+        let conn = db::get_connection(&db_path).unwrap();
+        let reading: Option<String> = conn
+            .query_row(
+                "SELECT reading FROM dictionary_candidates WHERE surface = 'candle'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reading.as_deref(), Some(nfc_worker));
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
+    }
+
+    /// An NFD surface with no explicit yomi falls back to the surface as its
+    /// own reading — that fallback must use the *normalized* surface, not
+    /// the raw NFD input, so both columns end up NFC.
+    #[test]
+    #[serial_test::serial]
+    fn test_cmd_dict_add_no_yomi_falls_back_to_normalized_surface() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TSM_STATE_DIR", dir.path());
+        config::reload();
+        let db_path = config::db_path();
+        db::init_db(&db_path).unwrap();
+        let nfd_worker = "\u{30ef}\u{30fc}\u{30ab}\u{3099}\u{30fc}"; // ワーガー decomposed
+        let nfc_worker = "\u{30ef}\u{30fc}\u{30ac}\u{30fc}"; // ワーガー precomposed
+
+        cmd_dict_add(nfd_worker, None).unwrap();
+
+        let conn = db::get_connection(&db_path).unwrap();
+        let (surface, reading): (String, Option<String>) = conn
+            .query_row(
+                "SELECT surface, reading FROM dictionary_candidates",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(surface, nfc_worker);
+        assert_eq!(reading.as_deref(), Some(nfc_worker));
+
+        std::env::remove_var("TSM_STATE_DIR");
+        config::reload();
     }
 
     #[test]

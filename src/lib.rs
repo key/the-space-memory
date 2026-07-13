@@ -22,6 +22,7 @@ pub mod logging;
 pub mod lua_hooks;
 pub mod manifest;
 pub mod model_loader;
+pub mod normalize;
 pub mod paths;
 pub mod placement;
 pub mod read_pool;
