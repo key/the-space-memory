@@ -114,9 +114,14 @@ jobs:
             --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv')
           checks=$(awk -F'\t' -v self="$SELF_CHECK_NAME" '$1 != self' <<<"$checks")
 
+          # Every exit below this point except this one is "wait for the next
+          # event". A workflow_run event implies a triggering workflow, which
+          # implies at least one check run at this commit, so an empty set means
+          # the query or the filter is broken. Fail loudly: a stall that only
+          # shows up as a green run nobody reads is worse than a red one.
           if [[ -z "$checks" ]]; then
-            echo "::warning::no check runs found for $HEAD_SHA; refusing to merge PR #$pr_number"
-            exit 0
+            echo "::error::no check runs found for $HEAD_SHA; cannot evaluate PR #$pr_number"
+            exit 1
           fi
 
           incomplete=$(awk -F'\t' '$2 != "completed" { printf "%s ", $1 }' <<<"$checks")
