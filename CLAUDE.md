@@ -471,6 +471,16 @@ A change is merge-ready when **all** of the following hold:
   `embed_via_socket`. The embedder socket server (`embedder_proc::handle_client`)
   also sub-batches internally at `BACKFILL_BATCH_SIZE` as defense in depth, so a
   client talking to the socket directly cannot bypass the cap either.
+- **Dependabot pull requests merge themselves** —
+  `.github/workflows/dependabot-auto-merge.yml` reacts to every completed
+  workflow run on a `dependabot/**` branch and squash-merges once every check on
+  the head commit is `success`, `skipped`, or `neutral`. It inspects only the
+  checks that exist, so the path filters on CI/E2E/Quality/Bench stay harmless.
+  `scripts/dependabot-automerge-decision.sh` decides eligibility:
+  `github_actions` bumps always qualify, `cargo` bumps only while they stay
+  inside Cargo's caret range — so `0.11 → 0.12` is held for review, not just
+  `1 → 2`. A held or stalled pull request prints the reason as a notice in that
+  workflow's run log; `@dependabot rebase` re-runs the whole evaluation.
 
 ## Design Decisions (ADR)
 

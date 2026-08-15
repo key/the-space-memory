@@ -64,6 +64,14 @@ repos:
         pass_filenames: false
         stages: [pre-commit]
 
+      - id: dependabot-automerge-decision
+        name: Dependabot auto-merge decision tests
+        entry: scripts/dependabot-automerge-decision.test.sh
+        language: script
+        files: ^scripts/dependabot-automerge-decision
+        pass_filenames: false
+        stages: [pre-commit]
+
       - id: gitleaks
         name: gitleaks (secret scan)
         entry: scripts/hook-run.sh gitleaks git --pre-commit --staged --redact --no-banner

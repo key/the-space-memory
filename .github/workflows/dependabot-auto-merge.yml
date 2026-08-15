@@ -1,0 +1,157 @@
+name: Dependabot Auto-merge
+
+# Merge a green Dependabot pull request without a human in the loop.
+#
+# Why `workflow_run` instead of GitHub's native auto-merge: enabling auto-merge
+# needs a required status check to wait on, and this repository has none — every
+# pull request reports CLEAN the moment it opens. Marking the existing checks
+# required is not a drop-in replacement either, because CI, E2E, Quality and
+# Bench are path-filtered: a pull request touching only `.github/workflows/**`
+# produces no check at all for them, so a required check would stay pending
+# forever and block every pull request, with no bypass actor to rescue it.
+# Reacting to completed workflow runs and inspecting whichever checks actually
+# exist for the head commit sidesteps both problems and leaves the repository's
+# merge policy untouched.
+#
+# `workflow_run` is also how a Dependabot-originated workflow gets a
+# write-capable GITHUB_TOKEN: the read-only-token restriction covers
+# `pull_request`, `push`, `create` and friends, not this event.
+
+on:
+  workflow_run:
+    # Every workflow that can report a check on a Dependabot pull request. Each
+    # completion re-evaluates the whole check set, so whichever finishes last is
+    # the one that merges. `PR Labeler` is deliberately absent: it runs on
+    # `pull_request_target`, so its payload carries the base branch and would
+    # never match the branch filter below — its `label` and `breaking` checks
+    # are still counted when the check set is inspected.
+    workflows: [CI, Lint, E2E, Quality, Bench, Code Metrics]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  # Serialize per pull request so two workflows finishing together cannot both
+  # decide to merge. Never cancel: a cancelled run is a lost evaluation, and the
+  # event that would have re-triggered it has already been consumed.
+  group: dependabot-auto-merge-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: dependabot-auto-merge
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # In a `workflow_run` context GITHUB_SHA is the default branch head,
+          # so this checks out main and never the pull request being judged.
+          # Only the decision script is needed, and `gh` authenticates from
+          # GH_TOKEN rather than the checkout's stored credentials.
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Merge when the pull request is eligible and every check is green
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          # This job's own check run. GitHub attaches a `workflow_run` job to
+          # the default branch commit rather than the pull request head, so it
+          # should not appear in the set below; filter it by name anyway so a
+          # change in that behaviour cannot deadlock the job on itself.
+          SELF_CHECK_NAME: dependabot-auto-merge
+        run: |
+          set -euo pipefail
+
+          # Pull request text is untrusted: read it from JSON into variables,
+          # never interpolate it into this script.
+          pr_json=$(gh pr list --repo "$REPO" --head "$HEAD_BRANCH" --state open \
+            --json number,title,author,headRefOid --limit 1)
+
+          if [[ $(jq 'length' <<<"$pr_json") -ne 1 ]]; then
+            echo "::notice::no open pull request for $HEAD_BRANCH"
+            exit 0
+          fi
+
+          author=$(jq -r '.[0].author.login' <<<"$pr_json")
+          if [[ "$author" != "app/dependabot" ]]; then
+            echo "::notice::$HEAD_BRANCH is not authored by Dependabot (author: $author)"
+            exit 0
+          fi
+
+          pr_number=$(jq -r '.[0].number' <<<"$pr_json")
+          pr_title=$(jq -r '.[0].title' <<<"$pr_json")
+          pr_head=$(jq -r '.[0].headRefOid' <<<"$pr_json")
+
+          # A push that landed after the triggering run started invalidates its
+          # result. The checks for the new head fire their own events.
+          if [[ "$pr_head" != "$HEAD_SHA" ]]; then
+            echo "::notice::PR #$pr_number moved on ($HEAD_SHA -> $pr_head); waiting for its new checks"
+            exit 0
+          fi
+
+          decision_reason=$(mktemp)
+          verdict=$(scripts/dependabot-automerge-decision.sh "$HEAD_BRANCH" "$pr_title" 2>"$decision_reason")
+          reason=$(<"$decision_reason")
+          if [[ "$verdict" != "merge" ]]; then
+            echo "::notice::PR #$pr_number held for review: $reason"
+            exit 0
+          fi
+
+          # Only the checks that actually exist for this commit are inspected,
+          # which is what makes path-filtered workflows harmless here: a
+          # workflow that never ran contributes nothing to merge on.
+          checks=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+            --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv')
+          checks=$(awk -F'\t' -v self="$SELF_CHECK_NAME" '$1 != self' <<<"$checks")
+
+          if [[ -z "$checks" ]]; then
+            echo "::warning::no check runs found for $HEAD_SHA; refusing to merge PR #$pr_number"
+            exit 0
+          fi
+
+          incomplete=$(awk -F'\t' '$2 != "completed" { printf "%s ", $1 }' <<<"$checks")
+          if [[ -n "$incomplete" ]]; then
+            echo "::notice::PR #$pr_number still running: $incomplete"
+            exit 0
+          fi
+
+          # `skipped` and `neutral` are how a conditional job reports "nothing
+          # to do" (Bench's `update-baseline`, for one) — they are not failures.
+          unsuccessful=$(awk -F'\t' \
+            '$3 != "success" && $3 != "skipped" && $3 != "neutral" { printf "%s(%s) ", $1, $3 }' <<<"$checks")
+          if [[ -n "$unsuccessful" ]]; then
+            echo "::notice::PR #$pr_number is not green: $unsuccessful"
+            exit 0
+          fi
+
+          # GitHub computes mergeability asynchronously and reports UNKNOWN
+          # until it settles; give it a moment before believing the answer.
+          mergeable=UNKNOWN
+          for _ in 1 2 3; do
+            mergeable=$(gh pr view "$pr_number" --repo "$REPO" --json mergeable --jq '.mergeable')
+            if [[ "$mergeable" != "UNKNOWN" ]]; then
+              break
+            fi
+            sleep 5
+          done
+          if [[ "$mergeable" != "MERGEABLE" ]]; then
+            # A conflicting Dependabot pull request is normal once a sibling
+            # lands; Dependabot rebases it, and the new checks retry this.
+            echo "::notice::PR #$pr_number is not mergeable ($mergeable); waiting for Dependabot to rebase"
+            exit 0
+          fi
+
+          # The branch is removed by the repository's delete-branch-on-merge
+          # setting, and there is no review requirement to approve away.
+          gh pr merge "$pr_number" --repo "$REPO" --squash
+          echo "::notice::merged PR #$pr_number: $reason"
