@@ -479,6 +479,11 @@ A change is merge-ready when **all** of the following hold:
   The merge is bound to the inspected commit with `--match-head-commit`, so a
   Dependabot rebase landing mid-evaluation cannot slip an unchecked revision
   through — GitHub rejects the merge and the new head's checks start over.
+  Re-evaluation only happens when a workflow named in that file's `workflows:`
+  trigger list finishes, so a workflow able to post a check but missing from the
+  list would strand a green pull request forever, with every auto-merge run
+  reporting success. `scripts/lint-automerge-triggers.sh` (wired into `Lint` and
+  prek) fails the build rather than let those two lists drift apart.
   `scripts/dependabot-automerge-decision.sh` decides eligibility:
   `github_actions` bumps always qualify, `cargo` bumps only while they stay
   inside Cargo's caret range — so `0.11 → 0.12` is held for review, not just

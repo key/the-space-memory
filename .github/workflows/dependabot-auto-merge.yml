@@ -21,11 +21,16 @@ on:
   workflow_run:
     # Every workflow that can report a check on a Dependabot pull request. Each
     # completion re-evaluates the whole check set, so whichever finishes last is
-    # the one that merges. `PR Labeler` is deliberately absent: it runs on
-    # `pull_request_target`, so its payload carries the base branch and would
-    # never match the branch filter below — its `label` and `breaking` checks
-    # are still counted when the check set is inspected.
-    workflows: [CI, Lint, E2E, Quality, Bench, Code Metrics]
+    # the one that merges — which means a workflow missing from this list can
+    # never resume an evaluation that is waiting on its check, leaving a green
+    # pull request open forever. `scripts/lint-automerge-triggers.sh` keeps the
+    # list honest; do not edit one without the other.
+    #
+    # `PR Labeler` is deliberately absent: it runs on `pull_request_target`, so
+    # its payload carries the base branch and would never match the branch
+    # filter below — its `label` and `breaking` checks are still counted when
+    # the check set is inspected.
+    workflows: [CI, Lint, E2E, Quality, Bench, Code Metrics, DevContainer]
     types: [completed]
 
 permissions:
