@@ -140,6 +140,10 @@ jobs:
         working-directory: tests/e2e/testdata
         run: |
           DEPS="${{ github.workspace }}/target/release/deps"
+          # cargo names these files itself, so the non-alphanumeric filenames
+          # SC2010 warns about cannot occur here, and the newest-first ordering
+          # `ls -t` provides has no concise glob equivalent.
+          # shellcheck disable=SC2010
           BIN=$(ls -t "$DEPS"/record_metrics-* 2>/dev/null | grep -v '\.d$' | head -1)
           if [ -z "$BIN" ]; then
             echo "::error::record_metrics binary not found — did the pre-build step run?"
@@ -273,6 +277,10 @@ jobs:
         working-directory: tests/e2e/testdata
         run: |
           DEPS="${{ github.workspace }}/target/release/deps"
+          # cargo names these files itself, so the non-alphanumeric filenames
+          # SC2010 warns about cannot occur here, and the newest-first ordering
+          # `ls -t` provides has no concise glob equivalent.
+          # shellcheck disable=SC2010
           BIN=$(ls -t "$DEPS"/record_metrics-* 2>/dev/null | grep -v '\.d$' | head -1)
           if [ -z "$BIN" ]; then
             echo "::error::record_metrics binary not found — did the pre-build step run?"
