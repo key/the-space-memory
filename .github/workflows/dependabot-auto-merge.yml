@@ -93,7 +93,9 @@ jobs:
           pr_head=$(jq -r '.[0].headRefOid' <<<"$pr_json")
 
           # A push that landed after the triggering run started invalidates its
-          # result. The checks for the new head fire their own events.
+          # result. The checks for the new head fire their own events. This is
+          # an early exit only — it saves the work below but proves nothing
+          # about the moment of the merge, which `--match-head-commit` does.
           if [[ "$pr_head" != "$HEAD_SHA" ]]; then
             echo "::notice::PR #$pr_number moved on ($HEAD_SHA -> $pr_head); waiting for its new checks"
             exit 0
@@ -156,7 +158,28 @@ jobs:
             exit 0
           fi
 
+          # `--match-head-commit` is what actually enforces this workflow's one
+          # invariant: the commit that lands is the commit whose checks were
+          # inspected. Everything above reads the head at a point in time and
+          # then does more I/O, so a rebase in between would otherwise merge a
+          # revision nothing has checked — and Dependabot rebases exactly when
+          # a sibling pull request lands, which this workflow itself causes.
+          # GitHub rejects the merge on mismatch, making the check-and-merge a
+          # single atomic decision on the server.
+          #
           # The branch is removed by the repository's delete-branch-on-merge
           # setting, and there is no review requirement to approve away.
-          gh pr merge "$pr_number" --repo "$REPO" --squash
-          echo "::notice::merged PR #$pr_number: $reason"
+          if gh pr merge "$pr_number" --repo "$REPO" --squash --match-head-commit "$HEAD_SHA"; then
+            echo "::notice::merged PR #$pr_number: $reason"
+            exit 0
+          fi
+
+          # Distinguish the expected rejection from a real failure by re-reading
+          # the head rather than by matching on GitHub's error text.
+          current_head=$(gh pr view "$pr_number" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+          if [[ "$current_head" != "$HEAD_SHA" ]]; then
+            echo "::notice::PR #$pr_number moved to $current_head mid-merge; waiting for its new checks"
+            exit 0
+          fi
+          echo "::error::merging PR #$pr_number failed while its head was still $HEAD_SHA"
+          exit 1

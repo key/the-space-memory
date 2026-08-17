@@ -476,6 +476,9 @@ A change is merge-ready when **all** of the following hold:
   workflow run on a `dependabot/**` branch and squash-merges once every check on
   the head commit is `success`, `skipped`, or `neutral`. It inspects only the
   checks that exist, so the path filters on CI/E2E/Quality/Bench stay harmless.
+  The merge is bound to the inspected commit with `--match-head-commit`, so a
+  Dependabot rebase landing mid-evaluation cannot slip an unchecked revision
+  through — GitHub rejects the merge and the new head's checks start over.
   `scripts/dependabot-automerge-decision.sh` decides eligibility:
   `github_actions` bumps always qualify, `cargo` bumps only while they stay
   inside Cargo's caret range — so `0.11 → 0.12` is held for review, not just
