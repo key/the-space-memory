@@ -2,14 +2,14 @@
 # Keep the Dependabot auto-merge trigger list in sync with the workflows that
 # can attach a check to a Dependabot pull request.
 #
-# Why: dependabot-auto-merge.yml waits until every check run on the head commit
-# is complete, and it re-evaluates only when one of the workflows in its
-# `workflows:` trigger list finishes. A workflow that can post a check but is
-# missing from that list can therefore never resume the evaluation it is
-# blocking — whichever listed workflow finished last already looked, saw the
-# missing one still running, and exited 0. The pull request goes green and sits
-# there forever while every auto-merge run reports success. Nothing in GitHub
-# couples the two lists, so this check does.
+# Why: dependabot-auto-merge.yml waits for every `pull_request`-triggered
+# workflow run on the head commit, and it re-evaluates only when a workflow in
+# its `workflows:` trigger list finishes. Those two sets must be the same one.
+# A workflow that is waited on but not listed can never resume the evaluation
+# it is blocking — whichever listed workflow finished last already looked, saw
+# it still running, and exited 0. The pull request goes green and sits there
+# forever while every auto-merge run reports success. Nothing in GitHub couples
+# the two, so this check does.
 #
 # The parse is deliberately strict: anything it cannot read is an error, never
 # a pass, because a false green here is exactly the failure being prevented.

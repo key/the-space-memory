@@ -473,18 +473,25 @@ A change is merge-ready when **all** of the following hold:
   client talking to the socket directly cannot bypass the cap either.
 - **Dependabot pull requests merge themselves** —
   `.github/workflows/dependabot-auto-merge.yml` reacts to every completed
-  workflow run on a `dependabot/**` branch and squash-merges once every check on
-  the head commit is `success`, `skipped`, or `neutral`. It inspects only the
-  checks that exist, so the path filters on CI/E2E/Quality/Bench stay harmless.
-  The merge is bound to the inspected commit with `--match-head-commit`, so a
-  Dependabot rebase landing mid-evaluation cannot slip an unchecked revision
-  through — GitHub rejects the merge and the new head's checks start over.
-  Re-evaluation only happens when a workflow named in that file's `workflows:`
-  trigger list finishes, so a workflow able to post a check but missing from the
-  list would strand a green pull request forever, with every auto-merge run
-  reporting success. `scripts/lint-automerge-triggers.sh` (wired into `Lint` and
-  prek) fails the build rather than let those two lists drift apart.
-  `scripts/dependabot-automerge-decision.sh` decides eligibility:
+  workflow run on a `dependabot/**` branch and squash-merges once every
+  `pull_request`-triggered workflow run on the head commit is `success`,
+  `skipped`, or `neutral`. Only the runs that exist are inspected, so the path
+  filters on CI/E2E/Quality/Bench stay harmless. The merge is bound to the
+  inspected commit with `--match-head-commit`, so a Dependabot rebase landing
+  mid-evaluation cannot slip an unchecked revision through — GitHub rejects the
+  merge and the new head's checks start over.
+- **The auto-merge gate waits only on what can wake it** — re-evaluation happens
+  solely when a workflow named in that file's `workflows:` trigger list
+  finishes, so waiting on anything outside that set is a permanent, invisible
+  stall: the run that gave up exited green. That rules out `pull_request_target`
+  checks (`label`, `breaking`) and third-party apps, which post checks on the
+  commit but can never re-trigger the workflow. Their pending state is ignored;
+  a verdict they have already reached is still respected, so a red one holds the
+  pull request for a human. The other half of the invariant —
+  every `pull_request` workflow being in the trigger list —
+  is enforced by `scripts/lint-automerge-triggers.sh`, wired into `Lint` and
+  prek, which fails the build rather than let the two sets drift apart.
+- **Auto-merge eligibility** — `scripts/dependabot-automerge-decision.sh`:
   `github_actions` bumps always qualify, `cargo` bumps only while they stay
   inside Cargo's caret range — so `0.11 → 0.12` is held for review, not just
   `1 → 2`. A held or stalled pull request prints the reason as a notice in that

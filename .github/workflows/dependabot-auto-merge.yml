@@ -69,11 +69,6 @@ jobs:
           REPO: ${{ github.repository }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          # This job's own check run. GitHub attaches a `workflow_run` job to
-          # the default branch commit rather than the pull request head, so it
-          # should not appear in the set below; filter it by name anyway so a
-          # change in that behaviour cannot deadlock the job on itself.
-          SELF_CHECK_NAME: dependabot-auto-merge
         run: |
           set -euo pipefail
 
@@ -114,35 +109,61 @@ jobs:
             exit 0
           fi
 
-          # Only the checks that actually exist for this commit are inspected,
-          # which is what makes path-filtered workflows harmless here: a
-          # workflow that never ran contributes nothing to merge on.
-          checks=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-            --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv')
-          checks=$(awk -F'\t' -v self="$SELF_CHECK_NAME" '$1 != self' <<<"$checks")
+          # Wait only on things whose completion can wake this workflow up.
+          #
+          # `event=pull_request` is exactly that set. A run from any other event
+          # cannot re-trigger an evaluation: `pull_request_target` (PR Labeler)
+          # reports its checks on this commit but its workflow_run payload
+          # carries the base branch, so it never matches the branch filter
+          # above. Waiting on such a check is a permanent stall — nothing will
+          # ever look again — and it is an invisible one, because the run that
+          # gave up exited green. `scripts/lint-automerge-triggers.sh` closes
+          # the other half of this: it guarantees every pull_request workflow
+          # appears in the trigger list, so everything counted here can wake us.
+          #
+          # Only the runs that exist are inspected, which is what makes the path
+          # filters harmless: a workflow that never ran is nothing to wait on.
+          runs=$(gh api --paginate \
+            "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100" \
+            --jq '.workflow_runs[] | [.name, .status, (.conclusion // "")] | @tsv')
 
           # Every exit below this point except this one is "wait for the next
-          # event". A workflow_run event implies a triggering workflow, which
-          # implies at least one check run at this commit, so an empty set means
-          # the query or the filter is broken. Fail loudly: a stall that only
-          # shows up as a green run nobody reads is worse than a red one.
-          if [[ -z "$checks" ]]; then
-            echo "::error::no check runs found for $HEAD_SHA; cannot evaluate PR #$pr_number"
+          # event". This workflow only runs because a pull_request-triggered
+          # workflow completed at this commit, so an empty set means the query
+          # is broken. Fail loudly: a stall that shows up as a green run nobody
+          # reads is worse than a red one.
+          if [[ -z "$runs" ]]; then
+            echo "::error::no pull_request workflow runs found for $HEAD_SHA; cannot evaluate PR #$pr_number"
             exit 1
           fi
 
-          incomplete=$(awk -F'\t' '$2 != "completed" { printf "%s ", $1 }' <<<"$checks")
+          incomplete=$(awk -F'\t' '$2 != "completed" { printf "%s ", $1 }' <<<"$runs")
           if [[ -n "$incomplete" ]]; then
             echo "::notice::PR #$pr_number still running: $incomplete"
             exit 0
           fi
 
-          # `skipped` and `neutral` are how a conditional job reports "nothing
-          # to do" (Bench's `update-baseline`, for one) — they are not failures.
+          # `skipped` and `neutral` are how a conditional workflow reports
+          # "nothing to do" — they are not failures.
           unsuccessful=$(awk -F'\t' \
-            '$3 != "success" && $3 != "skipped" && $3 != "neutral" { printf "%s(%s) ", $1, $3 }' <<<"$checks")
+            '$3 != "success" && $3 != "skipped" && $3 != "neutral" { printf "%s(%s) ", $1, $3 }' <<<"$runs")
           if [[ -n "$unsuccessful" ]]; then
             echo "::notice::PR #$pr_number is not green: $unsuccessful"
+            exit 0
+          fi
+
+          # Checks from outside that set — PR Labeler, and any third-party app —
+          # are not waited on, but a verdict they have already reached is still
+          # respected. Ignoring a pending one costs nothing; ignoring a red one
+          # would merge over a stated objection. A red check here holds the pull
+          # request until a human looks, which is a visible stop, not a stall.
+          objections=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+            --jq '.check_runs[]
+                  | select(.status == "completed")
+                  | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")
+                  | "\(.name)(\(.conclusion // "none"))"')
+          if [[ -n "$objections" ]]; then
+            echo "::notice::PR #$pr_number held by a check outside the trigger set: $(tr '\n' ' ' <<<"$objections")"
             exit 0
           fi
 
