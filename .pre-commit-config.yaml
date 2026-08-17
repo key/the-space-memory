@@ -64,6 +64,30 @@ repos:
         pass_filenames: false
         stages: [pre-commit]
 
+      - id: dependabot-automerge-decision
+        name: Dependabot auto-merge decision tests
+        entry: scripts/dependabot-automerge-decision.test.sh
+        language: script
+        files: ^scripts/dependabot-automerge-decision
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: automerge-triggers
+        name: Dependabot auto-merge trigger list in sync
+        entry: scripts/lint-automerge-triggers.sh
+        language: script
+        files: ^\.github/workflows/
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: automerge-triggers-test
+        name: Dependabot auto-merge trigger guard tests
+        entry: scripts/lint-automerge-triggers.test.sh
+        language: script
+        files: ^scripts/lint-automerge-triggers
+        pass_filenames: false
+        stages: [pre-commit]
+
       - id: actionlint
         name: actionlint (workflows)
         entry: scripts/lint-workflows.sh

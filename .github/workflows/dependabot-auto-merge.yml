@@ -1,0 +1,110 @@
+name: Dependabot Auto-merge
+
+# Merge a green Dependabot pull request without a human in the loop.
+#
+# Why `workflow_run` instead of GitHub's native auto-merge: enabling auto-merge
+# needs a required status check to wait on, and this repository has none — every
+# pull request reports CLEAN the moment it opens. Marking the existing checks
+# required is not a drop-in replacement either, because CI, E2E, Quality and
+# Bench are path-filtered: a pull request touching only `.github/workflows/**`
+# produces no check at all for them, so a required check would stay pending
+# forever and block every pull request, with no bypass actor to rescue it.
+# Reacting to completed workflow runs and inspecting whichever runs actually
+# exist for the head commit sidesteps both problems and leaves the repository's
+# merge policy untouched.
+#
+# `workflow_run` is also how a Dependabot-originated workflow gets a
+# write-capable GITHUB_TOKEN: the read-only-token restriction covers
+# `pull_request`, `push`, `create` and friends, not this event.
+#
+# The decision itself lives in `scripts/dependabot-automerge.sh`, which keeps it
+# under the repository's own shellcheck and prek coverage instead of hiding it
+# in a YAML string.
+
+on:
+  workflow_run:
+    # Every workflow that can report a check on a Dependabot pull request. Each
+    # completion re-evaluates the whole set, so whichever finishes last is the
+    # one that merges — which means a workflow missing from this list can never
+    # resume an evaluation waiting on it. `scripts/lint-automerge-triggers.sh`
+    # keeps the list honest; do not edit one without the other.
+    #
+    # `PR Labeler` is deliberately absent: it runs on `pull_request_target`, so
+    # its payload carries the base branch and would never match the branch
+    # filter below — its `label` and `breaking` checks are still accounted for
+    # by the script.
+    workflows: [CI, Lint, E2E, Quality, Bench, Code Metrics, DevContainer]
+    types: [completed]
+
+  # The reconciler. Every "not yet" in the script returns without merging and
+  # relies on a later look, but the event above only fires when a pull_request
+  # workflow finishes — so a wait on anything else (a base that moved, a scanner
+  # that has not answered, a mergeability recompute) has nothing to resume it.
+  # This sweep is that resumption, and it is what allows each individual wait to
+  # be a plain "return and try again" rather than a poll or a failure.
+  schedule:
+    - cron: "23 * * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  # One global group, not one per pull request. Per-branch serialization still
+  # let two siblings evaluate at the same instant, both observe an up-to-date
+  # base, and both merge — the second landing on a base its checks never saw.
+  # Serializing every evaluation means the second one runs after the first has
+  # merged, finds itself behind, and holds.
+  #
+  # `queue: max` is load-bearing. Under the default `single`, a newly queued run
+  # cancels the pending one, so with a shared group one pull request's final
+  # evaluation could be dropped by a sibling's event. `max` holds up to 100
+  # pending runs, and an evaluation is a handful of API calls.
+  group: dependabot-auto-merge
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: dependabot-auto-merge
+    # The schedule and manual runs sweep every open Dependabot pull request, so
+    # they carry no branch to filter on; only the workflow_run path does.
+    if: >-
+      github.event_name != 'workflow_run' || (
+        github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        startsWith(github.event.workflow_run.head_branch, 'dependabot/')
+      )
+    runs-on: ubuntu-latest
+    # Generous because a sweep evaluates every open pull request in turn, and
+    # each may pause briefly on checks outside the trigger set.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # In a `workflow_run` context GITHUB_SHA is the default branch head,
+          # so this checks out main and never the pull request being judged.
+          # Only the scripts are needed, and `gh` authenticates from GH_TOKEN
+          # rather than the checkout's stored credentials.
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Merge eligible, green Dependabot pull requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Empty on schedule and manual runs, which makes the script sweep.
+          # Passed through the environment because a branch name is untrusted
+          # text that must never be interpolated into a command line.
+          EVENT_BRANCH: >-
+            ${{ github.event_name == 'workflow_run'
+                && github.event.workflow_run.head_branch || '' }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$EVENT_BRANCH" ]]; then
+            scripts/dependabot-automerge.sh "$EVENT_BRANCH"
+          else
+            scripts/dependabot-automerge.sh
+          fi

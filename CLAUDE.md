@@ -471,6 +471,54 @@ A change is merge-ready when **all** of the following hold:
   `embed_via_socket`. The embedder socket server (`embedder_proc::handle_client`)
   also sub-batches internally at `BACKFILL_BATCH_SIZE` as defense in depth, so a
   client talking to the socket directly cannot bypass the cap either.
+- **Dependabot pull requests merge themselves** —
+  `.github/workflows/dependabot-auto-merge.yml` reacts to every completed
+  workflow run on a `dependabot/**` branch and squash-merges once every
+  `pull_request`-triggered workflow run on the head commit is `success`,
+  `skipped`, or `neutral`. Only the runs that exist are inspected, so the path
+  filters on CI/E2E/Quality/Bench stay harmless. The merge is bound to the
+  inspected commit with `--match-head-commit`, so a Dependabot rebase landing
+  mid-evaluation cannot slip an unchecked revision through — GitHub rejects the
+  merge and the new head's checks start over. A pull request behind its base is
+  held too, because its checks tested a merge ref the base has since moved past;
+  it waits for Dependabot's next scheduled rebase (a bounded wait, at the same
+  weekly cadence these pull requests arrive on). Every evaluation runs under one
+  global `concurrency` group with `queue: max`, so two siblings cannot both pass
+  the base check and both merge; `queue: max` rather than the default `single`
+  because a cancelled pending run is a dropped evaluation nothing retries.
+  Pinning the base against writers outside this workflow would need a merge
+  queue, which this repository has not adopted — main's push-triggered CI is the
+  backstop there. The same boundary leaves an external check that has not been
+  created yet unwaitable: only an up-front list of required contexts closes
+  that, and there are no such checks on this repository today. Both limits are
+  spelled out at the top of `scripts/dependabot-automerge.sh`; treat "adopt
+  required checks or a merge queue" as the one change that moves them.
+- **The auto-merge gate waits only on what can wake it** — re-evaluation happens
+  solely when a workflow named in that file's `workflows:` trigger list
+  finishes, so waiting on anything outside that set is a permanent, invisible
+  stall: the run that gave up exited green. That rules out `pull_request_target`
+  checks (`label`, `breaking`) and third-party apps, which post checks on the
+  commit but can never re-trigger the workflow. Those get a short poll and are
+  then left to the hourly sweep, never merged past. The other half of the
+  invariant —
+  every `pull_request` workflow being in the trigger list —
+  is enforced by `scripts/lint-automerge-triggers.sh`, wired into `Lint` and
+  prek, which fails the build rather than let the two sets drift apart.
+- **An hourly sweep is what makes every auto-merge wait safe** — the decision
+  lives in `scripts/dependabot-automerge.sh`, called with a branch from the
+  `workflow_run` fast path and with no argument from an hourly `schedule`, where
+  it re-examines every open Dependabot pull request. Each "not yet" in that
+  script simply returns and relies on a later look; the fast path only fires
+  when a `pull_request` workflow finishes, so a wait on anything else (a moved
+  base, an unanswered scanner, a mergeability recompute, a dropped event) has
+  nothing to resume it. The sweep is that resumption — which is why no wait
+  there needs to poll hard or fail red. `workflow_dispatch` runs the same sweep
+  on demand.
+- **Auto-merge eligibility** — `scripts/dependabot-automerge-decision.sh`:
+  `github_actions` bumps always qualify, `cargo` bumps only while they stay
+  inside Cargo's caret range — so `0.11 → 0.12` is held for review, not just
+  `1 → 2`. A held or stalled pull request prints the reason as a notice in that
+  workflow's run log; `@dependabot rebase` re-runs the whole evaluation.
 
 ## Design Decisions (ADR)
 
