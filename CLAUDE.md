@@ -494,13 +494,22 @@ A change is merge-ready when **all** of the following hold:
   finishes, so waiting on anything outside that set is a permanent, invisible
   stall: the run that gave up exited green. That rules out `pull_request_target`
   checks (`label`, `breaking`) and third-party apps, which post checks on the
-  commit but can never re-trigger the workflow. Those get a bounded poll instead
-  — two minutes, after which the run fails red rather than merging past a
-  scanner that has not answered — and a red verdict from one holds the pull
-  request for a human. The other half of the invariant —
+  commit but can never re-trigger the workflow. Those get a short poll and are
+  then left to the hourly sweep, never merged past. The other half of the
+  invariant —
   every `pull_request` workflow being in the trigger list —
   is enforced by `scripts/lint-automerge-triggers.sh`, wired into `Lint` and
   prek, which fails the build rather than let the two sets drift apart.
+- **An hourly sweep is what makes every auto-merge wait safe** — the decision
+  lives in `scripts/dependabot-automerge.sh`, called with a branch from the
+  `workflow_run` fast path and with no argument from an hourly `schedule`, where
+  it re-examines every open Dependabot pull request. Each "not yet" in that
+  script simply returns and relies on a later look; the fast path only fires
+  when a `pull_request` workflow finishes, so a wait on anything else (a moved
+  base, an unanswered scanner, a mergeability recompute, a dropped event) has
+  nothing to resume it. The sweep is that resumption — which is why no wait
+  there needs to poll hard or fail red. `workflow_dispatch` runs the same sweep
+  on demand.
 - **Auto-merge eligibility** — `scripts/dependabot-automerge-decision.sh`:
   `github_actions` bumps always qualify, `cargo` bumps only while they stay
   inside Cargo's caret range — so `0.11 → 0.12` is held for review, not just
