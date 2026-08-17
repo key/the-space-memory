@@ -132,11 +132,29 @@ evaluate() {
     # checks take seconds and because this holds the shared concurrency queue,
     # then hand the wait to the sweep rather than failing — a red run here would
     # be one nothing ever retries.
-    local attempts="$EXTERNAL_POLL_ATTEMPTS" checks pending objections
+    # The Checks API is not the only surface. The older Statuses API is a
+    # separate mechanism whose contexts appear in neither `check-runs` nor
+    # `actions/runs`, and plenty of third-party tools still post through it, so
+    # ignoring it would quietly undo the paragraph above. Fold its contexts into
+    # the same three columns and one rule covers both.
+    #
+    # Read `.statuses[]`, never the combined `.state`: that field reports
+    # "pending" for a commit carrying no statuses at all, which would hold every
+    # pull request forever. An empty array contributes nothing, which is right.
+    local attempts="$EXTERNAL_POLL_ATTEMPTS" checks statuses pending objections
     while true; do
         checks=$(gh api --paginate "repos/$REPO/commits/$head/check-runs" \
             --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv')
-        pending=$(awk -F'\t' '$2 != "completed" { printf "%s ", $1 }' <<<"$checks")
+        statuses=$(gh api "repos/$REPO/commits/$head/status" \
+            --jq '.statuses[]
+                  | [.context,
+                     (if .state == "pending" then "in_progress" else "completed" end),
+                     .state]
+                  | @tsv')
+        checks="$checks"$'\n'"$statuses"
+        # `NF` skips the blank line left when either query returns nothing;
+        # without it an empty field would read as a nameless pending check.
+        pending=$(awk -F'\t' 'NF && $2 != "completed" { printf "%s ", $1 }' <<<"$checks")
         if [[ -z "$pending" ]]; then
             break
         fi
@@ -148,7 +166,7 @@ evaluate() {
         sleep "$EXTERNAL_POLL_INTERVAL"
     done
     objections=$(awk -F'\t' \
-        '$3 != "success" && $3 != "skipped" && $3 != "neutral" { printf "%s(%s) ", $1, $3 }' <<<"$checks")
+        'NF && $3 != "success" && $3 != "skipped" && $3 != "neutral" { printf "%s(%s) ", $1, $3 }' <<<"$checks")
     if [[ -n "$objections" ]]; then
         note "PR #$number held by a check outside the trigger set: $objections"
         return 0
