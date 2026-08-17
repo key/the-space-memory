@@ -38,10 +38,21 @@ permissions:
   pull-requests: write
 
 concurrency:
-  # Serialize per pull request so two workflows finishing together cannot both
-  # decide to merge. Never cancel: a cancelled run is a lost evaluation, and the
-  # event that would have re-triggered it has already been consumed.
-  group: dependabot-auto-merge-${{ github.event.workflow_run.head_branch }}
+  # One global group, not one per pull request. Per-branch serialization still
+  # let two siblings evaluate at the same instant, both observe an up-to-date
+  # base, and both merge — the second landing on a base its checks never saw.
+  # Serializing every evaluation means the second one runs after the first has
+  # merged, finds itself behind, and holds. (Races against writers this
+  # workflow does not control — a human merging — are not closable without a
+  # merge queue; see the base check in the job below.)
+  #
+  # `queue: max` is load-bearing. Under the default `single`, a newly queued run
+  # cancels the pending one, so with a shared group one pull request's final
+  # evaluation could be dropped by a sibling's event and never retried. That
+  # would trade a rare race for a routine silent stall. `max` holds up to 100
+  # pending runs, and each evaluation is a handful of API calls.
+  group: dependabot-auto-merge
+  queue: max
   cancel-in-progress: false
 
 jobs:
@@ -213,9 +224,13 @@ jobs:
           # Dependabot rebases exactly when a sibling pull request lands, which
           # this workflow itself causes. GitHub rejects the merge on mismatch.
           #
-          # Nothing available here pins the *base* the same way, so the window
-          # between the check above and this merge stays open; closing it needs
-          # a merge queue, which this repository has deliberately not adopted.
+          # Nothing available here pins the *base* the same way. The global
+          # concurrency group closes that window against sibling auto-merges,
+          # which are the only concurrent writer this workflow controls; a
+          # human merging in the same second is not closable without a merge
+          # queue, which this repository has deliberately not adopted. If that
+          # ever lands an untested combination, main's own push-triggered CI
+          # goes red on it rather than hiding it.
           #
           # The branch is removed by the repository's delete-branch-on-merge
           # setting, and there is no review requirement to approve away.

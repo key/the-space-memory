@@ -482,8 +482,13 @@ A change is merge-ready when **all** of the following hold:
   merge and the new head's checks start over. A pull request behind its base is
   held too, because its checks tested a merge ref the base has since moved past;
   it waits for Dependabot's next scheduled rebase (a bounded wait, at the same
-  weekly cadence these pull requests arrive on). Pinning the base as tightly as
-  the head would need a merge queue, which this repository has not adopted.
+  weekly cadence these pull requests arrive on). Every evaluation runs under one
+  global `concurrency` group with `queue: max`, so two siblings cannot both pass
+  the base check and both merge; `queue: max` rather than the default `single`
+  because a cancelled pending run is a dropped evaluation nothing retries.
+  Pinning the base against writers outside this workflow would need a merge
+  queue, which this repository has not adopted — main's push-triggered CI is the
+  backstop there.
 - **The auto-merge gate waits only on what can wake it** — re-evaluation happens
   solely when a workflow named in that file's `workflows:` trigger list
   finishes, so waiting on anything outside that set is a permanent, invisible
