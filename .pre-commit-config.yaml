@@ -88,6 +88,14 @@ repos:
         pass_filenames: false
         stages: [pre-commit]
 
+      - id: actionlint
+        name: actionlint (workflows)
+        entry: scripts/lint-workflows.sh
+        language: script
+        files: ^\.github/workflows/
+        pass_filenames: false
+        stages: [pre-commit]
+
       - id: gitleaks
         name: gitleaks (secret scan)
         entry: scripts/hook-run.sh gitleaks git --pre-commit --staged --redact --no-banner

@@ -2,6 +2,7 @@
 "github-cli" = "latest"
 jq = "latest"
 shellcheck = "latest"
+actionlint = "latest"
 "github:rvben/rumdl" = "latest"
 taplo = "latest"
 "aqua:gitleaks/gitleaks" = "latest"
