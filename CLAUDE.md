@@ -488,7 +488,11 @@ A change is merge-ready when **all** of the following hold:
   because a cancelled pending run is a dropped evaluation nothing retries.
   Pinning the base against writers outside this workflow would need a merge
   queue, which this repository has not adopted — main's push-triggered CI is the
-  backstop there.
+  backstop there. The same boundary leaves an external check that has not been
+  created yet unwaitable: only an up-front list of required contexts closes
+  that, and there are no such checks on this repository today. Both limits are
+  spelled out at the top of `scripts/dependabot-automerge.sh`; treat "adopt
+  required checks or a merge queue" as the one change that moves them.
 - **The auto-merge gate waits only on what can wake it** — re-evaluation happens
   solely when a workflow named in that file's `workflows:` trigger list
   finishes, so waiting on anything outside that set is a permanent, invisible

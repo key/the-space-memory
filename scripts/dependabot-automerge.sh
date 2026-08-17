@@ -12,6 +12,23 @@
 # answered, a mergeability recompute — has nothing to resume it. The sweep is
 # that resumption, and it is what lets each individual wait stay simple.
 #
+# Two gaps are known, deliberate, and not closable here. Both need required
+# status checks or a merge queue — the repository-wide policy this design exists
+# to avoid — so they are stated rather than half-patched:
+#
+#   The base is not pinned at the moment of merge. `--match-head-commit` pins
+#   the head, and the workflow's global concurrency group serializes this script
+#   against itself, but a direct push or a human merge can still move the base
+#   between the freshness check below and the merge. GitHub offers no
+#   expected-base parameter outside a merge queue. What catches an untested
+#   combination is main's own push-triggered CI, after the fact.
+#
+#   An external check that does not exist yet cannot be waited for. The poll
+#   below waits on checks that are present; a third-party app whose webhook
+#   arrives late could post a failure after the merge. Closing that needs the
+#   expected context names up front, which is what required status checks are —
+#   nothing in this repository can derive them, and there are none today.
+#
 # Usage: dependabot-automerge.sh [<head-branch>...]
 # Env:   REPO (or GITHUB_REPOSITORY), GH_TOKEN
 set -euo pipefail
