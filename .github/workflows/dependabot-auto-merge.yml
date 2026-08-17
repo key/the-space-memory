@@ -164,18 +164,40 @@ jobs:
             exit 0
           fi
 
-          # Checks from outside that set — PR Labeler, and any third-party app —
-          # are not waited on, but a verdict they have already reached is still
-          # respected. Ignoring a pending one costs nothing; ignoring a red one
-          # would merge over a stated objection. A red check here holds the pull
-          # request until a human looks, which is a visible stop, not a stall.
-          objections=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-            --jq '.check_runs[]
-                  | select(.status == "completed")
-                  | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")
-                  | "\(.name)(\(.conclusion // "none"))"')
+          # Every gated run is complete by now, and a workflow run completes only
+          # once its jobs do — so any check still pending on this commit came
+          # from outside the trigger set: PR Labeler, or a third-party app. No
+          # classification is needed; being pending here is the definition.
+          #
+          # Such a check cannot wake this workflow, which rules out waiting on
+          # it the way the gated runs are waited on — nothing would ever look
+          # again. It cannot be ignored either: a policy check that reports
+          # after the merge reports too late. So wait, but with a deadline, and
+          # give up loudly. A red run is something a person can act on; a green
+          # run that merged past a pending scanner is not. The window is short
+          # because these checks are seconds-long (PR Labeler finishes in under
+          # ten) and because this poll holds the shared concurrency queue.
+          attempts=8
+          while true; do
+            checks=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+              --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv')
+            pending=$(awk -F'\t' '$2 != "completed" { printf "%s ", $1 }' <<<"$checks")
+            if [[ -z "$pending" ]]; then
+              break
+            fi
+            attempts=$((attempts - 1))
+            if [[ "$attempts" -le 0 ]]; then
+              echo "::error::PR #$pr_number has checks outside the trigger set still pending" \
+                   "after two minutes: $pending"
+              exit 1
+            fi
+            sleep 15
+          done
+
+          objections=$(awk -F'\t' \
+            '$3 != "success" && $3 != "skipped" && $3 != "neutral" { printf "%s(%s) ", $1, $3 }' <<<"$checks")
           if [[ -n "$objections" ]]; then
-            echo "::notice::PR #$pr_number held by a check outside the trigger set: $(tr '\n' ' ' <<<"$objections")"
+            echo "::notice::PR #$pr_number held by a check outside the trigger set: $objections"
             exit 0
           fi
 

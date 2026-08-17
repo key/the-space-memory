@@ -494,9 +494,10 @@ A change is merge-ready when **all** of the following hold:
   finishes, so waiting on anything outside that set is a permanent, invisible
   stall: the run that gave up exited green. That rules out `pull_request_target`
   checks (`label`, `breaking`) and third-party apps, which post checks on the
-  commit but can never re-trigger the workflow. Their pending state is ignored;
-  a verdict they have already reached is still respected, so a red one holds the
-  pull request for a human. The other half of the invariant —
+  commit but can never re-trigger the workflow. Those get a bounded poll instead
+  — two minutes, after which the run fails red rather than merging past a
+  scanner that has not answered — and a red verdict from one holds the pull
+  request for a human. The other half of the invariant —
   every `pull_request` workflow being in the trigger list —
   is enforced by `scripts/lint-automerge-triggers.sh`, wired into `Lint` and
   prek, which fails the build rather than let the two sets drift apart.
