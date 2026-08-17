@@ -75,7 +75,7 @@ jobs:
           # Pull request text is untrusted: read it from JSON into variables,
           # never interpolate it into this script.
           pr_json=$(gh pr list --repo "$REPO" --head "$HEAD_BRANCH" --state open \
-            --json number,title,author,headRefOid --limit 1)
+            --json number,title,author,headRefOid,baseRefName --limit 1)
 
           if [[ $(jq 'length' <<<"$pr_json") -ne 1 ]]; then
             echo "::notice::no open pull request for $HEAD_BRANCH"
@@ -91,6 +91,7 @@ jobs:
           pr_number=$(jq -r '.[0].number' <<<"$pr_json")
           pr_title=$(jq -r '.[0].title' <<<"$pr_json")
           pr_head=$(jq -r '.[0].headRefOid' <<<"$pr_json")
+          base_branch=$(jq -r '.[0].baseRefName' <<<"$pr_json")
 
           # A push that landed after the triggering run started invalidates its
           # result. The checks for the new head fire their own events. This is
@@ -184,14 +185,37 @@ jobs:
             exit 0
           fi
 
-          # `--match-head-commit` is what actually enforces this workflow's one
-          # invariant: the commit that lands is the commit whose checks were
-          # inspected. Everything above reads the head at a point in time and
-          # then does more I/O, so a rebase in between would otherwise merge a
-          # revision nothing has checked — and Dependabot rebases exactly when
-          # a sibling pull request lands, which this workflow itself causes.
-          # GitHub rejects the merge on mismatch, making the check-and-merge a
-          # single atomic decision on the server.
+          # A `pull_request` run tests the merge ref — this head merged into the
+          # base as it stood then. Once the base moves, the combination that
+          # would land is one nothing ever built, which is what "require
+          # branches to be up to date" prevents on repositories that enforce it.
+          #
+          # Refusing here waits for Dependabot's next scheduled run to rebase:
+          # `rebase-strategy` defaults to `auto`, which rebases on conflict, on
+          # schedule, on reopen — but not for a branch that is merely behind. So
+          # this wait is bounded by the update interval, the same cadence at
+          # which these pull requests arrive. That is the difference from the
+          # `pull_request_target` case above, which had no mechanism that could
+          # ever resume it; do not mistake this one for that and bolt on a
+          # rebase nudge, which costs a full CI cycle per pull request and puts
+          # a non-Dependabot commit on a Dependabot branch.
+          behind=$(gh api "repos/$REPO/compare/$base_branch...$HEAD_SHA" --jq '.behind_by')
+          if [[ "$behind" -ne 0 ]]; then
+            echo "::notice::PR #$pr_number is $behind commit(s) behind $base_branch, so its checks" \
+                 "tested a stale merge; waiting for Dependabot to rebase"
+            exit 0
+          fi
+
+          # `--match-head-commit` pins the head: the commit that lands is the
+          # commit whose checks were inspected. Everything above reads the head
+          # at a point in time and then does more I/O, so a rebase in between
+          # would otherwise merge a revision nothing has checked — and
+          # Dependabot rebases exactly when a sibling pull request lands, which
+          # this workflow itself causes. GitHub rejects the merge on mismatch.
+          #
+          # Nothing available here pins the *base* the same way, so the window
+          # between the check above and this merge stays open; closing it needs
+          # a merge queue, which this repository has deliberately not adopted.
           #
           # The branch is removed by the repository's delete-branch-on-merge
           # setting, and there is no review requirement to approve away.

@@ -479,7 +479,11 @@ A change is merge-ready when **all** of the following hold:
   filters on CI/E2E/Quality/Bench stay harmless. The merge is bound to the
   inspected commit with `--match-head-commit`, so a Dependabot rebase landing
   mid-evaluation cannot slip an unchecked revision through — GitHub rejects the
-  merge and the new head's checks start over.
+  merge and the new head's checks start over. A pull request behind its base is
+  held too, because its checks tested a merge ref the base has since moved past;
+  it waits for Dependabot's next scheduled rebase (a bounded wait, at the same
+  weekly cadence these pull requests arrive on). Pinning the base as tightly as
+  the head would need a merge queue, which this repository has not adopted.
 - **The auto-merge gate waits only on what can wake it** — re-evaluation happens
   solely when a workflow named in that file's `workflows:` trigger list
   finishes, so waiting on anything outside that set is a permanent, invisible
